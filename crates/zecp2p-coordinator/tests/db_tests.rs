@@ -19,6 +19,7 @@ fn create_test_request() -> OfframpRequest {
         venmo_username: "testuser".to_string(),
         user_address: Address::ZERO,
         taker_address: Address::ZERO,
+        zec_refund_address: "t1TestZcashAddress123".to_string(),
         min_rate: U256::from(30_000000_000000_000000u128), // 30 USDC/ZEC
         timeout_seconds: 600,
     }

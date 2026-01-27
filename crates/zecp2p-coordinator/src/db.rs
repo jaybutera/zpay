@@ -1,4 +1,8 @@
 //! SQLite database for session persistence
+//!
+//! Database operations for persisting offramp sessions.
+
+#![allow(dead_code)]
 
 use anyhow::Result;
 use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};

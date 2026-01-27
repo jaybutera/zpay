@@ -1,4 +1,9 @@
 //! Ethereum/Base chain interaction
+//!
+//! Chain interaction functions for the coordinator. Many public API methods
+//! are defined here for future use in the full offramp flow.
+
+#![allow(dead_code)]
 
 use alloy::{
     network::EthereumWallet,
@@ -288,6 +293,42 @@ impl ChainClient {
     /// Get current block number
     pub async fn current_block(&self) -> Result<u64> {
         Ok(self.provider().get_block_number().await?)
+    }
+
+    /// Rescue funds from GlueContract (user only)
+    /// Returns USDC to the user if processOfframp failed
+    pub async fn rescue(&self, session_id: B256) -> Result<B256> {
+        let glue_addr = self.glue_contract()?;
+        let provider = self.signing_provider()?;
+
+        let glue = OfframpGlue::new(glue_addr, provider);
+
+        let tx = glue
+            .rescue(session_id)
+            .send()
+            .await
+            .context("Failed to send rescue transaction")?;
+
+        let receipt = tx.get_receipt().await?;
+        Ok(receipt.transaction_hash)
+    }
+
+    /// Withdraw from zk-p2p deposit (user only)
+    /// Withdraws USDC from zk-p2p escrow if no taker signaled intent
+    pub async fn withdraw_from_zkp2p(&self, session_id: B256, amount: U256) -> Result<B256> {
+        let glue_addr = self.glue_contract()?;
+        let provider = self.signing_provider()?;
+
+        let glue = OfframpGlue::new(glue_addr, provider);
+
+        let tx = glue
+            .withdrawFromZkp2p(session_id, amount)
+            .send()
+            .await
+            .context("Failed to send withdrawFromZkp2p transaction")?;
+
+        let receipt = tx.get_receipt().await?;
+        Ok(receipt.transaction_hash)
     }
 }
 

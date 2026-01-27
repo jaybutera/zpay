@@ -1,4 +1,8 @@
 //! Application state and keeper loop
+//!
+//! Contains the shared application state and offramp processing logic.
+
+#![allow(dead_code)]
 
 use std::sync::Arc;
 
@@ -51,21 +55,22 @@ impl AppState {
         let mut session = OfframpSession::new(request.clone());
 
         // Get quote from NEAR Intents
+        let glue_address = self
+            .chain
+            .glue_contract()
+            .map_err(|e| AppError::Config(e.to_string()))?;
+
+        // Use the helper to create ZEC → USDC on Base request
+        let quote_request = crate::near::NearIntentsClient::zec_to_usdc_base_request(
+            request.zec_amount,
+            &glue_address.to_string(),
+            &request.zec_refund_address,
+            Some(50), // 0.5% slippage
+        );
+
         let quote = self
             .near
-            .get_quote(crate::near::QuoteRequest {
-                source_chain: "zcash".to_string(),
-                source_token: "ZEC".to_string(),
-                source_amount: request.zec_amount.to_string(),
-                destination_chain: "base".to_string(),
-                destination_token: "USDC".to_string(),
-                recipient: self
-                    .chain
-                    .glue_contract()
-                    .map_err(|e| AppError::Config(e.to_string()))?
-                    .to_string(),
-                slippage_bps: Some(50), // 0.5% slippage
-            })
+            .get_quote(quote_request)
             .await
             .map_err(|e| AppError::NearIntents(e.to_string()))?;
 
@@ -387,5 +392,93 @@ impl AppState {
         }
 
         Ok(())
+    }
+
+    /// Rescue funds from GlueContract
+    pub async fn rescue(self: &Arc<Self>, id: uuid::Uuid) -> Result<OfframpSession, AppError> {
+        let mut session = self
+            .get_session(id)
+            .await?
+            .ok_or(AppError::SessionNotFound)?;
+
+        // Can only rescue if USDC is in GlueContract (UsdcReceived state)
+        // or if session failed after USDC arrived
+        if !matches!(
+            session.status,
+            OfframpStatus::UsdcReceived | OfframpStatus::Failed
+        ) {
+            return Err(AppError::InvalidState(format!(
+                "Cannot rescue in state: {:?}",
+                session.status
+            )));
+        }
+
+        // Execute rescue on-chain
+        let _tx_hash = self
+            .chain
+            .rescue(session.session_id)
+            .await
+            .map_err(|e| AppError::Chain(e.to_string()))?;
+
+        session.set_status(OfframpStatus::Rescued);
+
+        // Persist
+        self.db
+            .update_session(&session)
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+
+        // Update cache
+        {
+            let mut sessions = self.sessions.write().await;
+            sessions.insert(session.id, session.clone());
+        }
+
+        Ok(session)
+    }
+
+    /// Withdraw from zk-p2p deposit
+    pub async fn withdraw(self: &Arc<Self>, id: uuid::Uuid) -> Result<OfframpSession, AppError> {
+        let mut session = self
+            .get_session(id)
+            .await?
+            .ok_or(AppError::SessionNotFound)?;
+
+        // Can only withdraw if USDC is in zk-p2p deposit (Zkp2pDeposited state)
+        if session.status != OfframpStatus::Zkp2pDeposited {
+            return Err(AppError::InvalidState(format!(
+                "Cannot withdraw in state: {:?}",
+                session.status
+            )));
+        }
+
+        // Get the amount to withdraw (use received_usdc or expected_usdc)
+        let amount = session
+            .received_usdc
+            .or(session.expected_usdc)
+            .ok_or_else(|| AppError::InvalidState("No USDC amount recorded".to_string()))?;
+
+        // Execute withdrawal on-chain
+        let _tx_hash = self
+            .chain
+            .withdraw_from_zkp2p(session.session_id, amount)
+            .await
+            .map_err(|e| AppError::Chain(e.to_string()))?;
+
+        session.set_status(OfframpStatus::Withdrawn);
+
+        // Persist
+        self.db
+            .update_session(&session)
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+
+        // Update cache
+        {
+            let mut sessions = self.sessions.write().await;
+            sessions.insert(session.id, session.clone());
+        }
+
+        Ok(session)
     }
 }

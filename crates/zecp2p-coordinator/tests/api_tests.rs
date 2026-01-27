@@ -182,7 +182,8 @@ async fn test_create_offramp_validates_addresses() {
         "zec_amount": "0.5",
         "venmo_username": "testuser",
         "user_address": "not-an-address",
-        "taker_address": "0x1234567890123456789012345678901234567890"
+        "taker_address": "0x1234567890123456789012345678901234567890",
+        "zec_refund_address": "t1VJnUz9FDy7WfFxqXwMZJWVxzMrRD7MvBA"
     });
 
     let response = app
@@ -218,7 +219,8 @@ async fn test_create_offramp_validates_zec_amount() {
         "zec_amount": "not-a-number",
         "venmo_username": "testuser",
         "user_address": "0x1234567890123456789012345678901234567890",
-        "taker_address": "0x1234567890123456789012345678901234567890"
+        "taker_address": "0x1234567890123456789012345678901234567890",
+        "zec_refund_address": "t1VJnUz9FDy7WfFxqXwMZJWVxzMrRD7MvBA"
     });
 
     let response = app
@@ -262,4 +264,236 @@ async fn test_process_offramp_session_not_found() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_create_offramp_validates_zec_address() {
+    let app = create_test_app().await;
+
+    let body = serde_json::json!({
+        "zec_amount": "0.5",
+        "venmo_username": "testuser",
+        "user_address": "0x1234567890123456789012345678901234567890",
+        "taker_address": "0x1234567890123456789012345678901234567890",
+        "zec_refund_address": "invalid_address"
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/offramp")
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert!(json["error"]
+        .as_str()
+        .unwrap()
+        .contains("Invalid ZEC refund address"));
+}
+
+#[tokio::test]
+async fn test_create_offramp_requires_zec_address() {
+    let app = create_test_app().await;
+
+    // Missing zec_refund_address should fail JSON parsing
+    let body = serde_json::json!({
+        "zec_amount": "0.5",
+        "venmo_username": "testuser",
+        "user_address": "0x1234567890123456789012345678901234567890",
+        "taker_address": "0x1234567890123456789012345678901234567890"
+        // zec_refund_address is missing
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/offramp")
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Missing required field should fail (JSON deserialization error)
+    assert!(response.status().is_client_error());
+}
+
+#[tokio::test]
+async fn test_create_offramp_validates_venmo_username_too_short() {
+    let app = create_test_app().await;
+
+    let body = serde_json::json!({
+        "zec_amount": "0.5",
+        "venmo_username": "x",  // Too short
+        "user_address": "0x1234567890123456789012345678901234567890",
+        "taker_address": "0x1234567890123456789012345678901234567890",
+        "zec_refund_address": "t1VJnUz9FDy7WfFxqXwMZJWVxzMrRD7MvBA"
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/offramp")
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(json["error"].as_str().unwrap().contains("too short"));
+}
+
+#[tokio::test]
+async fn test_create_offramp_validates_venmo_username_invalid_chars() {
+    let app = create_test_app().await;
+
+    let body = serde_json::json!({
+        "zec_amount": "0.5",
+        "venmo_username": "test@user!",  // Invalid characters
+        "user_address": "0x1234567890123456789012345678901234567890",
+        "taker_address": "0x1234567890123456789012345678901234567890",
+        "zec_refund_address": "t1VJnUz9FDy7WfFxqXwMZJWVxzMrRD7MvBA"
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/offramp")
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(json["error"].as_str().unwrap().contains("invalid characters"));
+}
+
+#[tokio::test]
+async fn test_create_offramp_validates_zec_amount_zero() {
+    let app = create_test_app().await;
+
+    let body = serde_json::json!({
+        "zec_amount": "0",
+        "venmo_username": "testuser",
+        "user_address": "0x1234567890123456789012345678901234567890",
+        "taker_address": "0x1234567890123456789012345678901234567890",
+        "zec_refund_address": "t1VJnUz9FDy7WfFxqXwMZJWVxzMrRD7MvBA"
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/offramp")
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(json["error"].as_str().unwrap().contains("greater than 0"));
+}
+
+#[tokio::test]
+async fn test_create_offramp_validates_zec_address_length() {
+    let app = create_test_app().await;
+
+    let body = serde_json::json!({
+        "zec_amount": "0.5",
+        "venmo_username": "testuser",
+        "user_address": "0x1234567890123456789012345678901234567890",
+        "taker_address": "0x1234567890123456789012345678901234567890",
+        "zec_refund_address": "t1TooShort"  // Valid prefix but wrong length
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/offramp")
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(json["error"].as_str().unwrap().contains("length"));
+}
+
+#[tokio::test]
+async fn test_create_offramp_validates_min_rate_negative() {
+    let app = create_test_app().await;
+
+    let body = serde_json::json!({
+        "zec_amount": "0.5",
+        "venmo_username": "testuser",
+        "user_address": "0x1234567890123456789012345678901234567890",
+        "taker_address": "0x1234567890123456789012345678901234567890",
+        "zec_refund_address": "t1VJnUz9FDy7WfFxqXwMZJWVxzMrRD7MvBA",
+        "min_rate": "-10"  // Negative rate
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/offramp")
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(json["error"].as_str().unwrap().contains("positive"));
 }

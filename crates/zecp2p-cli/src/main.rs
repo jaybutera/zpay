@@ -1,13 +1,17 @@
 //! zecp2p CLI - Command line interface for ZEC → Venmo offramps
 //!
 //! Usage:
-//!   zecp2p offramp <amount> ZEC to venmo @<username> --taker <address>
-//!   zecp2p status <session-id>
 //!   zecp2p quote <amount>
+//!   zecp2p offramp <amount> --venmo <username> --taker <address> ...
+//!   zecp2p status <session-id>
+//!   zecp2p watch <session-id>
+//!   zecp2p rescue <session-id>
+//!   zecp2p withdraw <session-id>
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use reqwest::Client;
+use std::time::Duration;
 use zecp2p_types::{OfframpResponse, OfframpStatus, QuoteResponse};
 
 #[derive(Parser)]
@@ -52,6 +56,10 @@ enum Commands {
         #[arg(long)]
         taker: String,
 
+        /// Your Zcash address for refunds (t1/t3/zs prefix)
+        #[arg(long)]
+        zec_address: String,
+
         /// Minimum USDC/ZEC rate to accept
         #[arg(long)]
         min_rate: Option<String>,
@@ -63,6 +71,28 @@ enum Commands {
 
     /// Check offramp status
     Status {
+        /// Session ID (UUID)
+        session_id: String,
+    },
+
+    /// Watch offramp status until completion
+    Watch {
+        /// Session ID (UUID)
+        session_id: String,
+
+        /// Poll interval in seconds
+        #[arg(long, default_value = "5")]
+        interval: u64,
+    },
+
+    /// Rescue USDC from GlueContract (if processOfframp failed)
+    Rescue {
+        /// Session ID (UUID)
+        session_id: String,
+    },
+
+    /// Withdraw USDC from zk-p2p deposit (if no taker)
+    Withdraw {
         /// Session ID (UUID)
         session_id: String,
     },
@@ -102,6 +132,7 @@ async fn main() -> Result<()> {
             venmo,
             user_address,
             taker,
+            zec_address,
             min_rate,
             timeout,
         } => {
@@ -110,6 +141,7 @@ async fn main() -> Result<()> {
                 "venmo_username": venmo,
                 "user_address": user_address,
                 "taker_address": taker,
+                "zec_refund_address": zec_address,
                 "min_rate": min_rate,
                 "timeout_seconds": timeout,
             });
@@ -141,63 +173,150 @@ async fn main() -> Result<()> {
         }
 
         Commands::Status { session_id } => {
+            let resp = fetch_status(&client, &cli.coordinator, &session_id).await?;
+            print_status(&resp);
+        }
+
+        Commands::Watch {
+            session_id,
+            interval,
+        } => {
+            println!("Watching session {}...", session_id);
+            println!("Press Ctrl+C to stop\n");
+
+            let mut last_status: Option<OfframpStatus> = None;
+            let poll_interval = Duration::from_secs(interval);
+
+            loop {
+                let resp = fetch_status(&client, &cli.coordinator, &session_id).await?;
+
+                // Only print if status changed
+                if last_status.as_ref() != Some(&resp.status) {
+                    print_status(&resp);
+                    println!();
+                    last_status = Some(resp.status);
+                } else {
+                    // Print a dot to show we're still polling
+                    print!(".");
+                    use std::io::Write;
+                    std::io::stdout().flush().ok();
+                }
+
+                // Check if terminal state
+                if is_terminal(&resp.status) {
+                    println!("\nSession complete.");
+                    break;
+                }
+
+                tokio::time::sleep(poll_interval).await;
+            }
+        }
+
+        Commands::Rescue { session_id } => {
+            println!("Rescuing funds for session {}...", session_id);
+
             let resp: OfframpResponse = client
-                .get(format!("{}/offramp/{}", cli.coordinator, session_id))
+                .post(format!("{}/offramp/{}/rescue", cli.coordinator, session_id))
                 .send()
                 .await?
                 .error_for_status()?
                 .json()
                 .await?;
 
-            println!("Session: {}", resp.session_id);
-            println!("Status: {:?}", resp.status);
+            println!("Rescue successful!");
+            print_status(&resp);
+        }
 
-            if let Some(ref addr) = resp.near_deposit_address {
-                println!("NEAR Deposit Address: {}", addr);
-            }
+        Commands::Withdraw { session_id } => {
+            println!("Withdrawing funds for session {}...", session_id);
 
-            if let Some(ref usdc) = resp.expected_usdc {
-                println!("Expected USDC: {}", usdc);
-            }
+            let resp: OfframpResponse = client
+                .post(format!("{}/offramp/{}/withdraw", cli.coordinator, session_id))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
 
-            if let Some(ref err) = resp.error {
-                println!("Error: {}", err);
-            }
-
-            // Print status-specific messages
-            match resp.status {
-                OfframpStatus::Created => {
-                    println!("\nWaiting for NEAR Intent to be initiated...");
-                }
-                OfframpStatus::NearIntentPending => {
-                    if let Some(ref addr) = resp.near_deposit_address {
-                        println!("\nSend ZEC to: {}", addr);
-                    }
-                }
-                OfframpStatus::UsdcReceived => {
-                    println!("\nUSDC received! Processing deposit to zk-p2p...");
-                }
-                OfframpStatus::Zkp2pDeposited => {
-                    println!("\nDeposit created on zk-p2p. Waiting for taker...");
-                }
-                OfframpStatus::IntentSignaled => {
-                    println!("\nTaker signaled intent! Waiting for Venmo payment...");
-                }
-                OfframpStatus::Fulfilled => {
-                    println!("\nOfframp complete! Check your Venmo for payment.");
-                }
-                OfframpStatus::Failed => {
-                    println!("\nOfframp failed.");
-                }
-                OfframpStatus::Rescued => {
-                    println!("\nFunds rescued to your wallet.");
-                }
-                OfframpStatus::Withdrawn => {
-                    println!("\nFunds withdrawn from zk-p2p.");
-                }
-            }
+            println!("Withdrawal successful!");
+            print_status(&resp);
         }
     }
 
     Ok(())
+}
+
+async fn fetch_status(
+    client: &Client,
+    coordinator: &str,
+    session_id: &str,
+) -> Result<OfframpResponse> {
+    let resp: OfframpResponse = client
+        .get(format!("{}/offramp/{}", coordinator, session_id))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    Ok(resp)
+}
+
+fn is_terminal(status: &OfframpStatus) -> bool {
+    matches!(
+        status,
+        OfframpStatus::Fulfilled
+            | OfframpStatus::Failed
+            | OfframpStatus::Rescued
+            | OfframpStatus::Withdrawn
+    )
+}
+
+fn print_status(resp: &OfframpResponse) {
+    println!("Session: {}", resp.session_id);
+    println!("Status: {:?}", resp.status);
+
+    if let Some(ref addr) = resp.near_deposit_address {
+        println!("NEAR Deposit Address: {}", addr);
+    }
+
+    if let Some(ref usdc) = resp.expected_usdc {
+        println!("Expected USDC: {}", usdc);
+    }
+
+    if let Some(ref err) = resp.error {
+        println!("Error: {}", err);
+    }
+
+    // Print status-specific messages
+    match resp.status {
+        OfframpStatus::Created => {
+            println!("\nWaiting for NEAR Intent to be initiated...");
+        }
+        OfframpStatus::NearIntentPending => {
+            if let Some(ref addr) = resp.near_deposit_address {
+                println!("\nSend ZEC to: {}", addr);
+            }
+        }
+        OfframpStatus::UsdcReceived => {
+            println!("\nUSDC received! Processing deposit to zk-p2p...");
+        }
+        OfframpStatus::Zkp2pDeposited => {
+            println!("\nDeposit created on zk-p2p. Waiting for taker...");
+        }
+        OfframpStatus::IntentSignaled => {
+            println!("\nTaker signaled intent! Waiting for Venmo payment...");
+        }
+        OfframpStatus::Fulfilled => {
+            println!("\nOfframp complete! Check your Venmo for payment.");
+        }
+        OfframpStatus::Failed => {
+            println!("\nOfframp failed.");
+        }
+        OfframpStatus::Rescued => {
+            println!("\nFunds rescued to your wallet.");
+        }
+        OfframpStatus::Withdrawn => {
+            println!("\nFunds withdrawn from zk-p2p.");
+        }
+    }
 }

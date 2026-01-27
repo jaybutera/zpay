@@ -3,8 +3,10 @@
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use thiserror::Error;
+use tracing::warn;
 
 #[derive(Debug, Error)]
+#[allow(dead_code)]
 pub enum AppError {
     #[error("Session not found")]
     SessionNotFound,
@@ -43,6 +45,16 @@ impl IntoResponse for AppError {
             AppError::Config(_) => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
             AppError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Internal error".to_string()),
         };
+
+        // Log errors with appropriate level
+        match &self {
+            AppError::SessionNotFound | AppError::InvalidState(_) => {
+                warn!(error = %self, status = %status, "Client error")
+            }
+            _ => {
+                warn!(error = %self, status = %status, "Server error")
+            }
+        }
 
         let body = serde_json::json!({
             "error": message

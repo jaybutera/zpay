@@ -70,6 +70,8 @@ async fn main() -> Result<()> {
         .route("/offramp", post(api::create_offramp))
         .route("/offramp/{id}", get(api::get_offramp))
         .route("/offramp/{id}/process", post(api::process_offramp))
+        .route("/offramp/{id}/rescue", post(api::rescue_offramp))
+        .route("/offramp/{id}/withdraw", post(api::withdraw_offramp))
         .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any))
         .layer(TraceLayer::new_for_http())
         .with_state(state.clone());
