@@ -1,0 +1,44 @@
+# zecp2p Configuration
+# Public settings for the ZEC → Venmo offramp system
+
+[network]
+# Base mainnet RPC URL
+base_rpc_url = "https://mainnet.base.org"
+# Base Sepolia testnet RPC (for testing)
+base_sepolia_rpc_url = "https://sepolia.base.org"
+# Chain ID (8453 = Base mainnet, 84532 = Base Sepolia)
+chain_id = 8453
+
+[contracts]
+# USDC on Base mainnet
+usdc = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+# zk-p2p Escrow on Base
+zkp2p_escrow = "0x59Cf3c90E8e7D27773b5E468D1a24B247db9B78d"
+# zk-p2p Orchestrator on Base
+zkp2p_orchestrator = "0x88888883Ed048FF0a415271B28b2F52d431810D0"
+# GlueContract address (set after deployment)
+# glue_contract = "0x..."
+
+[contracts.testnet]
+# USDC on Base Sepolia (Circle official testnet USDC)
+usdc = "0x036CbD53842c5426634e7929541eC2318f3dCF7e"
+# zk-p2p Escrow on Base Sepolia
+zkp2p_escrow = "0x6a5e11c3D87e22b828d02ee65a4e8f322BF6B97E"
+# zk-p2p Orchestrator on Base Sepolia
+zkp2p_orchestrator = "0x7D563c65456deF11c1Fdb9510eB745D5a780F5Fd"
+
+[near]
+# NEAR Intents 1Click API
+api_url = "https://1click.chaindefuser.com"
+# Default timeout for NEAR settlement (seconds)
+default_timeout = 600
+
+[server]
+# Coordinator server host
+host = "127.0.0.1"
+# Coordinator server port
+port = 3000
+
+[database]
+# SQLite database path
+path = "zecp2p.db"

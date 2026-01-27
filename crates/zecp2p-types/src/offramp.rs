@@ -1,0 +1,219 @@
+//! Offramp session types and state machine
+
+use alloy::primitives::{Address, B256, U256};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+/// Offramp session status state machine
+///
+/// ```text
+/// Created → NearIntentPending → UsdcReceived → Zkp2pDeposited → IntentSignaled → Fulfilled
+///                                    ↓                              ↓
+///                                 Failed                         Failed
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OfframpStatus {
+    /// Session created, waiting for NEAR Intent to be initiated
+    Created,
+    /// NEAR Intent initiated, waiting for ZEC deposit
+    NearIntentPending,
+    /// USDC received at GlueContract
+    UsdcReceived,
+    /// USDC deposited to zk-p2p escrow
+    Zkp2pDeposited,
+    /// Taker has signaled intent to fulfill
+    IntentSignaled,
+    /// Offramp complete - user received Venmo payment
+    Fulfilled,
+    /// Offramp failed at some stage
+    Failed,
+    /// User rescued funds from GlueContract
+    Rescued,
+    /// User withdrew from zk-p2p deposit
+    Withdrawn,
+}
+
+impl std::fmt::Display for OfframpStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OfframpStatus::Created => write!(f, "created"),
+            OfframpStatus::NearIntentPending => write!(f, "near_intent_pending"),
+            OfframpStatus::UsdcReceived => write!(f, "usdc_received"),
+            OfframpStatus::Zkp2pDeposited => write!(f, "zkp2p_deposited"),
+            OfframpStatus::IntentSignaled => write!(f, "intent_signaled"),
+            OfframpStatus::Fulfilled => write!(f, "fulfilled"),
+            OfframpStatus::Failed => write!(f, "failed"),
+            OfframpStatus::Rescued => write!(f, "rescued"),
+            OfframpStatus::Withdrawn => write!(f, "withdrawn"),
+        }
+    }
+}
+
+/// Request to initiate a new offramp
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OfframpRequest {
+    /// Amount of ZEC to offramp (in zatoshi, 1 ZEC = 100_000_000 zatoshi)
+    pub zec_amount: u64,
+    /// Venmo username (without @)
+    pub venmo_username: String,
+    /// User's Base address for rescue/withdraw
+    pub user_address: Address,
+    /// Pre-arranged taker address (required for V0)
+    pub taker_address: Address,
+    /// Minimum USDC/ZEC conversion rate (in 18-decimal precision)
+    /// e.g., 30_000000_000000_000000 = 30 USDC per ZEC
+    pub min_rate: U256,
+    /// Timeout for NEAR settlement in seconds (default: 600)
+    #[serde(default = "default_timeout")]
+    pub timeout_seconds: u64,
+}
+
+fn default_timeout() -> u64 {
+    600
+}
+
+/// Offramp session tracking all state for a single offramp operation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OfframpSession {
+    /// Unique session identifier
+    pub id: Uuid,
+    /// On-chain session ID (keccak256 of UUID)
+    pub session_id: B256,
+    /// Current status
+    pub status: OfframpStatus,
+    /// Original request parameters
+    pub request: OfframpRequest,
+    /// Hash of Venmo username (keccak256)
+    pub venmo_id_hash: B256,
+    /// Expected USDC amount from NEAR Intent (6 decimals)
+    pub expected_usdc: Option<U256>,
+    /// Actual USDC received
+    pub received_usdc: Option<U256>,
+    /// NEAR Intent deposit address (for ZEC)
+    pub near_deposit_address: Option<String>,
+    /// NEAR Intent transaction hash
+    pub near_tx_hash: Option<String>,
+    /// zk-p2p deposit ID (set after processOfframp)
+    pub zkp2p_deposit_id: Option<U256>,
+    /// zk-p2p intent hash (set after taker signals)
+    pub zkp2p_intent_hash: Option<B256>,
+    /// GlueContract transaction hash (createSession)
+    pub create_session_tx: Option<B256>,
+    /// GlueContract transaction hash (processOfframp)
+    pub process_offramp_tx: Option<B256>,
+    /// Error message if failed
+    pub error: Option<String>,
+    /// Session creation timestamp
+    pub created_at: DateTime<Utc>,
+    /// Last update timestamp
+    pub updated_at: DateTime<Utc>,
+}
+
+impl OfframpSession {
+    /// Create a new offramp session from a request
+    pub fn new(request: OfframpRequest) -> Self {
+        let id = Uuid::new_v4();
+        let session_id = Self::compute_session_id(&id);
+        let venmo_id_hash = Self::compute_venmo_hash(&request.venmo_username);
+        let now = Utc::now();
+
+        Self {
+            id,
+            session_id,
+            status: OfframpStatus::Created,
+            request,
+            venmo_id_hash,
+            expected_usdc: None,
+            received_usdc: None,
+            near_deposit_address: None,
+            near_tx_hash: None,
+            zkp2p_deposit_id: None,
+            zkp2p_intent_hash: None,
+            create_session_tx: None,
+            process_offramp_tx: None,
+            error: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// Compute on-chain session ID from UUID
+    pub fn compute_session_id(id: &Uuid) -> B256 {
+        use alloy::primitives::keccak256;
+        keccak256(id.as_bytes())
+    }
+
+    /// Compute keccak256 hash of Venmo username
+    pub fn compute_venmo_hash(username: &str) -> B256 {
+        use alloy::primitives::keccak256;
+        keccak256(username.as_bytes())
+    }
+
+    /// Update status and timestamp
+    pub fn set_status(&mut self, status: OfframpStatus) {
+        self.status = status;
+        self.updated_at = Utc::now();
+    }
+
+    /// Mark as failed with error message
+    pub fn fail(&mut self, error: impl Into<String>) {
+        self.status = OfframpStatus::Failed;
+        self.error = Some(error.into());
+        self.updated_at = Utc::now();
+    }
+
+    /// Check if session is in a terminal state
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self.status,
+            OfframpStatus::Fulfilled
+                | OfframpStatus::Failed
+                | OfframpStatus::Rescued
+                | OfframpStatus::Withdrawn
+        )
+    }
+}
+
+/// Response from coordinator for offramp initiation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OfframpResponse {
+    /// Session ID (UUID)
+    pub session_id: Uuid,
+    /// Current status
+    pub status: OfframpStatus,
+    /// NEAR deposit address for ZEC (if available)
+    pub near_deposit_address: Option<String>,
+    /// Expected USDC amount (if quoted)
+    pub expected_usdc: Option<String>,
+    /// Error message if any
+    pub error: Option<String>,
+}
+
+impl From<&OfframpSession> for OfframpResponse {
+    fn from(session: &OfframpSession) -> Self {
+        Self {
+            session_id: session.id,
+            status: session.status,
+            near_deposit_address: session.near_deposit_address.clone(),
+            expected_usdc: session.expected_usdc.map(|u| u.to_string()),
+            error: session.error.clone(),
+        }
+    }
+}
+
+/// Quote response for ZEC → Venmo conversion
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuoteResponse {
+    /// Input amount in ZEC
+    pub zec_amount: String,
+    /// Expected USDC output (after NEAR Intent)
+    pub usdc_amount: String,
+    /// Expected USD to Venmo (after fees)
+    pub venmo_amount: String,
+    /// Effective conversion rate (USDC per ZEC)
+    pub rate: String,
+    /// Quote expiry timestamp
+    pub expires_at: DateTime<Utc>,
+}
