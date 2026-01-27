@@ -1,0 +1,1130 @@
+//! Keeper-driven end-to-end tests with event-driven state transitions
+//!
+//! This test addresses the gaps in local e2e testing:
+//! 1. Keeper loop auto-detection of USDC arrival (instead of calling processOfframp directly)
+//! 2. Event-driven state transitions (IntentSignaled, IntentFulfilled events)
+//! 3. Tests the coordinator's actual behavior rather than just contract interfaces
+//!
+//! Run with: cargo test --package zecp2p-coordinator --test keeper_e2e_test -- --ignored --nocapture
+
+mod test_utils;
+
+use alloy::{
+    network::EthereumWallet,
+    primitives::{Address, U256},
+    providers::{Provider, ProviderBuilder},
+    signers::local::PrivateKeySigner,
+};
+use axum::{
+    routing::{get, post},
+    Json, Router,
+};
+use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU16, Ordering};
+use std::time::Duration;
+use tempfile::TempDir;
+use test_utils::ANVIL_PRIVATE_KEY;
+use tokio::net::TcpListener;
+use zecp2p_types::abi::{
+    usd_currency_code, venmo_payment_method, MockEscrowWithOrchestrator, MockUSDC,
+};
+
+/// Atomic counters for unique port allocation
+static ANVIL_PORT: AtomicU16 = AtomicU16::new(8900);
+static NEAR_PORT: AtomicU16 = AtomicU16::new(9900);
+
+/// Test user address (anvil account[1])
+const TEST_USER: &str = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
+
+/// Test user private key (anvil account[1])
+const TEST_USER_PRIVATE_KEY: &str =
+    "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
+
+/// RAII wrapper for anvil process
+struct AnvilInstance {
+    process: Child,
+    rpc_url: String,
+    port: u16,
+}
+
+impl AnvilInstance {
+    fn start() -> Self {
+        let port = ANVIL_PORT.fetch_add(1, Ordering::SeqCst);
+
+        let process = Command::new("anvil")
+            .args(["--port", &port.to_string()])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("Failed to start anvil");
+
+        std::thread::sleep(Duration::from_secs(2));
+
+        Self {
+            process,
+            rpc_url: format!("http://localhost:{}", port),
+            port,
+        }
+    }
+
+    fn rpc_url(&self) -> &str {
+        &self.rpc_url
+    }
+}
+
+impl Drop for AnvilInstance {
+    fn drop(&mut self) {
+        let _ = self.process.kill();
+        let _ = self.process.wait();
+    }
+}
+
+/// Deploy contracts using the enhanced script with Orchestrator mock
+fn deploy_enhanced_contracts(rpc_url: &str) -> (Address, Address, Address) {
+    let project_root = std::env::current_dir()
+        .expect("Failed to get current dir")
+        .parent()
+        .expect("Failed to get parent")
+        .parent()
+        .expect("Failed to get workspace root")
+        .to_path_buf();
+
+    let contracts_dir = project_root.join("contracts");
+
+    let output = Command::new("forge")
+        .current_dir(&contracts_dir)
+        .args([
+            "script",
+            "script/DeployLocalEnhanced.s.sol:DeployLocalEnhanced",
+            "--rpc-url",
+            rpc_url,
+            "--broadcast",
+        ])
+        .output()
+        .expect("Failed to run forge script");
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        panic!(
+            "forge script failed:\nstderr: {}\nstdout: {}",
+            stderr, stdout
+        );
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    let mut usdc_addr = None;
+    let mut escrow_addr = None;
+    let mut glue_addr = None;
+
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("MockUSDC deployed at:") {
+            usdc_addr = Some(extract_address(trimmed));
+        } else if trimmed.starts_with("MockEscrowWithOrchestrator deployed at:") {
+            escrow_addr = Some(extract_address(trimmed));
+        } else if trimmed.starts_with("OfframpGlue deployed at:") {
+            glue_addr = Some(extract_address(trimmed));
+        }
+    }
+
+    (
+        usdc_addr.expect("MockUSDC address not found"),
+        escrow_addr.expect("MockEscrowWithOrchestrator address not found"),
+        glue_addr.expect("OfframpGlue address not found"),
+    )
+}
+
+fn extract_address(line: &str) -> Address {
+    line.split_whitespace()
+        .rfind(|s| s.starts_with("0x") && s.len() == 42)
+        .expect("No valid address found")
+        .parse()
+        .expect("Invalid address")
+}
+
+/// Get a provider with signing capabilities
+async fn get_signing_provider(rpc_url: &str, private_key: &str) -> impl Provider {
+    let signer: PrivateKeySigner = private_key.parse().expect("valid key");
+    let wallet = EthereumWallet::from(signer);
+    ProviderBuilder::new()
+        .wallet(wallet)
+        .connect_http(rpc_url.parse().expect("valid url"))
+}
+
+/// Mock NEAR Intents API server with stateful tracking
+struct MockNearServer {
+    port: u16,
+    #[allow(dead_code)]
+    shutdown_tx: tokio::sync::oneshot::Sender<()>,
+    #[allow(dead_code)]
+    handle: tokio::task::JoinHandle<()>,
+}
+
+/// State shared across mock NEAR handlers
+#[derive(Clone)]
+struct MockNearState {
+    #[allow(dead_code)]
+    glue_contract: Address,
+    /// Track deposit addresses and their completion status
+    status_response: std::sync::Arc<std::sync::RwLock<String>>,
+}
+
+impl MockNearState {
+    fn new(glue_contract: Address) -> Self {
+        Self {
+            glue_contract,
+            status_response: std::sync::Arc::new(std::sync::RwLock::new("PENDING".to_string())),
+        }
+    }
+
+    fn set_status(&self, status: &str) {
+        *self.status_response.write().unwrap() = status.to_string();
+    }
+}
+
+impl MockNearServer {
+    async fn start(glue_contract: Address) -> (Self, MockNearState) {
+        let port = NEAR_PORT.fetch_add(1, Ordering::SeqCst);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+
+        let state = MockNearState::new(glue_contract);
+        let state_clone = state.clone();
+
+        let app = Router::new()
+            .route("/v0/quote", post(mock_quote_handler))
+            .route("/v0/status", get(mock_status_handler))
+            .with_state(state_clone);
+
+        let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+        let listener = TcpListener::bind(addr).await.expect("bind mock server");
+
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        (
+            Self {
+                port,
+                shutdown_tx,
+                handle,
+            },
+            state,
+        )
+    }
+
+    fn api_url(&self) -> String {
+        format!("http://localhost:{}", self.port)
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MockQuoteResponse {
+    correlation_id: String,
+    quote: MockQuote,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MockQuote {
+    amount_out: String,
+    min_amount_out: String,
+    time_estimate: i64,
+    deposit_address: String,
+    deadline: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QuoteRequest {
+    amount: String,
+    #[allow(dead_code)]
+    recipient: String,
+}
+
+async fn mock_quote_handler(
+    axum::extract::State(_state): axum::extract::State<MockNearState>,
+    Json(request): Json<QuoteRequest>,
+) -> Json<MockQuoteResponse> {
+    let zatoshi: u64 = request.amount.parse().unwrap_or(50_000_000);
+    let usdc_out = (zatoshi as f64 / 100_000_000.0 * 30.0 * 1_000_000.0) as u64;
+    let deadline = chrono::Utc::now() + chrono::Duration::minutes(10);
+
+    Json(MockQuoteResponse {
+        correlation_id: uuid::Uuid::new_v4().to_string(),
+        quote: MockQuote {
+            amount_out: usdc_out.to_string(),
+            min_amount_out: (usdc_out * 99 / 100).to_string(),
+            time_estimate: 300,
+            deposit_address: format!("t1MockZecDeposit{}", rand::random::<u32>()),
+            deadline: deadline.to_rfc3339(),
+        },
+    })
+}
+
+#[derive(Deserialize)]
+struct StatusQuery {
+    #[serde(rename = "depositAddress")]
+    #[allow(dead_code)]
+    deposit_address: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MockStatusResponse {
+    status: String,
+    source_transaction_hash: Option<String>,
+    destination_transaction_hash: Option<String>,
+    amount_out: Option<String>,
+    error: Option<String>,
+}
+
+async fn mock_status_handler(
+    axum::extract::State(state): axum::extract::State<MockNearState>,
+    axum::extract::Query(_query): axum::extract::Query<StatusQuery>,
+) -> Json<MockStatusResponse> {
+    let status = state.status_response.read().unwrap().clone();
+
+    Json(MockStatusResponse {
+        status,
+        source_transaction_hash: Some("0xmocksourcetx".to_string()),
+        destination_transaction_hash: Some("0xmockdesttx".to_string()),
+        amount_out: Some("15000000".to_string()),
+        error: None,
+    })
+}
+
+/// Create a test configuration
+fn create_test_config(
+    anvil_url: &str,
+    near_url: &str,
+    usdc: Address,
+    escrow: Address,
+    glue: Address,
+    db_path: &str,
+) -> zecp2p_types::Config {
+    zecp2p_types::Config {
+        network: zecp2p_types::config::NetworkConfig {
+            base_rpc_url: anvil_url.to_string(),
+            base_sepolia_rpc_url: Some(anvil_url.to_string()),
+            chain_id: 31337,
+        },
+        contracts: zecp2p_types::config::ContractConfig {
+            usdc,
+            zkp2p_escrow: escrow,
+            zkp2p_orchestrator: escrow, // Using combined mock
+            glue_contract: Some(glue),
+        },
+        near: zecp2p_types::config::NearConfig {
+            api_url: near_url.to_string(),
+            default_timeout: 600,
+        },
+        server: zecp2p_types::config::ServerConfig {
+            host: "127.0.0.1".to_string(),
+            port: 3000, // Not used in these tests
+        },
+        database: zecp2p_types::config::DatabaseConfig {
+            path: db_path.to_string(),
+        },
+    }
+}
+
+/// Test infrastructure for keeper-driven tests
+struct TestInfra {
+    anvil: AnvilInstance,
+    #[allow(dead_code)]
+    near_server: MockNearServer,
+    near_state: MockNearState,
+    usdc_addr: Address,
+    escrow_addr: Address,
+    glue_addr: Address,
+    config: zecp2p_types::Config,
+    _temp_dir: TempDir,
+}
+
+impl TestInfra {
+    async fn setup() -> Self {
+        let anvil = AnvilInstance::start();
+        println!("Anvil started at {} (port {})", anvil.rpc_url(), anvil.port);
+
+        let (usdc_addr, escrow_addr, glue_addr) = deploy_enhanced_contracts(anvil.rpc_url());
+        println!("Contracts deployed:");
+        println!("  MockUSDC: {}", usdc_addr);
+        println!("  MockEscrowWithOrchestrator: {}", escrow_addr);
+        println!("  OfframpGlue: {}", glue_addr);
+
+        let (near_server, near_state) = MockNearServer::start(glue_addr).await;
+        println!("Mock NEAR server at {}", near_server.api_url());
+
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let db_path = temp_dir
+            .path()
+            .join("test.db")
+            .to_string_lossy()
+            .to_string();
+
+        let config = create_test_config(
+            anvil.rpc_url(),
+            &near_server.api_url(),
+            usdc_addr,
+            escrow_addr,
+            glue_addr,
+            &db_path,
+        );
+
+        Self {
+            anvil,
+            near_server,
+            near_state,
+            usdc_addr,
+            escrow_addr,
+            glue_addr,
+            config,
+            _temp_dir: temp_dir,
+        }
+    }
+
+    async fn get_signing_provider(&self) -> impl Provider {
+        get_signing_provider(self.anvil.rpc_url(), ANVIL_PRIVATE_KEY).await
+    }
+
+    async fn get_user_provider(&self) -> impl Provider {
+        get_signing_provider(self.anvil.rpc_url(), TEST_USER_PRIVATE_KEY).await
+    }
+
+    /// Mint USDC to an address (simulating NEAR Intent delivery)
+    async fn mint_usdc(&self, to: Address, amount: U256) {
+        let provider = self.get_signing_provider().await;
+        let usdc = MockUSDC::new(self.usdc_addr, &provider);
+
+        usdc.mint(to, amount)
+            .send()
+            .await
+            .expect("mint send")
+            .get_receipt()
+            .await
+            .expect("mint receipt");
+    }
+}
+
+/// Test the keeper loop auto-detecting USDC arrival and processing the offramp
+#[tokio::test]
+#[ignore = "requires anvil and forge to be installed"]
+async fn test_keeper_auto_processes_on_usdc_arrival() {
+    let infra = TestInfra::setup().await;
+    std::env::set_var("COORDINATOR_PRIVATE_KEY", ANVIL_PRIVATE_KEY);
+
+    // Initialize coordinator components
+    let db = zecp2p_coordinator::db::Database::new(&infra.config.database.path)
+        .await
+        .expect("create db");
+    db.run_migrations().await.expect("run migrations");
+
+    let chain_client = zecp2p_coordinator::chain::ChainClient::new(&infra.config)
+        .await
+        .expect("create chain client");
+    let near_client = zecp2p_coordinator::near::NearIntentsClient::new(&infra.config.near);
+
+    let state = std::sync::Arc::new(zecp2p_coordinator::state::AppState::new(
+        infra.config.clone(),
+        db,
+        chain_client,
+        near_client,
+    ));
+
+    println!("\n=== Testing Keeper Auto-Processing ===\n");
+
+    // Step 1: Create offramp session
+    println!("Step 1: Creating offramp session...");
+    let request = zecp2p_types::OfframpRequest {
+        zec_amount: 50_000_000,
+        venmo_username: "keepertest".to_string(),
+        user_address: TEST_USER.parse().unwrap(),
+        taker_address: TEST_USER.parse().unwrap(),
+        zec_refund_address: "t1TestRefundAddressXXXXXXXXXXXX".to_string(),
+        min_rate: U256::from(1_000_000_000_000_000_000u128),
+        timeout_seconds: 600,
+    };
+
+    let session = state.create_offramp(request).await.expect("create offramp");
+    println!("  Session ID: {}", session.id);
+    println!("  Status: {:?}", session.status);
+    assert_eq!(
+        session.status,
+        zecp2p_types::OfframpStatus::NearIntentPending
+    );
+
+    // Step 2: Start keeper loop in background with shutdown signal
+    println!("\nStep 2: Starting keeper loop...");
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let keeper_state = state.clone();
+    let keeper_handle = tokio::spawn(async move {
+        keeper_state
+            .run_keeper_loop_with_shutdown(shutdown_rx)
+            .await
+    });
+
+    // Step 3: Simulate USDC arrival by minting to GlueContract
+    println!("\nStep 3: Simulating USDC arrival (minting to GlueContract)...");
+    let usdc_amount = session.expected_usdc.unwrap();
+    infra.mint_usdc(infra.glue_addr, usdc_amount).await;
+    println!("  Minted {} USDC to GlueContract", usdc_amount);
+
+    // Step 4: Update NEAR status to SUCCESS (simulating NEAR Intent completion)
+    println!("\nStep 4: Updating NEAR status to SUCCESS...");
+    infra.near_state.set_status("SUCCESS");
+
+    // Step 5: Wait for keeper to detect and process
+    // Keeper poll interval is 15 seconds, so we need to wait longer (up to ~35s for two ticks)
+    println!("\nStep 5: Waiting for keeper to auto-process (up to 40s)...");
+    let mut processed = false;
+    for i in 0..20 {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let current_session = state
+            .get_session(session.id)
+            .await
+            .expect("get session")
+            .expect("session exists");
+
+        println!(
+            "  Check {}: Status = {:?}",
+            i + 1,
+            current_session.status
+        );
+
+        if current_session.status == zecp2p_types::OfframpStatus::Zkp2pDeposited {
+            processed = true;
+            println!("  ✓ Keeper auto-processed offramp!");
+            println!("  zk-p2p deposit ID: {:?}", current_session.zkp2p_deposit_id);
+            break;
+        }
+    }
+
+    // Shutdown keeper
+    let _ = shutdown_tx.send(true);
+    let _ = keeper_handle.await;
+
+    assert!(processed, "Keeper should have auto-processed the offramp");
+    println!("\n=== Keeper auto-processing test passed! ===");
+}
+
+/// Test the full event-driven flow: USDC arrival → process → IntentSignaled → IntentFulfilled
+#[tokio::test]
+#[ignore = "requires anvil and forge to be installed"]
+async fn test_full_event_driven_flow() {
+    let infra = TestInfra::setup().await;
+    std::env::set_var("COORDINATOR_PRIVATE_KEY", ANVIL_PRIVATE_KEY);
+
+    let db = zecp2p_coordinator::db::Database::new(&infra.config.database.path)
+        .await
+        .expect("create db");
+    db.run_migrations().await.expect("run migrations");
+
+    let chain_client = zecp2p_coordinator::chain::ChainClient::new(&infra.config)
+        .await
+        .expect("create chain client");
+    let near_client = zecp2p_coordinator::near::NearIntentsClient::new(&infra.config.near);
+
+    let state = std::sync::Arc::new(zecp2p_coordinator::state::AppState::new(
+        infra.config.clone(),
+        db,
+        chain_client,
+        near_client,
+    ));
+
+    println!("\n=== Testing Full Event-Driven Flow ===\n");
+
+    // Step 1: Create offramp session
+    println!("Step 1: Creating offramp session...");
+    let request = zecp2p_types::OfframpRequest {
+        zec_amount: 50_000_000,
+        venmo_username: "eventtest".to_string(),
+        user_address: TEST_USER.parse().unwrap(),
+        taker_address: TEST_USER.parse().unwrap(),
+        zec_refund_address: "t1TestRefundAddressXXXXXXXXXXXX".to_string(),
+        min_rate: U256::from(1_000_000_000_000_000_000u128),
+        timeout_seconds: 600,
+    };
+
+    let session = state.create_offramp(request).await.expect("create offramp");
+    println!("  Session ID: {}", session.id);
+
+    // Step 2: Mint USDC to GlueContract and update status
+    println!("\nStep 2: Simulating USDC arrival...");
+    let usdc_amount = session.expected_usdc.unwrap();
+    infra.mint_usdc(infra.glue_addr, usdc_amount).await;
+    infra.near_state.set_status("SUCCESS");
+
+    // Step 3: Manually update session to UsdcReceived (simulating what keeper does)
+    let mut updated_session = state
+        .get_session(session.id)
+        .await
+        .expect("get")
+        .expect("exists");
+    updated_session.received_usdc = Some(usdc_amount);
+    updated_session.set_status(zecp2p_types::OfframpStatus::UsdcReceived);
+    state.update_session(&updated_session).await.expect("update");
+    println!("  Status: UsdcReceived");
+
+    // Step 4: Process offramp (creates zk-p2p deposit)
+    println!("\nStep 3: Processing offramp (depositing to zk-p2p)...");
+    let processed_session = state
+        .process_offramp(session.id)
+        .await
+        .expect("process offramp");
+    println!("  Status: {:?}", processed_session.status);
+    println!("  Deposit ID: {:?}", processed_session.zkp2p_deposit_id);
+    assert_eq!(
+        processed_session.status,
+        zecp2p_types::OfframpStatus::Zkp2pDeposited
+    );
+
+    let deposit_id = processed_session.zkp2p_deposit_id.unwrap();
+
+    // Step 5: Simulate taker signaling intent (using MockEscrowWithOrchestrator)
+    println!("\nStep 4: Simulating taker signaling intent...");
+    let user_provider = infra.get_user_provider().await;
+    let orchestrator =
+        MockEscrowWithOrchestrator::new(infra.escrow_addr, &user_provider);
+
+    let intent_hash = orchestrator
+        .signalIntent(
+            deposit_id,
+            TEST_USER.parse::<Address>().unwrap(),
+            usdc_amount,
+            venmo_payment_method(),
+            usd_currency_code(),
+            U256::from(1_000_000_000_000_000_000u128),
+        )
+        .send()
+        .await
+        .expect("signal intent send")
+        .get_receipt()
+        .await
+        .expect("signal intent receipt");
+
+    println!("  Intent signaled, tx: {:?}", intent_hash.transaction_hash);
+
+    // Verify the event was emitted by checking the chain client
+    let provider = infra.get_signing_provider().await;
+    let current_block = provider.get_block_number().await.expect("get block");
+
+    // Check for IntentSignaled events
+    let chain_client = zecp2p_coordinator::chain::ChainClient::new(&infra.config)
+        .await
+        .expect("create chain client");
+    let events = chain_client
+        .get_intent_signaled_events(deposit_id, 0, current_block)
+        .await
+        .expect("get events");
+
+    assert!(!events.is_empty(), "Should have IntentSignaled event");
+    let event = &events[0];
+    println!("  IntentSignaled event detected:");
+    println!("    intent_hash: {:?}", event.intent_hash);
+    println!("    deposit_id: {}", event.deposit_id);
+    println!("    amount: {}", event.amount);
+
+    // Step 6: Simulate taker fulfilling intent
+    println!("\nStep 5: Simulating taker fulfilling intent...");
+    orchestrator
+        .fulfillIntent(event.intent_hash)
+        .send()
+        .await
+        .expect("fulfill intent send")
+        .get_receipt()
+        .await
+        .expect("fulfill intent receipt");
+
+    // Check for IntentFulfilled events
+    let current_block = provider.get_block_number().await.expect("get block");
+    let fulfill_events = chain_client
+        .get_intent_fulfilled_events(event.intent_hash, 0, current_block)
+        .await
+        .expect("get fulfill events");
+
+    assert!(
+        !fulfill_events.is_empty(),
+        "Should have IntentFulfilled event"
+    );
+    let fulfill_event = &fulfill_events[0];
+    println!("  IntentFulfilled event detected:");
+    println!(
+        "    funds_transferred_to: {:?}",
+        fulfill_event.funds_transferred_to
+    );
+    println!("    amount: {}", fulfill_event.amount);
+
+    println!("\n=== Full event-driven flow test passed! ===");
+}
+
+/// Test that the keeper correctly transitions state based on IntentSignaled events
+#[tokio::test]
+#[ignore = "requires anvil and forge to be installed"]
+async fn test_keeper_detects_intent_signaled() {
+    let infra = TestInfra::setup().await;
+    std::env::set_var("COORDINATOR_PRIVATE_KEY", ANVIL_PRIVATE_KEY);
+
+    let db = zecp2p_coordinator::db::Database::new(&infra.config.database.path)
+        .await
+        .expect("create db");
+    db.run_migrations().await.expect("run migrations");
+
+    let chain_client = zecp2p_coordinator::chain::ChainClient::new(&infra.config)
+        .await
+        .expect("create chain client");
+    let near_client = zecp2p_coordinator::near::NearIntentsClient::new(&infra.config.near);
+
+    let state = std::sync::Arc::new(zecp2p_coordinator::state::AppState::new(
+        infra.config.clone(),
+        db,
+        chain_client,
+        near_client,
+    ));
+
+    println!("\n=== Testing Keeper IntentSignaled Detection ===\n");
+
+    // Create and process session manually to reach Zkp2pDeposited state
+    let request = zecp2p_types::OfframpRequest {
+        zec_amount: 50_000_000,
+        venmo_username: "intenttest".to_string(),
+        user_address: TEST_USER.parse().unwrap(),
+        taker_address: TEST_USER.parse().unwrap(),
+        zec_refund_address: "t1TestRefundAddressXXXXXXXXXXXX".to_string(),
+        min_rate: U256::from(1_000_000_000_000_000_000u128),
+        timeout_seconds: 600,
+    };
+
+    let session = state.create_offramp(request).await.expect("create");
+    let usdc_amount = session.expected_usdc.unwrap();
+    infra.mint_usdc(infra.glue_addr, usdc_amount).await;
+    infra.near_state.set_status("SUCCESS");
+
+    // Fast-forward to UsdcReceived
+    let mut s = state.get_session(session.id).await.unwrap().unwrap();
+    s.received_usdc = Some(usdc_amount);
+    s.set_status(zecp2p_types::OfframpStatus::UsdcReceived);
+    state.update_session(&s).await.unwrap();
+
+    // Process to Zkp2pDeposited
+    let processed = state.process_offramp(session.id).await.expect("process");
+    let deposit_id = processed.zkp2p_deposit_id.unwrap();
+    println!("Session deposited to zk-p2p, deposit_id: {}", deposit_id);
+
+    // Start keeper loop
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let keeper_state = state.clone();
+    let keeper_handle = tokio::spawn(async move {
+        keeper_state
+            .run_keeper_loop_with_shutdown(shutdown_rx)
+            .await
+    });
+
+    // Signal intent on the deposit
+    println!("Signaling intent...");
+    let user_provider = infra.get_user_provider().await;
+    let orchestrator = MockEscrowWithOrchestrator::new(infra.escrow_addr, &user_provider);
+
+    orchestrator
+        .signalIntent(
+            deposit_id,
+            TEST_USER.parse::<Address>().unwrap(),
+            usdc_amount,
+            venmo_payment_method(),
+            usd_currency_code(),
+            U256::from(1_000_000_000_000_000_000u128),
+        )
+        .send()
+        .await
+        .expect("signal")
+        .get_receipt()
+        .await
+        .expect("receipt");
+
+    // Wait for keeper to detect
+    println!("Waiting for keeper to detect IntentSignaled...");
+    let mut detected = false;
+    for i in 0..10 {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let current = state.get_session(session.id).await.unwrap().unwrap();
+        println!(
+            "  Check {}: Status = {:?}, intent_hash = {:?}",
+            i + 1,
+            current.status,
+            current.zkp2p_intent_hash
+        );
+
+        if current.status == zecp2p_types::OfframpStatus::IntentSignaled {
+            detected = true;
+            println!("  ✓ Keeper detected IntentSignaled!");
+            break;
+        }
+    }
+
+    // Shutdown keeper
+    let _ = shutdown_tx.send(true);
+    let _ = keeper_handle.await;
+
+    assert!(detected, "Keeper should have detected IntentSignaled event");
+    println!("\n=== Keeper IntentSignaled detection test passed! ===");
+}
+
+/// Test the complete flow from creation through fulfillment
+#[tokio::test]
+#[ignore = "requires anvil and forge to be installed"]
+async fn test_keeper_detects_intent_fulfilled() {
+    let infra = TestInfra::setup().await;
+    std::env::set_var("COORDINATOR_PRIVATE_KEY", ANVIL_PRIVATE_KEY);
+
+    let db = zecp2p_coordinator::db::Database::new(&infra.config.database.path)
+        .await
+        .expect("create db");
+    db.run_migrations().await.expect("run migrations");
+
+    let chain_client = zecp2p_coordinator::chain::ChainClient::new(&infra.config)
+        .await
+        .expect("create chain client");
+    let near_client = zecp2p_coordinator::near::NearIntentsClient::new(&infra.config.near);
+
+    let state = std::sync::Arc::new(zecp2p_coordinator::state::AppState::new(
+        infra.config.clone(),
+        db,
+        chain_client,
+        near_client,
+    ));
+
+    println!("\n=== Testing Keeper IntentFulfilled Detection ===\n");
+
+    // Setup: Create, fund, process session
+    let request = zecp2p_types::OfframpRequest {
+        zec_amount: 50_000_000,
+        venmo_username: "fulfilltest".to_string(),
+        user_address: TEST_USER.parse().unwrap(),
+        taker_address: TEST_USER.parse().unwrap(),
+        zec_refund_address: "t1TestRefundAddressXXXXXXXXXXXX".to_string(),
+        min_rate: U256::from(1_000_000_000_000_000_000u128),
+        timeout_seconds: 600,
+    };
+
+    let session = state.create_offramp(request).await.expect("create");
+    let usdc_amount = session.expected_usdc.unwrap();
+    infra.mint_usdc(infra.glue_addr, usdc_amount).await;
+    infra.near_state.set_status("SUCCESS");
+
+    let mut s = state.get_session(session.id).await.unwrap().unwrap();
+    s.received_usdc = Some(usdc_amount);
+    s.set_status(zecp2p_types::OfframpStatus::UsdcReceived);
+    state.update_session(&s).await.unwrap();
+
+    let processed = state.process_offramp(session.id).await.expect("process");
+    let deposit_id = processed.zkp2p_deposit_id.unwrap();
+
+    // Signal intent
+    let user_provider = infra.get_user_provider().await;
+    let orchestrator = MockEscrowWithOrchestrator::new(infra.escrow_addr, &user_provider);
+
+    let _receipt = orchestrator
+        .signalIntent(
+            deposit_id,
+            TEST_USER.parse::<Address>().unwrap(),
+            usdc_amount,
+            venmo_payment_method(),
+            usd_currency_code(),
+            U256::from(1_000_000_000_000_000_000u128),
+        )
+        .send()
+        .await
+        .expect("signal")
+        .get_receipt()
+        .await
+        .expect("receipt");
+
+    // Get intent hash from logs
+    let chain_client2 = zecp2p_coordinator::chain::ChainClient::new(&infra.config)
+        .await
+        .expect("create");
+    let provider = infra.get_signing_provider().await;
+    let block = provider.get_block_number().await.unwrap();
+    let events = chain_client2
+        .get_intent_signaled_events(deposit_id, 0, block)
+        .await
+        .unwrap();
+    let intent_hash = events[0].intent_hash;
+
+    // Manually update session to IntentSignaled (simulating keeper detection)
+    let mut s = state.get_session(session.id).await.unwrap().unwrap();
+    s.zkp2p_intent_hash = Some(intent_hash);
+    s.set_status(zecp2p_types::OfframpStatus::IntentSignaled);
+    state.update_session(&s).await.unwrap();
+    println!("Session in IntentSignaled state, intent_hash: {:?}", intent_hash);
+
+    // Start keeper loop
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let keeper_state = state.clone();
+    let keeper_handle = tokio::spawn(async move {
+        keeper_state
+            .run_keeper_loop_with_shutdown(shutdown_rx)
+            .await
+    });
+
+    // Fulfill intent
+    println!("Fulfilling intent...");
+    orchestrator
+        .fulfillIntent(intent_hash)
+        .send()
+        .await
+        .expect("fulfill")
+        .get_receipt()
+        .await
+        .expect("receipt");
+
+    // Wait for keeper to detect
+    println!("Waiting for keeper to detect IntentFulfilled...");
+    let mut detected = false;
+    for i in 0..10 {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let current = state.get_session(session.id).await.unwrap().unwrap();
+        println!("  Check {}: Status = {:?}", i + 1, current.status);
+
+        if current.status == zecp2p_types::OfframpStatus::Fulfilled {
+            detected = true;
+            println!("  ✓ Keeper detected IntentFulfilled!");
+            break;
+        }
+    }
+
+    // Shutdown keeper
+    let _ = shutdown_tx.send(true);
+    let _ = keeper_handle.await;
+
+    assert!(detected, "Keeper should have detected IntentFulfilled event");
+    println!("\n=== Keeper IntentFulfilled detection test passed! ===");
+}
+
+/// Comprehensive end-to-end test: Complete flow from session creation through fulfillment
+/// driven ENTIRELY by the keeper loop - NO manual state updates.
+///
+/// This test exercises the full system behavior:
+/// 1. Create offramp session via coordinator
+/// 2. NEAR Intents mock returns quote, session enters NearIntentPending
+/// 3. Simulate USDC delivery to GlueContract
+/// 4. NEAR status API returns SUCCESS
+/// 5. Keeper detects USDC arrival, transitions to UsdcReceived
+/// 6. Keeper auto-processes offramp, transitions to Zkp2pDeposited
+/// 7. Taker signals intent on zk-p2p
+/// 8. Keeper detects IntentSignaled event, transitions to IntentSignaled
+/// 9. Taker fulfills intent (simulating payment proof verification)
+/// 10. Keeper detects IntentFulfilled event, transitions to Fulfilled
+///
+/// The only external actions are USDC minting and taker contract calls -
+/// all state transitions are driven by the keeper's event monitoring.
+#[tokio::test]
+#[ignore = "requires anvil and forge to be installed"]
+async fn test_complete_keeper_driven_flow() {
+    let infra = TestInfra::setup().await;
+    std::env::set_var("COORDINATOR_PRIVATE_KEY", ANVIL_PRIVATE_KEY);
+
+    let db = zecp2p_coordinator::db::Database::new(&infra.config.database.path)
+        .await
+        .expect("create db");
+    db.run_migrations().await.expect("run migrations");
+
+    let chain_client = zecp2p_coordinator::chain::ChainClient::new(&infra.config)
+        .await
+        .expect("create chain client");
+    let near_client = zecp2p_coordinator::near::NearIntentsClient::new(&infra.config.near);
+
+    let state = std::sync::Arc::new(zecp2p_coordinator::state::AppState::new(
+        infra.config.clone(),
+        db,
+        chain_client,
+        near_client,
+    ));
+
+    println!("\n=== COMPREHENSIVE KEEPER-DRIVEN E2E TEST ===\n");
+    println!("This test exercises the COMPLETE flow with NO manual state updates.");
+    println!("All state transitions are driven by the keeper's event monitoring.\n");
+
+    // Step 1: Create offramp session
+    println!("Step 1: Creating offramp session...");
+    let request = zecp2p_types::OfframpRequest {
+        zec_amount: 50_000_000, // 0.5 ZEC
+        venmo_username: "completeflowtest".to_string(),
+        user_address: TEST_USER.parse().unwrap(),
+        taker_address: TEST_USER.parse().unwrap(),
+        zec_refund_address: "t1TestRefundAddressXXXXXXXXXXXX".to_string(),
+        min_rate: U256::from(1_000_000_000_000_000_000u128), // 1.0 (18 decimals)
+        timeout_seconds: 600,
+    };
+
+    let session = state.create_offramp(request).await.expect("create offramp");
+    println!("  Session ID: {}", session.id);
+    println!("  Initial status: {:?}", session.status);
+    println!("  NEAR deposit address: {:?}", session.near_deposit_address);
+    println!("  Expected USDC: {:?}", session.expected_usdc);
+    assert_eq!(
+        session.status,
+        zecp2p_types::OfframpStatus::NearIntentPending
+    );
+
+    let usdc_amount = session.expected_usdc.unwrap();
+
+    // Step 2: Start keeper loop in background
+    println!("\nStep 2: Starting keeper loop in background...");
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let keeper_state = state.clone();
+    let keeper_handle = tokio::spawn(async move {
+        keeper_state
+            .run_keeper_loop_with_shutdown(shutdown_rx)
+            .await
+    });
+
+    // Step 3: Simulate USDC delivery from NEAR Intents
+    println!("\nStep 3: Simulating USDC delivery from NEAR Intents...");
+    infra.mint_usdc(infra.glue_addr, usdc_amount).await;
+    println!("  Minted {} USDC to GlueContract", usdc_amount);
+
+    // Step 4: Update NEAR status to SUCCESS
+    println!("\nStep 4: Setting NEAR status to SUCCESS...");
+    infra.near_state.set_status("SUCCESS");
+
+    // Step 5: Wait for keeper to detect USDC arrival AND auto-process to Zkp2pDeposited
+    println!("\nStep 5: Waiting for keeper to auto-process to Zkp2pDeposited...");
+    let mut zkp2p_deposited = false;
+    let mut deposit_id = U256::ZERO;
+    for i in 0..30 {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let current = state.get_session(session.id).await.unwrap().unwrap();
+        println!(
+            "  Check {}: Status = {:?}, deposit_id = {:?}",
+            i + 1,
+            current.status,
+            current.zkp2p_deposit_id
+        );
+
+        if current.status == zecp2p_types::OfframpStatus::Zkp2pDeposited {
+            zkp2p_deposited = true;
+            deposit_id = current.zkp2p_deposit_id.unwrap();
+            println!("  ✓ Keeper auto-processed to Zkp2pDeposited!");
+            println!("  zk-p2p deposit ID: {}", deposit_id);
+            break;
+        }
+    }
+    assert!(
+        zkp2p_deposited,
+        "Keeper should have auto-processed to Zkp2pDeposited"
+    );
+
+    // Step 6: Taker signals intent (this is an external action, not done by keeper)
+    println!("\nStep 6: Taker signaling intent on zk-p2p...");
+    let user_provider = infra.get_user_provider().await;
+    let orchestrator = MockEscrowWithOrchestrator::new(infra.escrow_addr, &user_provider);
+
+    let intent_receipt = orchestrator
+        .signalIntent(
+            deposit_id,
+            TEST_USER.parse::<Address>().unwrap(),
+            usdc_amount,
+            venmo_payment_method(),
+            usd_currency_code(),
+            U256::from(1_000_000_000_000_000_000u128),
+        )
+        .send()
+        .await
+        .expect("signal intent")
+        .get_receipt()
+        .await
+        .expect("receipt");
+    println!("  Intent signaled, tx: {:?}", intent_receipt.transaction_hash);
+
+    // Step 7: Wait for keeper to detect IntentSignaled
+    println!("\nStep 7: Waiting for keeper to detect IntentSignaled event...");
+    let mut intent_signaled = false;
+    let mut intent_hash = alloy::primitives::B256::ZERO;
+    for i in 0..15 {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let current = state.get_session(session.id).await.unwrap().unwrap();
+        println!(
+            "  Check {}: Status = {:?}, intent_hash = {:?}",
+            i + 1,
+            current.status,
+            current.zkp2p_intent_hash
+        );
+
+        if current.status == zecp2p_types::OfframpStatus::IntentSignaled {
+            intent_signaled = true;
+            intent_hash = current.zkp2p_intent_hash.unwrap();
+            println!("  ✓ Keeper detected IntentSignaled!");
+            println!("  Intent hash: {:?}", intent_hash);
+            break;
+        }
+    }
+    assert!(
+        intent_signaled,
+        "Keeper should have detected IntentSignaled event"
+    );
+
+    // Step 8: Taker fulfills intent (external action - simulating payment proof verification)
+    println!("\nStep 8: Taker fulfilling intent (simulating payment proof)...");
+    orchestrator
+        .fulfillIntent(intent_hash)
+        .send()
+        .await
+        .expect("fulfill intent")
+        .get_receipt()
+        .await
+        .expect("receipt");
+    println!("  Intent fulfilled");
+
+    // Step 9: Wait for keeper to detect IntentFulfilled
+    println!("\nStep 9: Waiting for keeper to detect IntentFulfilled event...");
+    let mut fulfilled = false;
+    for i in 0..15 {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let current = state.get_session(session.id).await.unwrap().unwrap();
+        println!("  Check {}: Status = {:?}", i + 1, current.status);
+
+        if current.status == zecp2p_types::OfframpStatus::Fulfilled {
+            fulfilled = true;
+            println!("  ✓ Keeper detected IntentFulfilled!");
+            println!("  Session is now FULFILLED - offramp complete!");
+            break;
+        }
+    }
+
+    // Shutdown keeper
+    let _ = shutdown_tx.send(true);
+    let _ = keeper_handle.await;
+
+    assert!(fulfilled, "Keeper should have detected IntentFulfilled event");
+
+    // Final verification
+    let final_session = state.get_session(session.id).await.unwrap().unwrap();
+    println!("\n=== FINAL SESSION STATE ===");
+    println!("  ID: {}", final_session.id);
+    println!("  Status: {:?}", final_session.status);
+    println!("  NEAR deposit address: {:?}", final_session.near_deposit_address);
+    println!("  Expected USDC: {:?}", final_session.expected_usdc);
+    println!("  Received USDC: {:?}", final_session.received_usdc);
+    println!("  zk-p2p deposit ID: {:?}", final_session.zkp2p_deposit_id);
+    println!("  zk-p2p intent hash: {:?}", final_session.zkp2p_intent_hash);
+
+    assert_eq!(final_session.status, zecp2p_types::OfframpStatus::Fulfilled);
+    assert!(final_session.zkp2p_deposit_id.is_some());
+    assert!(final_session.zkp2p_intent_hash.is_some());
+
+    println!("\n=== COMPREHENSIVE KEEPER-DRIVEN E2E TEST PASSED! ===");
+    println!("The complete offramp flow (ZEC → USDC → Venmo) was executed");
+    println!("with ALL state transitions driven by the keeper loop.");
+}

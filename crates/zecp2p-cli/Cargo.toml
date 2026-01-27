@@ -22,6 +22,8 @@ dotenvy = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 
+# No dev-dependencies needed - CLI tests run the binary directly
+
 [[bin]]
 name = "zecp2p"
 path = "src/main.rs"

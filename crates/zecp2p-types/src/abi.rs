@@ -223,6 +223,146 @@ sol! {
     }
 }
 
+// MockUSDC interface for local testing (extends IERC20)
+sol! {
+    #[sol(rpc)]
+    interface MockUSDC {
+        function name() external view returns (string memory);
+        function symbol() external view returns (string memory);
+        function decimals() external view returns (uint8);
+        function totalSupply() external view returns (uint256);
+        function balanceOf(address account) external view returns (uint256);
+        function transfer(address to, uint256 amount) external returns (bool);
+        function allowance(address owner, address spender) external view returns (uint256);
+        function approve(address spender, uint256 amount) external returns (bool);
+        function transferFrom(address from, address to, uint256 amount) external returns (bool);
+
+        /// Mint function for testing - not in real USDC
+        function mint(address to, uint256 amount) external;
+
+        event Transfer(address indexed from, address indexed to, uint256 value);
+        event Approval(address indexed owner, address indexed spender, uint256 value);
+    }
+}
+
+// MockEscrowWithOrchestrator interface for enhanced local testing
+sol! {
+    #[sol(rpc)]
+    interface MockEscrowWithOrchestrator {
+        // Escrow functions
+        struct Range {
+            uint256 min;
+            uint256 max;
+        }
+
+        struct Currency {
+            bytes32 code;
+            uint256 minConversionRate;
+        }
+
+        struct DepositPaymentMethodData {
+            address intentGatingService;
+            bytes32 payeeDetails;
+            bytes data;
+        }
+
+        struct CreateDepositParams {
+            address token;
+            uint256 amount;
+            Range intentAmountRange;
+            bytes32[] paymentMethods;
+            DepositPaymentMethodData[] paymentMethodData;
+            Currency[][] currencies;
+            address delegate;
+            address intentGuardian;
+            bool retainOnEmpty;
+        }
+
+        struct Deposit {
+            address depositor;
+            address delegate;
+            address token;
+            uint256 amount;
+            Range intentAmountRange;
+            bytes32[] acceptedPaymentMethods;
+            address intentGuardian;
+            bool retainOnEmpty;
+            bool closed;
+        }
+
+        function createDeposit(CreateDepositParams calldata params) external returns (uint256 depositId);
+        function withdrawDeposit(uint256 depositId, uint256 amount) external;
+        function getDeposit(uint256 depositId) external view returns (Deposit memory);
+        function getAccountDeposits(address account) external view returns (uint256[] memory);
+
+        // Orchestrator functions
+        struct Intent {
+            address owner;
+            address to;
+            address escrow;
+            uint256 depositId;
+            uint256 amount;
+            uint256 timestamp;
+            bytes32 paymentMethod;
+            bytes32 fiatCurrency;
+            uint256 conversionRate;
+            bytes32 payeeDetails;
+            address referrer;
+            uint256 referrerFee;
+            address postIntentHook;
+            bytes data;
+        }
+
+        function signalIntent(
+            uint256 depositId,
+            address taker,
+            uint256 amount,
+            bytes32 paymentMethod,
+            bytes32 fiatCurrency,
+            uint256 conversionRate
+        ) external returns (bytes32 intentHash);
+
+        function fulfillIntent(bytes32 intentHash) external;
+
+        function getIntent(bytes32 intentHash) external view returns (Intent memory);
+        function getAccountIntents(address account) external view returns (bytes32[] memory);
+
+        // Events
+        event DepositCreated(
+            uint256 indexed depositId,
+            address indexed depositor,
+            address indexed token,
+            uint256 amount
+        );
+
+        event DepositWithdrawn(
+            uint256 indexed depositId,
+            address indexed depositor,
+            uint256 amount
+        );
+
+        event IntentSignaled(
+            bytes32 indexed intentHash,
+            address indexed escrow,
+            uint256 indexed depositId,
+            bytes32 paymentMethod,
+            address owner,
+            address to,
+            uint256 amount,
+            bytes32 fiatCurrency,
+            uint256 conversionRate,
+            uint256 timestamp
+        );
+
+        event IntentFulfilled(
+            bytes32 indexed intentHash,
+            address indexed fundsTransferredTo,
+            uint256 amount,
+            bool isManualRelease
+        );
+    }
+}
+
 /// Payment method hash for Venmo
 pub fn venmo_payment_method() -> alloy::primitives::B256 {
     alloy::primitives::keccak256(b"venmo")

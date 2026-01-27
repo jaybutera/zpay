@@ -125,6 +125,24 @@ impl AppState {
         self.db.get_session(id).await.map_err(|e| AppError::Internal(e.to_string()))
     }
 
+    /// Update session in both cache and database
+    /// Used for testing and keeper loop operations
+    pub async fn update_session(&self, session: &OfframpSession) -> Result<(), AppError> {
+        // Update database
+        self.db
+            .update_session(session)
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+
+        // Update cache
+        {
+            let mut sessions = self.sessions.write().await;
+            sessions.insert(session.id, session.clone());
+        }
+
+        Ok(())
+    }
+
     /// Process offramp - route USDC to zk-p2p
     pub async fn process_offramp(
         self: &Arc<Self>,
@@ -197,6 +215,41 @@ impl AppState {
             }
             tokio::time::sleep(poll_interval).await;
         }
+    }
+
+    /// Run the keeper loop with graceful shutdown support
+    pub async fn run_keeper_loop_with_shutdown(
+        self: &Arc<Self>,
+        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<()> {
+        let poll_interval = std::time::Duration::from_secs(15);
+
+        loop {
+            // Check for shutdown signal
+            if *shutdown_rx.borrow() {
+                tracing::info!("Keeper loop received shutdown signal");
+                break;
+            }
+
+            // Run keeper tick
+            if let Err(e) = self.keeper_tick().await {
+                tracing::error!("Keeper tick error: {}", e);
+            }
+
+            // Wait for next tick or shutdown
+            tokio::select! {
+                _ = tokio::time::sleep(poll_interval) => {}
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        tracing::info!("Keeper loop received shutdown signal during sleep");
+                        break;
+                    }
+                }
+            }
+        }
+
+        tracing::info!("Keeper loop shutdown complete");
+        Ok(())
     }
 
     async fn keeper_tick(self: &Arc<Self>) -> Result<()> {
