@@ -22,6 +22,13 @@ pub async fn health() -> Json<serde_json::Value> {
     }))
 }
 
+/// Transparent stand-in refund address used for price quotes only.
+///
+/// `/quote` runs before the user has given a refund address, but 1Click still
+/// validates the field. Nothing is ever deposited against these quotes, so the
+/// address is never used; a real one is required to start an offramp.
+const QUOTE_REFUND_PLACEHOLDER: &str = "t1KhV8ADhTGvVvBpTiEcJGnhTvBBFVFYHXx";
+
 /// Quote request query parameters
 #[derive(Debug, Deserialize)]
 pub struct QuoteQuery {
@@ -40,18 +47,27 @@ pub async fn get_quote(
     // Parse ZEC amount (convert from decimal ZEC to zatoshi)
     let zatoshi = parse_zec_amount(&query.zec_amount)?;
 
+    if zatoshi < crate::near::MIN_ZEC_ZATOSHI {
+        return Err(AppError::InvalidRequest(format!(
+            "ZEC amount {} zatoshi is below the 1Click minimum of {} zatoshi",
+            zatoshi,
+            crate::near::MIN_ZEC_ZATOSHI
+        )));
+    }
+
     // Get quote from NEAR Intents
     let glue_address = state
         .chain
         .glue_contract()
         .map_err(|e| AppError::Config(e.to_string()))?;
 
-    // Use the helper to create the ZEC → USDC request
-    // For refund address, we use a placeholder since we don't have user's ZEC address yet
+    // Quoting needs a well-formed refund address even though this is only a price
+    // check; the user supplies their own when they start an offramp. 1Click
+    // rejects shielded addresses, so this stand-in is transparent.
     let quote_request = crate::near::NearIntentsClient::zec_to_usdc_base_request(
         zatoshi,
         &glue_address.to_string(),
-        "t1placeholder", // User will provide real ZEC refund address during offramp
+        QUOTE_REFUND_PLACEHOLDER,
         Some(50), // 0.5% slippage
     );
 

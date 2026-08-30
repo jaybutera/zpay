@@ -10,6 +10,13 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use zecp2p_types::config::NearConfig;
 
+/// Smallest ZEC deposit 1Click will quote, in zatoshi.
+///
+/// Below this the API rejects the quote with
+/// `Amount is too low for bridge, try at least 52000`. Checking locally turns a
+/// raw 400 into an error the caller can act on.
+pub const MIN_ZEC_ZATOSHI: u64 = 52_000;
+
 /// Asset IDs for commonly used tokens in the NEAR Intents network
 pub mod assets {
     /// ZEC (Zcash) on the ZEC network
@@ -45,6 +52,8 @@ impl NearIntentsClient {
     /// This uses the 1Click API v0 format with proper asset IDs.
     /// Returns a deposit address and expected output amount.
     pub async fn get_quote(&self, request: QuoteRequest) -> Result<QuoteResponse> {
+        request.validate()?;
+
         let url = format!("{}/v0/quote", self.base_url);
 
         // Calculate deadline (now + timeout)
@@ -100,7 +109,11 @@ impl NearIntentsClient {
     }
 
     /// Poll status of a deposit by its deposit address
-    pub async fn get_status(&self, deposit_address: &str) -> Result<StatusResponse> {
+    ///
+    /// Returns `Ok(None)` when the service does not (yet) know the address. 1Click
+    /// answers 404 in the window between handing out a deposit address and
+    /// registering it, so that case is retryable rather than a session failure.
+    pub async fn get_status(&self, deposit_address: &str) -> Result<Option<StatusResponse>> {
         let url = format!(
             "{}/v0/status?depositAddress={}",
             self.base_url, deposit_address
@@ -113,6 +126,10 @@ impl NearIntentsClient {
             .await
             .context("Failed to send status request")?;
 
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
@@ -121,13 +138,20 @@ impl NearIntentsClient {
 
         let api_response: ApiStatusResponse = response.json().await.context("Failed to parse status response")?;
 
-        Ok(StatusResponse {
+        // The transaction hashes and settled amounts live inside `swapDetails`, and
+        // the chain hashes are arrays of objects rather than bare strings.
+        let details = api_response.swap_details.unwrap_or_default();
+
+        Ok(Some(StatusResponse {
             status: api_response.status,
-            source_tx_hash: api_response.source_transaction_hash,
-            destination_tx_hash: api_response.destination_transaction_hash,
-            output_amount: api_response.amount_out,
-            error: api_response.error,
-        })
+            source_tx_hash: details.origin_chain_tx_hashes.first().map(|t| t.hash.clone()),
+            destination_tx_hash: details
+                .destination_chain_tx_hashes
+                .first()
+                .map(|t| t.hash.clone()),
+            output_amount: details.amount_out,
+            refunded_amount: details.refunded_amount,
+        }))
     }
 
     /// Helper to create a quote request for ZEC → USDC on Base
@@ -165,6 +189,53 @@ pub struct QuoteRequest {
     pub slippage_bps: Option<u32>,
 }
 
+impl QuoteRequest {
+    /// Check the constraints 1Click enforces, before spending a round trip on them.
+    ///
+    /// Two rejections are worth catching locally because the API's own messages
+    /// are hard to act on: amounts under [`MIN_ZEC_ZATOSHI`] come back as a bare
+    /// 400, and a shielded `refundTo` reports only `refundTo is not valid`.
+    pub fn validate(&self) -> Result<()> {
+        if self.origin_asset == assets::ZEC {
+            let zatoshi: u64 = self
+                .amount
+                .parse()
+                .with_context(|| format!("ZEC amount {:?} is not an integer", self.amount))?;
+
+            if zatoshi < MIN_ZEC_ZATOSHI {
+                anyhow::bail!(
+                    "ZEC amount {} zatoshi is below the 1Click minimum of {} zatoshi",
+                    zatoshi,
+                    MIN_ZEC_ZATOSHI
+                );
+            }
+
+            validate_zec_refund_address(&self.refund_to)?;
+        }
+
+        Ok(())
+    }
+}
+
+/// 1Click only accepts a transparent Zcash address for refunds.
+///
+/// Unified (`u1`) and Sapling (`zs`) addresses are rejected by the API, so funds
+/// refunded from a swap always land in the transparent pool.
+pub fn validate_zec_refund_address(address: &str) -> Result<()> {
+    if address.starts_with("t1") || address.starts_with("t3") {
+        return Ok(());
+    }
+
+    if address.starts_with("u1") || address.starts_with("zs") || address.starts_with("zc") {
+        anyhow::bail!(
+            "refund address {} is shielded; 1Click only accepts a transparent t1/t3 address",
+            address
+        );
+    }
+
+    anyhow::bail!("refund address {} is not a Zcash transparent address", address)
+}
+
 /// Simplified quote response
 #[derive(Debug, Clone)]
 pub struct QuoteResponse {
@@ -185,17 +256,21 @@ pub struct QuoteResponse {
 pub struct StatusResponse {
     /// Current status
     pub status: IntentStatus,
-    /// Source transaction hash (if known)
+    /// First origin-chain (ZEC) transaction hash, if any
     pub source_tx_hash: Option<String>,
-    /// Destination transaction hash (if complete)
+    /// First destination-chain (Base) transaction hash, if any
     pub destination_tx_hash: Option<String>,
-    /// Output amount (if complete)
+    /// Settled output amount (if complete)
     pub output_amount: Option<String>,
-    /// Error message (if failed)
-    pub error: Option<String>,
+    /// Amount of the origin asset returned to `refundTo`, if refunded
+    pub refunded_amount: Option<String>,
 }
 
 /// Status of a NEAR Intent
+///
+/// These are exactly the seven values in the 1Click `GetExecutionStatusResponse`
+/// schema. There is no `EXPIRED`: a quote whose deadline passes without a
+/// matching deposit stays `PENDING_DEPOSIT`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum IntentStatus {
@@ -203,33 +278,37 @@ pub enum IntentStatus {
     PendingDeposit,
     /// Deposit transaction detected
     KnownDepositTx,
+    /// Deposit seen but below the quoted amount; refunded by the deadline
+    IncompleteDeposit,
     /// Processing the swap
     Processing,
     /// Swap complete, funds delivered
     Success,
-    /// Swap failed
-    Failed,
     /// Deposit refunded
     Refunded,
-    /// Quote expired
-    Expired,
-    /// Incomplete deposit (wrong amount)
-    IncompleteDeposit,
+    /// Swap failed
+    Failed,
 }
 
 impl IntentStatus {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
-            IntentStatus::Success
-                | IntentStatus::Failed
-                | IntentStatus::Refunded
-                | IntentStatus::Expired
+            IntentStatus::Success | IntentStatus::Failed | IntentStatus::Refunded
         )
     }
 
     pub fn is_success(&self) -> bool {
         matches!(self, IntentStatus::Success)
+    }
+
+    /// True while the swap can still move on its own.
+    ///
+    /// `INCOMPLETE_DEPOSIT` is not terminal: 1Click refunds an under-deposit by
+    /// the quote deadline, which can be days out, so the session waits rather
+    /// than failing.
+    pub fn is_pending(&self) -> bool {
+        !self.is_terminal()
     }
 }
 
@@ -345,18 +424,40 @@ struct ApiQuote {
 struct ApiStatusResponse {
     /// Current status
     status: IntentStatus,
-    /// Source transaction hash
+    /// Last time the state was updated
     #[serde(default)]
-    source_transaction_hash: Option<String>,
-    /// Destination transaction hash
+    #[allow(dead_code)]
+    updated_at: Option<DateTime<Utc>>,
+    /// Details of the actual swaps and withdrawals
     #[serde(default)]
-    destination_transaction_hash: Option<String>,
-    /// Output amount
+    swap_details: Option<ApiSwapDetails>,
+}
+
+/// The `swapDetails` object, where the settled amounts and chain hashes live.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ApiSwapDetails {
+    /// Settled amount of the destination asset
     #[serde(default)]
     amount_out: Option<String>,
-    /// Error message
+    /// Amount of the origin asset returned to `refundTo`
     #[serde(default)]
-    error: Option<String>,
+    refunded_amount: Option<String>,
+    /// Transactions on the origin chain
+    #[serde(default)]
+    origin_chain_tx_hashes: Vec<ApiTransactionDetails>,
+    /// Transactions on the destination chain
+    #[serde(default)]
+    destination_chain_tx_hashes: Vec<ApiTransactionDetails>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ApiTransactionDetails {
+    hash: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    explorer_url: Option<String>,
 }
 
 #[cfg(test)]
@@ -371,8 +472,158 @@ mod tests {
         assert!(IntentStatus::Success.is_terminal());
         assert!(IntentStatus::Failed.is_terminal());
         assert!(IntentStatus::Refunded.is_terminal());
-        assert!(IntentStatus::Expired.is_terminal());
+        // An under-deposit is refunded by the quote deadline, so the session waits.
         assert!(!IntentStatus::IncompleteDeposit.is_terminal());
+        assert!(IntentStatus::IncompleteDeposit.is_pending());
+    }
+
+    /// Every value in the 1Click `GetExecutionStatusResponse` status enum must
+    /// deserialize, and nothing outside it should.
+    #[test]
+    fn test_intent_status_matches_spec_enum() {
+        let spec = [
+            ("KNOWN_DEPOSIT_TX", IntentStatus::KnownDepositTx),
+            ("PENDING_DEPOSIT", IntentStatus::PendingDeposit),
+            ("INCOMPLETE_DEPOSIT", IntentStatus::IncompleteDeposit),
+            ("PROCESSING", IntentStatus::Processing),
+            ("SUCCESS", IntentStatus::Success),
+            ("REFUNDED", IntentStatus::Refunded),
+            ("FAILED", IntentStatus::Failed),
+        ];
+
+        for (name, want) in spec {
+            let got: IntentStatus = serde_json::from_str(&format!("\"{}\"", name))
+                .unwrap_or_else(|e| panic!("status {} should deserialize: {}", name, e));
+            assert_eq!(got, want, "status {} mapped to the wrong variant", name);
+        }
+
+        // EXPIRED is not in the 1Click status enum; it belongs to an unrelated
+        // order-status enum in the same OpenAPI document.
+        assert!(serde_json::from_str::<IntentStatus>("\"EXPIRED\"").is_err());
+    }
+
+    /// The hashes and settled amounts live inside `swapDetails`, and the chain
+    /// hashes are arrays of objects rather than bare strings.
+    #[test]
+    fn test_status_response_reads_nested_swap_details() {
+        let body = serde_json::json!({
+            "correlationId": "550e8400-e29b-41d4-a716-446655440000",
+            "status": "SUCCESS",
+            "updatedAt": "2026-08-30T18:16:03.374Z",
+            "swapDetails": {
+                "intentHashes": ["intent-1"],
+                "nearTxHashes": ["near-1"],
+                "amountOut": "8696004",
+                "amountOutFormatted": "8.696004",
+                "slippage": 50,
+                "originChainTxHashes": [
+                    {"hash": "zec-txid-1", "explorerUrl": "https://example.invalid/zec-txid-1"}
+                ],
+                "destinationChainTxHashes": [
+                    {"hash": "0xbase1", "explorerUrl": "https://basescan.org/tx/0xbase1"}
+                ]
+            }
+        });
+
+        let parsed: ApiStatusResponse = serde_json::from_value(body).expect("spec-shaped status");
+        let details = parsed.swap_details.expect("swapDetails present");
+
+        assert_eq!(parsed.status, IntentStatus::Success);
+        assert_eq!(details.amount_out.as_deref(), Some("8696004"));
+        assert_eq!(details.origin_chain_tx_hashes[0].hash, "zec-txid-1");
+        assert_eq!(details.destination_chain_tx_hashes[0].hash, "0xbase1");
+    }
+
+    /// A pending status carries no `swapDetails` content yet.
+    #[test]
+    fn test_status_response_pending_has_no_hashes() {
+        let body = serde_json::json!({
+            "correlationId": "c1",
+            "status": "PENDING_DEPOSIT",
+            "updatedAt": "2026-08-30T18:16:03.374Z",
+            "swapDetails": {}
+        });
+
+        let parsed: ApiStatusResponse = serde_json::from_value(body).expect("pending status");
+        let details = parsed.swap_details.unwrap_or_default();
+
+        assert_eq!(parsed.status, IntentStatus::PendingDeposit);
+        assert!(details.origin_chain_tx_hashes.is_empty());
+        assert!(details.destination_chain_tx_hashes.is_empty());
+        assert!(details.amount_out.is_none());
+    }
+
+    #[test]
+    fn test_refunded_status_carries_refunded_amount() {
+        let body = serde_json::json!({
+            "correlationId": "c2",
+            "status": "REFUNDED",
+            "updatedAt": "2026-08-30T18:16:03.374Z",
+            "swapDetails": {
+                "refundedAmount": "5000",
+                "refundedAmountFormatted": "0.00005"
+            }
+        });
+
+        let parsed: ApiStatusResponse = serde_json::from_value(body).expect("refunded status");
+        let details = parsed.swap_details.expect("swapDetails present");
+
+        assert_eq!(parsed.status, IntentStatus::Refunded);
+        assert_eq!(details.refunded_amount.as_deref(), Some("5000"));
+    }
+
+    #[test]
+    fn test_validate_rejects_below_minimum() {
+        let request = NearIntentsClient::zec_to_usdc_base_request(
+            MIN_ZEC_ZATOSHI - 1,
+            "0x1234567890123456789012345678901234567890",
+            "t1KhV8ADhTGvVvBpTiEcJGnhTvBBFVFYHXx",
+            Some(50),
+        );
+
+        let err = request.validate().expect_err("below the bridge minimum");
+        assert!(err.to_string().contains("52000"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_validate_accepts_exact_minimum() {
+        let request = NearIntentsClient::zec_to_usdc_base_request(
+            MIN_ZEC_ZATOSHI,
+            "0x1234567890123456789012345678901234567890",
+            "t1KhV8ADhTGvVvBpTiEcJGnhTvBBFVFYHXx",
+            Some(50),
+        );
+
+        request.validate().expect("52000 zatoshi is quotable");
+    }
+
+    #[test]
+    fn test_validate_rejects_shielded_refund_address() {
+        for shielded in [
+            "u1lq6jn3fkgd0dcxpvdnfrhrqrmvdnvzdmhdpvzdshgqe8gksv5x4nzn6vhpwzvz",
+            "zs1z7rejlpsa98s2rrrfkwmaxu53e4ue0ulcrw0h4x5g8jl04tak0d3mm47vdtahatqrlkngh9sly",
+        ] {
+            let request = NearIntentsClient::zec_to_usdc_base_request(
+                1_000_000,
+                "0x1234567890123456789012345678901234567890",
+                shielded,
+                Some(50),
+            );
+
+            let err = request.validate().expect_err("shielded refundTo is rejected");
+            assert!(err.to_string().contains("shielded"), "got: {}", err);
+        }
+    }
+
+    #[test]
+    fn test_validate_accepts_transparent_refund_addresses() {
+        for transparent in [
+            "t1KhV8ADhTGvVvBpTiEcJGnhTvBBFVFYHXx",
+            "t3Vz22vK5z2LcKEdg16Yv4FFneEL1zg9ojd",
+        ] {
+            validate_zec_refund_address(transparent)
+                .unwrap_or_else(|e| panic!("{} should be accepted: {}", transparent, e));
+        }
     }
 
     #[test]

@@ -15,7 +15,11 @@ use zecp2p_types::{
 };
 
 use crate::{
-    chain::ChainClient, db::Database, error::AppError, near::NearIntentsClient, zkp2p::Zkp2pClient,
+    chain::ChainClient,
+    db::Database,
+    error::AppError,
+    near::{IntentStatus, NearIntentsClient},
+    zkp2p::Zkp2pClient,
 };
 
 /// Number of blocks to look back when checking for events (fallback if no stored block)
@@ -25,7 +29,18 @@ const EVENT_LOOKBACK_BLOCKS: u64 = 1000;
 const LAST_PROCESSED_BLOCK_KEY: &str = "last_processed_block";
 
 /// Session timeout in seconds (1 hour)
+///
+/// Applies to the stages the coordinator itself drives on Base.
 const SESSION_TIMEOUT_SECS: i64 = 3600;
+
+/// Timeout for a session still waiting on the NEAR Intents leg (3.5 days)
+///
+/// 1Click keeps a deposit address live for about three days: a quote issued
+/// 2026-08-30T18:16Z came back with a `deadline` and `timeWhenInactive` of
+/// 2026-09-02T18:16Z, regardless of the shorter deadline in the request. An
+/// under-deposit is refunded by that deadline, so failing the session after an
+/// hour would abandon it while the swap or its refund is still in flight.
+const NEAR_INTENT_TIMEOUT_SECS: i64 = 302_400;
 
 /// Shared application state
 pub struct AppState {
@@ -83,6 +98,17 @@ impl AppState {
 
         // Create session
         let mut session = OfframpSession::new(request.clone(), payee_details_hash);
+
+        // Reject what 1Click would reject, before a round trip turns it into a 502.
+        if request.zec_amount < crate::near::MIN_ZEC_ZATOSHI {
+            return Err(AppError::InvalidRequest(format!(
+                "ZEC amount {} zatoshi is below the 1Click minimum of {} zatoshi",
+                request.zec_amount,
+                crate::near::MIN_ZEC_ZATOSHI
+            )));
+        }
+        crate::near::validate_zec_refund_address(&request.zec_refund_address)
+            .map_err(|e| AppError::InvalidRequest(e.to_string()))?;
 
         // Get quote from NEAR Intents
         let glue_address = self
@@ -320,7 +346,11 @@ impl AppState {
     async fn process_session(self: &Arc<Self>, session: &OfframpSession) -> Result<()> {
         // Check for timeout first
         if self.is_session_timed_out(session) {
-            tracing::warn!("Session {} timed out after {} seconds", session.id, SESSION_TIMEOUT_SECS);
+            tracing::warn!(
+                "Session {} timed out after {} seconds",
+                session.id,
+                self.session_timeout_secs(session)
+            );
             let mut updated = session.clone();
             updated.fail("Session timed out");
             self.db.update_session(&updated).await?;
@@ -350,10 +380,22 @@ impl AppState {
     }
 
     /// Check if a session has timed out
+    ///
+    /// A session waiting on the ZEC deposit gets the longer
+    /// [`NEAR_INTENT_TIMEOUT_SECS`] budget, since that leg is bounded by 1Click's
+    /// deposit deadline rather than by anything the coordinator controls.
     fn is_session_timed_out(&self, session: &OfframpSession) -> bool {
         let now = chrono::Utc::now();
         let elapsed = now.signed_duration_since(session.created_at);
-        elapsed.num_seconds() > SESSION_TIMEOUT_SECS
+        elapsed.num_seconds() > self.session_timeout_secs(session)
+    }
+
+    /// The timeout budget that applies to a session at its current stage
+    fn session_timeout_secs(&self, session: &OfframpSession) -> i64 {
+        match session.status {
+            OfframpStatus::NearIntentPending => NEAR_INTENT_TIMEOUT_SECS,
+            _ => SESSION_TIMEOUT_SECS,
+        }
     }
 
     async fn check_near_intent(&self, session: &OfframpSession) -> Result<()> {
@@ -362,7 +404,15 @@ impl AppState {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("No deposit address"))?;
 
-        let status = self.near.get_status(deposit_addr).await?;
+        // 1Click answers 404 until it has registered the deposit address it just
+        // handed out. Treat that as "not yet", not as a failed session.
+        let Some(status) = self.near.get_status(deposit_addr).await? else {
+            tracing::debug!(
+                "Session {} deposit address not yet known to 1Click",
+                session.id
+            );
+            return Ok(());
+        };
 
         if status.status.is_success() {
             // Check USDC balance at GlueContract
@@ -381,15 +431,32 @@ impl AppState {
 
                 tracing::info!("Session {} received USDC: {}", session.id, balance);
             }
-        } else if status.status.is_terminal() {
-            // Failed or expired
+        } else if status.status == IntentStatus::Refunded {
             let mut updated = session.clone();
-            updated.fail(status.error.unwrap_or_else(|| "NEAR Intent failed".to_string()));
+            updated.fail(match status.refunded_amount {
+                Some(amount) => format!("NEAR Intent refunded {} zatoshi to the refund address", amount),
+                None => "NEAR Intent refunded to the refund address".to_string(),
+            });
 
             self.db.update_session(&updated).await?;
 
             let mut sessions = self.sessions.write().await;
             sessions.insert(updated.id, updated);
+        } else if status.status.is_terminal() {
+            let mut updated = session.clone();
+            updated.fail("NEAR Intent failed");
+
+            self.db.update_session(&updated).await?;
+
+            let mut sessions = self.sessions.write().await;
+            sessions.insert(updated.id, updated);
+        } else if status.status == IntentStatus::IncompleteDeposit {
+            // Under-deposit. 1Click refunds this by the quote deadline, which can be
+            // days out, so keep polling rather than failing the session.
+            tracing::warn!(
+                "Session {} has an incomplete deposit; awaiting 1Click refund or top-up",
+                session.id
+            );
         }
 
         Ok(())
