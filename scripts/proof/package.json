@@ -1,0 +1,9 @@
+{
+  "name": "zecp2p-proof",
+  "private": true,
+  "type": "module",
+  "description": "Standalone Peer/zk-p2p TEE attestation for a real Venmo payment",
+  "dependencies": {
+    "@zkp2p/zkp2p-attestation": "^3.0.1"
+  }
+}

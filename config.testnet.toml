@@ -19,10 +19,10 @@ usdc = "0x036CbD53842c5426634e7929541eC2318f3dCF7e"
 # (MockEscrowWithOrchestrator) that also emits the orchestrator events; put its
 # address in both fields below. The real EscrowV2 encoding is exercised by
 # scripts/dryrun/fork_base.sh on a mainnet fork.
-zkp2p_escrow = "0x0000000000000000000000000000000000000000"
-zkp2p_orchestrator = "0x0000000000000000000000000000000000000000"
-# GlueContract address (set after 01_deploy_sepolia.sh --broadcast)
-# glue_contract = "0x..."
+zkp2p_escrow = "0x88501C514b4226A45C108aC9C443cBaA635430eE"
+zkp2p_orchestrator = "0x88501C514b4226A45C108aC9C443cBaA635430eE"
+# GlueContract address (deployed 2026-08-30 by 01_deploy_sepolia.sh --broadcast)
+glue_contract = "0x78329E4195d0cED3E06b19F9DA800160bcF74511"
 
 [near]
 # NEAR Intents 1Click API (same for mainnet and testnet)

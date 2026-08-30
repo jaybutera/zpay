@@ -31,3 +31,8 @@ contracts/broadcast/
 
 # testnet deployment output (local to each deployer)
 scripts/testnet/deployed.sepolia.env
+
+# standalone proof harness
+scripts/proof/node_modules/
+scripts/proof/attestation.json
+scripts/testnet/live.intent.env
