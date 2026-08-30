@@ -1,0 +1,28 @@
+# Rust
+/target/
+Cargo.lock
+
+# Database
+*.db
+*.db-*
+
+# Environment
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Foundry (in contracts/)
+contracts/cache/
+contracts/out/
+contracts/broadcast/
+
+# ralph loop log
+.ralph.log
