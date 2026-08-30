@@ -2,23 +2,36 @@
 pragma solidity ^0.8.28;
 
 /// @title IEscrow
-/// @notice Interface for zk-p2p Escrow contract
-/// @dev Based on https://github.com/zkp2p/zkp2p-contracts/blob/main/contracts/interfaces/IEscrow.sol
+/// @notice Subset of the zk-p2p EscrowV2 interface used by OfframpGlue
+/// @dev Matches the verified deployment at 0x777777779d229cdF3110e9de47943791c26300Ef (Base mainnet).
+///      Source: https://github.com/zkp2p/zkp2p-contracts/blob/main/contracts/interfaces/IEscrowV2.sol
+///      Struct layouts here are part of the function selectors, so they must stay byte-for-byte
+///      identical to EscrowV2's.
 interface IEscrow {
     struct Range {
         uint256 min;
         uint256 max;
     }
 
+    /// @dev Optional oracle-driven rate floor. adapter == address(0) disables it, in which case
+    ///      minConversionRate is the only floor.
+    struct OracleRateConfig {
+        address adapter;
+        bytes adapterConfig;
+        int16 spreadBps;
+        uint32 maxStaleness;
+    }
+
     struct Currency {
-        bytes32 code;               // keccak256 hash of currency code (e.g., keccak256("USD"))
-        uint256 minConversionRate;  // Minimum rate in 18 decimal precision
+        bytes32 code;                     // keccak256 hash of currency code (e.g., keccak256("USD"))
+        uint256 minConversionRate;        // Minimum fiat per deposit token, 18 decimals (USD per USDC)
+        OracleRateConfig oracleRateConfig; // Oracle floor config (adapter == address(0) means disabled)
     }
 
     struct DepositPaymentMethodData {
-        address intentGatingService;  // Gating service public key for intent verification
+        address intentGatingService;  // Gating service that must sign signalIntent (address(0) = none)
         bytes32 payeeDetails;         // Payee details hash issued by the zk-p2p curator (hashedOnchainId)
-        bytes data;                   // Additional verification data (attester address, etc.)
+        bytes data;                   // Additional verification data
     }
 
     struct CreateDepositParams {
@@ -37,47 +50,44 @@ interface IEscrow {
         address depositor;
         address delegate;
         address token;
-        uint256 amount;
         Range intentAmountRange;
-        bytes32[] acceptedPaymentMethods;
+        bool acceptingIntents;
+        uint256 remainingDeposits;
+        uint256 outstandingIntentAmount;
         address intentGuardian;
         bool retainOnEmpty;
-        bool closed;
     }
 
-    /// @notice Create a new deposit for off-ramping
-    /// @param params Deposit creation parameters
-    /// @return depositId The unique deposit identifier
-    function createDeposit(CreateDepositParams calldata params) external returns (uint256 depositId);
+    /// @notice Create a new deposit. EscrowV2 returns nothing; the deposit id is the value of
+    ///         depositCounter() immediately before the call.
+    function createDeposit(CreateDepositParams calldata params) external;
 
-    /// @notice Withdraw funds from a deposit
-    /// @param depositId The deposit to withdraw from
-    /// @param amount Amount to withdraw
-    function withdrawDeposit(uint256 depositId, uint256 amount) external;
+    /// @notice Withdraw all remaining liquidity from a deposit (depositor only)
+    function withdrawDeposit(uint256 depositId) external;
+
+    /// @notice Id that the next createDeposit will be assigned
+    function depositCounter() external view returns (uint256);
 
     /// @notice Get deposit details
-    /// @param depositId The deposit to query
-    /// @return Deposit struct
     function getDeposit(uint256 depositId) external view returns (Deposit memory);
 
-    /// @notice Get all deposits for an account
-    /// @param account Account to query
-    /// @return Array of deposit IDs
-    function getAccountDeposits(address account) external view returns (uint256[] memory);
-
-    // Events
-    event DepositCreated(
+    // Events (EscrowV2 signatures)
+    event DepositReceived(
         uint256 indexed depositId,
         address indexed depositor,
         address indexed token,
-        uint256 amount
+        uint256 amount,
+        Range intentAmountRange,
+        address delegate,
+        address intentGuardian
     );
 
-    event DepositWithdrawn(
+    event DepositPaymentMethodAdded(
         uint256 indexed depositId,
-        address indexed depositor,
-        uint256 amount
+        bytes32 indexed paymentMethod,
+        bytes32 indexed payeeDetails,
+        address intentGatingService
     );
 
-    event DepositClosed(uint256 indexed depositId);
+    event DepositWithdrawn(uint256 indexed depositId, address indexed depositor, uint256 amount);
 }

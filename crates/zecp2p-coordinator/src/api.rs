@@ -112,7 +112,7 @@ pub struct CreateOfframpBody {
     pub taker_address: String,
     /// User's Zcash address for refunds (t1/t3/zs prefix)
     pub zec_refund_address: String,
-    /// Minimum USDC/ZEC rate (decimal)
+    /// Minimum USD per USDC the taker must pay on zk-p2p (decimal, default "1.0")
     #[serde(default)]
     pub min_rate: Option<String>,
     /// Timeout in seconds
@@ -386,7 +386,8 @@ fn validate_zec_address(address: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-/// Parse min_rate from decimal string to U256 with 18 decimals
+/// Parse min_rate (USD per USDC the zk-p2p taker must pay) from a decimal
+/// string to U256 with 18 decimals
 fn parse_min_rate(rate_str: Option<&str>) -> Result<U256, AppError> {
     match rate_str {
         Some(s) => {
@@ -414,8 +415,8 @@ fn parse_min_rate(rate_str: Option<&str>) -> Result<U256, AppError> {
             Ok(U256::from(scaled))
         }
         None => {
-            // Default: 20 USDC per ZEC minimum
-            Ok(U256::from(20u64) * U256::from(10u64).pow(U256::from(18u64)))
+            // Default: 1 USD per USDC
+            Ok(U256::from(10u64).pow(U256::from(18u64)))
         }
     }
 }

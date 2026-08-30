@@ -315,14 +315,14 @@ impl ChainClient {
 
     /// Withdraw from zk-p2p deposit (user only)
     /// Withdraws USDC from zk-p2p escrow if no taker signaled intent
-    pub async fn withdraw_from_zkp2p(&self, session_id: B256, amount: U256) -> Result<B256> {
+    pub async fn withdraw_from_zkp2p(&self, session_id: B256) -> Result<B256> {
         let glue_addr = self.glue_contract()?;
         let provider = self.signing_provider()?;
 
         let glue = OfframpGlue::new(glue_addr, provider);
 
         let tx = glue
-            .withdrawFromZkp2p(session_id, amount)
+            .withdrawFromZkp2p(session_id)
             .send()
             .await
             .context("Failed to send withdrawFromZkp2p transaction")?;

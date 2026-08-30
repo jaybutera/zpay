@@ -26,7 +26,8 @@ sol! {
     }
 }
 
-// zk-p2p Escrow interface (subset we need)
+// zk-p2p EscrowV2 interface (subset we need)
+// Matches the verified deployment at 0x777777779d229cdF3110e9de47943791c26300Ef on Base.
 sol! {
     #[sol(rpc)]
     interface IEscrow {
@@ -35,9 +36,17 @@ sol! {
             uint256 max;
         }
 
+        struct OracleRateConfig {
+            address adapter;
+            bytes adapterConfig;
+            int16 spreadBps;
+            uint32 maxStaleness;
+        }
+
         struct Currency {
             bytes32 code;
             uint256 minConversionRate;
+            OracleRateConfig oracleRateConfig;
         }
 
         struct DepositPaymentMethodData {
@@ -62,31 +71,39 @@ sol! {
             address depositor;
             address delegate;
             address token;
-            uint256 amount;
             Range intentAmountRange;
-            bytes32[] acceptedPaymentMethods;
+            bool acceptingIntents;
+            uint256 remainingDeposits;
+            uint256 outstandingIntentAmount;
             address intentGuardian;
             bool retainOnEmpty;
-            bool closed;
         }
 
-        function createDeposit(CreateDepositParams calldata params) external returns (uint256 depositId);
-        function withdrawDeposit(uint256 depositId, uint256 amount) external;
+        /// Returns nothing; the new deposit's id is depositCounter() before the call
+        function createDeposit(CreateDepositParams calldata params) external;
+        /// Withdraws all remaining liquidity (depositor only)
+        function withdrawDeposit(uint256 depositId) external;
+        function depositCounter() external view returns (uint256);
         function getDeposit(uint256 depositId) external view returns (Deposit memory);
-        function getAccountDeposits(address account) external view returns (uint256[] memory);
 
-        event DepositCreated(
+        event DepositReceived(
             uint256 indexed depositId,
             address indexed depositor,
             address indexed token,
-            uint256 amount
+            uint256 amount,
+            Range intentAmountRange,
+            address delegate,
+            address intentGuardian
         );
 
-        event DepositWithdrawn(
+        event DepositPaymentMethodAdded(
             uint256 indexed depositId,
-            address indexed depositor,
-            uint256 amount
+            bytes32 indexed paymentMethod,
+            bytes32 indexed payeeDetails,
+            address intentGatingService
         );
+
+        event DepositWithdrawn(uint256 indexed depositId, address indexed depositor, uint256 amount);
     }
 }
 
@@ -142,9 +159,17 @@ sol! {
     #[sol(rpc)]
     contract OfframpGlue {
         // Inlined types from IEscrow that we need for processOfframp
+        struct OracleRateConfig {
+            address adapter;
+            bytes adapterConfig;
+            int16 spreadBps;
+            uint32 maxStaleness;
+        }
+
         struct Currency {
             bytes32 code;
             uint256 minConversionRate;
+            OracleRateConfig oracleRateConfig;
         }
 
         struct DepositPaymentMethodData {
@@ -159,6 +184,7 @@ sol! {
             uint256 minConversionRate;
             uint256 expectedAmount;
             uint256 depositId;
+            bool processed;
             bool fulfilled;
             bool rescued;
         }
@@ -213,7 +239,7 @@ sol! {
 
         function rescue(bytes32 sessionId) external;
 
-        function withdrawFromZkp2p(bytes32 sessionId, uint256 amount) external;
+        function withdrawFromZkp2p(bytes32 sessionId) external;
 
         function setKeeper(address newKeeper) external;
 
@@ -249,15 +275,23 @@ sol! {
 sol! {
     #[sol(rpc)]
     interface MockEscrowWithOrchestrator {
-        // Escrow functions
+        // Escrow functions (EscrowV2 shapes)
         struct Range {
             uint256 min;
             uint256 max;
         }
 
+        struct OracleRateConfig {
+            address adapter;
+            bytes adapterConfig;
+            int16 spreadBps;
+            uint32 maxStaleness;
+        }
+
         struct Currency {
             bytes32 code;
             uint256 minConversionRate;
+            OracleRateConfig oracleRateConfig;
         }
 
         struct DepositPaymentMethodData {
@@ -282,18 +316,19 @@ sol! {
             address depositor;
             address delegate;
             address token;
-            uint256 amount;
             Range intentAmountRange;
-            bytes32[] acceptedPaymentMethods;
+            bool acceptingIntents;
+            uint256 remainingDeposits;
+            uint256 outstandingIntentAmount;
             address intentGuardian;
             bool retainOnEmpty;
-            bool closed;
         }
 
-        function createDeposit(CreateDepositParams calldata params) external returns (uint256 depositId);
-        function withdrawDeposit(uint256 depositId, uint256 amount) external;
+        function createDeposit(CreateDepositParams calldata params) external;
+        function withdrawDeposit(uint256 depositId) external;
+        function depositCounter() external view returns (uint256);
         function getDeposit(uint256 depositId) external view returns (Deposit memory);
-        function getAccountDeposits(address account) external view returns (uint256[] memory);
+        function getDepositPayeeDetails(uint256 depositId, bytes32 paymentMethod) external view returns (bytes32);
 
         // Orchestrator functions
         struct Intent {
@@ -328,18 +363,17 @@ sol! {
         function getAccountIntents(address account) external view returns (bytes32[] memory);
 
         // Events
-        event DepositCreated(
+        event DepositReceived(
             uint256 indexed depositId,
             address indexed depositor,
             address indexed token,
-            uint256 amount
+            uint256 amount,
+            Range intentAmountRange,
+            address delegate,
+            address intentGuardian
         );
 
-        event DepositWithdrawn(
-            uint256 indexed depositId,
-            address indexed depositor,
-            uint256 amount
-        );
+        event DepositWithdrawn(uint256 indexed depositId, address indexed depositor, uint256 amount);
 
         event IntentSignaled(
             bytes32 indexed intentHash,
@@ -360,6 +394,23 @@ sol! {
             uint256 amount,
             bool isManualRelease
         );
+    }
+}
+
+/// Build a zk-p2p `Currency` entry with a fixed rate floor and no oracle.
+///
+/// `min_conversion_rate` is fiat per deposit token in 18 decimals
+/// (USD per USDC; 1e18 means the taker must pay at least 1 USD per USDC).
+pub fn fixed_rate_currency(code: alloy::primitives::B256, min_conversion_rate: alloy::primitives::U256) -> OfframpGlue::Currency {
+    OfframpGlue::Currency {
+        code,
+        minConversionRate: min_conversion_rate,
+        oracleRateConfig: OfframpGlue::OracleRateConfig {
+            adapter: alloy::primitives::Address::ZERO,
+            adapterConfig: alloy::primitives::Bytes::new(),
+            spreadBps: 0,
+            maxStaleness: 0,
+        },
     }
 }
 

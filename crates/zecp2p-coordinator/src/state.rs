@@ -10,7 +10,7 @@ use alloy::primitives::{Bytes, U256};
 use anyhow::Result;
 use tokio::sync::RwLock;
 use zecp2p_types::{
-    abi::{usd_currency_code, venmo_payment_method, OfframpGlue},
+    abi::{fixed_rate_currency, usd_currency_code, venmo_payment_method, OfframpGlue},
     Config, OfframpRequest, OfframpSession, OfframpStatus,
 };
 
@@ -199,10 +199,11 @@ impl AppState {
             data: Bytes::new(),
         }];
 
-        let currencies = vec![vec![OfframpGlue::Currency {
-            code: usd_currency_code(),
-            minConversionRate: session.request.min_rate,
-        }]];
+        // min_rate is the USD-per-USDC floor the taker must pay (18 decimals)
+        let currencies = vec![vec![fixed_rate_currency(
+            usd_currency_code(),
+            session.request.min_rate,
+        )]];
 
         // Execute on-chain
         let (tx_hash, deposit_id) = self
@@ -535,16 +536,10 @@ impl AppState {
             )));
         }
 
-        // Get the amount to withdraw (use received_usdc or expected_usdc)
-        let amount = session
-            .received_usdc
-            .or(session.expected_usdc)
-            .ok_or_else(|| AppError::InvalidState("No USDC amount recorded".to_string()))?;
-
-        // Execute withdrawal on-chain
+        // Execute withdrawal on-chain; EscrowV2 returns all remaining liquidity
         let _tx_hash = self
             .chain
-            .withdraw_from_zkp2p(session.session_id, amount)
+            .withdraw_from_zkp2p(session.session_id)
             .await
             .map_err(|e| AppError::Chain(e.to_string()))?;
 

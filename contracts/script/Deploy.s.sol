@@ -9,7 +9,8 @@ import {OfframpGlue} from "../src/OfframpGlue.sol";
 contract DeployOfframpGlue is Script {
     // Base Mainnet addresses
     address constant USDC_BASE_MAINNET = 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913;
-    address constant ZKP2P_ESCROW_BASE_MAINNET = 0x59Cf3c90E8e7D27773b5E468D1a24B247db9B78d;
+    // zk-p2p EscrowV2 (the escrow production makers deposit into; paired with OrchestratorV3)
+    address constant ZKP2P_ESCROW_BASE_MAINNET = 0x777777779d229cdF3110e9de47943791c26300Ef;
 
     // Base Sepolia addresses
     address constant USDC_BASE_SEPOLIA = 0x036CbD53842c5426634e7929541eC2318f3dCF7e;

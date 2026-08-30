@@ -59,9 +59,9 @@ contract MockUSDC is IERC20 {
 /// @notice Mock zk-p2p Escrow that also acts as the Orchestrator
 /// Emits IntentSignaled and IntentFulfilled events for testing the coordinator's event monitoring
 contract MockEscrowWithOrchestrator is IEscrow {
-    uint256 private _nextDepositId = 1;
+    uint256 public depositCounter;
     mapping(uint256 => Deposit) private _deposits;
-    mapping(address => uint256[]) private _accountDeposits;
+    mapping(uint256 => mapping(bytes32 => bytes32)) private _payeeDetails;
 
     // Orchestrator state
     mapping(bytes32 => Intent) private _intents;
@@ -112,50 +112,69 @@ contract MockEscrowWithOrchestrator is IEscrow {
         token = IERC20(_token);
     }
 
-    function createDeposit(CreateDepositParams calldata params) external returns (uint256 depositId) {
-        depositId = _nextDepositId++;
+    /// @dev Mirrors EscrowV2._createDeposit: checks, id = depositCounter++, no return value
+    function createDeposit(CreateDepositParams calldata params) external {
+        require(params.intentAmountRange.min > 0, "ZeroMinValue");
+        require(params.intentAmountRange.min <= params.intentAmountRange.max, "InvalidRange");
+        require(params.amount >= params.intentAmountRange.min, "AmountBelowMin");
+        require(params.paymentMethods.length == params.paymentMethodData.length, "PaymentMethodDataLength");
+        require(params.paymentMethods.length == params.currencies.length, "CurrenciesLength");
 
-        // Transfer tokens from caller
-        bool success = token.transferFrom(msg.sender, address(this), params.amount);
-        require(success, "Transfer failed");
+        uint256 depositId = depositCounter++;
 
         _deposits[depositId] = Deposit({
             depositor: msg.sender,
             delegate: params.delegate,
             token: params.token,
-            amount: params.amount,
             intentAmountRange: params.intentAmountRange,
-            acceptedPaymentMethods: params.paymentMethods,
+            acceptingIntents: true,
+            remainingDeposits: params.amount,
+            outstandingIntentAmount: 0,
             intentGuardian: params.intentGuardian,
-            retainOnEmpty: params.retainOnEmpty,
-            closed: false
+            retainOnEmpty: params.retainOnEmpty
         });
 
-        _accountDeposits[msg.sender].push(depositId);
+        emit DepositReceived(
+            depositId, msg.sender, params.token, params.amount, params.intentAmountRange, params.delegate, params.intentGuardian
+        );
 
-        emit DepositCreated(depositId, msg.sender, params.token, params.amount);
+        for (uint256 i = 0; i < params.paymentMethods.length; i++) {
+            require(params.paymentMethodData[i].payeeDetails != bytes32(0), "EmptyPayeeDetails");
+            _payeeDetails[depositId][params.paymentMethods[i]] = params.paymentMethodData[i].payeeDetails;
+            emit DepositPaymentMethodAdded(
+                depositId,
+                params.paymentMethods[i],
+                params.paymentMethodData[i].payeeDetails,
+                params.paymentMethodData[i].intentGatingService
+            );
+        }
 
-        return depositId;
+        bool success = IERC20(params.token).transferFrom(msg.sender, address(this), params.amount);
+        require(success, "Transfer failed");
     }
 
-    function withdrawDeposit(uint256 depositId, uint256 amount) external {
+    /// @dev Mirrors EscrowV2.withdrawDeposit: depositor only, returns all remaining liquidity
+    function withdrawDeposit(uint256 depositId) external {
         Deposit storage deposit = _deposits[depositId];
-        require(deposit.depositor == msg.sender, "Not depositor");
-        require(deposit.amount >= amount, "Insufficient balance");
+        require(deposit.depositor == msg.sender, "UnauthorizedCaller");
 
-        deposit.amount -= amount;
-        bool success = token.transfer(msg.sender, amount);
+        uint256 returnAmount = deposit.remainingDeposits;
+        deposit.remainingDeposits = 0;
+        deposit.acceptingIntents = false;
+
+        emit DepositWithdrawn(depositId, msg.sender, returnAmount);
+
+        bool success = IERC20(deposit.token).transfer(msg.sender, returnAmount);
         require(success, "Transfer failed");
-
-        emit DepositWithdrawn(depositId, msg.sender, amount);
     }
 
     function getDeposit(uint256 depositId) external view returns (Deposit memory) {
         return _deposits[depositId];
     }
 
-    function getAccountDeposits(address account) external view returns (uint256[] memory) {
-        return _accountDeposits[account];
+    /// @notice Test helper: payeeDetails recorded for a deposit's payment method
+    function getDepositPayeeDetails(uint256 depositId, bytes32 paymentMethod) external view returns (bytes32) {
+        return _payeeDetails[depositId][paymentMethod];
     }
 
     // ============ Orchestrator Functions (for testing) ============
@@ -178,7 +197,7 @@ contract MockEscrowWithOrchestrator is IEscrow {
         uint256 conversionRate
     ) external returns (bytes32 intentHash) {
         Deposit storage deposit = _deposits[depositId];
-        require(deposit.amount >= amount, "Insufficient deposit");
+        require(deposit.remainingDeposits >= amount, "Insufficient deposit");
         require(amount >= deposit.intentAmountRange.min, "Below min amount");
         require(amount <= deposit.intentAmountRange.max, "Above max amount");
 
@@ -201,7 +220,7 @@ contract MockEscrowWithOrchestrator is IEscrow {
             paymentMethod: paymentMethod,
             fiatCurrency: fiatCurrency,
             conversionRate: conversionRate,
-            payeeDetails: bytes32(0),
+            payeeDetails: _payeeDetails[depositId][paymentMethod],
             referrer: address(0),
             referrerFee: 0,
             postIntentHook: address(0),
@@ -235,10 +254,10 @@ contract MockEscrowWithOrchestrator is IEscrow {
         require(intent.owner == msg.sender, "Not intent owner");
 
         Deposit storage deposit = _deposits[intent.depositId];
-        require(deposit.amount >= intent.amount, "Insufficient deposit");
+        require(deposit.remainingDeposits >= intent.amount, "Insufficient deposit");
 
         // Transfer USDC from deposit to taker
-        deposit.amount -= intent.amount;
+        deposit.remainingDeposits -= intent.amount;
         bool success = token.transfer(intent.to, intent.amount);
         require(success, "Transfer failed");
 

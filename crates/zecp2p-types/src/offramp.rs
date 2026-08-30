@@ -65,8 +65,9 @@ pub struct OfframpRequest {
     /// User's Zcash address for refunds (t1/t3/zs prefix)
     /// If the NEAR Intent fails, ZEC is refunded here
     pub zec_refund_address: String,
-    /// Minimum USDC/ZEC conversion rate (in 18-decimal precision)
-    /// e.g., 30_000000_000000_000000 = 30 USDC per ZEC
+    /// Minimum USD per USDC the zk-p2p taker must pay, 18-decimal precision
+    /// (zk-p2p `Currency.minConversionRate`). 1e18 = 1 USD per USDC.
+    /// The ZEC to USDC leg is priced by the NEAR Intents quote, not by this.
     pub min_rate: U256,
     /// Timeout for NEAR settlement in seconds (default: 600)
     #[serde(default = "default_timeout")]

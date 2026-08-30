@@ -65,7 +65,7 @@ cargo run --bin zecp2p -- offramp 0.5 \
   --user-address 0xYourBaseAddress \
   --taker 0xTakerAddress \
   --zec-address t1YourZcashAddress \
-  --min-rate 30
+  --min-rate 1.0
 
 # Check status
 cargo run --bin zecp2p -- status <session-id>
@@ -117,7 +117,7 @@ forge test
   "user_address": "0x...",
   "taker_address": "0x...",
   "zec_refund_address": "t1...",
-  "min_rate": "30000000000000000000",
+  "min_rate": "1.0",
   "timeout_seconds": 600
 }
 ```

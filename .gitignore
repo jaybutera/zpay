@@ -26,3 +26,6 @@ contracts/broadcast/
 
 # ralph loop log
 .ralph.log
+
+# testnet deployment output (local to each deployer)
+scripts/testnet/deployed.sepolia.env

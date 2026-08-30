@@ -60,7 +60,7 @@ enum Commands {
         #[arg(long)]
         zec_address: String,
 
-        /// Minimum USDC/ZEC rate to accept
+        /// Minimum USD per USDC the taker must pay on zk-p2p (default 1.0)
         #[arg(long)]
         min_rate: Option<String>,
 

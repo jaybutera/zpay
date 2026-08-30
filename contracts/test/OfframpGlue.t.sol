@@ -58,9 +58,9 @@ contract MockUSDC is IERC20 {
 
 /// @notice Mock zk-p2p Escrow for testing
 contract MockEscrow is IEscrow {
-    uint256 private _nextDepositId = 1;
+    uint256 public depositCounter;
     mapping(uint256 => Deposit) private _deposits;
-    mapping(address => uint256[]) private _accountDeposits;
+    mapping(uint256 => mapping(bytes32 => bytes32)) private _payeeDetails;
 
     IERC20 public token;
 
@@ -68,50 +68,69 @@ contract MockEscrow is IEscrow {
         token = IERC20(_token);
     }
 
-    function createDeposit(CreateDepositParams calldata params) external returns (uint256 depositId) {
-        depositId = _nextDepositId++;
+    /// @dev Mirrors EscrowV2._createDeposit: checks, id = depositCounter++, no return value
+    function createDeposit(CreateDepositParams calldata params) external {
+        require(params.intentAmountRange.min > 0, "ZeroMinValue");
+        require(params.intentAmountRange.min <= params.intentAmountRange.max, "InvalidRange");
+        require(params.amount >= params.intentAmountRange.min, "AmountBelowMin");
+        require(params.paymentMethods.length == params.paymentMethodData.length, "PaymentMethodDataLength");
+        require(params.paymentMethods.length == params.currencies.length, "CurrenciesLength");
 
-        // Transfer tokens from caller
-        bool success = token.transferFrom(msg.sender, address(this), params.amount);
-        require(success, "Transfer failed");
+        uint256 depositId = depositCounter++;
 
         _deposits[depositId] = Deposit({
             depositor: msg.sender,
             delegate: params.delegate,
             token: params.token,
-            amount: params.amount,
             intentAmountRange: params.intentAmountRange,
-            acceptedPaymentMethods: params.paymentMethods,
+            acceptingIntents: true,
+            remainingDeposits: params.amount,
+            outstandingIntentAmount: 0,
             intentGuardian: params.intentGuardian,
-            retainOnEmpty: params.retainOnEmpty,
-            closed: false
+            retainOnEmpty: params.retainOnEmpty
         });
 
-        _accountDeposits[msg.sender].push(depositId);
+        emit DepositReceived(
+            depositId, msg.sender, params.token, params.amount, params.intentAmountRange, params.delegate, params.intentGuardian
+        );
 
-        emit DepositCreated(depositId, msg.sender, params.token, params.amount);
+        for (uint256 i = 0; i < params.paymentMethods.length; i++) {
+            require(params.paymentMethodData[i].payeeDetails != bytes32(0), "EmptyPayeeDetails");
+            _payeeDetails[depositId][params.paymentMethods[i]] = params.paymentMethodData[i].payeeDetails;
+            emit DepositPaymentMethodAdded(
+                depositId,
+                params.paymentMethods[i],
+                params.paymentMethodData[i].payeeDetails,
+                params.paymentMethodData[i].intentGatingService
+            );
+        }
 
-        return depositId;
+        bool success = IERC20(params.token).transferFrom(msg.sender, address(this), params.amount);
+        require(success, "Transfer failed");
     }
 
-    function withdrawDeposit(uint256 depositId, uint256 amount) external {
+    /// @dev Mirrors EscrowV2.withdrawDeposit: depositor only, returns all remaining liquidity
+    function withdrawDeposit(uint256 depositId) external {
         Deposit storage deposit = _deposits[depositId];
-        require(deposit.depositor == msg.sender, "Not depositor");
-        require(deposit.amount >= amount, "Insufficient balance");
+        require(deposit.depositor == msg.sender, "UnauthorizedCaller");
 
-        deposit.amount -= amount;
-        bool success = token.transfer(msg.sender, amount);
+        uint256 returnAmount = deposit.remainingDeposits;
+        deposit.remainingDeposits = 0;
+        deposit.acceptingIntents = false;
+
+        emit DepositWithdrawn(depositId, msg.sender, returnAmount);
+
+        bool success = IERC20(deposit.token).transfer(msg.sender, returnAmount);
         require(success, "Transfer failed");
-
-        emit DepositWithdrawn(depositId, msg.sender, amount);
     }
 
     function getDeposit(uint256 depositId) external view returns (Deposit memory) {
         return _deposits[depositId];
     }
 
-    function getAccountDeposits(address account) external view returns (uint256[] memory) {
-        return _accountDeposits[account];
+    /// @notice Test helper: payeeDetails recorded for a deposit's payment method
+    function getDepositPayeeDetails(uint256 depositId, bytes32 paymentMethod) external view returns (bytes32) {
+        return _payeeDetails[depositId][paymentMethod];
     }
 }
 
@@ -129,6 +148,15 @@ contract OfframpGlueTest is Test {
     bytes32 public constant USD_CODE = keccak256("USD");
     // Stand-in for a curator-issued payee details hash (opaque bytes32 in production)
     bytes32 public constant PAYEE_HASH = keccak256("mock-zkp2p-payee:alice");
+
+    /// USD at a fixed floor of 1 USD per USDC, no oracle
+    function _usd() internal pure returns (IEscrow.Currency memory) {
+        return IEscrow.Currency({
+            code: USD_CODE,
+            minConversionRate: 1e18,
+            oracleRateConfig: IEscrow.OracleRateConfig({adapter: address(0), adapterConfig: "", spreadBps: 0, maxStaleness: 0})
+        });
+    }
 
     function setUp() public {
         usdc = new MockUSDC();
@@ -161,6 +189,7 @@ contract OfframpGlueTest is Test {
         assertEq(session.minConversionRate, minRate);
         assertEq(session.expectedAmount, expectedAmount);
         assertEq(session.depositId, 0);
+        assertFalse(session.processed);
         assertFalse(session.fulfilled);
         assertFalse(session.rescued);
     }
@@ -211,19 +240,24 @@ contract OfframpGlueTest is Test {
 
         IEscrow.Currency[][] memory currencies = new IEscrow.Currency[][](1);
         currencies[0] = new IEscrow.Currency[](1);
-        currencies[0][0] = IEscrow.Currency({
-            code: USD_CODE,
-            minConversionRate: 1e18
-        });
+        currencies[0][0] = _usd();
 
         // Process offramp
         vm.prank(keeper);
         uint256 depositId = glue.processOfframp(sessionId, methods, methodData, currencies);
 
-        assertEq(depositId, 1);
+        // EscrowV2 ids start at 0 and are read from depositCounter, not a return value
+        assertEq(depositId, 0);
+        assertEq(escrow.depositCounter(), 1);
 
         OfframpGlue.Session memory session = glue.getSession(sessionId);
-        assertEq(session.depositId, 1);
+        assertEq(session.depositId, 0);
+        assertTrue(session.processed);
+
+        // The deposit carries the session's payee hash and the glue is the depositor
+        assertEq(escrow.getDepositPayeeDetails(0, VENMO_METHOD), payeeHash);
+        assertEq(escrow.getDeposit(0).depositor, address(glue));
+        assertEq(escrow.getDeposit(0).remainingDeposits, amount);
 
         // Verify USDC moved to escrow
         assertEq(usdc.balanceOf(address(glue)), 0);
@@ -267,7 +301,7 @@ contract OfframpGlueTest is Test {
 
         IEscrow.Currency[][] memory currencies = new IEscrow.Currency[][](1);
         currencies[0] = new IEscrow.Currency[](1);
-        currencies[0][0] = IEscrow.Currency({code: USD_CODE, minConversionRate: 1e18});
+        currencies[0][0] = _usd();
 
         vm.prank(keeper);
         vm.expectRevert(OfframpGlue.PayeeDetailsMismatch.selector);
@@ -298,7 +332,7 @@ contract OfframpGlueTest is Test {
 
         IEscrow.Currency[][] memory currencies = new IEscrow.Currency[][](1);
         currencies[0] = new IEscrow.Currency[](1);
-        currencies[0][0] = IEscrow.Currency({code: USD_CODE, minConversionRate: 1e18});
+        currencies[0][0] = _usd();
 
         vm.prank(keeper);
         glue.processOfframp(sessionId, methods, methodData, currencies);
@@ -364,7 +398,7 @@ contract OfframpGlueTest is Test {
 
         IEscrow.Currency[][] memory currencies = new IEscrow.Currency[][](1);
         currencies[0] = new IEscrow.Currency[](1);
-        currencies[0][0] = IEscrow.Currency({code: USD_CODE, minConversionRate: 1e18});
+        currencies[0][0] = _usd();
 
         vm.prank(keeper);
         glue.processOfframp(sessionId, methods, methodData, currencies);
@@ -396,16 +430,28 @@ contract OfframpGlueTest is Test {
 
         IEscrow.Currency[][] memory currencies = new IEscrow.Currency[][](1);
         currencies[0] = new IEscrow.Currency[](1);
-        currencies[0][0] = IEscrow.Currency({code: USD_CODE, minConversionRate: 1e18});
+        currencies[0][0] = _usd();
 
         vm.prank(keeper);
         glue.processOfframp(sessionId, methods, methodData, currencies);
 
         // User withdraws from zk-p2p
         vm.prank(user);
-        glue.withdrawFromZkp2p(sessionId, amount);
+        glue.withdrawFromZkp2p(sessionId);
 
         assertEq(usdc.balanceOf(user), amount);
+        assertEq(escrow.getDeposit(0).remainingDeposits, 0);
+    }
+
+    function test_WithdrawFromZkp2p_RevertIfNotProcessed() public {
+        bytes32 sessionId = keccak256("session1");
+
+        vm.prank(keeper);
+        glue.createSession(sessionId, user, PAYEE_HASH, 1e18, 100e6);
+
+        vm.prank(user);
+        vm.expectRevert(OfframpGlue.NoDepositToWithdraw.selector);
+        glue.withdrawFromZkp2p(sessionId);
     }
 
     function test_SetKeeper() public {

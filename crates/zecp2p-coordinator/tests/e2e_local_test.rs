@@ -15,7 +15,7 @@ use test_utils::{
     deploy_contracts, get_signing_provider, AnvilInstance, ANVIL_PRIVATE_KEY, TEST_USER,
     TEST_USER_PRIVATE_KEY,
 };
-use zecp2p_types::abi::{usd_currency_code, venmo_payment_method, MockUSDC, OfframpGlue};
+use zecp2p_types::abi::{usd_currency_code, venmo_payment_method, MockUSDC, OfframpGlue, fixed_rate_currency};
 
 #[tokio::test]
 #[ignore = "requires anvil and forge to be installed"]
@@ -72,6 +72,7 @@ async fn test_full_offramp_flow_local() {
     assert_eq!(session.minConversionRate, min_rate);
     assert_eq!(session.expectedAmount, expected_amount);
     assert_eq!(session.depositId, U256::ZERO);
+    assert!(!session.processed);
     assert!(!session.fulfilled);
     assert!(!session.rescued);
 
@@ -109,10 +110,7 @@ async fn test_full_offramp_flow_local() {
         payeeDetails: venmo_hash,
         data: Bytes::new(),
     }];
-    let currencies = vec![vec![OfframpGlue::Currency {
-        code: usd_currency_code(),
-        minConversionRate: min_rate,
-    }]];
+    let currencies = vec![vec![fixed_rate_currency(usd_currency_code(), min_rate)]];
 
     let tx = glue
         .processOfframp(session_id, payment_methods, payment_method_data, currencies)
@@ -130,7 +128,9 @@ async fn test_full_offramp_flow_local() {
         .await
         .expect("Failed to get session");
 
-    assert_ne!(session.depositId, U256::ZERO);
+    // EscrowV2-style ids start at 0, so `processed` is the flag, not a non-zero id
+    assert!(session.processed);
+    assert_eq!(session.depositId, U256::ZERO);
     println!("zk-p2p deposit ID: {}", session.depositId);
 
     // Verify GlueContract balance is now 0 (transferred to escrow)
@@ -293,10 +293,7 @@ async fn test_withdraw_from_zkp2p_flow_local() {
         payeeDetails: venmo_hash,
         data: Bytes::new(),
     }];
-    let currencies = vec![vec![OfframpGlue::Currency {
-        code: usd_currency_code(),
-        minConversionRate: min_rate,
-    }]];
+    let currencies = vec![vec![fixed_rate_currency(usd_currency_code(), min_rate)]];
 
     glue_owner
         .processOfframp(session_id, payment_methods, payment_method_data, currencies)
@@ -322,7 +319,7 @@ async fn test_withdraw_from_zkp2p_flow_local() {
 
     // Withdraw as user
     glue_user
-        .withdrawFromZkp2p(session_id, expected_amount)
+        .withdrawFromZkp2p(session_id)
         .send()
         .await
         .expect("Failed to withdraw")
@@ -388,10 +385,7 @@ async fn test_session_cannot_process_twice() {
         payeeDetails: venmo_hash,
         data: Bytes::new(),
     }];
-    let currencies = vec![vec![OfframpGlue::Currency {
-        code: usd_currency_code(),
-        minConversionRate: min_rate,
-    }]];
+    let currencies = vec![vec![fixed_rate_currency(usd_currency_code(), min_rate)]];
 
     glue.processOfframp(
         session_id,

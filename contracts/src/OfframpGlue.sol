@@ -15,7 +15,8 @@ contract OfframpGlue {
         bytes32 payeeDetailsHash; // zk-p2p payee details hash (curator-issued hashedOnchainId)
         uint256 minConversionRate; // Minimum acceptable rate (18 decimals)
         uint256 expectedAmount; // Expected USDC from NEAR Intent (6 decimals)
-        uint256 depositId;      // zk-p2p deposit ID (0 until processed)
+        uint256 depositId;      // zk-p2p deposit ID (meaningful once processed; EscrowV2 ids start at 0)
+        bool processed;         // Whether USDC was deposited to zk-p2p
         bool fulfilled;         // Whether session is complete
         bool rescued;           // Whether user rescued funds
     }
@@ -65,6 +66,7 @@ contract OfframpGlue {
     error ZeroAmount();
     error TransferFailed();
     error PayeeDetailsMismatch();
+    error DepositNotCreated();
 
     // ============ Modifiers ============
 
@@ -116,6 +118,7 @@ contract OfframpGlue {
             minConversionRate: minConversionRate,
             expectedAmount: expectedAmount,
             depositId: 0,
+            processed: false,
             fulfilled: false,
             rescued: false
         });
@@ -138,7 +141,7 @@ contract OfframpGlue {
         Session storage session = sessions[sessionId];
 
         if (session.user == address(0)) revert SessionNotFound();
-        if (session.depositId != 0) revert SessionAlreadyProcessed();
+        if (session.processed) revert SessionAlreadyProcessed();
         if (session.rescued) revert SessionAlreadyRescued();
 
         // Every payment method on the deposit must pay out to the payee registered
@@ -171,10 +174,14 @@ contract OfframpGlue {
             retainOnEmpty: false  // Close deposit when drained
         });
 
-        // Create the zk-p2p deposit
-        depositId = zkp2pEscrow.createDeposit(params);
+        // EscrowV2.createDeposit returns nothing; it assigns depositCounter and
+        // increments it. Read the counter before and verify it moved by exactly one.
+        depositId = zkp2pEscrow.depositCounter();
+        zkp2pEscrow.createDeposit(params);
+        if (zkp2pEscrow.depositCounter() != depositId + 1) revert DepositNotCreated();
 
         session.depositId = depositId;
+        session.processed = true;
 
         emit OfframpProcessed(sessionId, depositId, balance);
 
@@ -188,7 +195,7 @@ contract OfframpGlue {
 
         if (session.user == address(0)) revert SessionNotFound();
         if (msg.sender != session.user) revert Unauthorized();
-        if (session.depositId != 0) revert SessionAlreadyProcessed();
+        if (session.processed) revert SessionAlreadyProcessed();
         if (session.rescued) revert SessionAlreadyRescued();
 
         uint256 balance = usdc.balanceOf(address(this));
@@ -202,18 +209,19 @@ contract OfframpGlue {
         emit SessionRescued(sessionId, session.user, balance);
     }
 
-    /// @notice Withdraw USDC from zk-p2p if no taker fulfilled
+    /// @notice Withdraw the remaining USDC from the zk-p2p deposit if no taker fulfilled it
+    /// @dev EscrowV2.withdrawDeposit returns everything not locked by an open intent
+    ///      and closes the deposit; only the depositor (this contract) may call it.
     /// @param sessionId Session to withdraw
-    /// @param amount Amount to withdraw from zk-p2p deposit
-    function withdrawFromZkp2p(bytes32 sessionId, uint256 amount) external {
+    function withdrawFromZkp2p(bytes32 sessionId) external {
         Session storage session = sessions[sessionId];
 
         if (session.user == address(0)) revert SessionNotFound();
         if (msg.sender != session.user) revert Unauthorized();
-        if (session.depositId == 0) revert NoDepositToWithdraw();
+        if (!session.processed) revert NoDepositToWithdraw();
 
         // Withdraw from zk-p2p
-        zkp2pEscrow.withdrawDeposit(session.depositId, amount);
+        zkp2pEscrow.withdrawDeposit(session.depositId);
 
         // Transfer to user
         uint256 balance = usdc.balanceOf(address(this));

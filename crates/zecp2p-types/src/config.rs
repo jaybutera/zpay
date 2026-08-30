@@ -102,12 +102,12 @@ impl Default for Config {
                 usdc: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
                     .parse()
                     .unwrap(),
-                // zk-p2p Escrow on Base
-                zkp2p_escrow: "0x59Cf3c90E8e7D27773b5E468D1a24B247db9B78d"
+                // zk-p2p EscrowV2 on Base
+                zkp2p_escrow: "0x777777779d229cdF3110e9de47943791c26300Ef"
                     .parse()
                     .unwrap(),
-                // zk-p2p Orchestrator on Base
-                zkp2p_orchestrator: "0x88888883Ed048FF0a415271B28b2F52d431810D0"
+                // zk-p2p OrchestratorV3 on Base
+                zkp2p_orchestrator: "0x014025fDE093f8701d86e9f38e2C3a9b779cb5c7"
                     .parse()
                     .unwrap(),
                 glue_contract: None,

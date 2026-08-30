@@ -17,11 +17,11 @@ fn test_config() -> Config {
             usdc: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
                 .parse()
                 .unwrap(),
-            // These are real zk-p2p contract addresses on Base
-            zkp2p_escrow: "0x59Cf3c90E8e7D27773b5E468D1a24B247db9B78d"
+            // zk-p2p EscrowV2 and OrchestratorV3 on Base
+            zkp2p_escrow: "0x777777779d229cdF3110e9de47943791c26300Ef"
                 .parse()
                 .unwrap(),
-            zkp2p_orchestrator: "0x88888883Ed048FF0a415271B28b2F52d431810D0"
+            zkp2p_orchestrator: "0x014025fDE093f8701d86e9f38e2C3a9b779cb5c7"
                 .parse()
                 .unwrap(),
             glue_contract: None,
@@ -95,7 +95,7 @@ async fn test_get_deposit() {
     match result {
         Ok(deposit) => {
             println!("Deposit 1 depositor: {}", deposit.depositor);
-            println!("Deposit 1 amount: {}", deposit.amount);
+            println!("Deposit 1 remaining: {}", deposit.remainingDeposits);
         }
         Err(e) => {
             // Some errors are expected (e.g., deposit doesn't exist)
@@ -118,11 +118,11 @@ async fn test_address_getters() {
     );
     assert_eq!(
         client.zkp2p_escrow().to_string().to_lowercase(),
-        "0x59cf3c90e8e7d27773b5e468d1a24b247db9b78d"
+        "0x777777779d229cdf3110e9de47943791c26300ef"
     );
     assert_eq!(
         client.zkp2p_orchestrator().to_string().to_lowercase(),
-        "0x88888883ed048ff0a415271b28b2f52d431810d0"
+        "0x014025fde093f8701d86e9f38e2c3a9b779cb5c7"
     );
 }
 
