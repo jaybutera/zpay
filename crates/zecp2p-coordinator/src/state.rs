@@ -14,7 +14,9 @@ use zecp2p_types::{
     Config, OfframpRequest, OfframpSession, OfframpStatus,
 };
 
-use crate::{chain::ChainClient, db::Database, error::AppError, near::NearIntentsClient};
+use crate::{
+    chain::ChainClient, db::Database, error::AppError, near::NearIntentsClient, zkp2p::Zkp2pClient,
+};
 
 /// Number of blocks to look back when checking for events (fallback if no stored block)
 const EVENT_LOOKBACK_BLOCKS: u64 = 1000;
@@ -31,17 +33,25 @@ pub struct AppState {
     pub db: Database,
     pub chain: ChainClient,
     pub near: NearIntentsClient,
+    pub zkp2p: Zkp2pClient,
     /// In-memory cache of active sessions
     sessions: RwLock<std::collections::HashMap<uuid::Uuid, OfframpSession>>,
 }
 
 impl AppState {
-    pub fn new(config: Config, db: Database, chain: ChainClient, near: NearIntentsClient) -> Self {
+    pub fn new(
+        config: Config,
+        db: Database,
+        chain: ChainClient,
+        near: NearIntentsClient,
+        zkp2p: Zkp2pClient,
+    ) -> Self {
         Self {
             config,
             db,
             chain,
             near,
+            zkp2p,
             sessions: RwLock::new(std::collections::HashMap::new()),
         }
     }
@@ -51,8 +61,28 @@ impl AppState {
         self: &Arc<Self>,
         request: OfframpRequest,
     ) -> Result<OfframpSession, AppError> {
+        // Register the Venmo username with the zk-p2p curator. The hash it
+        // returns is the only payeeDetails value the payment verifier accepts;
+        // do this before touching the chain so a bad username costs no gas.
+        let valid = self
+            .zkp2p
+            .validate_venmo_payee(&request.venmo_username)
+            .await
+            .map_err(|e| AppError::Zkp2p(e.to_string()))?;
+        if !valid {
+            return Err(AppError::InvalidState(format!(
+                "Venmo username '{}' was rejected by zk-p2p (must match the account's exact casing, without '@')",
+                request.venmo_username
+            )));
+        }
+        let payee_details_hash = self
+            .zkp2p
+            .register_venmo_payee(&request.venmo_username)
+            .await
+            .map_err(|e| AppError::Zkp2p(e.to_string()))?;
+
         // Create session
-        let mut session = OfframpSession::new(request.clone());
+        let mut session = OfframpSession::new(request.clone(), payee_details_hash);
 
         // Get quote from NEAR Intents
         let glue_address = self
@@ -86,7 +116,7 @@ impl AppState {
             .create_session(
                 session.session_id,
                 request.user_address,
-                session.venmo_id_hash,
+                session.payee_details_hash,
                 request.min_rate,
                 session.expected_usdc.unwrap_or(U256::ZERO),
             )
@@ -165,7 +195,7 @@ impl AppState {
 
         let payment_method_data = vec![OfframpGlue::DepositPaymentMethodData {
             intentGatingService: alloy::primitives::Address::ZERO, // No gating service for V0
-            payeeDetails: session.venmo_id_hash,
+            payeeDetails: session.payee_details_hash,
             data: Bytes::new(),
         }];
 

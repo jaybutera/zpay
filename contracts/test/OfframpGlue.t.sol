@@ -127,6 +127,8 @@ contract OfframpGlueTest is Test {
 
     bytes32 public constant VENMO_METHOD = keccak256("venmo");
     bytes32 public constant USD_CODE = keccak256("USD");
+    // Stand-in for a curator-issued payee details hash (opaque bytes32 in production)
+    bytes32 public constant PAYEE_HASH = keccak256("mock-zkp2p-payee:alice");
 
     function setUp() public {
         usdc = new MockUSDC();
@@ -146,16 +148,16 @@ contract OfframpGlueTest is Test {
 
     function test_CreateSession() public {
         bytes32 sessionId = keccak256("session1");
-        bytes32 venmoHash = keccak256("alice");
+        bytes32 payeeHash = PAYEE_HASH;
         uint256 minRate = 1e18; // 1:1
         uint256 expectedAmount = 100e6; // 100 USDC
 
         vm.prank(keeper);
-        glue.createSession(sessionId, user, venmoHash, minRate, expectedAmount);
+        glue.createSession(sessionId, user, payeeHash, minRate, expectedAmount);
 
         OfframpGlue.Session memory session = glue.getSession(sessionId);
         assertEq(session.user, user);
-        assertEq(session.venmoIdHash, venmoHash);
+        assertEq(session.payeeDetailsHash, payeeHash);
         assertEq(session.minConversionRate, minRate);
         assertEq(session.expectedAmount, expectedAmount);
         assertEq(session.depositId, 0);
@@ -165,33 +167,33 @@ contract OfframpGlueTest is Test {
 
     function test_CreateSession_RevertIfNotKeeper() public {
         bytes32 sessionId = keccak256("session1");
-        bytes32 venmoHash = keccak256("alice");
+        bytes32 payeeHash = PAYEE_HASH;
 
         vm.prank(user);
         vm.expectRevert(OfframpGlue.Unauthorized.selector);
-        glue.createSession(sessionId, user, venmoHash, 1e18, 100e6);
+        glue.createSession(sessionId, user, payeeHash, 1e18, 100e6);
     }
 
     function test_CreateSession_RevertIfExists() public {
         bytes32 sessionId = keccak256("session1");
-        bytes32 venmoHash = keccak256("alice");
+        bytes32 payeeHash = PAYEE_HASH;
 
         vm.prank(keeper);
-        glue.createSession(sessionId, user, venmoHash, 1e18, 100e6);
+        glue.createSession(sessionId, user, payeeHash, 1e18, 100e6);
 
         vm.prank(keeper);
         vm.expectRevert(OfframpGlue.SessionExists.selector);
-        glue.createSession(sessionId, user, venmoHash, 1e18, 100e6);
+        glue.createSession(sessionId, user, payeeHash, 1e18, 100e6);
     }
 
     function test_ProcessOfframp() public {
         bytes32 sessionId = keccak256("session1");
-        bytes32 venmoHash = keccak256("alice");
+        bytes32 payeeHash = PAYEE_HASH;
         uint256 amount = 100e6;
 
         // Create session
         vm.prank(keeper);
-        glue.createSession(sessionId, user, venmoHash, 1e18, amount);
+        glue.createSession(sessionId, user, payeeHash, 1e18, amount);
 
         // Simulate NEAR Intent delivery
         usdc.mint(address(glue), amount);
@@ -203,7 +205,7 @@ contract OfframpGlueTest is Test {
         IEscrow.DepositPaymentMethodData[] memory methodData = new IEscrow.DepositPaymentMethodData[](1);
         methodData[0] = IEscrow.DepositPaymentMethodData({
             intentGatingService: address(0),
-            payeeDetails: venmoHash,
+            payeeDetails: payeeHash,
             data: ""
         });
 
@@ -232,7 +234,7 @@ contract OfframpGlueTest is Test {
         bytes32 sessionId = keccak256("session1");
 
         vm.prank(keeper);
-        glue.createSession(sessionId, user, keccak256("alice"), 1e18, 100e6);
+        glue.createSession(sessionId, user, PAYEE_HASH, 1e18, 100e6);
 
         usdc.mint(address(glue), 100e6);
 
@@ -245,12 +247,11 @@ contract OfframpGlueTest is Test {
         glue.processOfframp(sessionId, methods, methodData, currencies);
     }
 
-    function test_ProcessOfframp_RevertIfAlreadyProcessed() public {
+    function test_ProcessOfframp_RevertIfPayeeMismatch() public {
         bytes32 sessionId = keccak256("session1");
-        bytes32 venmoHash = keccak256("alice");
 
         vm.prank(keeper);
-        glue.createSession(sessionId, user, venmoHash, 1e18, 100e6);
+        glue.createSession(sessionId, user, PAYEE_HASH, 1e18, 100e6);
 
         usdc.mint(address(glue), 100e6);
 
@@ -260,7 +261,38 @@ contract OfframpGlueTest is Test {
         IEscrow.DepositPaymentMethodData[] memory methodData = new IEscrow.DepositPaymentMethodData[](1);
         methodData[0] = IEscrow.DepositPaymentMethodData({
             intentGatingService: address(0),
-            payeeDetails: venmoHash,
+            payeeDetails: keccak256("someone-else"),
+            data: ""
+        });
+
+        IEscrow.Currency[][] memory currencies = new IEscrow.Currency[][](1);
+        currencies[0] = new IEscrow.Currency[](1);
+        currencies[0][0] = IEscrow.Currency({code: USD_CODE, minConversionRate: 1e18});
+
+        vm.prank(keeper);
+        vm.expectRevert(OfframpGlue.PayeeDetailsMismatch.selector);
+        glue.processOfframp(sessionId, methods, methodData, currencies);
+
+        // Funds stay in the glue contract, so the user can still rescue
+        assertEq(usdc.balanceOf(address(glue)), 100e6);
+    }
+
+    function test_ProcessOfframp_RevertIfAlreadyProcessed() public {
+        bytes32 sessionId = keccak256("session1");
+        bytes32 payeeHash = PAYEE_HASH;
+
+        vm.prank(keeper);
+        glue.createSession(sessionId, user, payeeHash, 1e18, 100e6);
+
+        usdc.mint(address(glue), 100e6);
+
+        bytes32[] memory methods = new bytes32[](1);
+        methods[0] = VENMO_METHOD;
+
+        IEscrow.DepositPaymentMethodData[] memory methodData = new IEscrow.DepositPaymentMethodData[](1);
+        methodData[0] = IEscrow.DepositPaymentMethodData({
+            intentGatingService: address(0),
+            payeeDetails: payeeHash,
             data: ""
         });
 
@@ -284,7 +316,7 @@ contract OfframpGlueTest is Test {
         uint256 amount = 100e6;
 
         vm.prank(keeper);
-        glue.createSession(sessionId, user, keccak256("alice"), 1e18, amount);
+        glue.createSession(sessionId, user, PAYEE_HASH, 1e18, amount);
 
         usdc.mint(address(glue), amount);
 
@@ -302,7 +334,7 @@ contract OfframpGlueTest is Test {
         bytes32 sessionId = keccak256("session1");
 
         vm.prank(keeper);
-        glue.createSession(sessionId, user, keccak256("alice"), 1e18, 100e6);
+        glue.createSession(sessionId, user, PAYEE_HASH, 1e18, 100e6);
 
         usdc.mint(address(glue), 100e6);
 
@@ -313,10 +345,10 @@ contract OfframpGlueTest is Test {
 
     function test_Rescue_RevertIfAlreadyProcessed() public {
         bytes32 sessionId = keccak256("session1");
-        bytes32 venmoHash = keccak256("alice");
+        bytes32 payeeHash = PAYEE_HASH;
 
         vm.prank(keeper);
-        glue.createSession(sessionId, user, venmoHash, 1e18, 100e6);
+        glue.createSession(sessionId, user, payeeHash, 1e18, 100e6);
 
         usdc.mint(address(glue), 100e6);
 
@@ -326,7 +358,7 @@ contract OfframpGlueTest is Test {
         IEscrow.DepositPaymentMethodData[] memory methodData = new IEscrow.DepositPaymentMethodData[](1);
         methodData[0] = IEscrow.DepositPaymentMethodData({
             intentGatingService: address(0),
-            payeeDetails: venmoHash,
+            payeeDetails: payeeHash,
             data: ""
         });
 
@@ -344,11 +376,11 @@ contract OfframpGlueTest is Test {
 
     function test_WithdrawFromZkp2p() public {
         bytes32 sessionId = keccak256("session1");
-        bytes32 venmoHash = keccak256("alice");
+        bytes32 payeeHash = PAYEE_HASH;
         uint256 amount = 100e6;
 
         vm.prank(keeper);
-        glue.createSession(sessionId, user, venmoHash, 1e18, amount);
+        glue.createSession(sessionId, user, payeeHash, 1e18, amount);
 
         usdc.mint(address(glue), amount);
 
@@ -358,7 +390,7 @@ contract OfframpGlueTest is Test {
         IEscrow.DepositPaymentMethodData[] memory methodData = new IEscrow.DepositPaymentMethodData[](1);
         methodData[0] = IEscrow.DepositPaymentMethodData({
             intentGatingService: address(0),
-            payeeDetails: venmoHash,
+            payeeDetails: payeeHash,
             data: ""
         });
 
@@ -395,7 +427,7 @@ contract OfframpGlueTest is Test {
         bytes32 sessionId = keccak256("session1");
 
         // Acting as owner (address(this))
-        glue.createSession(sessionId, user, keccak256("alice"), 1e18, 100e6);
+        glue.createSession(sessionId, user, PAYEE_HASH, 1e18, 100e6);
 
         OfframpGlue.Session memory session = glue.getSession(sessionId);
         assertEq(session.user, user);

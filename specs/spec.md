@@ -77,21 +77,21 @@ A single contract deployed once on Base. Receives USDC from NEAR Intents and rou
 
 | Function | Description |
 |----------|-------------|
-| `createSession(sessionId, user, venmoIdHash, minRate, expectedAmount)` | Register an offramp before NEAR Intent executes |
+| `createSession(sessionId, user, payeeDetailsHash, minRate, expectedAmount)` | Register an offramp before NEAR Intent executes |
 | `processOfframp(sessionId, zkp2pParams)` | Route received USDC to zk-p2p (called by keeper) |
 | `rescue(sessionId)` | Return USDC to user if something fails (user only) |
 | `withdrawFromZkp2p(sessionId)` | Withdraw from zk-p2p if no taker (user only) |
 
 **Session State:**
 - `user`: User's Base address (for rescue/withdraw)
-- `venmoIdHash`: keccak256 of Venmo username
+- `payeeDetailsHash`: zk-p2p payee details hash for the Venmo account. Issued by the zk-p2p curator API (`POST /v2/makers/create`, `{processorName: "venmo", offchainId: <username>}`) as `hashedOnchainId`; the attestation witness matches it against the taker's Venmo proof, so it cannot be derived locally
 - `minConversionRate`: Minimum acceptable rate
 - `expectedAmount`: Expected USDC from NEAR Intent
 - `depositId`: zk-p2p deposit ID (0 until processed)
 - `fulfilled`: Whether session is complete
 
 **Events:**
-- `SessionCreated(sessionId, user, venmoIdHash)`
+- `SessionCreated(sessionId, user, payeeDetailsHash)`
 - `OfframpProcessed(sessionId, depositId, amount)`
 - `SessionRescued(sessionId, user, amount)`
 

@@ -26,7 +26,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 use tempfile::TempDir;
-use test_utils::{deploy_contracts, AnvilInstance, ANVIL_PRIVATE_KEY, TEST_USER};
+use test_utils::{deploy_contracts, AnvilInstance, MockZkp2pServer, ANVIL_PRIVATE_KEY, TEST_USER};
 use tokio::net::TcpListener;
 use zecp2p_types::abi::MockUSDC;
 
@@ -168,6 +168,7 @@ async fn mock_status_handler(Query(_query): Query<StatusQuery>) -> Json<MockStat
 fn create_test_config(
     anvil_url: &str,
     near_url: &str,
+    zkp2p_url: &str,
     usdc: Address,
     escrow: Address,
     glue: Address,
@@ -190,6 +191,9 @@ fn create_test_config(
             api_url: near_url.to_string(),
             default_timeout: 600,
         },
+        zkp2p: zecp2p_types::config::Zkp2pConfig {
+            api_url: zkp2p_url.to_string(),
+        },
         server: zecp2p_types::config::ServerConfig {
             host: "127.0.0.1".to_string(),
             port: server_port,
@@ -205,6 +209,8 @@ struct TestInfra {
     anvil: AnvilInstance,
     #[allow(dead_code)]
     near_server: MockNearServer,
+    #[allow(dead_code)]
+    zkp2p_server: MockZkp2pServer,
     usdc_addr: Address,
     #[allow(dead_code)]
     escrow_addr: Address,
@@ -230,6 +236,9 @@ impl TestInfra {
         let near_server = MockNearServer::start(glue_addr).await;
         println!("Mock NEAR server at {}", near_server.api_url());
 
+        let zkp2p_server = MockZkp2pServer::start().await;
+        println!("Mock zk-p2p curator at {}", zkp2p_server.api_url());
+
         // Create temp directory for database
         let temp_dir = TempDir::new().expect("create temp dir");
         let db_path = temp_dir.path().join("test.db").to_string_lossy().to_string();
@@ -239,6 +248,7 @@ impl TestInfra {
         let config = create_test_config(
             anvil.rpc_url(),
             &near_server.api_url(),
+            &zkp2p_server.api_url(),
             usdc_addr,
             escrow_addr,
             glue_addr,
@@ -249,6 +259,7 @@ impl TestInfra {
         Self {
             anvil,
             near_server,
+            zkp2p_server,
             usdc_addr,
             escrow_addr,
             glue_addr,
@@ -306,6 +317,7 @@ async fn test_coordinator_full_flow() {
         db,
         chain_client,
         near_client,
+        zecp2p_coordinator::zkp2p::Zkp2pClient::new(&infra.config.zkp2p),
     ));
 
     println!("\n=== Testing Coordinator Flow ===\n");
@@ -413,6 +425,7 @@ async fn test_coordinator_rescue_state_validation() {
         db,
         chain_client,
         near_client,
+        zecp2p_coordinator::zkp2p::Zkp2pClient::new(&infra.config.zkp2p),
     ));
 
     println!("\n=== Testing Coordinator Rescue State Validation ===\n");
@@ -488,6 +501,7 @@ async fn test_coordinator_withdraw_state_validation() {
         db,
         chain_client,
         near_client,
+        zecp2p_coordinator::zkp2p::Zkp2pClient::new(&infra.config.zkp2p),
     ));
 
     println!("\n=== Testing Coordinator Withdraw State Validation ===\n");
@@ -562,6 +576,7 @@ async fn test_coordinator_state_validation() {
         db,
         chain_client,
         near_client,
+        zecp2p_coordinator::zkp2p::Zkp2pClient::new(&infra.config.zkp2p),
     ));
 
     println!("\n=== Testing Coordinator State Validation ===\n");

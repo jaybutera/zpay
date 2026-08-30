@@ -8,3 +8,4 @@ pub mod db;
 pub mod error;
 pub mod near;
 pub mod state;
+pub mod zkp2p;

@@ -24,6 +24,11 @@ api_url = "https://1click.chaindefuser.com"
 # Default timeout for NEAR settlement (seconds)
 default_timeout = 600
 
+[zkp2p]
+# zk-p2p curator API. Venmo usernames are registered here and the returned
+# hashedOnchainId is the payeeDetails used for the zk-p2p deposit.
+api_url = "https://api.zkp2p.xyz"
+
 [server]
 # Coordinator server host
 host = "127.0.0.1"

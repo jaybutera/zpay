@@ -13,6 +13,11 @@ async fn setup_db() -> (Database, TempDir) {
     (db, tmp)
 }
 
+/// Stand-in for the curator-issued payee details hash
+fn test_payee_hash() -> alloy::primitives::B256 {
+    alloy::primitives::keccak256(b"test-payee")
+}
+
 fn create_test_request() -> OfframpRequest {
     OfframpRequest {
         zec_amount: 100_000_000, // 1 ZEC
@@ -30,7 +35,7 @@ async fn test_insert_and_get_session() {
     let (db, _tmp) = setup_db().await;
 
     let request = create_test_request();
-    let session = OfframpSession::new(request);
+    let session = OfframpSession::new(request, test_payee_hash());
 
     db.insert_session(&session).await.unwrap();
 
@@ -42,6 +47,7 @@ async fn test_insert_and_get_session() {
     assert_eq!(retrieved.status, OfframpStatus::Created);
     assert_eq!(retrieved.request.zec_amount, 100_000_000);
     assert_eq!(retrieved.request.venmo_username, "testuser");
+    assert_eq!(retrieved.payee_details_hash, test_payee_hash());
 }
 
 #[tokio::test]
@@ -49,7 +55,7 @@ async fn test_update_session() {
     let (db, _tmp) = setup_db().await;
 
     let request = create_test_request();
-    let mut session = OfframpSession::new(request);
+    let mut session = OfframpSession::new(request, test_payee_hash());
 
     db.insert_session(&session).await.unwrap();
 
@@ -72,15 +78,15 @@ async fn test_get_active_sessions() {
     let (db, _tmp) = setup_db().await;
 
     // Insert multiple sessions in various states
-    let mut s1 = OfframpSession::new(create_test_request());
+    let mut s1 = OfframpSession::new(create_test_request(), test_payee_hash());
     s1.set_status(OfframpStatus::NearIntentPending);
     db.insert_session(&s1).await.unwrap();
 
-    let mut s2 = OfframpSession::new(create_test_request());
+    let mut s2 = OfframpSession::new(create_test_request(), test_payee_hash());
     s2.set_status(OfframpStatus::Fulfilled);
     db.insert_session(&s2).await.unwrap();
 
-    let mut s3 = OfframpSession::new(create_test_request());
+    let mut s3 = OfframpSession::new(create_test_request(), test_payee_hash());
     s3.set_status(OfframpStatus::Zkp2pDeposited);
     db.insert_session(&s3).await.unwrap();
 
@@ -119,7 +125,7 @@ async fn test_session_with_all_fields() {
     let (db, _tmp) = setup_db().await;
 
     let request = create_test_request();
-    let mut session = OfframpSession::new(request);
+    let mut session = OfframpSession::new(request, test_payee_hash());
 
     // Set all optional fields
     session.expected_usdc = Some(U256::from(30_000000u64)); // 30 USDC

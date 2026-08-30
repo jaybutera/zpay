@@ -32,7 +32,7 @@ impl Database {
                 session_id TEXT NOT NULL UNIQUE,
                 status TEXT NOT NULL,
                 request_json TEXT NOT NULL,
-                venmo_id_hash TEXT NOT NULL,
+                payee_details_hash TEXT NOT NULL,
                 expected_usdc TEXT,
                 received_usdc TEXT,
                 near_deposit_address TEXT,
@@ -107,7 +107,7 @@ impl Database {
         sqlx::query(
             r#"
             INSERT INTO sessions (
-                id, session_id, status, request_json, venmo_id_hash,
+                id, session_id, status, request_json, payee_details_hash,
                 expected_usdc, received_usdc, near_deposit_address, near_tx_hash,
                 zkp2p_deposit_id, zkp2p_intent_hash, create_session_tx, process_offramp_tx,
                 error, created_at, updated_at
@@ -118,7 +118,7 @@ impl Database {
         .bind(format!("{:?}", session.session_id))
         .bind(session.status.to_string())
         .bind(&request_json)
-        .bind(format!("{:?}", session.venmo_id_hash))
+        .bind(format!("{:?}", session.payee_details_hash))
         .bind(session.expected_usdc.map(|u| u.to_string()))
         .bind(session.received_usdc.map(|u| u.to_string()))
         .bind(&session.near_deposit_address)
@@ -221,7 +221,7 @@ struct SessionRow {
     session_id: String,
     status: String,
     request_json: String,
-    venmo_id_hash: String,
+    payee_details_hash: String,
     expected_usdc: Option<String>,
     received_usdc: Option<String>,
     near_deposit_address: Option<String>,
@@ -269,7 +269,7 @@ impl SessionRow {
                 s => anyhow::bail!("Unknown status: {}", s),
             },
             request,
-            venmo_id_hash: parse_b256(&self.venmo_id_hash)?,
+            payee_details_hash: parse_b256(&self.payee_details_hash)?,
             expected_usdc: self.expected_usdc.as_ref().map(|s| parse_u256(s)).transpose()?,
             received_usdc: self.received_usdc.as_ref().map(|s| parse_u256(s)).transpose()?,
             near_deposit_address: self.near_deposit_address,

@@ -155,7 +155,7 @@ sol! {
 
         struct Session {
             address user;
-            bytes32 venmoIdHash;
+            bytes32 payeeDetailsHash;
             uint256 minConversionRate;
             uint256 expectedAmount;
             uint256 depositId;
@@ -175,7 +175,7 @@ sol! {
         event SessionCreated(
             bytes32 indexed sessionId,
             address indexed user,
-            bytes32 venmoIdHash,
+            bytes32 payeeDetailsHash,
             uint256 expectedAmount
         );
 
@@ -199,7 +199,7 @@ sol! {
         function createSession(
             bytes32 sessionId,
             address user,
-            bytes32 venmoIdHash,
+            bytes32 payeeDetailsHash,
             uint256 minConversionRate,
             uint256 expectedAmount
         ) external;

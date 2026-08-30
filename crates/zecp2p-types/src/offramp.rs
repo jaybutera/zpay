@@ -88,8 +88,14 @@ pub struct OfframpSession {
     pub status: OfframpStatus,
     /// Original request parameters
     pub request: OfframpRequest,
-    /// Hash of Venmo username (keccak256)
-    pub venmo_id_hash: B256,
+    /// zk-p2p payee details hash for the Venmo username.
+    ///
+    /// This is the `hashedOnchainId` issued by the zk-p2p curator API when the
+    /// username is registered (`POST /v2/makers/create`). It is stored in
+    /// `DepositPaymentMethodData.payeeDetails` and the attestation witness
+    /// matches it against the taker's Venmo payment proof, so it cannot be
+    /// computed locally.
+    pub payee_details_hash: B256,
     /// Expected USDC amount from NEAR Intent (6 decimals)
     pub expected_usdc: Option<U256>,
     /// Actual USDC received
@@ -115,11 +121,11 @@ pub struct OfframpSession {
 }
 
 impl OfframpSession {
-    /// Create a new offramp session from a request
-    pub fn new(request: OfframpRequest) -> Self {
+    /// Create a new offramp session from a request and the curator-issued
+    /// payee details hash for `request.venmo_username`
+    pub fn new(request: OfframpRequest, payee_details_hash: B256) -> Self {
         let id = Uuid::new_v4();
         let session_id = Self::compute_session_id(&id);
-        let venmo_id_hash = Self::compute_venmo_hash(&request.venmo_username);
         let now = Utc::now();
 
         Self {
@@ -127,7 +133,7 @@ impl OfframpSession {
             session_id,
             status: OfframpStatus::Created,
             request,
-            venmo_id_hash,
+            payee_details_hash,
             expected_usdc: None,
             received_usdc: None,
             near_deposit_address: None,
@@ -146,12 +152,6 @@ impl OfframpSession {
     pub fn compute_session_id(id: &Uuid) -> B256 {
         use alloy::primitives::keccak256;
         keccak256(id.as_bytes())
-    }
-
-    /// Compute keccak256 hash of Venmo username
-    pub fn compute_venmo_hash(username: &str) -> B256 {
-        use alloy::primitives::keccak256;
-        keccak256(username.as_bytes())
     }
 
     /// Update status and timestamp

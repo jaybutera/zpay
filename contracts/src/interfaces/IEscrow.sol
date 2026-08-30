@@ -17,7 +17,7 @@ interface IEscrow {
 
     struct DepositPaymentMethodData {
         address intentGatingService;  // Gating service public key for intent verification
-        bytes32 payeeDetails;         // Hash of payee details (e.g., Venmo username hash)
+        bytes32 payeeDetails;         // Payee details hash issued by the zk-p2p curator (hashedOnchainId)
         bytes data;                   // Additional verification data (attester address, etc.)
     }
 

@@ -12,6 +12,9 @@ pub struct Config {
     pub contracts: ContractConfig,
     /// NEAR Intents configuration
     pub near: NearConfig,
+    /// zk-p2p curator API configuration
+    #[serde(default)]
+    pub zkp2p: Zkp2pConfig,
     /// Coordinator server configuration
     pub server: ServerConfig,
     /// Database configuration
@@ -49,6 +52,25 @@ pub struct NearConfig {
     pub api_url: String,
     /// Default timeout for NEAR Intent settlement (seconds)
     pub default_timeout: u64,
+}
+
+/// zk-p2p curator API configuration
+///
+/// The curator is zk-p2p's off-chain service. Makers register their payout
+/// identifier with it and receive the `hashedOnchainId` that goes on-chain as
+/// `payeeDetails`. There is no local formula for that hash.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Zkp2pConfig {
+    /// Curator API base URL
+    pub api_url: String,
+}
+
+impl Default for Zkp2pConfig {
+    fn default() -> Self {
+        Self {
+            api_url: "https://api.zkp2p.xyz".to_string(),
+        }
+    }
 }
 
 /// Coordinator server configuration
@@ -94,6 +116,7 @@ impl Default for Config {
                 api_url: "https://1click.chaindefuser.com".to_string(),
                 default_timeout: 600,
             },
+            zkp2p: Zkp2pConfig::default(),
             server: ServerConfig {
                 host: "127.0.0.1".to_string(),
                 port: 3000,
@@ -123,6 +146,12 @@ impl Config {
         }
         if let Ok(url) = std::env::var("BASE_SEPOLIA_RPC_URL") {
             config.network.base_sepolia_rpc_url = Some(url);
+        }
+        if let Ok(url) = std::env::var("NEAR_API_URL") {
+            config.near.api_url = url;
+        }
+        if let Ok(url) = std::env::var("ZKP2P_API_URL") {
+            config.zkp2p.api_url = url;
         }
         if let Ok(addr) = std::env::var("GLUE_CONTRACT_ADDRESS") {
             config.contracts.glue_contract = Some(

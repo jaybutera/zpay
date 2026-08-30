@@ -116,7 +116,7 @@ impl ChainClient {
         &self,
         session_id: B256,
         user: Address,
-        venmo_id_hash: B256,
+        payee_details_hash: B256,
         min_conversion_rate: U256,
         expected_amount: U256,
     ) -> Result<B256> {
@@ -129,7 +129,7 @@ impl ChainClient {
             .createSession(
                 session_id,
                 user,
-                venmo_id_hash,
+                payee_details_hash,
                 min_conversion_rate,
                 expected_amount,
             )

@@ -25,7 +25,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 use tempfile::TempDir;
-use test_utils::ANVIL_PRIVATE_KEY;
+use test_utils::{MockZkp2pServer, ANVIL_PRIVATE_KEY};
 use tokio::net::TcpListener;
 use zecp2p_types::abi::{
     usd_currency_code, venmo_payment_method, MockEscrowWithOrchestrator, MockUSDC,
@@ -309,6 +309,7 @@ async fn mock_status_handler(
 fn create_test_config(
     anvil_url: &str,
     near_url: &str,
+    zkp2p_url: &str,
     usdc: Address,
     escrow: Address,
     glue: Address,
@@ -330,6 +331,9 @@ fn create_test_config(
             api_url: near_url.to_string(),
             default_timeout: 600,
         },
+        zkp2p: zecp2p_types::config::Zkp2pConfig {
+            api_url: zkp2p_url.to_string(),
+        },
         server: zecp2p_types::config::ServerConfig {
             host: "127.0.0.1".to_string(),
             port: 3000, // Not used in these tests
@@ -345,6 +349,8 @@ struct TestInfra {
     anvil: AnvilInstance,
     #[allow(dead_code)]
     near_server: MockNearServer,
+    #[allow(dead_code)]
+    zkp2p_server: MockZkp2pServer,
     near_state: MockNearState,
     usdc_addr: Address,
     escrow_addr: Address,
@@ -367,6 +373,9 @@ impl TestInfra {
         let (near_server, near_state) = MockNearServer::start(glue_addr).await;
         println!("Mock NEAR server at {}", near_server.api_url());
 
+        let zkp2p_server = MockZkp2pServer::start().await;
+        println!("Mock zk-p2p curator at {}", zkp2p_server.api_url());
+
         let temp_dir = TempDir::new().expect("create temp dir");
         let db_path = temp_dir
             .path()
@@ -377,6 +386,7 @@ impl TestInfra {
         let config = create_test_config(
             anvil.rpc_url(),
             &near_server.api_url(),
+            &zkp2p_server.api_url(),
             usdc_addr,
             escrow_addr,
             glue_addr,
@@ -386,6 +396,7 @@ impl TestInfra {
         Self {
             anvil,
             near_server,
+            zkp2p_server,
             near_state,
             usdc_addr,
             escrow_addr,
@@ -441,6 +452,7 @@ async fn test_keeper_auto_processes_on_usdc_arrival() {
         db,
         chain_client,
         near_client,
+        zecp2p_coordinator::zkp2p::Zkp2pClient::new(&infra.config.zkp2p),
     ));
 
     println!("\n=== Testing Keeper Auto-Processing ===\n");
@@ -458,6 +470,17 @@ async fn test_keeper_auto_processes_on_usdc_arrival() {
     };
 
     let session = state.create_offramp(request).await.expect("create offramp");
+    // The payee hash must be the curator-issued one, not a local keccak of the username
+    assert_eq!(
+        session.payee_details_hash,
+        MockZkp2pServer::expected_hash(&session.request.venmo_username),
+        "payee_details_hash must come from the zk-p2p curator"
+    );
+    assert_eq!(
+        infra.zkp2p_server.registered(),
+        vec![session.request.venmo_username.clone()],
+        "the Venmo username must be registered with the curator exactly once"
+    );
     println!("  Session ID: {}", session.id);
     println!("  Status: {:?}", session.status);
     assert_eq!(
@@ -541,6 +564,7 @@ async fn test_full_event_driven_flow() {
         db,
         chain_client,
         near_client,
+        zecp2p_coordinator::zkp2p::Zkp2pClient::new(&infra.config.zkp2p),
     ));
 
     println!("\n=== Testing Full Event-Driven Flow ===\n");
@@ -691,6 +715,7 @@ async fn test_keeper_detects_intent_signaled() {
         db,
         chain_client,
         near_client,
+        zecp2p_coordinator::zkp2p::Zkp2pClient::new(&infra.config.zkp2p),
     ));
 
     println!("\n=== Testing Keeper IntentSignaled Detection ===\n");
@@ -802,6 +827,7 @@ async fn test_keeper_detects_intent_fulfilled() {
         db,
         chain_client,
         near_client,
+        zecp2p_coordinator::zkp2p::Zkp2pClient::new(&infra.config.zkp2p),
     ));
 
     println!("\n=== Testing Keeper IntentFulfilled Detection ===\n");
@@ -950,6 +976,7 @@ async fn test_complete_keeper_driven_flow() {
         db,
         chain_client,
         near_client,
+        zecp2p_coordinator::zkp2p::Zkp2pClient::new(&infra.config.zkp2p),
     ));
 
     println!("\n=== COMPREHENSIVE KEEPER-DRIVEN E2E TEST ===\n");

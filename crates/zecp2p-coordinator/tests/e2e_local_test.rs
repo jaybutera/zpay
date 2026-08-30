@@ -68,7 +68,7 @@ async fn test_full_offramp_flow_local() {
         .expect("Failed to get session");
 
     assert_eq!(session.user, user);
-    assert_eq!(session.venmoIdHash, venmo_hash);
+    assert_eq!(session.payeeDetailsHash, venmo_hash);
     assert_eq!(session.minConversionRate, min_rate);
     assert_eq!(session.expectedAmount, expected_amount);
     assert_eq!(session.depositId, U256::ZERO);

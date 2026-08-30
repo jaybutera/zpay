@@ -122,6 +122,24 @@ forge test
 }
 ```
 
+## Venmo payee registration
+
+zk-p2p identifies the payout account on-chain by `payeeDetails`, a bytes32 that
+its curator service issues when a maker registers a payout identifier. The
+coordinator performs that registration when an offramp is created:
+
+1. `POST {zkp2p.api_url}/v2/makers/validate` with `{"processorName": "venmo", "offchainId": "<username>"}`.
+   The curator checks the exact username casing; a `false` answer fails the request with HTTP 400.
+2. `POST {zkp2p.api_url}/v2/makers/create` with the same body. The returned
+   `hashedOnchainId` is stored as the session's `payee_details_hash`, written to
+   the GlueContract session, and used as `payeeDetails` for the zk-p2p deposit.
+
+The hash is opaque and server-side; `keccak256(username)` would create a deposit
+that no Venmo proof can ever fulfill. `GlueContract.processOfframp` rejects any
+deposit whose `payeeDetails` differs from the hash recorded at session creation.
+
+Usernames are sent without the leading `@`.
+
 ## Configuration
 
 Two config files are provided:
@@ -143,7 +161,12 @@ port = 3000
 
 [database]
 path = "zecp2p.db"
+
+[zkp2p]
+api_url = "https://api.zkp2p.xyz"   # curator API used for payee registration
 ```
+
+Environment overrides: `BASE_RPC_URL`, `GLUE_CONTRACT_ADDRESS`, `NEAR_API_URL`, `ZKP2P_API_URL`.
 
 ## Session Flow
 

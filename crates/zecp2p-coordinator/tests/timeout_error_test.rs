@@ -18,7 +18,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration as StdDuration;
 use tempfile::TempDir;
-use test_utils::ANVIL_PRIVATE_KEY;
+use test_utils::{MockZkp2pServer, ANVIL_PRIVATE_KEY};
 use tokio::net::TcpListener;
 use zecp2p_types::OfframpStatus;
 
@@ -313,6 +313,7 @@ async fn mock_status_handler_with_errors(
 fn create_test_config(
     anvil_url: &str,
     near_url: &str,
+    zkp2p_url: &str,
     usdc: Address,
     escrow: Address,
     glue: Address,
@@ -334,6 +335,9 @@ fn create_test_config(
             api_url: near_url.to_string(),
             default_timeout: 600,
         },
+        zkp2p: zecp2p_types::config::Zkp2pConfig {
+            api_url: zkp2p_url.to_string(),
+        },
         server: zecp2p_types::config::ServerConfig {
             host: "127.0.0.1".to_string(),
             port: 3000,
@@ -350,6 +354,8 @@ struct TestInfra {
     anvil: AnvilInstance,
     #[allow(dead_code)]
     near_server: MockNearServerWithErrors,
+    #[allow(dead_code)]
+    zkp2p_server: MockZkp2pServer,
     near_config: MockNearConfig,
     #[allow(dead_code)]
     usdc_addr: Address,
@@ -372,6 +378,9 @@ impl TestInfra {
         let (near_server, near_config) = MockNearServerWithErrors::start().await;
         println!("Mock NEAR server at {}", near_server.api_url());
 
+        let zkp2p_server = MockZkp2pServer::start().await;
+        println!("Mock zk-p2p curator at {}", zkp2p_server.api_url());
+
         let temp_dir = TempDir::new().expect("create temp dir");
         let db_path = temp_dir
             .path()
@@ -382,6 +391,7 @@ impl TestInfra {
         let config = create_test_config(
             anvil.rpc_url(),
             &near_server.api_url(),
+            &zkp2p_server.api_url(),
             usdc_addr,
             escrow_addr,
             glue_addr,
@@ -391,6 +401,7 @@ impl TestInfra {
         Self {
             anvil,
             near_server,
+            zkp2p_server,
             near_config,
             usdc_addr,
             escrow_addr,
@@ -423,6 +434,7 @@ async fn test_session_timeout_detection() {
         db,
         chain_client,
         near_client,
+        zecp2p_coordinator::zkp2p::Zkp2pClient::new(&infra.config.zkp2p),
     ));
 
     println!("\n=== Testing Session Timeout Detection ===\n");
@@ -523,6 +535,7 @@ async fn test_near_api_failure_during_quote() {
         db,
         chain_client,
         near_client,
+        zecp2p_coordinator::zkp2p::Zkp2pClient::new(&infra.config.zkp2p),
     ));
 
     println!("\n=== Testing NEAR API Failure During Quote ===\n");
@@ -581,6 +594,7 @@ async fn test_near_status_failure_during_keeper() {
         db,
         chain_client,
         near_client,
+        zecp2p_coordinator::zkp2p::Zkp2pClient::new(&infra.config.zkp2p),
     ));
 
     println!("\n=== Testing NEAR Status Failure During Keeper ===\n");
@@ -654,6 +668,7 @@ async fn test_terminal_state_no_processing() {
         db,
         chain_client,
         near_client,
+        zecp2p_coordinator::zkp2p::Zkp2pClient::new(&infra.config.zkp2p),
     ));
 
     println!("\n=== Testing Terminal State No Processing ===\n");
@@ -733,6 +748,7 @@ async fn test_concurrent_reads_during_keeper() {
         db,
         chain_client,
         near_client,
+        zecp2p_coordinator::zkp2p::Zkp2pClient::new(&infra.config.zkp2p),
     ));
 
     println!("\n=== Testing Concurrent Reads During Keeper ===\n");
@@ -826,6 +842,7 @@ async fn test_cache_db_consistency() {
         db,
         chain_client,
         near_client,
+        zecp2p_coordinator::zkp2p::Zkp2pClient::new(&infra.config.zkp2p),
     ));
 
     println!("\n=== Testing Cache-DB Consistency ===\n");
@@ -904,6 +921,7 @@ async fn test_session_at_timeout_boundary() {
         db,
         chain_client,
         near_client,
+        zecp2p_coordinator::zkp2p::Zkp2pClient::new(&infra.config.zkp2p),
     ));
 
     println!("\n=== Testing Session at Timeout Boundary ===\n");

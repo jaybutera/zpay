@@ -10,7 +10,9 @@ use axum::{
 };
 use std::sync::Arc;
 use tower::ServiceExt;
-use zecp2p_coordinator::{api, chain::ChainClient, db::Database, near::NearIntentsClient, state::AppState};
+use zecp2p_coordinator::{
+    api, chain::ChainClient, db::Database, near::NearIntentsClient, state::AppState, zkp2p::Zkp2pClient,
+};
 use zecp2p_types::Config;
 
 /// Create a test configuration
@@ -38,6 +40,7 @@ fn test_config() -> Config {
             api_url: "https://1click.chaindefuser.com".to_string(),
             default_timeout: 600,
         },
+        zkp2p: zecp2p_types::config::Zkp2pConfig::default(),
         server: zecp2p_types::config::ServerConfig {
             host: "127.0.0.1".to_string(),
             port: 3000,
@@ -60,8 +63,9 @@ async fn create_test_app() -> Router {
         .expect("Failed to create chain client");
 
     let near_client = NearIntentsClient::new(&config.near);
+    let zkp2p_client = Zkp2pClient::new(&config.zkp2p);
 
-    let state = Arc::new(AppState::new(config, db, chain_client, near_client));
+    let state = Arc::new(AppState::new(config, db, chain_client, near_client, zkp2p_client));
 
     Router::new()
         .route("/health", get(api::health))

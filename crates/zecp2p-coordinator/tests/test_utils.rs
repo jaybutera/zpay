@@ -147,3 +147,185 @@ pub async fn get_signing_provider(rpc_url: &str, private_key: &str) -> impl Prov
         .wallet(wallet)
         .connect_http(rpc_url.parse().expect("valid url"))
 }
+
+// ============ Mock zk-p2p curator ============
+
+/// Mock of the zk-p2p curator endpoints the coordinator uses:
+/// `POST /v2/makers/validate` and `POST /v2/makers/create`.
+///
+/// The real curator issues an opaque `hashedOnchainId`. The mock derives a
+/// deterministic one from the username so tests can assert on it via
+/// [`MockZkp2pServer::expected_hash`].
+pub struct MockZkp2pServer {
+    port: u16,
+    state: MockZkp2pState,
+    shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Clone, Default)]
+pub struct MockZkp2pState {
+    /// When set, validate answers `false` and create answers HTTP 400
+    reject: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// When set, create returns a hashedOnchainId that is not 32 bytes
+    malformed_hash: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// When set, both endpoints answer HTTP 500
+    server_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Every offchainId that was registered, in order
+    registered: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MockPayeeRequest {
+    processor_name: String,
+    offchain_id: String,
+}
+
+impl MockZkp2pServer {
+    pub async fn start() -> Self {
+        use axum::{routing::post, Router};
+
+        let state = MockZkp2pState::default();
+        let app = Router::new()
+            .route("/v2/makers/validate", post(mock_zkp2p_validate))
+            .route("/v2/makers/create", post(mock_zkp2p_create))
+            .with_state(state.clone());
+
+        // Bind port 0 so parallel tests never collide
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind mock zkp2p server");
+        let port = listener.local_addr().expect("local addr").port();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+
+        Self {
+            port,
+            state,
+            shutdown_tx: Some(shutdown_tx),
+            handle,
+        }
+    }
+
+    pub fn api_url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+
+    /// The hash the mock issues for a username (after `@` stripping)
+    pub fn expected_hash(offchain_id: &str) -> alloy::primitives::B256 {
+        alloy::primitives::keccak256(format!("mock-zkp2p-payee:{}", offchain_id).as_bytes())
+    }
+
+    pub fn registered(&self) -> Vec<String> {
+        self.state.registered.lock().unwrap().clone()
+    }
+
+    pub fn set_reject(&self, reject: bool) {
+        self.state
+            .reject
+            .store(reject, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn set_malformed_hash(&self, malformed: bool) {
+        self.state
+            .malformed_hash
+            .store(malformed, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn set_server_error(&self, error: bool) {
+        self.state
+            .server_error
+            .store(error, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl Drop for MockZkp2pServer {
+    fn drop(&mut self) {
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+        self.handle.abort();
+    }
+}
+
+async fn mock_zkp2p_validate(
+    axum::extract::State(state): axum::extract::State<MockZkp2pState>,
+    axum::Json(req): axum::Json<MockPayeeRequest>,
+) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    use std::sync::atomic::Ordering;
+    if state.server_error.load(Ordering::SeqCst) {
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(serde_json::json!({"success": false, "message": "boom"})),
+        );
+    }
+    let ok = req.processor_name == "venmo"
+        && !req.offchain_id.is_empty()
+        && !req.offchain_id.starts_with('@')
+        && !state.reject.load(Ordering::SeqCst);
+    (
+        axum::http::StatusCode::OK,
+        axum::Json(serde_json::json!({
+            "success": true,
+            "message": if ok { "Maker data is valid" } else { "Maker data is invalid" },
+            "responseObject": ok,
+            "statusCode": 200
+        })),
+    )
+}
+
+async fn mock_zkp2p_create(
+    axum::extract::State(state): axum::extract::State<MockZkp2pState>,
+    axum::Json(req): axum::Json<MockPayeeRequest>,
+) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    use std::sync::atomic::Ordering;
+    if state.server_error.load(Ordering::SeqCst) {
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(serde_json::json!({"success": false, "message": "boom"})),
+        );
+    }
+    if req.processor_name != "venmo" || req.offchain_id.is_empty() || state.reject.load(Ordering::SeqCst)
+    {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({
+                "success": false,
+                "message": "Invalid maker data",
+                "responseObject": null,
+                "statusCode": 400,
+                "errorCode": "invalid_maker_data"
+            })),
+        );
+    }
+    state.registered.lock().unwrap().push(req.offchain_id.clone());
+    let hashed = if state.malformed_hash.load(Ordering::SeqCst) {
+        "hashed-id-1".to_string()
+    } else {
+        format!("{:?}", MockZkp2pServer::expected_hash(&req.offchain_id))
+    };
+    (
+        axum::http::StatusCode::OK,
+        axum::Json(serde_json::json!({
+            "success": true,
+            "message": "Maker created",
+            "responseObject": {
+                "id": 1,
+                "processorName": "venmo",
+                "offchainId": req.offchain_id,
+                "hashedOnchainId": hashed,
+                "createdAt": "2026-08-29T00:00:00.000Z"
+            },
+            "statusCode": 200
+        })),
+    )
+}

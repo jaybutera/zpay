@@ -26,6 +26,9 @@ pub enum AppError {
     #[error("NEAR Intents error: {0}")]
     NearIntents(String),
 
+    #[error("zk-p2p curator error: {0}")]
+    Zkp2p(String),
+
     #[error("Configuration error: {0}")]
     Config(String),
 
@@ -42,6 +45,7 @@ impl IntoResponse for AppError {
             AppError::Database(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Database error".to_string()),
             AppError::Chain(_) => (StatusCode::BAD_GATEWAY, self.to_string()),
             AppError::NearIntents(_) => (StatusCode::BAD_GATEWAY, self.to_string()),
+            AppError::Zkp2p(_) => (StatusCode::BAD_GATEWAY, self.to_string()),
             AppError::Config(_) => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
             AppError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Internal error".to_string()),
         };

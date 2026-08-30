@@ -12,7 +12,7 @@ contract OfframpGlue {
 
     struct Session {
         address user;           // User's address for rescue/withdraw
-        bytes32 venmoIdHash;    // keccak256 of Venmo username
+        bytes32 payeeDetailsHash; // zk-p2p payee details hash (curator-issued hashedOnchainId)
         uint256 minConversionRate; // Minimum acceptable rate (18 decimals)
         uint256 expectedAmount; // Expected USDC from NEAR Intent (6 decimals)
         uint256 depositId;      // zk-p2p deposit ID (0 until processed)
@@ -34,7 +34,7 @@ contract OfframpGlue {
     event SessionCreated(
         bytes32 indexed sessionId,
         address indexed user,
-        bytes32 venmoIdHash,
+        bytes32 payeeDetailsHash,
         uint256 expectedAmount
     );
 
@@ -64,6 +64,7 @@ contract OfframpGlue {
     error ZeroAddress();
     error ZeroAmount();
     error TransferFailed();
+    error PayeeDetailsMismatch();
 
     // ============ Modifiers ============
 
@@ -93,13 +94,15 @@ contract OfframpGlue {
     /// @notice Create a new offramp session
     /// @param sessionId Unique session identifier (from coordinator)
     /// @param user User's address for rescue/withdraw operations
-    /// @param venmoIdHash keccak256 hash of user's Venmo username
+    /// @param payeeDetailsHash zk-p2p payee details hash for the user's Venmo account.
+    ///        This is the hashedOnchainId issued by the zk-p2p curator API when the
+    ///        username is registered; it is not derivable from the username.
     /// @param minConversionRate Minimum acceptable USDC/fiat rate (18 decimals)
     /// @param expectedAmount Expected USDC amount from NEAR Intent (6 decimals)
     function createSession(
         bytes32 sessionId,
         address user,
-        bytes32 venmoIdHash,
+        bytes32 payeeDetailsHash,
         uint256 minConversionRate,
         uint256 expectedAmount
     ) external onlyKeeper {
@@ -109,7 +112,7 @@ contract OfframpGlue {
 
         sessions[sessionId] = Session({
             user: user,
-            venmoIdHash: venmoIdHash,
+            payeeDetailsHash: payeeDetailsHash,
             minConversionRate: minConversionRate,
             expectedAmount: expectedAmount,
             depositId: 0,
@@ -117,7 +120,7 @@ contract OfframpGlue {
             rescued: false
         });
 
-        emit SessionCreated(sessionId, user, venmoIdHash, expectedAmount);
+        emit SessionCreated(sessionId, user, payeeDetailsHash, expectedAmount);
     }
 
     /// @notice Process received USDC by depositing to zk-p2p
@@ -137,6 +140,13 @@ contract OfframpGlue {
         if (session.user == address(0)) revert SessionNotFound();
         if (session.depositId != 0) revert SessionAlreadyProcessed();
         if (session.rescued) revert SessionAlreadyRescued();
+
+        // Every payment method on the deposit must pay out to the payee registered
+        // for this session; otherwise the keeper could route the user's USDC to
+        // someone else's Venmo account.
+        for (uint256 i = 0; i < paymentMethodData.length; i++) {
+            if (paymentMethodData[i].payeeDetails != session.payeeDetailsHash) revert PayeeDetailsMismatch();
+        }
 
         // Use actual balance (may differ from expectedAmount due to fees/slippage)
         uint256 balance = usdc.balanceOf(address(this));

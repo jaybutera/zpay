@@ -13,6 +13,7 @@ mod db;
 mod error;
 mod near;
 mod state;
+mod zkp2p;
 
 use std::sync::Arc;
 
@@ -66,8 +67,18 @@ async fn main() -> Result<()> {
     // Initialize NEAR Intents client
     let near_client = near::NearIntentsClient::new(&config.near);
 
+    // Initialize zk-p2p curator client (payee registration)
+    let zkp2p_client = zkp2p::Zkp2pClient::new(&config.zkp2p);
+    tracing::info!("zk-p2p curator: {}", config.zkp2p.api_url);
+
     // Build application state
-    let state = Arc::new(AppState::new(config.clone(), db, chain_client, near_client));
+    let state = Arc::new(AppState::new(
+        config.clone(),
+        db,
+        chain_client,
+        near_client,
+        zkp2p_client,
+    ));
 
     // Build router with middleware layers
     // Note: Layers are applied bottom-to-top, so request flow is:
