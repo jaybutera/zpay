@@ -4,6 +4,7 @@ members = [
     "crates/zecp2p-types",
     "crates/zecp2p-coordinator",
     "crates/zecp2p-cli",
+    "crates/zecp2p-taker",
 ]
 
 [workspace.package]

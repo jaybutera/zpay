@@ -329,7 +329,7 @@ async fn test_coordinator_full_flow() {
         zec_amount: 50_000_000,    // 0.5 ZEC
         venmo_username: "testuser".to_string(),
         user_address: TEST_USER.parse().unwrap(),
-        taker_address: TEST_USER.parse().unwrap(), // Same for testing
+        taker_address: Some(TEST_USER.parse().unwrap()), // Same for testing
         zec_refund_address: "t1TestRefundAddressXXXXXXXXXXXX".to_string(),
         min_rate: U256::from(1_000_000_000_000_000_000u128), // 1 USDC/ZEC minimum
         timeout_seconds: 600,
@@ -435,7 +435,7 @@ async fn test_coordinator_rescue_state_validation() {
         zec_amount: 50_000_000,
         venmo_username: "rescueuser".to_string(),
         user_address: TEST_USER.parse().unwrap(),
-        taker_address: TEST_USER.parse().unwrap(),
+        taker_address: Some(TEST_USER.parse().unwrap()),
         zec_refund_address: "t1TestRefundAddressXXXXXXXXXXXX".to_string(),
         min_rate: U256::from(1_000_000_000_000_000_000u128),
         timeout_seconds: 600,
@@ -511,7 +511,7 @@ async fn test_coordinator_withdraw_state_validation() {
         zec_amount: 75_000_000, // 0.75 ZEC
         venmo_username: "withdrawuser".to_string(),
         user_address: TEST_USER.parse().unwrap(),
-        taker_address: TEST_USER.parse().unwrap(),
+        taker_address: Some(TEST_USER.parse().unwrap()),
         zec_refund_address: "t1TestRefundAddressXXXXXXXXXXXX".to_string(),
         min_rate: U256::from(1_000_000_000_000_000_000u128),
         timeout_seconds: 600,
@@ -586,7 +586,7 @@ async fn test_coordinator_state_validation() {
         zec_amount: 50_000_000,
         venmo_username: "statetest".to_string(),
         user_address: TEST_USER.parse().unwrap(),
-        taker_address: TEST_USER.parse().unwrap(),
+        taker_address: Some(TEST_USER.parse().unwrap()),
         zec_refund_address: "t1TestRefundAddressXXXXXXXXXXXX".to_string(),
         min_rate: U256::from(1_000_000_000_000_000_000u128),
         timeout_seconds: 600,

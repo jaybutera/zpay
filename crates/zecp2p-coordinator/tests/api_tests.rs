@@ -501,3 +501,69 @@ async fn test_create_offramp_validates_min_rate_negative() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert!(json["error"].as_str().unwrap().contains("positive"));
 }
+
+/// An offramp with no taker is the normal case now: zk-p2p deposits are open to
+/// any staked taker, so the request must not be rejected for omitting one.
+#[tokio::test]
+async fn test_create_offramp_accepts_a_request_with_no_taker() {
+    let app = create_test_app().await;
+
+    let body = serde_json::json!({
+        "zec_amount": "0.5",
+        "venmo_username": "testuser",
+        "user_address": "0x1234567890123456789012345678901234567890",
+        "zec_refund_address": "t1VJnUz9FDy7WfFxqXwMZJWVxzMrRD7MvBA"
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/offramp")
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // This test app has no chain and no curator behind it, so the request
+    // cannot succeed either way. What matters is why it fails: it must get past
+    // address validation and die on the curator, not complain about the taker.
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        !text.contains("taker"),
+        "a missing taker must not be an error, got: {text}"
+    );
+}
+
+/// A malformed taker address is still an error when one is supplied.
+#[tokio::test]
+async fn test_create_offramp_still_rejects_a_bad_taker() {
+    let app = create_test_app().await;
+
+    let body = serde_json::json!({
+        "zec_amount": "0.5",
+        "venmo_username": "testuser",
+        "user_address": "0x1234567890123456789012345678901234567890",
+        "taker_address": "not-an-address",
+        "zec_refund_address": "t1VJnUz9FDy7WfFxqXwMZJWVxzMrRD7MvBA"
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/offramp")
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}

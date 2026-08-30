@@ -60,8 +60,14 @@ pub struct OfframpRequest {
     pub venmo_username: String,
     /// User's Base address for rescue/withdraw
     pub user_address: Address,
-    /// Pre-arranged taker address (required for V0)
-    pub taker_address: Address,
+    /// Address the user expects to take this offramp, if they arranged one.
+    ///
+    /// Advisory only. The deposit is created with `intentGatingService`
+    /// set to `address(0)`, so zk-p2p lets any staked taker signal on it and
+    /// enforces nothing about this field. It is recorded so an offramp made
+    /// with a taker in mind can still say who that was.
+    #[serde(default)]
+    pub taker_address: Option<Address>,
     /// User's Zcash address for refunds (t1/t3/zs prefix)
     /// If the NEAR Intent fails, ZEC is refunded here
     pub zec_refund_address: String,

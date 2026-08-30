@@ -1,0 +1,36 @@
+[package]
+name = "zecp2p-taker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Taker agent: discovers open zk-p2p deposits, signals intents, pays via Venmo"
+
+[dependencies]
+zecp2p-types = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+alloy = { workspace = true }
+reqwest = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+hex = { workspace = true }
+dotenvy = { workspace = true }
+chrono = { workspace = true }
+tokio-tungstenite = "0.26"
+futures-util = "0.3"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[[bin]]
+name = "zecp2p-taker"
+path = "src/main.rs"
+
+[lib]
+name = "zecp2p_taker"
+path = "src/lib.rs"

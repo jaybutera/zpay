@@ -59,13 +59,14 @@ The server runs on `http://127.0.0.1:3000` by default.
 # Get a quote for ZEC amount
 cargo run --bin zecp2p -- quote 0.5
 
-# Start an offramp
+# Start an offramp. No taker needed: the zk-p2p deposit is open to any taker.
 cargo run --bin zecp2p -- offramp 0.5 \
   --venmo myusername \
   --user-address 0xYourBaseAddress \
-  --taker 0xTakerAddress \
   --zec-address t1YourZcashAddress \
   --min-rate 1.0
+
+# --taker 0xAddress still works, but is advisory; zk-p2p does not enforce it.
 
 # Check status
 cargo run --bin zecp2p -- status <session-id>
@@ -101,6 +102,24 @@ scripts/testnet/02_dryrun_sepolia.sh        # POST /offramp -> fake NEAR deliver
 the 1Click API and the zk-p2p curator; point the coordinator at them with
 `NEAR_API_URL` and `ZKP2P_API_URL`.
 
+## Running a taker
+
+The other side of the market. `zecp2p-taker` watches Base for claimable
+deposits, claims one, and pays the Venmo through a browser you have already
+logged in.
+
+```bash
+cp config.taker.example.toml config.taker.toml   # then set glue_contract
+
+# See what it would do without spending anything
+TAKER_PRIVATE_KEY=0x... cargo run --bin zecp2p-taker -- run --dry-run
+```
+
+`docs/taker-agent.md` covers the stake requirement, the commands, and the one
+step that stays manual. `docs/taker-matching-design.md` covers why deposits are
+open to any taker, verified against production bytecode by
+`scripts/taker/prove_open_signaling.sh`.
+
 ## Testing
 
 **Run all Rust tests:**
@@ -124,6 +143,7 @@ forge test
 | `/offramp/{id}` | GET | Get session status |
 | `/offramp/{id}/rescue` | POST | Rescue stuck funds |
 | `/offramp/{id}/withdraw` | POST | Withdraw from zk-p2p |
+| `/deposits/open` | GET | Deposits takers can claim, with the Venmo username to pay |
 
 **Create offramp request:**
 ```json
@@ -131,7 +151,6 @@ forge test
   "zec_amount": "500000000",
   "venmo_username": "alice",
   "user_address": "0x...",
-  "taker_address": "0x...",
   "zec_refund_address": "t1...",
   "min_rate": "1.0",
   "timeout_seconds": 600
@@ -190,7 +209,7 @@ Environment overrides: `BASE_RPC_URL`, `GLUE_CONTRACT_ADDRESS`, `NEAR_API_URL`, 
 2. **NearIntentPending** - Waiting for ZEC deposit to NEAR address
 3. **UsdcReceived** - USDC arrived at GlueContract
 4. **Zkp2pDeposited** - USDC deposited to zk-p2p escrow
-5. **IntentSignaled** - Taker claimed the order
+5. **IntentSignaled** - A taker claimed the order
 6. **Fulfilled** - Venmo payment verified, complete
 
 If something goes wrong:

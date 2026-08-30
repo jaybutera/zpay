@@ -2,7 +2,7 @@
 //!
 //! Usage:
 //!   zecp2p quote <amount>
-//!   zecp2p offramp <amount> --venmo <username> --taker <address> ...
+//!   zecp2p offramp <amount> --venmo <username> [--taker <address>] ...
 //!   zecp2p status <session-id>
 //!   zecp2p watch <session-id>
 //!   zecp2p rescue <session-id>
@@ -52,9 +52,10 @@ enum Commands {
         #[arg(long)]
         user_address: String,
 
-        /// Pre-arranged taker address (required for V0)
+        /// Address you expect to take this offramp. Optional; without it the
+        /// deposit is open to any zk-p2p taker, which is the normal case.
         #[arg(long)]
-        taker: String,
+        taker: Option<String>,
 
         /// Your Zcash address for refunds (t1/t3/zs prefix)
         #[arg(long)]

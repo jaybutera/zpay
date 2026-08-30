@@ -108,8 +108,10 @@ pub struct CreateOfframpBody {
     pub venmo_username: String,
     /// User's Base address
     pub user_address: String,
-    /// Pre-arranged taker address
-    pub taker_address: String,
+    /// Address expected to take this offramp. Optional: deposits are open to
+    /// any staked taker, so leaving it out is the normal case.
+    #[serde(default)]
+    pub taker_address: Option<String>,
     /// User's Zcash address for refunds (t1/t3/zs prefix)
     pub zec_refund_address: String,
     /// Minimum USD per USDC the taker must pay on zk-p2p (decimal, default "1.0")
@@ -130,7 +132,7 @@ pub async fn create_offramp(
         zec = %body.zec_amount,
         venmo = %body.venmo_username,
         user = %body.user_address,
-        taker = %body.taker_address,
+        taker = ?body.taker_address,
         "Creating offramp"
     );
 
@@ -145,9 +147,13 @@ pub async fn create_offramp(
         .user_address
         .parse()
         .map_err(|_| AppError::InvalidState("Invalid user address".to_string()))?;
+    // Optional: an offramp with no named taker is served by whoever claims the
+    // deposit first, which is the normal path.
     let taker_address = body
         .taker_address
-        .parse()
+        .as_deref()
+        .map(str::parse)
+        .transpose()
         .map_err(|_| AppError::InvalidState("Invalid taker address".to_string()))?;
 
     // Parse min rate (default to reasonable value)
@@ -218,6 +224,56 @@ pub async fn process_offramp(
     );
 
     Ok(Json(OfframpResponse::from(&session)))
+}
+
+/// An open deposit, as a taker sees it.
+///
+/// Takers find deposits on-chain; this endpoint exists because one field they
+/// need is deliberately not on-chain. `payeeDetails` is the curator's opaque
+/// hash of the Venmo username, so a taker who only watches Base knows what to
+/// pay and to which deposit, but not who to pay. The coordinator that opened
+/// the session is the only party that can answer that.
+#[derive(Debug, serde::Serialize)]
+pub struct OpenDeposit {
+    /// zk-p2p deposit id to signal an intent against.
+    pub deposit_id: String,
+    /// Venmo username to pay, without the leading @.
+    pub venmo_username: String,
+    /// USDC held in the deposit, 6 decimals.
+    pub amount: Option<String>,
+    /// The address the offramp named as its expected taker, if any. Advisory
+    /// only: the deposit is ungated and anyone may claim it.
+    pub preferred_taker: Option<String>,
+}
+
+/// List deposits that are up for grabs.
+///
+/// Anyone may call this; the deposits it describes are open on-chain to any
+/// staked taker, so there is nothing here a taker could not already see.
+#[instrument(skip(state))]
+pub async fn list_open_deposits(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<OpenDeposit>>, AppError> {
+    let sessions = state
+        .db
+        .get_sessions_by_status(zecp2p_types::OfframpStatus::Zkp2pDeposited)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    let deposits: Vec<OpenDeposit> = sessions
+        .iter()
+        .filter_map(|session| {
+            session.zkp2p_deposit_id.map(|deposit_id| OpenDeposit {
+                deposit_id: deposit_id.to_string(),
+                venmo_username: session.request.venmo_username.clone(),
+                amount: session.received_usdc.map(|a| a.to_string()),
+                preferred_taker: session.request.taker_address.map(|a| a.to_string()),
+            })
+        })
+        .collect();
+
+    info!(count = deposits.len(), "Listed open deposits");
+    Ok(Json(deposits))
 }
 
 /// Rescue funds from GlueContract

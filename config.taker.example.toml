@@ -1,0 +1,32 @@
+# zecp2p taker agent, Base mainnet.
+# Copy to config.taker.toml and set glue_contract.
+#
+# Needs TAKER_PRIVATE_KEY in the environment: a Base key holding USDC for both
+# the stake and the payments, plus ETH for gas.
+
+[network]
+base_rpc_url = "https://mainnet.base.org"
+chain_id = 8453
+
+[contracts]
+usdc = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+zkp2p_escrow = "0x777777779d229cdF3110e9de47943791c26300Ef"        # EscrowV2
+zkp2p_orchestrator = "0x014025fDE093f8701d86e9f38e2C3a9b779cb5c7"  # OrchestratorV3
+stake_vault = "0x47c26258222e2f96424bD2B21bf173f0DA5034C7"        # locks taker stake
+glue_contract = "0x0000000000000000000000000000000000000000"      # the OfframpGlue to serve
+
+[taker]
+# Where to look up the Venmo username behind a deposit. Omit it and pass
+# --recipient instead.
+coordinator_url = "http://127.0.0.1:3000"
+# 6-decimal USDC units. 100000000 = 100 USDC.
+max_intent_amount = "100000000"
+min_intent_amount = "1000000"
+poll_interval_seconds = 15
+lookback_blocks = 5000
+
+[venmo]
+# Chrome started with --remote-debugging-port=9222, already logged into Venmo.
+cdp_url = "http://127.0.0.1:9222"
+note = "thanks"
+timeout_seconds = 120
