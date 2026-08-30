@@ -12,9 +12,12 @@ contract DeployOfframpGlue is Script {
     // zk-p2p EscrowV2 (the escrow production makers deposit into; paired with OrchestratorV3)
     address constant ZKP2P_ESCROW_BASE_MAINNET = 0x777777779d229cdF3110e9de47943791c26300Ef;
 
-    // Base Sepolia addresses
+    // Base Sepolia: zk-p2p's testnet escrows (0x6a5e11c3..., 0x15EF83EB...) expose
+    // createDeposit signatures that differ from EscrowV2, so the glue cannot be
+    // deployed against them. Use script/DeploySepolia.s.sol, which deploys a
+    // stand-in escrow, or pass ZKP2P_ESCROW_ADDRESS explicitly if an
+    // EscrowV2-compatible testnet deployment appears.
     address constant USDC_BASE_SEPOLIA = 0x036CbD53842c5426634e7929541eC2318f3dCF7e;
-    address constant ZKP2P_ESCROW_BASE_SEPOLIA = 0x6a5e11c3D87e22b828d02ee65a4e8f322BF6B97E;
 
     function run() external {
         uint256 chainId = block.chainid;
@@ -31,7 +34,11 @@ contract DeployOfframpGlue is Script {
             // Base Sepolia
             console.log("Deploying to Base Sepolia...");
             usdc = USDC_BASE_SEPOLIA;
-            zkp2pEscrow = ZKP2P_ESCROW_BASE_SEPOLIA;
+            zkp2pEscrow = vm.envOr("ZKP2P_ESCROW_ADDRESS", address(0));
+            require(
+                zkp2pEscrow != address(0),
+                "No EscrowV2-compatible zk-p2p escrow on Base Sepolia; use DeploySepolia.s.sol or set ZKP2P_ESCROW_ADDRESS"
+            );
         } else {
             revert("Unsupported chain");
         }

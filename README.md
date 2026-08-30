@@ -85,6 +85,22 @@ Point CLI to a different coordinator:
 cargo run --bin zecp2p -- --coordinator http://other-server:3000 quote 0.5
 ```
 
+## Dry runs and testnet
+
+`docs/testnet-deploy-plan.md` describes the two-stage plan. The scripts:
+
+```bash
+scripts/dryrun/fork_base.sh contract        # GlueContract against the real EscrowV2 on an anvil fork of Base; free
+scripts/dryrun/fork_base.sh coordinator     # same, driven through the coordinator with mock NEAR and mock curator
+scripts/testnet/00_verify_zkp2p_addresses.sh   # read-only checks of the zk-p2p addresses in the configs
+scripts/testnet/01_deploy_sepolia.sh [--broadcast]   # deploy glue + stand-in escrow to Base Sepolia
+scripts/testnet/02_dryrun_sepolia.sh        # POST /offramp -> fake NEAR delivery -> keeper -> withdraw on Sepolia
+```
+
+`scripts/dryrun/mock_near.py` and `scripts/dryrun/mock_zkp2p.py` stand in for
+the 1Click API and the zk-p2p curator; point the coordinator at them with
+`NEAR_API_URL` and `ZKP2P_API_URL`.
+
 ## Testing
 
 **Run all Rust tests:**

@@ -164,10 +164,13 @@ port = $COORD_PORT
 [database]
 path = "$WORK/dryrun.db"
 EOF
-  # Run from $WORK so the repo's .env (with placeholder addresses) is not loaded
-  ( cd "$WORK" && ZECP2P_CONFIG="$WORK/config.toml" GLUE_CONTRACT_ADDRESS="$GLUE" COORDINATOR_PRIVATE_KEY=$KEEPER_KEY \
-      RUST_LOG=zecp2p_coordinator=info "$ROOT/target/debug/zecp2p-coordinator" > "$WORK/coordinator.log" 2>&1 ) & PIDS+=($!)
   COORD="http://127.0.0.1:$COORD_PORT"
+  if curl -sf "$COORD/health" >/dev/null 2>&1; then
+    echo "something already answers on $COORD (stale coordinator?); stop it first"; exit 1
+  fi
+  # Run from $WORK so the repo's .env (with placeholder addresses) is not loaded
+  ( cd "$WORK" && exec env ZECP2P_CONFIG="$WORK/config.toml" GLUE_CONTRACT_ADDRESS="$GLUE" COORDINATOR_PRIVATE_KEY=$KEEPER_KEY \
+      RUST_LOG=zecp2p_coordinator=info "$ROOT/target/debug/zecp2p-coordinator" > "$WORK/coordinator.log" 2>&1 ) & PIDS+=($!)
   for _ in $(seq 1 30); do sleep 1; curl -sf "$COORD/health" >/dev/null && break; done
   curl -sf "$COORD/health" >/dev/null || { cat "$WORK/coordinator.log"; exit 1; }
 

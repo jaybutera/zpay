@@ -9,13 +9,19 @@ base_sepolia_rpc_url = "https://sepolia.base.org"
 chain_id = 84532
 
 [contracts]
-# USDC on Base Sepolia (Circle official testnet USDC)
+# USDC on Base Sepolia (Circle official testnet USDC; faucet at faucet.circle.com)
 usdc = "0x036CbD53842c5426634e7929541eC2318f3dCF7e"
-# zk-p2p Escrow on Base Sepolia
-zkp2p_escrow = "0x6a5e11c3D87e22b828d02ee65a4e8f322BF6B97E"
-# zk-p2p Orchestrator on Base Sepolia
-zkp2p_orchestrator = "0x7D563c65456deF11c1Fdb9510eB745D5a780F5Fd"
-# GlueContract address (set after deployment to Base Sepolia)
+# zk-p2p has no EscrowV2-compatible deployment on Base Sepolia. The two known
+# testnet escrows (0x6a5e11c3D87e22b828d02ee65a4e8f322BF6B97E and
+# 0x15EF83EBB422B4AC8e3b8393d016Ed076dc50CB7) expose createDeposit signatures
+# that differ from production, so the glue cannot deposit into them.
+# scripts/testnet/01_deploy_sepolia.sh deploys a stand-in escrow
+# (MockEscrowWithOrchestrator) that also emits the orchestrator events; put its
+# address in both fields below. The real EscrowV2 encoding is exercised by
+# scripts/dryrun/fork_base.sh on a mainnet fork.
+zkp2p_escrow = "0x0000000000000000000000000000000000000000"
+zkp2p_orchestrator = "0x0000000000000000000000000000000000000000"
+# GlueContract address (set after 01_deploy_sepolia.sh --broadcast)
 # glue_contract = "0x..."
 
 [near]
