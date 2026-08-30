@@ -3,7 +3,7 @@ cache/
 out/
 
 # Ignores development broadcast logs
-!/broadcast
+# forge broadcast logs are ignored at the repo root
 /broadcast/*/31337/
 /broadcast/**/dry-run/
 
