@@ -24,6 +24,7 @@ fn test_config() -> Config {
             zkp2p_orchestrator: "0x014025fDE093f8701d86e9f38e2C3a9b779cb5c7"
                 .parse()
                 .unwrap(),
+            stake_vault: zecp2p_types::config::DEFAULT_STAKE_VAULT.parse().unwrap(),
             glue_contract: None,
         },
         near: zecp2p_types::config::NearConfig {
@@ -31,6 +32,8 @@ fn test_config() -> Config {
             default_timeout: 600,
         },
         zkp2p: zecp2p_types::config::Zkp2pConfig::default(),
+        keeper: zecp2p_types::config::KeeperConfig::default(),
+        attestation: zecp2p_types::config::AttestationConfig::default(),
         server: zecp2p_types::config::ServerConfig {
             host: "127.0.0.1".to_string(),
             port: 3000,

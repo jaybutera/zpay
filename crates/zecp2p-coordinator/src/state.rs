@@ -22,25 +22,14 @@ use crate::{
     zkp2p::Zkp2pClient,
 };
 
-/// Number of blocks to look back when checking for events (fallback if no stored block)
-const EVENT_LOOKBACK_BLOCKS: u64 = 1000;
-
 /// Key for storing last processed block in the database
 const LAST_PROCESSED_BLOCK_KEY: &str = "last_processed_block";
 
-/// Session timeout in seconds (1 hour)
-///
-/// Applies to the stages the coordinator itself drives on Base.
-const SESSION_TIMEOUT_SECS: i64 = 3600;
-
-/// Timeout for a session still waiting on the NEAR Intents leg (3.5 days)
-///
-/// 1Click keeps a deposit address live for about three days: a quote issued
-/// 2026-08-30T18:16Z came back with a `deadline` and `timeWhenInactive` of
-/// 2026-09-02T18:16Z, regardless of the shorter deadline in the request. An
-/// under-deposit is refunded by that deadline, so failing the session after an
-/// hour would abandon it while the swap or its refund is still in flight.
-const NEAR_INTENT_TIMEOUT_SECS: i64 = 302_400;
+// Loop timing lives in [`zecp2p_types::KeeperConfig`] (the `[keeper]` section of
+// the config file), so an operator can slow the poll down on a metered RPC
+// without a rebuild. The defaults there are the values this loop used to hard
+// code: 15s poll, 3600s session budget, 302400s for a session still waiting on
+// the NEAR leg, 1000 blocks of lookback.
 
 /// Shared application state
 pub struct AppState {
@@ -264,7 +253,8 @@ impl AppState {
 
     /// Run the keeper loop to monitor and process sessions
     pub async fn run_keeper_loop(self: &Arc<Self>) -> Result<()> {
-        let poll_interval = std::time::Duration::from_secs(15);
+        let poll_interval =
+            std::time::Duration::from_secs(self.config.keeper.poll_interval_seconds);
 
         loop {
             if let Err(e) = self.keeper_tick().await {
@@ -279,7 +269,8 @@ impl AppState {
         self: &Arc<Self>,
         mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ) -> Result<()> {
-        let poll_interval = std::time::Duration::from_secs(15);
+        let poll_interval =
+            std::time::Duration::from_secs(self.config.keeper.poll_interval_seconds);
 
         loop {
             // Check for shutdown signal
@@ -340,7 +331,7 @@ impl AppState {
         }
 
         // Fallback to lookback
-        Ok(current_block.saturating_sub(EVENT_LOOKBACK_BLOCKS))
+        Ok(current_block.saturating_sub(self.config.keeper.event_lookback_blocks))
     }
 
     async fn process_session(self: &Arc<Self>, session: &OfframpSession) -> Result<()> {
@@ -382,8 +373,8 @@ impl AppState {
     /// Check if a session has timed out
     ///
     /// A session waiting on the ZEC deposit gets the longer
-    /// [`NEAR_INTENT_TIMEOUT_SECS`] budget, since that leg is bounded by 1Click's
-    /// deposit deadline rather than by anything the coordinator controls.
+    /// `keeper.near_intent_timeout_seconds` budget, since that leg is bounded by
+    /// 1Click's deposit deadline rather than by anything the coordinator controls.
     fn is_session_timed_out(&self, session: &OfframpSession) -> bool {
         let now = chrono::Utc::now();
         let elapsed = now.signed_duration_since(session.created_at);
@@ -393,8 +384,8 @@ impl AppState {
     /// The timeout budget that applies to a session at its current stage
     fn session_timeout_secs(&self, session: &OfframpSession) -> i64 {
         match session.status {
-            OfframpStatus::NearIntentPending => NEAR_INTENT_TIMEOUT_SECS,
-            _ => SESSION_TIMEOUT_SECS,
+            OfframpStatus::NearIntentPending => self.config.keeper.near_intent_timeout_seconds,
+            _ => self.config.keeper.session_timeout_seconds,
         }
     }
 
