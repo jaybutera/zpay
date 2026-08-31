@@ -6,34 +6,38 @@ Trustless ZEC to Venmo offramp. Converts shielded Zcash to Venmo payments withou
 
 - Rust 1.75+
 - Foundry (for smart contracts)
+- Node >= 20 (for the Venmo attestation client)
+- Python 3 (for the deploy scripts)
 
 ## Setup
 
-1. **Build the project:**
-   ```bash
-   cargo build --release
-   ```
+**[DEPLOY.md](DEPLOY.md) is the deployment guide**: the ordered script sequence
+to stand this up on Base mainnet from scratch, and an itemized funding list with
+measured gas costs. Start there for a real deployment. The short version:
 
-2. **Deploy the GlueContract** (if not already deployed):
-   ```bash
-   cd contracts
-   forge build
-   forge script script/Deploy.s.sol:DeployOfframpGlue \
-     --rpc-url https://sepolia.base.org \
-     --broadcast \
-     --private-key $PRIVATE_KEY
-   ```
+```bash
+cargo build --release
+(cd contracts && forge build)
+(cd scripts/proof && npm install)
 
-3. **Configure environment:**
-   ```bash
-   cp .env.example .env
-   ```
+cp .env.example .env      # every address, key, RPC and URL lives here
+$EDITOR .env
 
-   Set your deployed contract address in `config.toml`:
-   ```toml
-   [contracts]
-   glue_contract = "0xYourDeployedContractAddress"
-   ```
+scripts/deploy/00_preflight.sh                    # read-only; spends nothing
+scripts/deploy/01_deploy_contracts.sh --broadcast  # deploys OfframpGlue
+scripts/deploy/02_configure_keeper.sh --broadcast  # hands the keeper role over
+scripts/deploy/03_write_config.sh                  # generates the config files
+scripts/deploy/04_verify_near_leg.sh               # dry quotes only
+scripts/deploy/05_rehearse_on_fork.sh              # local fork; spends nothing
+scripts/deploy/07_status.sh                        # read-only; run any time
+```
+
+Every step that can spend simulates by default and needs an explicit
+`--broadcast`. Every step is idempotent.
+
+Base mainnet (8453) is the only chain the whole flow runs on: zk-p2p's Venmo
+verifier exists only there, and the attestation enclave signs an EIP-712 domain
+bound to that chain, so a proof cannot be replayed elsewhere.
 
 ## Running the Coordinator
 
@@ -93,6 +97,7 @@ cargo run --bin zecp2p -- --coordinator http://other-server:3000 quote 0.5
 ```bash
 scripts/dryrun/fork_base.sh contract        # GlueContract against the real EscrowV2 on an anvil fork of Base; free
 scripts/dryrun/fork_base.sh coordinator     # same, driven through the coordinator with mock NEAR and mock curator
+scripts/dryrun/fork_base.sh claim           # + signalIntent/fulfillIntent with a real enclave attestation
 scripts/testnet/00_verify_zkp2p_addresses.sh   # read-only checks of the zk-p2p addresses in the configs
 scripts/testnet/01_deploy_sepolia.sh [--broadcast]   # deploy glue + stand-in escrow to Base Sepolia
 scripts/testnet/02_dryrun_sepolia.sh        # POST /offramp -> fake NEAR delivery -> keeper -> withdraw on Sepolia
@@ -116,7 +121,8 @@ TAKER_PRIVATE_KEY=0x... cargo run --bin zecp2p-taker -- run --dry-run
 ```
 
 `docs/taker-agent.md` covers the stake requirement, the commands, and the one
-step that stays manual. `docs/taker-matching-design.md` covers why deposits are
+step that stays manual. Proving a payment is a plain HTTPS call to zk-p2p's TEE;
+`scripts/deploy/06_prove_payment.sh` drives it against a live intent. `docs/taker-matching-design.md` covers why deposits are
 open to any taker, verified against production bytecode by
 `scripts/taker/prove_open_signaling.sh`.
 
@@ -177,8 +183,12 @@ Usernames are sent without the leading `@`.
 
 ## Configuration
 
-Two config files are provided:
-- `config.toml` - Base mainnet
+Configuration comes from `.env` (gitignored; `.env.example` documents every
+variable) and is turned into config files by
+`scripts/deploy/03_write_config.sh`. Two checked-in files remain for reference
+and for the testnet path:
+
+- `config.toml` - Base mainnet defaults
 - `config.testnet.toml` - Base Sepolia testnet
 
 Key settings:
@@ -199,9 +209,22 @@ path = "zecp2p.db"
 
 [zkp2p]
 api_url = "https://api.zkp2p.xyz"   # curator API used for payee registration
+
+[attestation]
+service_url = "https://attestation-service.zkp2p.xyz"  # the TEE that signs payment proofs
+verifier = "0xC6F4a193576C60892a47e111Bb5706c30162502B"
+
+[keeper]
+poll_interval_seconds = 15
 ```
 
-Environment overrides: `BASE_RPC_URL`, `GLUE_CONTRACT_ADDRESS`, `NEAR_API_URL`, `ZKP2P_API_URL`.
+Environment overrides: `BASE_RPC_URL`, `GLUE_CONTRACT_ADDRESS`, `NEAR_API_URL`,
+`ZKP2P_API_URL`, `ATTESTATION_URL`, `ATTESTATION_VERIFIER_ADDRESS`,
+`STAKE_VAULT_ADDRESS`, `KEEPER_POLL_INTERVAL_SECONDS`.
+
+Keys are never read from a config file. The coordinator takes
+`COORDINATOR_PRIVATE_KEY` and the taker takes `TAKER_PRIVATE_KEY` from the
+environment.
 
 ## Session Flow
 
