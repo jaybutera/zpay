@@ -2,6 +2,10 @@
 
 Trustless ZEC to Venmo offramp. Converts shielded Zcash to Venmo payments without centralized exchanges by combining NEAR Intents (ZEC → USDC) with zk-p2p (USDC → Venmo).
 
+**[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** explains the whole system end to
+end: both legs, the coordinator and taker, the trust boundaries, and why
+`OfframpGlue` is deployed immutable rather than behind a proxy.
+
 ## Prerequisites
 
 - Rust 1.75+
