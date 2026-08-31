@@ -1,23 +1,34 @@
 //! Turning a sent Venmo payment into something `fulfillIntent` accepts.
 //!
-//! This is the step that does not fully automate, and the reason is structural
-//! rather than a gap in this crate.
-//!
 //! `fulfillIntent` calldata reaches the Venmo verifier at
 //! `0xC6F4a193576C60892a47e111Bb5706c30162502B`, which hands the proof to an
-//! attestation verifier at `0x9Fe920b24e50e6a6362BA71a1BeB502A99c402d5`. That
-//! contract holds a witness set and a signature threshold; on Base mainnet
-//! today `witnessCount() == 2` and `requiredSignatures() == 1`. So a proof is
-//! only valid if one of zk-p2p's witnesses signed an attestation that the
-//! payment happened.
+//! attestation verifier. A proof is only valid if one of zk-p2p's witnesses
+//! signed an attestation that the payment happened.
 //!
-//! A witness signs after observing the taker's authenticated Venmo session
-//! through zk-p2p's PeerAuth browser extension, which performs the TLS
-//! attestation. The signing key is theirs, not ours: no amount of local
-//! automation produces that signature, and an agent cannot mint one.
+//! Obtaining that signature is fully automatable and needs no browser
+//! extension. zk-p2p now runs a TEE attestation service: the client encrypts a
+//! Venmo session cookie to a key whose AWS Nitro attestation document it
+//! verifies first, POSTs it to `/buyer/verify`, and the enclave replays the
+//! Venmo request itself and returns an EIP-712 signature over
+//! `(intentHash, releaseAmount, dataHash)`. `scripts/proof/prove_payment.mjs`
+//! does exactly this against the live service.
 //!
-//! What this module does, therefore, is drive everything up to and after that
-//! signature, and make the handoff explicit rather than silently stalling.
+//! Two properties of that service matter to a taker:
+//!
+//! - The enclave re-signs the same payment for whatever `intentHash` it is
+//!   given, so one payment can be bound to a new intent without paying again.
+//! - The signature is pinned to `chainId` 8453 and the verifier address, so it
+//!   is Base-mainnet-only; there is no zk-p2p verifier on Base Sepolia.
+//!
+//! `scripts/dryrun/fork_base.sh claim` drives signalIntent + fulfillIntent
+//! with a real attestation against the deployed mainnet contracts on a local
+//! fork. Note the verifier compares the attested snapshot's intent timestamp
+//! with the intent stored on chain: build the attestation with the intent's
+//! real signal time or fulfilment reverts with
+//! "UPV: Snapshot timestamp mismatch".
+//!
+//! What this module still leaves to the caller is the Venmo session material
+//! itself, which is a live credential a human has to supply.
 
 use alloy::primitives::{Bytes, B256};
 use serde::{Deserialize, Serialize};

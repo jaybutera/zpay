@@ -83,8 +83,8 @@ attestation really is well-formed and correctly signed, not merely returned.
 
 | Var | Meaning |
 |---|---|
-| `INTENT_HASH` | intent to bind to; defaults to the staged Sepolia intent |
-| `PAYEE_HASH` | defaults to @test-payee's curator hash |
+| `INTENT_HASH` | intent to bind to; defaults to the staged Sepolia intent `0xfd728abd…de453ae8e` (deposit 2, @test-payee) |
+| `PAYEE_HASH` | defaults to @test-payee's curator hash `0x853410f0…fc8555db` (maker 6588) |
 | `INTENT_AMOUNT` | 6-decimal units, default `1000000` ($1) |
 | `PAYMENT_INDEX` | feed position, try 0 then 1, 2 |
 | `CHAIN_ID` | default 8453; the enclave only signs for 8453 |
