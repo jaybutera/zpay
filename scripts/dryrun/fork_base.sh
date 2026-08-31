@@ -11,6 +11,10 @@
 #   contract     (default) drive GlueContract directly with cast
 #   coordinator  run mock NEAR + mock curator + the coordinator binary and go
 #                through POST /offramp -> keeper -> zkp2p_deposited -> withdraw
+#   claim        drive the REAL EscrowV2 + OrchestratorV3 + UnifiedPaymentVerifierV3
+#                through signalIntent -> fulfillIntent with a real enclave
+#                attestation. Proves the claim leg executes against deployed
+#                mainnet bytecode, on a local fork, spending nothing.
 #
 # Usage:
 #   scripts/dryrun/fork_base.sh [contract|coordinator]
@@ -41,6 +45,7 @@ USER_KEY=0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d
 USER=0x70997970C51812dc3A010C7d01b50e0d17dc79C8
 
 AMOUNT=25000000 # 25 USDC
+WORKDIR="${WORKDIR:-$(mktemp -d)}"
 PIDS=()
 cleanup() {
   for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null || true; done
@@ -203,6 +208,137 @@ EOF
   curl -sf -X POST "$COORD/offramp/$SID/withdraw"; echo
   echo "keeper USDC balance: $(cast call --rpc-url "$RPC" "$USDC" 'balanceOf(address)(uint256)' "$KEEPER")"
   log "PASS: coordinator drove POST /offramp -> keeper -> EscrowV2 deposit -> withdraw on the fork (logs in $WORK)"
+elif [ "$MODE" = "claim" ]; then
+  # ---------------------------------------------------------------- claim
+  # The full taker leg against real deployed bytecode: stake, signalIntent,
+  # then fulfillIntent with an enclave attestation re-bound to the intent hash
+  # this fork actually produces.
+  #
+  # Needs an attestation.json from scripts/proof (any intent hash; it gets
+  # re-bound below) and, to re-bind, the same Venmo cookie the prover uses.
+  ATT="${ATTESTATION_JSON:-$ROOT/scripts/proof/attestation.json}"
+  [ -f "$ATT" ] || { echo "no attestation at $ATT; run scripts/proof first"; exit 1; }
+  command -v python3 >/dev/null || { echo "python3 required"; exit 1; }
+  python3 -c 'import eth_abi, eth_utils' 2>/dev/null || { echo "pip install eth-abi eth-utils"; exit 1; }
+
+  CLAIM_AMOUNT="${CLAIM_AMOUNT:-1000000}"                       # $1, matches the payment
+  REAL_PAYEE="${PAYEE_HASH:-0x853410f0416f12611961e72ee5397ec6839a3f6475467f8a557bbdb3fc8555db}"
+  STAKE_VAULT=0x47c26258222e2f96424bD2B21bf173f0DA5034C7
+  VERIFIER=0xC6F4a193576C60892a47e111Bb5706c30162502B
+  MIN_RATE=1000000000000000000
+
+  log "claim rehearsal: \$$(python3 -c "print($CLAIM_AMOUNT/1e6)") deposit, payee $REAL_PAYEE"
+  echo "verifier code on fork: $(( ($(cast code --rpc-url "$RPC" $VERIFIER | wc -c) - 3) / 2 )) bytes"
+
+  # A maker deposit carrying the REAL curator payee hash. The verifier checks
+  # the attested payeeDetails against the intent's payeeId, so a mock hash here
+  # would fail for the right reason but prove nothing.
+  SESSION_ID=$(cast keccak "claim-session-$(date +%s)")
+  cast send --rpc-url "$RPC" --private-key "$KEEPER_KEY" "$GLUE" \
+    'createSession(bytes32,address,bytes32,uint256,uint256)' \
+    "$SESSION_ID" "$USER" "$REAL_PAYEE" "$MIN_RATE" "$CLAIM_AMOUNT" >/dev/null
+
+  log "funding the glue with exactly $CLAIM_AMOUNT USDC units"
+  cast rpc --rpc-url "$RPC" anvil_impersonateAccount "$ESCROW" >/dev/null
+  cast rpc --rpc-url "$RPC" anvil_setBalance "$ESCROW" 0x1000000000000000000 >/dev/null
+  cast send --rpc-url "$RPC" --unlocked --from "$ESCROW" "$USDC" \
+    'transfer(address,uint256)(bool)' "$GLUE" "$CLAIM_AMOUNT" >/dev/null
+  cast rpc --rpc-url "$RPC" anvil_stopImpersonatingAccount "$ESCROW" >/dev/null
+
+  log "processOfframp -> real EscrowV2.createDeposit"
+  DEPOSIT_ID=$(cast call --rpc-url "$RPC" "$ESCROW" 'depositCounter()(uint256)')
+  cast send --rpc-url "$RPC" --private-key "$KEEPER_KEY" "$GLUE" \
+    'processOfframp(bytes32,bytes32[],(address,bytes32,bytes)[],(bytes32,uint256,(address,bytes,int16,uint32))[][])' \
+    "$SESSION_ID" "[$VENMO]" "[(0x0000000000000000000000000000000000000000,$REAL_PAYEE,0x)]" \
+    "[[($USD,$MIN_RATE,(0x0000000000000000000000000000000000000000,0x,0,0))]]" >/dev/null
+  echo "deposit id: $DEPOSIT_ID"
+
+  # The taker is a fresh anvil account; give it USDC for the stake by
+  # impersonating a holder. On mainnet this is real money the taker must own.
+  log "funding + staking the taker (OrchestratorV3 lifecycle hook locks stake == intent amount)"
+  cast rpc --rpc-url "$RPC" anvil_impersonateAccount "$ESCROW" >/dev/null
+  cast rpc --rpc-url "$RPC" anvil_setBalance "$ESCROW" 0x1000000000000000000 >/dev/null
+  cast send --rpc-url "$RPC" --unlocked --from "$ESCROW" "$USDC" \
+    'transfer(address,uint256)(bool)' "$USER" "$CLAIM_AMOUNT" >/dev/null
+  cast rpc --rpc-url "$RPC" anvil_stopImpersonatingAccount "$ESCROW" >/dev/null
+  cast send --rpc-url "$RPC" --private-key "$USER_KEY" "$USDC" \
+    'approve(address,uint256)(bool)' "$STAKE_VAULT" "$CLAIM_AMOUNT" >/dev/null
+  cast send --rpc-url "$RPC" --private-key "$USER_KEY" "$STAKE_VAULT" \
+    'depositStake(uint256)' "$CLAIM_AMOUNT" >/dev/null
+  echo "taker freeStake: $(cast call --rpc-url "$RPC" $STAKE_VAULT 'freeStake(address)(uint256)' "$USER")"
+
+  log "signalIntent on the real OrchestratorV3"
+  SIGNAL_ARGS="($ESCROW,$DEPOSIT_ID,$CLAIM_AMOUNT,$USER,$VENMO,$USD,$MIN_RATE,[],0x,0,0x0000000000000000000000000000000000000000,0x,0x)"
+  SIGNAL_SIG='signalIntent((address,uint256,uint256,address,bytes32,bytes32,uint256,(address,uint256)[],bytes,uint256,address,bytes,bytes))'
+  # Simulate first so a revert prints its custom error instead of vanishing.
+  if ! SIM=$(cast call --rpc-url "$RPC" --from "$USER" "$ORCHESTRATOR" "$SIGNAL_SIG" "$SIGNAL_ARGS" 2>&1); then
+    echo "$SIM" | head -5
+    log "FAIL: signalIntent reverted (reason above)"; exit 1
+  fi
+  cast send --rpc-url "$RPC" --private-key "$USER_KEY" "$ORCHESTRATOR" "$SIGNAL_SIG" "$SIGNAL_ARGS" >/dev/null
+
+  # IntentSignaled's first indexed topic is the intent hash. The signature has
+  # ten parameters; taking it from the shipped ABI rather than retyping it.
+  SIGNALED=$(cast keccak 'IntentSignaled(bytes32,address,uint256,bytes32,address,address,uint256,bytes32,uint256,uint256)')
+  BN=$(cast block-number --rpc-url "$RPC")
+  INTENT_HASH=$(cast logs --rpc-url "$RPC" --from-block $((BN-5)) --to-block "$BN" \
+    --address "$ORCHESTRATOR" "$SIGNALED" --json 2>/dev/null \
+    | python3 -c 'import sys,json; l=json.load(sys.stdin); print(l[-1]["topics"][1] if l else "")')
+  [ -n "$INTENT_HASH" ] || { echo "could not read intent hash from IntentSignaled logs"; exit 1; }
+  echo "intent hash on fork: $INTENT_HASH"
+
+  # UnifiedPaymentVerifierV3 cross-checks the attested snapshot's intent
+  # timestamp against the intent actually stored on chain and reverts with
+  # "UPV: Snapshot timestamp mismatch" if they differ. So the attestation must
+  # be built with the intent's real signal time, not Date.now().
+  INTENT_TS=$(cast call --rpc-url "$RPC" "$ORCHESTRATOR" \
+    'getIntent(bytes32)((address,address,address,uint256,uint256,uint256,bytes32,bytes32,uint256,address,bytes))' \
+    "$INTENT_HASH" 2>/dev/null | tr -d '()' | cut -d, -f6 | tr -d ' ' | cut -d'[' -f1)
+  [ -n "$INTENT_TS" ] || { echo "could not read intent timestamp"; exit 1; }
+  INTENT_TS_MS=$((INTENT_TS * 1000))
+  echo "intent timestamp: ${INTENT_TS}s -> ${INTENT_TS_MS}ms"
+
+  # ---- re-bind the attestation to THIS intent hash ----
+  # The enclave re-signs the same Venmo payment for any intent hash, which is
+  # what makes a mainnet claim of this payment possible at all.
+  if [ -n "${VENMO_COOKIE:-}" ] && [ -n "${VENMO_SENDER_ID:-}" ]; then
+    log "re-binding the attestation to $INTENT_HASH via the live enclave"
+    ( cd "$ROOT/scripts/proof" && INTENT_HASH="$INTENT_HASH" PAYEE_HASH="$REAL_PAYEE" \
+        INTENT_AMOUNT="$CLAIM_AMOUNT" PAYMENT_INDEX="${PAYMENT_INDEX:-0}" \
+        INTENT_TIMESTAMP_MS="$INTENT_TS_MS" \
+        OUT="$WORKDIR/attestation.rebound.json" node prove_payment.mjs >"$WORKDIR/rebind.log" 2>&1 ) \
+      || { echo "re-binding failed:"; tail -20 "$WORKDIR/rebind.log"; exit 1; }
+    ATT="$WORKDIR/attestation.rebound.json"
+    echo "re-bound attestation written"
+  else
+    echo "VENMO_COOKIE/VENMO_SENDER_ID unset: using $ATT as-is."
+    echo "fulfillIntent will revert unless its intentHash already equals $INTENT_HASH."
+  fi
+
+  log "building fulfillIntent calldata from the attestation"
+  PROOF=$(python3 "$ROOT/scripts/dryrun/build_proof.py" "$ATT")
+  echo "paymentProof: ${#PROOF} hex chars"
+
+  log "fulfillIntent on the real OrchestratorV3 -> UnifiedPaymentVerifierV3"
+  BAL_BEFORE=$(cast call --rpc-url "$RPC" "$USDC" 'balanceOf(address)(uint256)' "$USER" | cut -d' ' -f1)
+  set +e
+  FULFILL_OUT=$(cast send --rpc-url "$RPC" --private-key "$USER_KEY" "$ORCHESTRATOR" \
+    'fulfillIntent((bytes,bytes32,bytes,bytes))' "($PROOF,$INTENT_HASH,0x,0x)" 2>&1)
+  FULFILL_RC=$?
+  set -e
+  if [ $FULFILL_RC -ne 0 ]; then
+    echo "$FULFILL_OUT" | tail -20
+    log "FAIL: fulfillIntent reverted (reason above)"
+    exit 1
+  fi
+  BAL_AFTER=$(cast call --rpc-url "$RPC" "$USDC" 'balanceOf(address)(uint256)' "$USER" | cut -d' ' -f1)
+  echo "taker USDC before=$BAL_BEFORE after=$BAL_AFTER"
+  VERIFIED=$(cast keccak 'PaymentVerified(bytes32,bytes32,bytes32,uint256,uint256,bytes32,bytes32)')
+  BN2=$(cast block-number --rpc-url "$RPC")
+  cast logs --rpc-url "$RPC" --from-block $((BN2-2)) --to-block "$BN2" --address "$VERIFIER" "$VERIFIED" 2>/dev/null | head -20
+
+  log "PASS: signalIntent + fulfillIntent executed against the real deployed EscrowV2/OrchestratorV3/UnifiedPaymentVerifierV3"
+
 else
   echo "unknown mode $MODE"; exit 1
 fi
