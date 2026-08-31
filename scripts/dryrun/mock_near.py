@@ -12,10 +12,19 @@ Response shapes come from the published 1Click OpenAPI document
 structs. Deriving them from the spec is the point: a mock written to match our
 own types cannot catch a mismatch between our types and the API.
 
-Two details this reproduces that a hand-written mock got wrong:
+Response fields and values are pinned to a real mainnet swap captured on
+2026-08-31 (scripts/stageb/fixtures/), so the mock reproduces what the service
+actually sends rather than what we assumed it sends.
+
+Details this reproduces that a hand-written mock got wrong:
   - /v0/quote answers 201, not 200
   - settled amounts and chain hashes live inside `swapDetails`, and the chain
     hashes are arrays of {hash, explorerUrl} objects rather than bare strings
+  - a real swap can go PENDING_DEPOSIT -> PROCESSING directly, never emitting
+    KNOWN_DEPOSIT_TX, so nothing may depend on seeing that state
+  - `swapDetails` carries deposited*/amountIn*/amountOut*/refund* fields, and
+    amountOut is already populated at PROCESSING, before the swap settles;
+    only `status` may be used to decide that funds arrived
 
 Endpoints:
   POST /v0/quote                      -> 201, quote with depositAddress
@@ -170,36 +179,62 @@ class Handler(BaseHTTPRequestHandler):
                 })
 
             # Settled amounts and chain hashes belong inside swapDetails, and the
-            # chain hashes are arrays of {hash, explorerUrl} objects.
+            # chain hashes are arrays of {hash, explorerUrl} objects. The live
+            # service always sends the refund* keys, with refundedAmount "0" and
+            # refundReason null on a healthy swap.
             details = {"intentHashes": [], "nearTxHashes": [],
-                       "originChainTxHashes": [], "destinationChainTxHashes": []}
+                       "originChainTxHashes": [], "destinationChainTxHashes": [],
+                       "refundedAmount": "0", "refundedAmountFormatted": "0",
+                       "refundedAmountUsd": "0", "refundReason": None,
+                       "refundFee": "47000", "withdrawFee": str(WITHDRAW_FEE)}
 
+            deposited = str(known["request"].get("amount") or "0")
+            out = str(known["amountOut"])
+
+            # Everything from deposit detection onward reports the origin tx and
+            # the deposited amount. Observed live: PROCESSING already carries a
+            # populated amountOut, so amountOut is NOT a settlement signal.
             if status in ("KNOWN_DEPOSIT_TX", "INCOMPLETE_DEPOSIT", "PROCESSING", "SUCCESS", "REFUNDED"):
                 details["originChainTxHashes"] = [{
                     "hash": "mock-zec-txid",
                     "explorerUrl": "https://example.invalid/tx/mock-zec-txid",
                 }]
+                # The *Usd fields are marks at observation time, not guarantees:
+                # live, amountInUsd moved between quote and settlement as the ZEC
+                # price ticked. Nothing may treat them as authoritative.
+                deposited_usd = "%.12f" % (int(deposited) / 1e8 * RATE)
+                details.update({
+                    "depositedAmount": deposited,
+                    "depositedAmountFormatted": "%.8f" % (int(deposited) / 1e8),
+                    "depositedAmountUsd": deposited_usd,
+                    "amountIn": deposited,
+                    "amountInFormatted": "%.8f" % (int(deposited) / 1e8),
+                    "amountInUsd": deposited_usd,
+                })
 
-            if status == "SUCCESS":
-                out = str(known["amountOut"])
+            if status in ("PROCESSING", "SUCCESS"):
                 details.update({
                     "intentHashes": ["mock-intent"],
                     "nearTxHashes": ["mock-near-tx"],
-                    "amountIn": known["request"].get("amount"),
                     "amountOut": out,
                     "amountOutFormatted": "%.6f" % (int(out) / 1e6),
+                    "amountOutUsd": "%.12f" % (int(out) / 1e6),
                     "slippage": int(known["request"].get("slippageTolerance") or 50),
-                    "destinationChainTxHashes": [{
-                        "hash": "0x" + "00" * 32,
-                        "explorerUrl": "https://basescan.org/tx/0x" + "00" * 32,
-                    }],
                 })
+
+            # The destination transaction appears only once the swap has settled.
+            if status == "SUCCESS":
+                details["destinationChainTxHashes"] = [{
+                    "hash": "0x" + "00" * 32,
+                    "explorerUrl": "https://basescan.org/tx/0x" + "00" * 32,
+                }]
 
             if status == "REFUNDED":
                 # 1Click charges the refund fee out of the returned principal.
                 refunded = max(int(known["request"].get("amount", "0") or 0) - 47000, 0)
                 details["refundedAmount"] = str(refunded)
                 details["refundedAmountFormatted"] = "%.8f" % (refunded / 1e8)
+                details["refundReason"] = "REFUND_REQUESTED"
 
             body = {
                 "correlationId": "mock-%08x" % random.getrandbits(32),

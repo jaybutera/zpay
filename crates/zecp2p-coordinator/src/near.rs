@@ -640,4 +640,78 @@ mod tests {
         assert_eq!(request.amount, "50000000");
         assert_eq!(request.slippage_bps, Some(100));
     }
+
+    // ---------------------------------------------------------------------
+    // Fixtures captured from a real mainnet ZEC -> USDC swap on 2026-08-31
+    // (52,000 zatoshi, correlationId 00000000-0000-4000-8000-000000000001).
+    // These pin the deserializer to bytes the live service actually sent, so a
+    // schema change breaks a test instead of silently parsing to None.
+    // ---------------------------------------------------------------------
+
+    const LIVE_SUCCESS: &str = include_str!("../tests/fixtures/1click_status_success.json");
+    const LIVE_PROCESSING: &str = include_str!("../tests/fixtures/1click_status_processing.json");
+    const LIVE_PENDING: &str = include_str!("../tests/fixtures/1click_status_pending_deposit.json");
+
+    /// The settled swap parses, and every field the coordinator records is present.
+    #[test]
+    fn test_live_success_fixture_parses() {
+        let parsed: ApiStatusResponse = serde_json::from_str(LIVE_SUCCESS).expect("live SUCCESS parses");
+        assert_eq!(parsed.status, IntentStatus::Success);
+
+        let d = parsed.swap_details.expect("swapDetails present");
+        assert_eq!(d.amount_out.as_deref(), Some("443561"));
+        // The real delivery hash, which the pre-fix deserializer recorded as None.
+        assert_eq!(
+            d.destination_chain_tx_hashes.first().map(|t| t.hash.as_str()),
+            Some("0x2222222222222222222222222222222222222222222222222222222222222222")
+        );
+        assert_eq!(
+            d.origin_chain_tx_hashes.first().map(|t| t.hash.as_str()),
+            Some("1111111111111111111111111111111111111111111111111111111111111111")
+        );
+        assert_eq!(d.refunded_amount.as_deref(), Some("0"));
+    }
+
+    /// A real swap can reach PROCESSING with `amountOut` already populated and no
+    /// destination transaction yet. Settlement must be decided by `status` alone;
+    /// treating a populated `amountOut` as "delivered" would fire early here.
+    #[test]
+    fn test_live_processing_fixture_is_not_settled() {
+        let parsed: ApiStatusResponse = serde_json::from_str(LIVE_PROCESSING).expect("live PROCESSING parses");
+        assert_eq!(parsed.status, IntentStatus::Processing);
+        assert!(!parsed.status.is_success());
+        assert!(parsed.status.is_pending());
+
+        let d = parsed.swap_details.expect("swapDetails present");
+        assert_eq!(d.amount_out.as_deref(), Some("443561"), "amountOut is set before settlement");
+        assert!(
+            d.destination_chain_tx_hashes.is_empty(),
+            "no destination tx until the swap settles"
+        );
+    }
+
+    /// PENDING_DEPOSIT carries an all-null swapDetails and must parse cleanly.
+    #[test]
+    fn test_live_pending_deposit_fixture_parses() {
+        let parsed: ApiStatusResponse = serde_json::from_str(LIVE_PENDING).expect("live PENDING parses");
+        assert_eq!(parsed.status, IntentStatus::PendingDeposit);
+        assert!(parsed.status.is_pending());
+        assert!(!parsed.status.is_terminal());
+
+        let d = parsed.swap_details.unwrap_or_default();
+        assert!(d.amount_out.is_none());
+        assert!(d.origin_chain_tx_hashes.is_empty());
+    }
+
+    /// The live run went PENDING_DEPOSIT -> PROCESSING directly, never emitting
+    /// KNOWN_DEPOSIT_TX. Both are non-terminal and pending, so nothing may depend
+    /// on observing that intermediate state.
+    #[test]
+    fn test_known_deposit_tx_is_not_required_in_progression() {
+        for s in [IntentStatus::PendingDeposit, IntentStatus::KnownDepositTx, IntentStatus::Processing] {
+            assert!(s.is_pending(), "{s:?} should be pending");
+            assert!(!s.is_terminal(), "{s:?} should not be terminal");
+            assert!(!s.is_success(), "{s:?} should not be success");
+        }
+    }
 }
