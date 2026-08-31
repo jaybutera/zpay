@@ -1,7 +1,9 @@
 # Standalone Venmo payment proof
 
 Generates a real Peer (zk-p2p) payment attestation for a real Venmo payment,
-without the PeerAuth browser extension and without touching any chain.
+without the PeerAuth browser extension and without touching any chain. The
+extension was only ever a cookie-capture UI; proving itself is a plain HTTPS
+call, which is what this script makes.
 
 ## What a "proof" is here
 
@@ -64,12 +66,30 @@ Or find `externalId=` in the URL of the stories request in the Network tab.
 
 ## Generate the proof
 
+The wrapper reads the intent's amount, payee hash and on-chain signal timestamp
+off the orchestrator for you, so use it rather than driving the script by hand:
+
+```bash
+scripts/deploy/06_prove_payment.sh --intent 0x<intentHash>
+```
+
+Directly, if you already have every field:
+
 ```bash
 export VENMO_COOKIE='<the whole Cookie header>'
 export VENMO_SENDER_ID='<numeric id>'
+export INTENT_HASH=0x...          # required; from the IntentSignaled log
+export PAYEE_HASH=0x...           # required; the curator's hashedOnchainId
+export INTENT_AMOUNT=1000000      # required; 6-decimal USDC units
+export INTENT_TIMESTAMP_MS=...    # the intent's on-chain signal time, in ms
 export PAYMENT_INDEX=0            # 0 = most recent payment in your feed
 node scripts/proof/prove_payment.mjs
 ```
+
+`INTENT_TIMESTAMP_MS` is not optional in practice. `UnifiedPaymentVerifierV3`
+compares the attested snapshot's timestamp against the intent stored on chain
+and reverts with `UPV: Snapshot timestamp mismatch` if they differ, so an
+attestation built from the wall clock verifies locally and then fails on chain.
 
 Writes `attestation.json` with the signature, the signer, the EIP-712 typed
 data, and the intent it is bound to. Expected signer today:
@@ -83,12 +103,18 @@ attestation really is well-formed and correctly signed, not merely returned.
 
 | Var | Meaning |
 |---|---|
-| `INTENT_HASH` | intent to bind to; defaults to the staged Sepolia intent `0xfd728abd…de453ae8e` (deposit 2, @test-payee) |
-| `PAYEE_HASH` | defaults to @test-payee's curator hash `0x853410f0…fc8555db` (maker 6588) |
-| `INTENT_AMOUNT` | 6-decimal units, default `1000000` ($1) |
+| `INTENT_HASH` | required. The intent to bind to, from its `IntentSignaled` log |
+| `PAYEE_HASH` | required. The curator's `hashedOnchainId` for the payee |
+| `INTENT_AMOUNT` | required. 6-decimal USDC units |
+| `INTENT_TIMESTAMP_MS` | the intent's on-chain signal time in ms; see above |
 | `PAYMENT_INDEX` | feed position, try 0 then 1, 2 |
 | `CHAIN_ID` | default 8453; the enclave only signs for 8453 |
+| `VERIFIER` | the EIP-712 verifyingContract |
 | `ATTESTATION_URL` | default `https://attestation-service.zkp2p.xyz` |
+
+There are no defaults for the first three on purpose. An attestation minted
+against a stale built-in intent is the easiest way to produce a signature that
+looks right and fulfils nothing.
 
 ## Notes
 

@@ -1,9 +1,9 @@
 //! Turning a sent Venmo payment into something `fulfillIntent` accepts.
 //!
-//! `fulfillIntent` calldata reaches the Venmo verifier at
-//! `0xC6F4a193576C60892a47e111Bb5706c30162502B`, which hands the proof to an
-//! attestation verifier. A proof is only valid if one of zk-p2p's witnesses
-//! signed an attestation that the payment happened.
+//! `fulfillIntent` calldata reaches the Venmo verifier named by
+//! `attestation.verifier` in the taker config (UnifiedPaymentVerifierV3 on Base
+//! mainnet), which checks an EIP-712 signature produced inside zk-p2p's
+//! enclave. A proof is only valid if that enclave signed it.
 //!
 //! Obtaining that signature is fully automatable and needs no browser
 //! extension. zk-p2p now runs a TEE attestation service: the client encrypts a
@@ -33,11 +33,8 @@
 use alloy::primitives::{Bytes, B256};
 use serde::{Deserialize, Serialize};
 
-/// Base mainnet attestation contracts, read off-chain at time of writing.
-pub const VENMO_VERIFIER: &str = "0xC6F4a193576C60892a47e111Bb5706c30162502B";
-pub const ATTESTATION_VERIFIER: &str = "0x9Fe920b24e50e6a6362BA71a1BeB502A99c402d5";
 
-/// Everything the taker needs to hand PeerAuth to get an attestation.
+/// Everything the taker needs to get an attestation for a sent payment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProofRequest {
     pub intent_hash: B256,
@@ -49,7 +46,7 @@ pub struct ProofRequest {
     pub sent_at: chrono::DateTime<chrono::Utc>,
 }
 
-/// A witness-attested proof, once PeerAuth has produced one.
+/// An enclave-attested proof, once the prover has produced one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttestedProof {
     /// ABI-encoded proof blob passed straight through to `fulfillIntent`.
@@ -62,11 +59,11 @@ pub struct AttestedProof {
 /// Why the agent stopped short of fulfilment.
 #[derive(Debug, Clone)]
 pub enum ProofStatus {
-    /// PeerAuth handed us a proof; `fulfillIntent` can go ahead.
+    /// The enclave handed us a proof; `fulfillIntent` can go ahead.
     Ready(AttestedProof),
     /// The payment is made and the intent is live, but no attestation exists
-    /// yet. The operator has to run PeerAuth.
-    NeedsPeerAuth(ProofRequest),
+    /// yet. The operator has to run the prover against the enclave.
+    NeedsAttestation(ProofRequest),
 }
 
 impl ProofStatus {
@@ -76,24 +73,35 @@ impl ProofStatus {
     /// do, because at this point the taker's money has already left and only
     /// the proof stands between them and the escrowed USDC.
     pub fn manual_step_report(&self) -> Option<String> {
+        self.manual_step_report_for("https://attestation-service.zkp2p.xyz")
+    }
+
+    /// The same report, naming the attestation service the operator configured.
+    pub fn manual_step_report_for(&self, service_url: &str) -> Option<String> {
         match self {
             ProofStatus::Ready(_) => None,
-            ProofStatus::NeedsPeerAuth(req) => Some(format!(
+            ProofStatus::NeedsAttestation(req) => Some(format!(
                 "Manual step required: proof of payment.\n\
                  \n\
                  The Venmo payment of ${amount} to @{recipient} has been sent and\n\
                  intent {intent} is claimed on zk-p2p. The escrowed USDC is released\n\
-                 only against a witness-signed attestation of that payment.\n\
+                 only against an enclave-signed attestation of that payment.\n\
                  \n\
-                 zk-p2p's attestation verifier ({verifier}) requires\n\
-                 {required} signature from its witness set, produced by the PeerAuth\n\
-                 browser extension against your logged-in Venmo session. The witness\n\
-                 key is zk-p2p's, so this agent cannot generate or forge it.\n\
+                 That attestation comes from zk-p2p's TEE at {service}. It replays\n\
+                 your Venmo feed from inside an AWS Nitro enclave and signs the\n\
+                 result, so it needs a logged-in account.venmo.com Cookie header\n\
+                 and your numeric Venmo sender id. This agent never handles those.\n\
                  \n\
                  To finish:\n\
-                   1. Open PeerAuth and select the Venmo payment sent at {sent_at}.\n\
-                   2. Let it produce the attestation (about 30 seconds).\n\
-                   3. Run: zecp2p-taker fulfill --intent {intent} --proof <file>\n\
+                   1. Capture the cookie and sender id (scripts/proof/README.md).\n\
+                   2. INTENT_HASH={intent} INTENT_AMOUNT=<6-decimal units> \\\n\
+                      INTENT_TIMESTAMP_MS=<the intent's on-chain signal time in ms> \\\n\
+                      node scripts/proof/prove_payment.mjs\n\
+                   3. Run: zecp2p-taker fulfill --intent {intent} --proof attestation.json\n\
+                 \n\
+                 The timestamp matters: the verifier compares the attested snapshot\n\
+                 against the intent stored on chain and reverts with\n\
+                 \"UPV: Snapshot timestamp mismatch\" if they differ.\n\
                  \n\
                  Until then the intent stays open. If you cannot prove it, run\n\
                  `zecp2p-taker cancel --intent {intent}` to release the maker's\n\
@@ -101,20 +109,18 @@ impl ProofStatus {
                 amount = req.amount,
                 recipient = req.recipient,
                 intent = req.intent_hash,
-                verifier = ATTESTATION_VERIFIER,
-                required = 1,
-                sent_at = req.sent_at.format("%Y-%m-%d %H:%M:%S UTC"),
+                service = service_url,
             )),
         }
     }
 }
 
-/// Load a proof PeerAuth exported to disk.
+/// Load an attestation the prover wrote to disk.
 pub fn load_proof(path: &str) -> anyhow::Result<AttestedProof> {
     let contents = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("could not read proof file '{path}': {e}"))?;
     let proof: AttestedProof = serde_json::from_str(&contents)
-        .map_err(|e| anyhow::anyhow!("'{path}' is not a PeerAuth proof export: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("'{path}' is not an attestation export: {e}"))?;
     if proof.payment_proof.is_empty() {
         anyhow::bail!("'{path}' contains an empty payment proof");
     }
@@ -136,18 +142,34 @@ mod tests {
 
     #[test]
     fn the_manual_report_names_the_intent_and_the_way_out() {
-        let status = ProofStatus::NeedsPeerAuth(ProofRequest {
+        let status = ProofStatus::NeedsAttestation(ProofRequest {
             intent_hash: B256::repeat_byte(0xab),
             recipient: "alice".to_string(),
             amount: "25.00".to_string(),
             sent_at: chrono::Utc::now(),
         });
         let report = status.manual_step_report().expect("should need a step");
-        assert!(report.contains("PeerAuth"));
+        // the intent, the payment, and the tool that produces the attestation
+        assert!(report.contains(&B256::repeat_byte(0xab).to_string()));
         assert!(report.contains("alice"));
         assert!(report.contains("25.00"));
+        assert!(report.contains("prove_payment.mjs"));
         // the operator must be told how to get their stake back
         assert!(report.contains("cancel"));
+    }
+
+    #[test]
+    fn the_report_names_the_configured_attestation_service() {
+        let status = ProofStatus::NeedsAttestation(ProofRequest {
+            intent_hash: B256::repeat_byte(0x01),
+            recipient: "bob".to_string(),
+            amount: "1.00".to_string(),
+            sent_at: chrono::Utc::now(),
+        });
+        let report = status
+            .manual_step_report_for("https://enclave.example")
+            .expect("should need a step");
+        assert!(report.contains("https://enclave.example"));
     }
 
     #[test]

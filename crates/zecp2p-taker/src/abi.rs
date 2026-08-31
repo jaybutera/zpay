@@ -42,7 +42,7 @@ sol! {
         }
 
         struct FulfillIntentParams {
-            /// Witness-attested payment proof from PeerAuth.
+            /// Enclave-attested payment proof; see scripts/proof.
             bytes paymentProof;
             bytes32 intentHash;
             bytes verificationData;

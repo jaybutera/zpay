@@ -4,7 +4,7 @@
 //! zecp2p-taker run --dry-run          # watch and report, spend nothing
 //! zecp2p-taker run                    # claim, pay, and hand off for proving
 //! zecp2p-taker stake --amount 100     # fund the zk-p2p StakeVault
-//! zecp2p-taker fulfill --intent 0x..  # submit a PeerAuth proof
+//! zecp2p-taker fulfill --intent 0x..  # submit an enclave attestation
 //! zecp2p-taker cancel --intent 0x..   # give a claim back
 //! ```
 
@@ -65,11 +65,11 @@ enum Commands {
     /// Show stake and wallet balances
     Status,
 
-    /// Submit a PeerAuth proof for a claimed intent
+    /// Submit an enclave attestation for a claimed intent
     Fulfill {
         #[arg(long)]
         intent: String,
-        /// Path to the proof PeerAuth exported
+        /// Path to the attestation, as written by scripts/proof/prove_payment.mjs
         #[arg(long)]
         proof: String,
     },

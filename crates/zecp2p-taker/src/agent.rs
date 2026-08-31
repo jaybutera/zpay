@@ -250,14 +250,16 @@ impl<P: alloy::providers::Provider + Clone> TakerAgent<P> {
                 recipient: recipient.to_string(),
             }),
             PaymentOutcome::Sent { .. } => {
-                // Everything from here needs a witness signature we cannot make.
-                let status = ProofStatus::NeedsPeerAuth(ProofRequest {
+                // Everything from here needs an enclave signature we cannot make.
+                let status = ProofStatus::NeedsAttestation(ProofRequest {
                     intent_hash: intent.intent_hash,
                     recipient: recipient.to_string(),
                     amount: dollars.to_string(),
                     sent_at: chrono::Utc::now(),
                 });
-                if let Some(report) = status.manual_step_report() {
+                if let Some(report) =
+                    status.manual_step_report_for(&self.config.attestation.service_url)
+                {
                     tracing::warn!("\n{report}");
                 }
                 Ok(Handled::AwaitingProof(Box::new(status)))

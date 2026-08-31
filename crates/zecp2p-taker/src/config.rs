@@ -4,7 +4,10 @@ use alloy::primitives::{Address, U256};
 use serde::{Deserialize, Serialize};
 
 /// Base mainnet StakeVault behind OrchestratorV3's lifecycle hook.
-pub const DEFAULT_STAKE_VAULT: &str = "0x47c26258222e2f96424bD2B21bf173f0DA5034C7";
+///
+/// Re-exported from `zecp2p-types` so the coordinator and the taker cannot
+/// drift apart on which vault holds the stake.
+pub use zecp2p_types::config::DEFAULT_STAKE_VAULT;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TakerConfig {
@@ -13,6 +16,9 @@ pub struct TakerConfig {
     pub taker: TakerSettings,
     #[serde(default)]
     pub venmo: VenmoConfig,
+    /// Peer TEE attestation service used to prove the Venmo payment.
+    #[serde(default)]
+    pub attestation: zecp2p_types::config::AttestationConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -128,6 +134,19 @@ impl TakerConfig {
         }
         if let Ok(url) = std::env::var("VENMO_CDP_URL") {
             config.venmo.cdp_url = url;
+        }
+        if let Ok(url) = std::env::var("ATTESTATION_URL") {
+            config.attestation.service_url = url;
+        }
+        if let Ok(addr) = std::env::var("ATTESTATION_VERIFIER_ADDRESS") {
+            config.attestation.verifier = addr.parse().map_err(|_| {
+                anyhow::anyhow!("ATTESTATION_VERIFIER_ADDRESS is not a valid address: {addr}")
+            })?;
+        }
+        if let Ok(addr) = std::env::var("STAKE_VAULT_ADDRESS") {
+            config.contracts.stake_vault = addr.parse().map_err(|_| {
+                anyhow::anyhow!("STAKE_VAULT_ADDRESS is not a valid address: {addr}")
+            })?;
         }
         Ok(config)
     }

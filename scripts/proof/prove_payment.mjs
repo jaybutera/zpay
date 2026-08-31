@@ -19,8 +19,17 @@
 //   VENMO_SENDER_ID   required. Casper's NUMERIC Venmo id (not the @handle).
 //   VENMO_USER_AGENT  the browser UA that cookie was captured with.
 //   PAYMENT_INDEX     which entry in the feed, 0 = most recent (default 0).
-//   INTENT_HASH       intent to bind the attestation to (default: the staged Sepolia intent).
+//   INTENT_HASH       required. The intent to bind the attestation to, as it
+//                     appears in the IntentSignaled log on chain.
+//   INTENT_AMOUNT     required. Release amount in 6-decimal USDC units.
+//   PAYEE_HASH        required. The curator's hashedOnchainId for the payee.
+//   INTENT_TIMESTAMP_MS  the intent's on-chain signal time in milliseconds. The
+//                     verifier compares it against the stored intent and reverts
+//                     with "UPV: Snapshot timestamp mismatch" if it differs, so
+//                     pass the real value for anything that will be submitted.
 //   CHAIN_ID          default 8453. The enclave only signs for 8453.
+//   VERIFIER          UnifiedPaymentVerifierV3, the EIP-712 verifyingContract.
+//   ATTESTATION_URL   attestation service base URL.
 //   OUT               where to write the attestation (default attestation.json).
 
 import { writeFileSync } from 'node:fs';
@@ -47,27 +56,47 @@ const senderId = need('VENMO_SENDER_ID');
 const userAgent = process.env.VENMO_USER_AGENT
   ?? 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36';
 
-// The staged Base Sepolia intent, for reference. On mainnet pass the real one.
-const intentHash = process.env.INTENT_HASH
-  ?? '0xfd728abd63355b81519bb4ce34cf8ca1690a14fb9f3af8b17432e93de453ae8e';
+// The intent this attestation is bound to. There is no sensible default: an
+// attestation minted for the wrong intent is rejected by the verifier, and a
+// stale built-in default is the easiest way to mint one by accident.
+const intentHash = need('INTENT_HASH');
+const payeeDetails = need('PAYEE_HASH');
+const intentAmount = need('INTENT_AMOUNT');
+
+if (!/^0x[0-9a-fA-F]{64}$/.test(intentHash)) {
+  console.error(`INTENT_HASH is not a 32-byte hex value: ${intentHash}`);
+  process.exit(2);
+}
+if (!/^0x[0-9a-fA-F]{64}$/.test(payeeDetails)) {
+  console.error(`PAYEE_HASH is not a 32-byte hex value: ${payeeDetails}`);
+  process.exit(2);
+}
+if (!/^[0-9]+$/.test(intentAmount)) {
+  console.error(`INTENT_AMOUNT must be an integer in 6-decimal USDC units: ${intentAmount}`);
+  process.exit(2);
+}
+if (!process.env.INTENT_TIMESTAMP_MS) {
+  console.warn('INTENT_TIMESTAMP_MS unset: using the wall clock. The verifier');
+  console.warn('compares this against the intent stored on chain, so an');
+  console.warn('attestation built this way will not fulfil a real intent.');
+}
 
 const intent = {
   intentHash,
-  amount: process.env.INTENT_AMOUNT ?? '1000000',
+  amount: intentAmount,
   // String, like every other IntentDetails field. The server's Zod schema
   // rejects a number here with "Expected string, received number".
   timestampMs: String(process.env.INTENT_TIMESTAMP_MS ?? Date.now()),
   paymentMethod: '0x90262a3db0edd0be2369c6b28f9e8511ec0bac7136cefbada0880602f87e7268', // keccak("venmo")
   fiatCurrency: '0xc4ae21aac0c6549d71dd96035b7e0bdb6c79ebdba8891b666115bc976d16a29e', // keccak("USD")
   conversionRate: process.env.INTENT_RATE ?? '1000000000000000000',
-  payeeDetails: process.env.PAYEE_HASH
-    ?? '0x853410f0416f12611961e72ee5397ec6839a3f6475467f8a557bbdb3fc8555db', // @test-payee
+  payeeDetails,
 };
 
 console.log('attestation service :', attestationServiceUrl);
 console.log('chainId             :', chainId, chainId === 8453 ? '' : '(enclave signs only for 8453)');
 console.log('intentHash          :', intent.intentHash);
-console.log('payeeDetails        :', intent.payeeDetails, '(@test-payee)');
+console.log('payeeDetails        :', intent.payeeDetails);
 console.log('feed index          :', index);
 console.log('cookie              : <%d chars, not logged>', cookie.length);
 
@@ -144,4 +173,4 @@ if (verified?.releaseAmount !== undefined) console.log('releaseAmount     :', St
 
 writeFileSync(out, JSON.stringify({ attestation, intent, chainId, verifyingContract }, null, 2));
 console.log('\nwrote', out);
-console.log('This file is the proof that the $1 Venmo payment happened, signed by the Peer enclave.');
+console.log('This file is the proof that the Venmo payment happened, signed by the Peer enclave.');

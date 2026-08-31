@@ -10,9 +10,11 @@
 //! - Claiming locks stake. OrchestratorV3's lifecycle hook requires free USDC
 //!   stake equal to the intent amount, so a taker needs capital beyond the
 //!   payment itself. See `docs/taker-matching-design.md`.
-//! - Fulfilment is not fully automatable. Releasing the escrowed USDC needs a
-//!   witness signature that only zk-p2p's PeerAuth extension can obtain. The
-//!   agent stops there and says exactly what to do; see [`proof`].
+//! - Fulfilment needs an attestation this crate does not produce. Releasing the
+//!   escrowed USDC needs an EIP-712 signature from zk-p2p's Nitro enclave over
+//!   a live Venmo session cookie, which stays on the operator's machine.
+//!   `scripts/deploy/06_prove_payment.sh` produces it; the agent stops there
+//!   and says exactly what to run. See [`proof`].
 
 pub mod abi;
 pub mod agent;

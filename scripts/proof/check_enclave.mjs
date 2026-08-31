@@ -4,6 +4,7 @@
 import { fetchAndVerifyAttestation, getUnifiedPaymentVerifierDomainSeparator } from '@zkp2p/zkp2p-attestation';
 
 const url = process.env.ATTESTATION_URL ?? 'https://attestation-service.zkp2p.xyz';
+const verifier = process.env.VERIFIER ?? '0xC6F4a193576C60892a47e111Bb5706c30162502B';
 const warnings = [];
 const att = await fetchAndVerifyAttestation({
   attestationServiceUrl: url,
@@ -20,8 +21,6 @@ if (warnings.length) console.log('warnings            :', warnings.join(', '));
 
 // The EIP-712 domain the enclave signs against is pinned to chain + verifier.
 for (const [chainId, label] of [[8453, 'Base mainnet'], [84532, 'Base Sepolia']]) {
-  const ds = getUnifiedPaymentVerifierDomainSeparator({
-    chainId, verifyingContract: '0xC6F4a193576C60892a47e111Bb5706c30162502B',
-  });
+  const ds = getUnifiedPaymentVerifierDomainSeparator({ chainId, verifyingContract: verifier });
   console.log(`domainSeparator ${String(chainId).padEnd(6)} (${label}) : ${ds}`);
 }

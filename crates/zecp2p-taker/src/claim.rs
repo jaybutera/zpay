@@ -157,7 +157,8 @@ impl<P: Provider> Claimer<P> {
 
     /// Submit the witness-attested proof and collect the escrowed USDC.
     ///
-    /// `payment_proof` has to come from PeerAuth; see `venmo::ProofRequest`.
+    /// `payment_proof` has to come from the enclave; see `proof::ProofRequest`
+    /// and `scripts/proof/prove_payment.mjs`.
     pub async fn fulfill_intent(
         &self,
         intent_hash: B256,
