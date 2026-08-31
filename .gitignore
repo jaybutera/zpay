@@ -29,13 +29,13 @@ contracts/broadcast/
 # ralph loop log
 .ralph.log
 
-# testnet deployment output (local to each deployer)
-scripts/testnet/deployed.sepolia.env
+# testnet deployment output (local to each deployer). The glob catches the next
+# deployed.<chain>.env before someone writes one.
+scripts/testnet/*.env
 
 # standalone proof harness
 scripts/proof/node_modules/
 scripts/proof/attestation.json
-scripts/testnet/live.intent.env
 scripts/testnet/live.intent.env.*
 
 # Stage B live-test keystore (real private keys; never commit)
@@ -43,3 +43,21 @@ scripts/stageb/keystore/
 scripts/stageb/*.key
 scripts/stageb/quote.json
 scripts/stageb/poll.log
+scripts/stageb/live.quote.env
+
+# Deploy state: addresses recorded per chain by scripts/deploy/*. No keys, but
+# it names one specific deployment, so it belongs to the operator, not the repo.
+scripts/deploy/state/
+
+# Configs generated from .env by scripts/deploy/03_write_config.sh. Regenerate
+# them rather than committing one deployment's addresses.
+config.generated.toml
+config.taker.generated.toml
+config.taker.toml
+
+# Attestations carry a signature over a real payment. Not a credential, but not
+# ours to publish either.
+scripts/proof/attestation*.json
+
+# Local coordinator database
+zecp2p*.db
