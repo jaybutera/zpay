@@ -6,7 +6,16 @@ import {IEscrow} from "./interfaces/IEscrow.sol";
 
 /// @title OfframpGlue
 /// @notice Bridges NEAR Intents (ZEC → USDC) with zk-p2p (USDC → Venmo)
-/// @dev Single deployment on Base, shared by all users via sessions
+/// @dev Single deployment on Base, shared by all users via sessions.
+///
+///      Every USDC amount this contract moves is drawn from a per-session
+///      balance, never from `usdc.balanceOf(address(this))`. The contract holds
+///      one pot but accounts for it in slices: `session.credited` is what a
+///      session owns and `totalCommitted` is the sum of every unspent slice.
+///      Only the difference between the token balance and `totalCommitted` is
+///      available to credit, so a session can never be funded out of another
+///      session's money, and every payout is bounded by what its own session
+///      was credited. Concurrent sessions are therefore safe.
 contract OfframpGlue {
     // ============ Structs ============
 
@@ -15,10 +24,12 @@ contract OfframpGlue {
         bytes32 payeeDetailsHash; // zk-p2p payee details hash (curator-issued hashedOnchainId)
         uint256 minConversionRate; // Minimum acceptable rate (18 decimals)
         uint256 expectedAmount; // Expected USDC from NEAR Intent (6 decimals)
+        uint256 credited;       // USDC this session owns and may spend (6 decimals)
         uint256 depositId;      // zk-p2p deposit ID (meaningful once processed; EscrowV2 ids start at 0)
         bool processed;         // Whether USDC was deposited to zk-p2p
         bool fulfilled;         // Whether session is complete
         bool rescued;           // Whether user rescued funds
+        bool withdrawn;         // Whether the zk-p2p deposit was withdrawn back to the user
     }
 
     // ============ State ============
@@ -30,6 +41,12 @@ contract OfframpGlue {
 
     mapping(bytes32 => Session) public sessions;
 
+    /// @notice Sum of every session's unspent `credited` balance.
+    /// @dev The contract's USDC balance above this figure is unassigned and is
+    ///      the only pool `creditSession` may draw on. Decremented whenever a
+    ///      session's credit leaves the contract or is committed to zk-p2p.
+    uint256 public totalCommitted;
+
     // ============ Events ============
 
     event SessionCreated(
@@ -39,6 +56,8 @@ contract OfframpGlue {
         uint256 expectedAmount
     );
 
+    event SessionCredited(bytes32 indexed sessionId, uint256 amount, uint256 totalCredited);
+
     event OfframpProcessed(
         bytes32 indexed sessionId,
         uint256 indexed depositId,
@@ -46,6 +65,12 @@ contract OfframpGlue {
     );
 
     event SessionRescued(
+        bytes32 indexed sessionId,
+        address indexed user,
+        uint256 amount
+    );
+
+    event SessionWithdrawn(
         bytes32 indexed sessionId,
         address indexed user,
         uint256 amount
@@ -60,13 +85,19 @@ contract OfframpGlue {
     error SessionNotFound();
     error SessionAlreadyProcessed();
     error SessionAlreadyRescued();
+    error SessionAlreadyWithdrawn();
     error InsufficientBalance();
+    error InsufficientUnassignedBalance();
     error NoDepositToWithdraw();
+    error NothingCredited();
     error ZeroAddress();
     error ZeroAmount();
     error TransferFailed();
     error PayeeDetailsMismatch();
     error DepositNotCreated();
+    error EmptyPaymentMethods();
+    error PaymentMethodLengthMismatch();
+    error CreditExceedsExpected();
 
     // ============ Modifiers ============
 
@@ -117,16 +148,49 @@ contract OfframpGlue {
             payeeDetailsHash: payeeDetailsHash,
             minConversionRate: minConversionRate,
             expectedAmount: expectedAmount,
+            credited: 0,
             depositId: 0,
             processed: false,
             fulfilled: false,
-            rescued: false
+            rescued: false,
+            withdrawn: false
         });
 
         emit SessionCreated(sessionId, user, payeeDetailsHash, expectedAmount);
     }
 
-    /// @notice Process received USDC by depositing to zk-p2p
+    /// @notice Assign arrived USDC to a session.
+    /// @dev This is the only way money becomes spendable by a session, and it can
+    ///      only draw on USDC that no other session already owns. `amount` is
+    ///      capped at the session's `expectedAmount` so a keeper mistake cannot
+    ///      hand one session more than the NEAR Intent quoted for it; the surplus
+    ///      stays unassigned and can be credited to whichever session it belongs to.
+    /// @param sessionId Session to credit
+    /// @param amount USDC units (6 decimals) to assign to the session
+    function creditSession(bytes32 sessionId, uint256 amount) public onlyKeeper {
+        Session storage session = sessions[sessionId];
+
+        if (session.user == address(0)) revert SessionNotFound();
+        if (session.processed) revert SessionAlreadyProcessed();
+        if (session.rescued) revert SessionAlreadyRescued();
+        if (amount == 0) revert ZeroAmount();
+
+        if (session.credited + amount > session.expectedAmount) revert CreditExceedsExpected();
+
+        // Only USDC that no session owns yet may be assigned.
+        if (usdc.balanceOf(address(this)) - totalCommitted < amount) {
+            revert InsufficientUnassignedBalance();
+        }
+
+        session.credited += amount;
+        totalCommitted += amount;
+
+        emit SessionCredited(sessionId, amount, session.credited);
+    }
+
+    /// @notice Process a session's credited USDC by depositing it to zk-p2p
+    /// @dev Deposits exactly `session.credited`, never the contract balance, so a
+    ///      session cannot deposit money belonging to another session.
     /// @param sessionId Session to process
     /// @param paymentMethods Payment methods for zk-p2p deposit (e.g., [keccak256("venmo")])
     /// @param paymentMethodData Payment verification data for each method
@@ -144,6 +208,13 @@ contract OfframpGlue {
         if (session.processed) revert SessionAlreadyProcessed();
         if (session.rescued) revert SessionAlreadyRescued();
 
+        // A zero-length paymentMethodData would make the payee loop below a no-op,
+        // so the deposit would carry no checked payee at all. Require at least one
+        // method, and require the three parallel arrays to line up.
+        if (paymentMethods.length == 0) revert EmptyPaymentMethods();
+        if (paymentMethods.length != paymentMethodData.length) revert PaymentMethodLengthMismatch();
+        if (paymentMethods.length != currencies.length) revert PaymentMethodLengthMismatch();
+
         // Every payment method on the deposit must pay out to the payee registered
         // for this session; otherwise the keeper could route the user's USDC to
         // someone else's Venmo account.
@@ -151,20 +222,26 @@ contract OfframpGlue {
             if (paymentMethodData[i].payeeDetails != session.payeeDetailsHash) revert PayeeDetailsMismatch();
         }
 
-        // Use actual balance (may differ from expectedAmount due to fees/slippage)
-        uint256 balance = usdc.balanceOf(address(this));
-        if (balance == 0) revert InsufficientBalance();
+        // Spend only what this session owns.
+        uint256 amount = session.credited;
+        if (amount == 0) revert NothingCredited();
 
-        // Approve zk-p2p escrow to spend USDC
-        usdc.approve(address(zkp2pEscrow), balance);
+        // Effects before the external calls: the credit is now spoken for by the
+        // zk-p2p deposit rather than held here, so it leaves the committed pool.
+        session.credited = 0;
+        session.processed = true;
+        totalCommitted -= amount;
+
+        // Approve zk-p2p escrow to spend exactly this session's amount
+        usdc.approve(address(zkp2pEscrow), amount);
 
         // Create deposit parameters
         IEscrow.CreateDepositParams memory params = IEscrow.CreateDepositParams({
             token: address(usdc),
-            amount: balance,
+            amount: amount,
             intentAmountRange: IEscrow.Range({
-                min: balance,  // Single intent for full amount
-                max: balance
+                min: amount,  // Single intent for full amount
+                max: amount
             }),
             paymentMethods: paymentMethods,
             paymentMethodData: paymentMethodData,
@@ -181,54 +258,76 @@ contract OfframpGlue {
         if (zkp2pEscrow.depositCounter() != depositId + 1) revert DepositNotCreated();
 
         session.depositId = depositId;
-        session.processed = true;
 
-        emit OfframpProcessed(sessionId, depositId, balance);
+        emit OfframpProcessed(sessionId, depositId, amount);
 
         return depositId;
     }
 
-    /// @notice Rescue USDC back to user if something fails before zk-p2p deposit
+    /// @notice Return a session's credited USDC to its user if something fails
+    ///         before the zk-p2p deposit.
+    /// @dev Callable by the session's user or by the keeper, but the money always
+    ///      goes to `session.user` and is always exactly `session.credited`. The
+    ///      user path is the escape hatch that does not depend on the keeper being
+    ///      alive; the keeper path exists so the coordinator can unwind a failed
+    ///      session without the user having to hold ETH for gas. Neither can take
+    ///      anything belonging to another session.
     /// @param sessionId Session to rescue
     function rescue(bytes32 sessionId) external {
         Session storage session = sessions[sessionId];
 
         if (session.user == address(0)) revert SessionNotFound();
-        if (msg.sender != session.user) revert Unauthorized();
+        if (msg.sender != session.user && msg.sender != keeper && msg.sender != owner) {
+            revert Unauthorized();
+        }
         if (session.processed) revert SessionAlreadyProcessed();
         if (session.rescued) revert SessionAlreadyRescued();
 
-        uint256 balance = usdc.balanceOf(address(this));
-        if (balance == 0) revert InsufficientBalance();
+        uint256 amount = session.credited;
+        if (amount == 0) revert InsufficientBalance();
 
+        session.credited = 0;
         session.rescued = true;
+        totalCommitted -= amount;
 
-        bool success = usdc.transfer(session.user, balance);
+        bool success = usdc.transfer(session.user, amount);
         if (!success) revert TransferFailed();
 
-        emit SessionRescued(sessionId, session.user, balance);
+        emit SessionRescued(sessionId, session.user, amount);
     }
 
     /// @notice Withdraw the remaining USDC from the zk-p2p deposit if no taker fulfilled it
     /// @dev EscrowV2.withdrawDeposit returns everything not locked by an open intent
     ///      and closes the deposit; only the depositor (this contract) may call it.
+    ///      Only the USDC that this withdrawal actually returned is forwarded, measured
+    ///      as the balance delta across the call, so an unrelated session's funds
+    ///      sitting on the contract are never swept out with it. Callable once, by the
+    ///      session's user or by the keeper, and always pays `session.user`.
     /// @param sessionId Session to withdraw
     function withdrawFromZkp2p(bytes32 sessionId) external {
         Session storage session = sessions[sessionId];
 
         if (session.user == address(0)) revert SessionNotFound();
-        if (msg.sender != session.user) revert Unauthorized();
+        if (msg.sender != session.user && msg.sender != keeper && msg.sender != owner) {
+            revert Unauthorized();
+        }
         if (!session.processed) revert NoDepositToWithdraw();
+        if (session.withdrawn) revert SessionAlreadyWithdrawn();
 
-        // Withdraw from zk-p2p
+        session.withdrawn = true;
+
+        // Measure what the escrow actually returned rather than reading the whole
+        // balance, which would include other sessions' credited USDC.
+        uint256 before = usdc.balanceOf(address(this));
         zkp2pEscrow.withdrawDeposit(session.depositId);
+        uint256 returned = usdc.balanceOf(address(this)) - before;
 
-        // Transfer to user
-        uint256 balance = usdc.balanceOf(address(this));
-        if (balance > 0) {
-            bool success = usdc.transfer(session.user, balance);
+        if (returned > 0) {
+            bool success = usdc.transfer(session.user, returned);
             if (!success) revert TransferFailed();
         }
+
+        emit SessionWithdrawn(sessionId, session.user, returned);
     }
 
     // ============ Admin ============
@@ -257,5 +356,11 @@ contract OfframpGlue {
     /// @return balance USDC balance
     function getContractUsdcBalance() external view returns (uint256) {
         return usdc.balanceOf(address(this));
+    }
+
+    /// @notice USDC held by this contract that no session owns yet.
+    /// @dev What `creditSession` may draw on. Arrivals show up here first.
+    function unassignedBalance() external view returns (uint256) {
+        return usdc.balanceOf(address(this)) - totalCommitted;
     }
 }
