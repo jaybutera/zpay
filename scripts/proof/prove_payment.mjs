@@ -235,6 +235,16 @@ try {
     chainId,
     intent,
     attestationServiceUrl,
+    // The same pin as the fetch above. This is the call that encrypts and
+    // transmits the cookie, so it is the one that matters most, and it used to
+    // pass no `trust` at all (NEW-5 in the 2026-08-31 re-audit). It still
+    // pinned hard, because the library consults its bundled table before the
+    // strictPin throw and the allowlist restricts the host to the three bundled
+    // ones. What it did not do is pin to the values named in this file, which
+    // is the independence the comment above claims. With a caret range in
+    // package.json, a 3.x release that rotated a PCR8 would have left the two
+    // calls pinning to different numbers without a word.
+    trust: { expectedPcr8Hex, strictPin: true },
     onWarning: (w) => warnings.push(w?.code ?? String(w)),
   });
 } catch (e) {
