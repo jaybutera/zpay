@@ -347,10 +347,13 @@ async fn test_create_offramp_validates_zec_address() {
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-    assert!(json["error"]
-        .as_str()
-        .unwrap()
-        .contains("Invalid ZEC refund address"));
+    // The API boundary now delegates to the one authoritative validator in
+    // near.rs, which phrases this as "not a Zcash transparent address".
+    let message = json["error"].as_str().unwrap();
+    assert!(
+        message.contains("refund address"),
+        "expected a refund-address rejection, got: {message}"
+    );
 }
 
 #[tokio::test]

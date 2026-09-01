@@ -25,6 +25,7 @@ contract OfframpGlue {
         uint256 minConversionRate; // Minimum acceptable rate (18 decimals)
         uint256 expectedAmount; // Expected USDC from NEAR Intent (6 decimals)
         uint256 credited;       // USDC this session owns and may spend (6 decimals)
+        uint256 deposited;      // USDC this session put into zk-p2p (6 decimals)
         uint256 depositId;      // zk-p2p deposit ID (meaningful once processed; EscrowV2 ids start at 0)
         bool processed;         // Whether USDC was deposited to zk-p2p
         bool fulfilled;         // Whether session is complete
@@ -40,6 +41,14 @@ contract OfframpGlue {
     IEscrow public immutable zkp2pEscrow;
 
     mapping(bytes32 => Session) public sessions;
+
+    /// @dev Reentrancy latch. USDC on Base is a standard non-callback token today,
+    ///      but it sits behind an upgradeable proxy and this contract does not.
+    ///      A token that called back into `creditSession` from inside the payout
+    ///      in `withdrawFromZkp2p` could assign another session the money on its
+    ///      way out the door, leaving `totalCommitted` above the real balance and
+    ///      bricking every later credit. One slot is cheaper than that risk.
+    uint256 private _entered;
 
     /// @notice Sum of every session's unspent `credited` balance.
     /// @dev The contract's USDC balance above this figure is unassigned and is
@@ -98,6 +107,7 @@ contract OfframpGlue {
     error EmptyPaymentMethods();
     error PaymentMethodLengthMismatch();
     error CreditExceedsExpected();
+    error Reentrancy();
 
     // ============ Modifiers ============
 
@@ -109,6 +119,13 @@ contract OfframpGlue {
     modifier onlyKeeper() {
         if (msg.sender != keeper && msg.sender != owner) revert Unauthorized();
         _;
+    }
+
+    modifier nonReentrant() {
+        if (_entered == 1) revert Reentrancy();
+        _entered = 1;
+        _;
+        _entered = 0;
     }
 
     // ============ Constructor ============
@@ -149,6 +166,7 @@ contract OfframpGlue {
             minConversionRate: minConversionRate,
             expectedAmount: expectedAmount,
             credited: 0,
+            deposited: 0,
             depositId: 0,
             processed: false,
             fulfilled: false,
@@ -167,7 +185,7 @@ contract OfframpGlue {
     ///      stays unassigned and can be credited to whichever session it belongs to.
     /// @param sessionId Session to credit
     /// @param amount USDC units (6 decimals) to assign to the session
-    function creditSession(bytes32 sessionId, uint256 amount) public onlyKeeper {
+    function creditSession(bytes32 sessionId, uint256 amount) public onlyKeeper nonReentrant {
         Session storage session = sessions[sessionId];
 
         if (session.user == address(0)) revert SessionNotFound();
@@ -201,7 +219,7 @@ contract OfframpGlue {
         bytes32[] calldata paymentMethods,
         IEscrow.DepositPaymentMethodData[] calldata paymentMethodData,
         IEscrow.Currency[][] calldata currencies
-    ) external onlyKeeper returns (uint256 depositId) {
+    ) external onlyKeeper nonReentrant returns (uint256 depositId) {
         Session storage session = sessions[sessionId];
 
         if (session.user == address(0)) revert SessionNotFound();
@@ -258,6 +276,7 @@ contract OfframpGlue {
         if (zkp2pEscrow.depositCounter() != depositId + 1) revert DepositNotCreated();
 
         session.depositId = depositId;
+        session.deposited = amount;
 
         emit OfframpProcessed(sessionId, depositId, amount);
 
@@ -273,7 +292,7 @@ contract OfframpGlue {
     ///      session without the user having to hold ETH for gas. Neither can take
     ///      anything belonging to another session.
     /// @param sessionId Session to rescue
-    function rescue(bytes32 sessionId) external {
+    function rescue(bytes32 sessionId) external nonReentrant {
         Session storage session = sessions[sessionId];
 
         if (session.user == address(0)) revert SessionNotFound();
@@ -304,7 +323,7 @@ contract OfframpGlue {
     ///      sitting on the contract are never swept out with it. Callable once, by the
     ///      session's user or by the keeper, and always pays `session.user`.
     /// @param sessionId Session to withdraw
-    function withdrawFromZkp2p(bytes32 sessionId) external {
+    function withdrawFromZkp2p(bytes32 sessionId) external nonReentrant {
         Session storage session = sessions[sessionId];
 
         if (session.user == address(0)) revert SessionNotFound();
@@ -321,6 +340,14 @@ contract OfframpGlue {
         uint256 before = usdc.balanceOf(address(this));
         zkp2pEscrow.withdrawDeposit(session.depositId);
         uint256 returned = usdc.balanceOf(address(this)) - before;
+
+        // The delta measures every USDC that arrived during the call, not only
+        // what the escrow sent back. A NEAR settlement for another session landing
+        // in the same transaction would otherwise be paid out here. This session
+        // can never be owed more than it put in, so that is the ceiling.
+        if (returned > session.deposited) {
+            returned = session.deposited;
+        }
 
         if (returned > 0) {
             bool success = usdc.transfer(session.user, returned);

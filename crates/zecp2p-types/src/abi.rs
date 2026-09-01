@@ -184,6 +184,7 @@ sol! {
             uint256 minConversionRate;
             uint256 expectedAmount;
             uint256 credited;
+            uint256 deposited;
             uint256 depositId;
             bool processed;
             bool fulfilled;

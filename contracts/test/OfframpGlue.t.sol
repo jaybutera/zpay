@@ -109,6 +109,17 @@ contract MockEscrow is IEscrow {
         require(success, "Transfer failed");
     }
 
+    /// @notice Test helper: extra USDC to send alongside a withdrawal.
+    ///
+    /// Stands in for anything that lands on the glue during the same call, such
+    /// as a NEAR settlement for a different session. The glue must not forward
+    /// it to whoever happened to be withdrawing.
+    uint256 public withdrawBonus;
+
+    function setWithdrawBonus(uint256 amount) external {
+        withdrawBonus = amount;
+    }
+
     /// @dev Mirrors EscrowV2.withdrawDeposit: depositor only, returns all remaining liquidity
     function withdrawDeposit(uint256 depositId) external {
         Deposit storage deposit = _deposits[depositId];
@@ -120,7 +131,7 @@ contract MockEscrow is IEscrow {
 
         emit DepositWithdrawn(depositId, msg.sender, returnAmount);
 
-        bool success = IERC20(deposit.token).transfer(msg.sender, returnAmount);
+        bool success = IERC20(deposit.token).transfer(msg.sender, returnAmount + withdrawBonus);
         require(success, "Transfer failed");
     }
 
@@ -905,5 +916,273 @@ contract OfframpGlueTest is Test {
         assertEq(usdc.balanceOf(userB), amountB);
         assertEq(usdc.balanceOf(address(glue)), 0);
         assertEq(glue.totalCommitted(), 0);
+    }
+
+    /// A withdraw must never forward more than the session put in, even if other
+    /// USDC lands on the contract during the same call.
+    ///
+    /// The payout is measured as a balance delta across `withdrawDeposit`, so
+    /// anything arriving inside that window would otherwise be counted as this
+    /// session's money. A NEAR settlement for another session, or a batched
+    /// transaction, is enough to trigger it.
+    function test_WithdrawIsCappedAtWhatTheSessionDeposited() public {
+        bytes32 sessionId = keccak256("session1");
+
+        vm.prank(keeper);
+        glue.createSession(sessionId, user, PAYEE_HASH, 1e18, 40e6);
+        _fund(sessionId, 40e6);
+
+        vm.prank(keeper);
+        glue.processOfframp(sessionId, _methods(), _methodData(PAYEE_HASH), _currencies());
+
+        // The escrow will hand back 40, and an unrelated 60 arrives too.
+        escrow.setWithdrawBonus(60e6);
+        usdc.mint(address(escrow), 60e6);
+
+        vm.prank(user);
+        glue.withdrawFromZkp2p(sessionId);
+
+        assertEq(usdc.balanceOf(user), 40e6, "the user got back only what they deposited");
+        assertEq(usdc.balanceOf(address(glue)), 60e6, "the surplus stayed on the contract");
+    }
+}
+
+/// A token that calls back into the glue on transfer.
+///
+/// USDC on Base does not do this today, but it is an upgradeable proxy and this
+/// contract is not upgradeable at all. Without a reentrancy guard, a callback
+/// landing inside `withdrawFromZkp2p`'s payout can credit another session out of
+/// money that is already on its way out, leaving `totalCommitted` above the real
+/// balance: every later `creditSession` and `unassignedBalance()` then reverts on
+/// underflow, and the credited session's rescue reverts forever.
+contract ReentrantUSDC is IERC20 {
+    string public constant name = "Callback USDC";
+    string public constant symbol = "cUSDC";
+    uint8 public constant decimals = 6;
+
+    mapping(address => uint256) private _balances;
+    mapping(address => mapping(address => uint256)) private _allowances;
+    uint256 private _totalSupply;
+
+    address public glue;
+    bytes32 public targetSession;
+    uint256 public creditAmount;
+    bool public armed;
+    bool public reentryAttempted;
+    bool public reentrySucceeded;
+
+    /// The reentrant call is made through this, so it arrives from the keeper.
+    ///
+    /// Calling `creditSession` as the token itself would be rejected by
+    /// `onlyKeeper` for a reason that has nothing to do with reentrancy, and the
+    /// test would pass whether or not a guard existed. The realistic case is a
+    /// hostile or upgraded token reentering while the keeper's own transaction
+    /// is on the stack, so the caller has to be the keeper.
+    address public reenterAs;
+
+    function arm(address _glue, bytes32 _session, uint256 _amount, address _reenterAs) external {
+        glue = _glue;
+        targetSession = _session;
+        creditAmount = _amount;
+        reenterAs = _reenterAs;
+        armed = true;
+    }
+
+    function mint(address to, uint256 amount) external {
+        _balances[to] += amount;
+        _totalSupply += amount;
+        emit Transfer(address(0), to, amount);
+    }
+
+    function totalSupply() external view returns (uint256) {
+        return _totalSupply;
+    }
+
+    function balanceOf(address account) external view returns (uint256) {
+        return _balances[account];
+    }
+
+    function transfer(address to, uint256 amount) external returns (bool) {
+        _balances[msg.sender] -= amount;
+        _balances[to] += amount;
+        emit Transfer(msg.sender, to, amount);
+        _maybeReenter();
+        return true;
+    }
+
+    function allowance(address owner_, address spender) external view returns (uint256) {
+        return _allowances[owner_][spender];
+    }
+
+    function approve(address spender, uint256 amount) external returns (bool) {
+        _allowances[msg.sender][spender] = amount;
+        emit Approval(msg.sender, spender, amount);
+        return true;
+    }
+
+    function transferFrom(address from, address to, uint256 amount) external returns (bool) {
+        _allowances[from][msg.sender] -= amount;
+        _balances[from] -= amount;
+        _balances[to] += amount;
+        emit Transfer(from, to, amount);
+        return true;
+    }
+
+    /// The hook: try to credit another session while the payout is in flight.
+    function _maybeReenter() internal {
+        if (!armed) return;
+        armed = false;
+        reentryAttempted = true;
+
+        // Enter as the keeper, so authorization is not what stops this.
+        Reenterer(reenterAs).creditFor(glue, targetSession, creditAmount);
+        reentrySucceeded = Reenterer(reenterAs).lastCallSucceeded();
+    }
+}
+
+/// Stands in for the keeper, so the reentrant call arrives authorized.
+contract Reenterer {
+    bool public lastCallSucceeded;
+
+    function creditFor(address glue, bytes32 sessionId, uint256 amount) external {
+        (bool ok,) =
+            glue.call(abi.encodeWithSignature("creditSession(bytes32,uint256)", sessionId, amount));
+        lastCallSucceeded = ok;
+    }
+
+    function creditSession(address glue, bytes32 sessionId, uint256 amount) external {
+        OfframpGlue(glue).creditSession(sessionId, amount);
+    }
+
+    function processOfframp(
+        address glue,
+        bytes32 sessionId,
+        bytes32[] calldata methods,
+        IEscrow.DepositPaymentMethodData[] calldata methodData,
+        IEscrow.Currency[][] calldata currencies
+    ) external {
+        OfframpGlue(glue).processOfframp(sessionId, methods, methodData, currencies);
+    }
+}
+
+contract OfframpGlueReentrancyTest is Test {
+    ReentrantUSDC public usdc;
+    MockEscrow public escrow;
+    OfframpGlue public glue;
+    Reenterer public keeperContract;
+
+    address public keeper;
+    address public userA = address(0xA1);
+    address public userB = address(0xB1);
+
+    bytes32 public constant VENMO_METHOD = keccak256("venmo");
+    bytes32 public constant PAYEE_HASH = keccak256("mock-zkp2p-payee:alice");
+
+    function setUp() public {
+        usdc = new ReentrantUSDC();
+        escrow = new MockEscrow(address(usdc));
+        glue = new OfframpGlue(address(usdc), address(escrow));
+
+        // The keeper is a contract here, so the token's callback can re-enter
+        // through it and arrive properly authorized.
+        keeperContract = new Reenterer();
+        keeper = address(keeperContract);
+        glue.setKeeper(keeper);
+    }
+
+    function _methods() internal pure returns (bytes32[] memory methods) {
+        methods = new bytes32[](1);
+        methods[0] = VENMO_METHOD;
+    }
+
+    function _methodData() internal pure returns (IEscrow.DepositPaymentMethodData[] memory data) {
+        data = new IEscrow.DepositPaymentMethodData[](1);
+        data[0] =
+            IEscrow.DepositPaymentMethodData({intentGatingService: address(0), payeeDetails: PAYEE_HASH, data: ""});
+    }
+
+    function _currencies() internal pure returns (IEscrow.Currency[][] memory currencies) {
+        currencies = new IEscrow.Currency[][](1);
+        currencies[0] = new IEscrow.Currency[](1);
+        currencies[0][0] = IEscrow.Currency({
+            code: keccak256("USD"),
+            minConversionRate: 1e18,
+            oracleRateConfig: IEscrow.OracleRateConfig({
+                adapter: address(0),
+                adapterConfig: "",
+                spreadBps: 0,
+                maxStaleness: 0
+            })
+        });
+    }
+
+    /// A callback token must not be able to credit a session out of money that is
+    /// already leaving the contract.
+    function test_ACallbackTokenCannotCreditDuringAPayout() public {
+        bytes32 sA = keccak256("sessionA");
+        bytes32 sB = keccak256("sessionB");
+
+        vm.startPrank(keeper);
+        glue.createSession(sA, userA, PAYEE_HASH, 1e18, 100e6);
+        glue.createSession(sB, userB, PAYEE_HASH, 1e18, 100e6);
+        vm.stopPrank();
+
+        usdc.mint(address(glue), 100e6);
+        keeperContract.creditSession(address(glue), sA, 100e6);
+
+        keeperContract.processOfframp(
+            address(glue), sA, _methods(), _methodData(), _currencies()
+        );
+
+        // The token will try to credit B, as the keeper, while A's withdrawal is
+        // being paid out.
+        usdc.arm(address(glue), sB, 100e6, address(keeperContract));
+
+        vm.prank(userA);
+        glue.withdrawFromZkp2p(sA);
+
+        assertTrue(usdc.reentryAttempted(), "the test's callback must actually fire");
+        assertFalse(usdc.reentrySucceeded(), "the reentrant creditSession must be rejected");
+
+        // The books still balance: A was paid, B was never credited, and the
+        // contract is not claiming to hold money it does not have.
+        assertEq(usdc.balanceOf(userA), 100e6);
+        assertEq(glue.getSession(sB).credited, 0);
+        assertEq(glue.totalCommitted(), 0);
+        assertLe(glue.totalCommitted(), usdc.balanceOf(address(glue)));
+
+        // And unassignedBalance still answers rather than reverting on underflow.
+        assertEq(glue.unassignedBalance(), usdc.balanceOf(address(glue)));
+    }
+
+    /// The rescue path, for the same callback.
+    ///
+    /// This one holds for a second reason on top of the guard: `rescue` zeroes
+    /// the credit and decrements `totalCommitted` before it transfers, so a
+    /// callback arriving mid-payout finds the money already accounted as leaving
+    /// and there is no unassigned balance to take. Effects-before-interactions is
+    /// doing the work here; the guard is the belt to that pair of braces. Both
+    /// are asserted, because the ordering is easy to lose in a later edit.
+    function test_ACallbackTokenCannotCreditDuringARescue() public {
+        bytes32 sA = keccak256("sessionA");
+        bytes32 sB = keccak256("sessionB");
+
+        vm.startPrank(keeper);
+        glue.createSession(sA, userA, PAYEE_HASH, 1e18, 50e6);
+        glue.createSession(sB, userB, PAYEE_HASH, 1e18, 50e6);
+        vm.stopPrank();
+
+        usdc.mint(address(glue), 50e6);
+        keeperContract.creditSession(address(glue), sA, 50e6);
+
+        usdc.arm(address(glue), sB, 50e6, address(keeperContract));
+
+        vm.prank(userA);
+        glue.rescue(sA);
+
+        assertTrue(usdc.reentryAttempted());
+        assertFalse(usdc.reentrySucceeded(), "the reentrant creditSession must be rejected");
+        assertEq(glue.totalCommitted(), 0);
+        assertLe(glue.totalCommitted(), usdc.balanceOf(address(glue)));
     }
 }

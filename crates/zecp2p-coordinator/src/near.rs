@@ -222,7 +222,20 @@ impl QuoteRequest {
 /// Unified (`u1`) and Sapling (`zs`) addresses are rejected by the API, so funds
 /// refunded from a swap always land in the transparent pool.
 pub fn validate_zec_refund_address(address: &str) -> Result<()> {
+    let address = address.trim();
+
     if address.starts_with("t1") || address.starts_with("t3") {
+        // Base58Check t-addresses are 34 or 35 characters. The api.rs copy of
+        // this check insisted on exactly 35, which rejected a valid 34.
+        if address.len() < 34 || address.len() > 35 {
+            anyhow::bail!(
+                "refund address {} is not a valid length for a t-address (expected 34 or 35 characters)",
+                address
+            );
+        }
+        if !address[1..].chars().all(|c| c.is_ascii_alphanumeric()) {
+            anyhow::bail!("refund address {} contains characters base58 does not use", address);
+        }
         return Ok(());
     }
 

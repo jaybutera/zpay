@@ -468,34 +468,53 @@ fn validate_venmo_username(username: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-/// Validate ZEC address format
+/// Validate a ZEC refund address.
+///
+/// Delegates to the one authoritative check rather than keeping a second
+/// opinion. There used to be two: this one accepted `zs`, and `near.rs`
+/// rejected it as shielded. The permissive one ran first, so a `zs` address
+/// passed the API layer and failed later, after the curator registration round
+/// trip had already been spent. This one also applied a 35-character rule to
+/// anything starting with `t`, though t-addresses are 34 or 35.
 fn validate_zec_address(address: &str) -> Result<(), AppError> {
-    let address = address.trim();
+    crate::near::validate_zec_refund_address(address)
+        .map_err(|e| AppError::InvalidState(e.to_string()))
+}
 
-    // Basic prefix check
-    if !address.starts_with("t1")
-        && !address.starts_with("t3")
-        && !address.starts_with("zs")
-    {
-        return Err(AppError::InvalidState(
-            "Invalid ZEC refund address (must start with t1, t3, or zs)".to_string(),
-        ));
+#[cfg(test)]
+mod zec_address_tests {
+    use super::*;
+
+    #[test]
+    fn transparent_addresses_are_accepted_at_both_valid_lengths() {
+        // 35 characters
+        assert!(validate_zec_address("t1KhV8ADhTGvVvBpTiEcJGnhTvBBFVFYHXx").is_ok());
+        // 34 characters, which the old api.rs rule rejected
+        assert!(validate_zec_address(&format!("t1{}", "a".repeat(32))).is_ok());
     }
 
-    // Length check - t-addresses are 35 chars, z-addresses are longer
-    if address.starts_with("t") && address.len() != 35 {
-        return Err(AppError::InvalidState(
-            "Invalid ZEC t-address length (expected 35 characters)".to_string(),
-        ));
+    /// The two validators used to disagree: this layer accepted `zs`, and the
+    /// near.rs one rejected it, so the failure landed after a curator round trip
+    /// had already been spent.
+    #[test]
+    fn shielded_addresses_are_rejected_here_not_later() {
+        for shielded in [
+            "zs1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+            "u1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+        ] {
+            assert!(
+                validate_zec_address(shielded).is_err(),
+                "{shielded} must be refused at the API boundary"
+            );
+        }
     }
 
-    if address.starts_with("zs") && address.len() < 78 {
-        return Err(AppError::InvalidState(
-            "Invalid ZEC z-address length (too short)".to_string(),
-        ));
+    #[test]
+    fn nonsense_is_rejected() {
+        assert!(validate_zec_address("").is_err());
+        assert!(validate_zec_address("bc1qxy2kgdygjrsqtzq2n0yrf249").is_err());
+        assert!(validate_zec_address("t1short").is_err());
     }
-
-    Ok(())
 }
 
 /// Parse min_rate (USD per USDC the zk-p2p taker must pay) from a decimal

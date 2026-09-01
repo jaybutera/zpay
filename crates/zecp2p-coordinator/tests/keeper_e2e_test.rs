@@ -488,7 +488,7 @@ async fn test_keeper_auto_processes_on_usdc_arrival() {
         venmo_username: "keepertest".to_string(),
         user_address: TEST_USER.parse().unwrap(),
         taker_address: Some(TEST_USER.parse().unwrap()),
-        zec_refund_address: "t1TestRefundAddressXXXXXXXXXXXX".to_string(),
+        zec_refund_address: "t1VJnUz9FDy7WfFxqXwMZJWVxzMrRD7MvBA".to_string(),
         min_rate: U256::from(1_000_000_000_000_000_000u128),
         timeout_seconds: 600,
     };
@@ -600,7 +600,7 @@ async fn test_full_event_driven_flow() {
         venmo_username: "eventtest".to_string(),
         user_address: TEST_USER.parse().unwrap(),
         taker_address: Some(TEST_USER.parse().unwrap()),
-        zec_refund_address: "t1TestRefundAddressXXXXXXXXXXXX".to_string(),
+        zec_refund_address: "t1VJnUz9FDy7WfFxqXwMZJWVxzMrRD7MvBA".to_string(),
         min_rate: U256::from(1_000_000_000_000_000_000u128),
         timeout_seconds: 600,
     };
@@ -750,7 +750,7 @@ async fn test_keeper_detects_intent_signaled() {
         venmo_username: "intenttest".to_string(),
         user_address: TEST_USER.parse().unwrap(),
         taker_address: Some(TEST_USER.parse().unwrap()),
-        zec_refund_address: "t1TestRefundAddressXXXXXXXXXXXX".to_string(),
+        zec_refund_address: "t1VJnUz9FDy7WfFxqXwMZJWVxzMrRD7MvBA".to_string(),
         min_rate: U256::from(1_000_000_000_000_000_000u128),
         timeout_seconds: 600,
     };
@@ -862,7 +862,7 @@ async fn test_keeper_detects_intent_fulfilled() {
         venmo_username: "fulfilltest".to_string(),
         user_address: TEST_USER.parse().unwrap(),
         taker_address: Some(TEST_USER.parse().unwrap()),
-        zec_refund_address: "t1TestRefundAddressXXXXXXXXXXXX".to_string(),
+        zec_refund_address: "t1VJnUz9FDy7WfFxqXwMZJWVxzMrRD7MvBA".to_string(),
         min_rate: U256::from(1_000_000_000_000_000_000u128),
         timeout_seconds: 600,
     };
@@ -1014,7 +1014,7 @@ async fn test_complete_keeper_driven_flow() {
         venmo_username: "completeflowtest".to_string(),
         user_address: TEST_USER.parse().unwrap(),
         taker_address: Some(TEST_USER.parse().unwrap()),
-        zec_refund_address: "t1TestRefundAddressXXXXXXXXXXXX".to_string(),
+        zec_refund_address: "t1VJnUz9FDy7WfFxqXwMZJWVxzMrRD7MvBA".to_string(),
         min_rate: U256::from(1_000_000_000_000_000_000u128), // 1.0 (18 decimals)
         timeout_seconds: 600,
     };
