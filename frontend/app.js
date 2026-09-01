@@ -6,9 +6,35 @@
 // ---------- config ----------
 // Same-origin by default so this works when the coordinator serves the files.
 // Override with ?api=http://host:port , persisted in localStorage.
+// A crafted ?api= link used to persist an attacker's coordinator into
+// localStorage permanently, and the coordinator is what supplies the ZEC
+// deposit address. Loopback still overrides silently, because that is the
+// development case; anything else has to be confirmed and is not persisted.
+function acceptApiOverride(raw) {
+  let url;
+  try { url = new URL(raw, location.origin); } catch (_) { return null; }
+
+  const host = (url.hostname || '').replace(/^\[|\]$/g, '');
+  const isLoopback = host === 'localhost' || host === '127.0.0.1' || host === '::1';
+  if (isLoopback) return { url: raw, persist: true };
+
+  const ok = confirm(
+    'This link points the page at a different coordinator:\n\n' + url.origin +
+    '\n\nThat server tells you which Zcash address to send funds to. Only ' +
+    'continue if you trust it. It will not be remembered.'
+  );
+  return ok ? { url: raw, persist: false } : null;
+}
+
 const API = (() => {
   const q = new URLSearchParams(location.search).get('api');
-  if (q) { try { localStorage.setItem('zecp2p.api', q); } catch (_) {} return q.replace(/\/+$/, ''); }
+  if (q) {
+    const accepted = acceptApiOverride(q);
+    if (accepted) {
+      if (accepted.persist) { try { localStorage.setItem('zecp2p.api', accepted.url); } catch (_) {} }
+      return accepted.url.replace(/\/+$/, '');
+    }
+  }
   let saved = null;
   try { saved = localStorage.getItem('zecp2p.api'); } catch (_) {}
   if (saved) return saved.replace(/\/+$/, '');
@@ -277,33 +303,22 @@ $('form-new').addEventListener('submit', async (ev) => {
     return;
   }
 
-  const body = {
-    zec_amount: zec,
-    venmo_username: venmo,
-    user_address: user,
-    taker_address: taker,
-    zec_refund_address: refund,
-  };
-  if (minR) body.min_rate = minR;
-  if (tmo)  body.timeout_seconds = Number(tmo);
-
-  const btn = $('btn-create');
-  busy(btn, true, 'creating…');
-  msg('new-msg', '');
-  try {
-    const r = await api('/offramp', { method: 'POST', body: JSON.stringify(body) });
-    $('session_id').value = r.session_id;
-    $('manage_id').value  = r.session_id;
-    showTab('tab-watch');
-    logLine(`session ${r.session_id} created`);
-    render(r);
-    startPolling(r.session_id);
-    msg('watch-msg', 'ok', `Session created. Send ${zec} ZEC to the deposit address below.`);
-  } catch (e) {
-    msg('new-msg', 'err', e.message);
-  } finally {
-    busy(btn, false);
-  }
+  // Opening a session names the Base address that rescue and withdraw will pay,
+  // so the coordinator requires a signature from that address. Without it,
+  // anyone could open a session naming someone else, which is how a
+  // caller-supplied user_address became a way to reach a victim's funds. This
+  // page holds no key and should not ask for one: a web page asking you to
+  // paste a private key is the shape of every wallet drainer. The CLI signs
+  // locally, so it does this part.
+  //
+  // Everything else here still works: quote, status, and watching a session.
+  msg('new-msg', 'err',
+    'Opening a session has to be signed by the wallet you want paid back, and ' +
+    'this page holds no key. Run:\n\n' +
+    `  zecp2p offramp ${zec} --venmo ${venmo} --zec-address ${refund}` +
+    (minR ? ` --min-rate ${minR}` : '') +
+    '\n\nwith ZECP2P_USER_PRIVATE_KEY set, then paste the session id here to ' +
+    'watch it.');
 });
 
 // ---------- status ladder ----------
@@ -467,9 +482,31 @@ $('btn-copy').addEventListener('click', async () => {
 
 // ---------- manage actions ----------
 
+// Rescue and withdraw move a session's USDC, so the coordinator requires a
+// signature from the address the session names, and the contract will only pay
+// that address. This page holds no key and never should: a browser page asking
+// for one is the shape of every wallet-drainer. The CLI signs locally, and with
+// --self-signed it sends the transaction itself, which is the path that still
+// works if this coordinator is gone.
+const SIGNED_ACTIONS = {
+  rescue: 'zecp2p rescue <session-id> --private-key <your key>',
+  withdraw: 'zecp2p withdraw <session-id> --private-key <your key>',
+  process: 'zecp2p status <session-id>',
+};
+
 async function manageAction(kind, btn, confirmText) {
   const id = $('manage_id').value.trim() || $('session_id').value.trim();
   if (!id) { msg('manage-msg', 'err', 'Enter a session id first.'); return; }
+
+  if (SIGNED_ACTIONS[kind]) {
+    msg('manage-msg', 'err',
+      `${kind} has to be signed by the wallet that owns this session, and this page ` +
+      `holds no key. Run:\n\n  ${SIGNED_ACTIONS[kind].replace('<session-id>', id)}\n\n` +
+      (kind === 'process' ? '' :
+       `Add --self-signed --glue <address> to send it straight to Base without the coordinator.`));
+    return;
+  }
+
   if (confirmText && !confirm(confirmText)) return;
 
   busy(btn, true, kind + '…');
