@@ -6,9 +6,11 @@ use serde::Deserialize;
 use zecp2p_types::abi::{usd_currency_code, venmo_payment_method};
 
 use crate::{
+    abi::IEscrowTaker,
     claim::{Claimer, SignaledIntent},
     config::TakerConfig,
     discovery::{ClaimableDeposit, Discovery},
+    payee,
     proof::{ProofRequest, ProofStatus},
     venmo::{usdc_to_dollars, PaymentOutcome, PaymentRequest, SendMode, VenmoBrowser},
 };
@@ -39,6 +41,9 @@ pub struct TakerAgent<P> {
     browser: VenmoBrowser,
     mode: SendMode,
     http: reqwest::Client,
+    /// Read side, for checking a deposit's payee against what the coordinator
+    /// says before any money moves.
+    provider: P,
     /// Username to pay, when the operator supplied one directly.
     recipient_override: Option<String>,
 }
@@ -69,7 +74,7 @@ impl<P: alloy::providers::Provider + Clone> TakerAgent<P> {
             config.contracts.zkp2p_escrow,
         );
         let claimer = Claimer::new(
-            provider,
+            provider.clone(),
             config.contracts.zkp2p_orchestrator,
             config.contracts.zkp2p_escrow,
             config.contracts.stake_vault,
@@ -84,6 +89,7 @@ impl<P: alloy::providers::Provider + Clone> TakerAgent<P> {
             browser,
             mode,
             http: reqwest::Client::new(),
+            provider,
             recipient_override,
         }
     }
@@ -267,20 +273,79 @@ impl<P: alloy::providers::Provider + Clone> TakerAgent<P> {
         }
     }
 
-    /// The Venmo username for a deposit.
+    /// The Venmo username for a deposit, checked against what the deposit will
+    /// actually pay.
     ///
-    /// On-chain there is only the curator's opaque `payeeDetails` hash, which
-    /// by design does not reveal the username, so this is the one thing a taker
-    /// cannot read off Base. The coordinator that opened the session publishes
-    /// it at `/deposits/open`.
+    /// On-chain there is only the curator's opaque `payeeDetails` hash, which by
+    /// design does not reveal the username, so the name itself has to come from
+    /// the coordinator. What does not have to be taken on trust is whether that
+    /// name is the right one: the curator will hash a username on request, and
+    /// the deposit carries the hash it will settle against. If they differ, the
+    /// coordinator named someone else.
     ///
-    /// An operator can also pin a username with `recipient_override` for a
-    /// single deposit they were told about out of band.
+    /// Without this check a hostile or compromised coordinator, or anyone on the
+    /// wire in front of a plain-http one, redirects the taker's real dollars to
+    /// their own handle. The proof then fails, because the enclave binds
+    /// `payeeDetails` from the deposit, so the taker eats the loss and can only
+    /// cancel to recover stake.
+    ///
+    /// An operator can pin a username with `recipient_override` for a deposit
+    /// they were told about out of band. That is checked too: the operator can
+    /// be wrong about which deposit it belongs to.
     async fn recipient_for(&self, deposit: &ClaimableDeposit) -> Result<String> {
-        if let Some(recipient) = &self.recipient_override {
-            return Ok(recipient.clone());
+        let claimed = match &self.recipient_override {
+            Some(recipient) => recipient.clone(),
+            None => self.ask_coordinator(deposit).await?,
+        };
+
+        // Shape first: this string ends up in a URL.
+        let claimed = payee::validate_username_shape(&claimed)?.to_string();
+
+        // What the deposit will actually pay.
+        let on_chain = self.deposit_payee(deposit.deposit_id).await?;
+
+        // What the coordinator's answer hashes to, according to the curator that
+        // issued the hash in the first place.
+        let resolved = payee::curator_hash_for(
+            &self.http,
+            &self.config.zkp2p.api_url,
+            &claimed,
+        )
+        .await
+        .context("could not check the coordinator's username against the zk-p2p curator")?;
+
+        payee::require_match(&claimed, resolved, on_chain)?;
+
+        tracing::info!(
+            deposit_id = %deposit.deposit_id,
+            recipient = %claimed,
+            payee = ?on_chain,
+            "payee verified against the deposit"
+        );
+
+        Ok(claimed)
+    }
+
+    /// Read the deposit's own `payeeDetails` from the escrow.
+    async fn deposit_payee(&self, deposit_id: U256) -> Result<alloy::primitives::B256> {
+        let escrow = IEscrowTaker::new(self.config.contracts.zkp2p_escrow, &self.provider);
+        let data = escrow
+            .getDepositPaymentMethodData(deposit_id, venmo_payment_method())
+            .call()
+            .await
+            .with_context(|| format!("could not read the payee for deposit {deposit_id}"))?;
+
+        if data.payeeDetails == alloy::primitives::B256::ZERO {
+            anyhow::bail!(
+                "deposit {deposit_id} carries no Venmo payee on chain; refusing to pay against it"
+            );
         }
 
+        Ok(data.payeeDetails)
+    }
+
+    /// Ask the coordinator which username is behind a deposit.
+    async fn ask_coordinator(&self, deposit: &ClaimableDeposit) -> Result<String> {
         let base = self
             .config
             .taker
@@ -295,14 +360,25 @@ impl<P: alloy::providers::Provider + Clone> TakerAgent<P> {
                 )
             })?;
 
+        // The username is the one thing here worth intercepting, and a plain-http
+        // coordinator hands it to anyone on the path to rewrite. Loopback is
+        // exempt: nothing is on the wire.
+        require_secure_url(base).context("taker.coordinator_url")?;
+
         let url = format!("{}/deposits/open", base.trim_end_matches('/'));
-        let open: Vec<OpenDeposit> = self
-            .http
-            .get(&url)
+        let mut request = self.http.get(&url);
+        if let Some(token) = &self.config.taker.coordinator_token {
+            request = request.bearer_auth(token);
+        }
+
+        let open: Vec<OpenDeposit> = request
             .send()
             .await
             .with_context(|| format!("could not reach the coordinator at {url}"))?
-            .error_for_status()?
+            .error_for_status()
+            .context(
+                "the coordinator refused the deposit listing; it needs taker.coordinator_token",
+            )?
             .json()
             .await
             .context("coordinator returned an unreadable deposit list")?;
@@ -318,5 +394,73 @@ impl<P: alloy::providers::Provider + Clone> TakerAgent<P> {
                     deposit.deposit_id
                 )
             })
+    }
+}
+
+/// Require https, unless the host is loopback.
+///
+/// The default in `config.taker.example.toml` was plain `http`, so the Venmo
+/// username a taker is about to pay travelled in clear text and could be
+/// rewritten in flight by anyone on the path.
+pub fn require_secure_url(url: &str) -> Result<()> {
+    let parsed = reqwest::Url::parse(url).with_context(|| format!("{url} is not a valid URL"))?;
+
+    match parsed.scheme() {
+        "https" => Ok(()),
+        "http" => {
+            // host_str keeps the brackets on an IPv6 literal.
+            let host = parsed
+                .host_str()
+                .unwrap_or("")
+                .trim_start_matches('[')
+                .trim_end_matches(']');
+            let is_loopback = host == "localhost"
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .map(|ip| ip.is_loopback())
+                    .unwrap_or(false);
+            if is_loopback {
+                Ok(())
+            } else {
+                anyhow::bail!(
+                    "{url} is plain http. The Venmo username you are about to pay travels over \
+                     this connection, and anyone on the path can rewrite it. Use https."
+                )
+            }
+        }
+        other => anyhow::bail!("{url} uses {other}, which is not supported; use https"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::require_secure_url;
+
+    #[test]
+    fn https_is_accepted() {
+        assert!(require_secure_url("https://coordinator.example").is_ok());
+        assert!(require_secure_url("https://coordinator.example:8443/").is_ok());
+    }
+
+    /// HIGH-2: the shipped example config used plain http, so the username the
+    /// taker is about to pay was rewritable in flight.
+    #[test]
+    fn plain_http_to_a_remote_host_is_refused() {
+        let err = require_secure_url("http://coordinator.example")
+            .expect_err("plain http must be refused");
+        assert!(err.to_string().contains("https"));
+    }
+
+    #[test]
+    fn loopback_http_is_still_fine() {
+        assert!(require_secure_url("http://127.0.0.1:3000").is_ok());
+        assert!(require_secure_url("http://localhost:3000").is_ok());
+        assert!(require_secure_url("http://[::1]:3000").is_ok());
+    }
+
+    #[test]
+    fn other_schemes_are_refused() {
+        assert!(require_secure_url("file:///etc/passwd").is_err());
+        assert!(require_secure_url("not a url").is_err());
     }
 }

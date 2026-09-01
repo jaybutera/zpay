@@ -21,6 +21,7 @@ pub mod agent;
 pub mod claim;
 pub mod config;
 pub mod discovery;
+pub mod payee;
 pub mod proof;
 pub mod venmo;
 

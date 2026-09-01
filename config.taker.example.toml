@@ -18,7 +18,15 @@ glue_contract = "0x0000000000000000000000000000000000000000"      # the OfframpG
 [taker]
 # Where to look up the Venmo username behind a deposit. Omit it and pass
 # --recipient instead.
-coordinator_url = "http://127.0.0.1:3000"
+#
+# Must be https for anything but loopback: the username you are about to pay
+# travels over this connection, and anyone on the path could rewrite it. The
+# agent checks the answer against the deposit's own on-chain payeeDetails before
+# paying either way, so a wrong name is refused rather than paid.
+coordinator_url = "https://coordinator.example"
+# The deposit listing serves Venmo usernames, so it is authenticated. Ask the
+# coordinator operator for a token; COORDINATOR_TAKER_TOKEN overrides this.
+# coordinator_token = "..."
 # 6-decimal USDC units. 100000000 = 100 USDC.
 max_intent_amount = "100000000"
 min_intent_amount = "1000000"
@@ -30,3 +38,9 @@ lookback_blocks = 5000
 cdp_url = "http://127.0.0.1:9222"
 note = "thanks"
 timeout_seconds = 120
+
+[zkp2p]
+# The curator that issues payeeDetails hashes. The agent asks it what the
+# coordinator's username hashes to, and refuses to pay unless that matches the
+# hash the deposit itself carries.
+api_url = "https://api.zkp2p.xyz"

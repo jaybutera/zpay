@@ -351,9 +351,32 @@ pub struct CdpTab {
 }
 
 /// Convert a USDC amount (6 decimals) into the string Venmo's field wants.
+///
+/// Venmo takes whole cents. USDC has four more decimal places than that, and
+/// the intent amount comes from swap output rather than a round number, so an
+/// amount that is not a whole cent is the normal case rather than the exception.
+///
+/// This used to truncate: 5,009,999 units rendered `$5.00`, four hundredths of a
+/// cent short of the intent. The verifier compares the attested payment against
+/// the intent amount, so that payment could never be proven; the taker's real
+/// dollars were gone and the escrow stayed shut. Rounding up instead means the
+/// payment is never short. The taker overpays by less than a cent, which is
+/// theirs to lose and provable, rather than losing the whole amount.
 pub fn usdc_to_dollars(amount: alloy::primitives::U256) -> String {
     let units: u128 = amount.to::<u128>();
-    format!("{}.{:02}", units / 1_000_000, (units % 1_000_000) / 10_000)
+
+    // Ceiling division to whole cents: 10_000 USDC units make one cent.
+    let cents = units.div_ceil(10_000);
+
+    format!("{}.{:02}", cents / 100, cents % 100)
+}
+
+/// Whether an amount is exactly a whole number of cents.
+///
+/// A caller that would rather refuse a payment than overpay can check this
+/// first; [`usdc_to_dollars`] rounds up when it is false.
+pub fn is_whole_cents(amount: alloy::primitives::U256) -> bool {
+    amount.to::<u128>() % 10_000 == 0
 }
 
 #[cfg(test)]
@@ -367,6 +390,53 @@ mod tests {
         assert_eq!(usdc_to_dollars(U256::from(1_500_000u64)), "1.50");
         assert_eq!(usdc_to_dollars(U256::from(999_990_000u64)), "999.99");
         assert_eq!(usdc_to_dollars(U256::from(50_000u64)), "0.05");
+    }
+
+    /// MEDIUM-1 in the 2026-08-31 audit. Truncation made a payment a fraction of
+    /// a cent short of the intent, which the verifier will not match, so the
+    /// taker's dollars left and the escrow never opened. These are the exact
+    /// amounts the audit ran.
+    #[test]
+    fn a_payment_is_never_short_of_the_intent() {
+        // Was "5.00", four hundredths of a cent short.
+        assert_eq!(usdc_to_dollars(U256::from(5_009_999u64)), "5.01");
+        // Was "25.99".
+        assert_eq!(usdc_to_dollars(U256::from(25_999_999u64)), "26.00");
+        // One unit above a whole cent still rounds up.
+        assert_eq!(usdc_to_dollars(U256::from(1_000_001u64)), "1.01");
+        // The smallest nonzero amount still asks for a cent, not nothing.
+        assert_eq!(usdc_to_dollars(U256::from(1u64)), "0.01");
+    }
+
+    /// The rounding never goes the other way: what Venmo is asked for is always
+    /// at least the intent, and never more than a cent above it.
+    #[test]
+    fn rounding_stays_within_one_cent_above() {
+        for units in [1u64, 9_999, 10_000, 5_009_999, 25_999_999, 999_990_001] {
+            let rendered = usdc_to_dollars(U256::from(units));
+            let (dollars, cents) = rendered.split_once('.').expect("two parts");
+            let paid_cents: u128 =
+                dollars.parse::<u128>().unwrap() * 100 + cents.parse::<u128>().unwrap();
+            let paid_units = paid_cents * 10_000;
+            let wanted = u128::from(units);
+
+            assert!(
+                paid_units >= wanted,
+                "{units} units rendered {rendered}, which is short"
+            );
+            assert!(
+                paid_units - wanted < 10_000,
+                "{units} units rendered {rendered}, more than a cent over"
+            );
+        }
+    }
+
+    #[test]
+    fn whole_cents_are_recognised() {
+        assert!(is_whole_cents(U256::from(5_000_000u64)));
+        assert!(is_whole_cents(U256::from(10_000u64)));
+        assert!(!is_whole_cents(U256::from(5_009_999u64)));
+        assert!(!is_whole_cents(U256::from(1u64)));
     }
 
     #[test]

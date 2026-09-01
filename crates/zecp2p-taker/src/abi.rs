@@ -95,7 +95,21 @@ sol! {
             bool retainOnEmpty;
         }
 
+        struct DepositPaymentMethodData {
+            address intentGatingService;
+            bytes32 payeeDetails;
+            bytes data;
+        }
+
         function getDeposit(uint256 depositId) external view returns (Deposit memory);
         function depositCounter() external view returns (uint256);
+
+        /// The payee the deposit will actually pay, as the curator's opaque
+        /// hash. A taker checks the coordinator's answer against this before
+        /// spending real dollars.
+        function getDepositPaymentMethodData(uint256 depositId, bytes32 paymentMethod)
+            external
+            view
+            returns (DepositPaymentMethodData memory);
     }
 }

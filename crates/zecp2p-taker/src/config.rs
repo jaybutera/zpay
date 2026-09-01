@@ -19,6 +19,11 @@ pub struct TakerConfig {
     /// Peer TEE attestation service used to prove the Venmo payment.
     #[serde(default)]
     pub attestation: zecp2p_types::config::AttestationConfig,
+    /// zk-p2p curator. The taker asks it what a username hashes to, so it can
+    /// check the coordinator's answer against the deposit's own payeeDetails
+    /// before paying anyone.
+    #[serde(default)]
+    pub zkp2p: zecp2p_types::config::Zkp2pConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,6 +59,12 @@ pub struct TakerSettings {
     /// already claimable by anyone on-chain.
     #[serde(default)]
     pub coordinator_url: Option<String>,
+    /// Bearer token for the coordinator's deposit listing.
+    ///
+    /// That endpoint serves Venmo usernames, so it is authenticated; a taker
+    /// without a token gets 401 and cannot look a deposit up.
+    #[serde(default)]
+    pub coordinator_token: Option<String>,
     /// Largest intent this agent will take, in USDC units (6 decimals).
     pub max_intent_amount: U256,
     /// Smallest intent worth the gas and the Venmo round trip.
@@ -137,6 +148,15 @@ impl TakerConfig {
         }
         if let Ok(url) = std::env::var("ATTESTATION_URL") {
             config.attestation.service_url = url;
+        }
+        if let Ok(url) = std::env::var("ZKP2P_API_URL") {
+            config.zkp2p.api_url = url;
+        }
+        if let Ok(token) = std::env::var("COORDINATOR_TAKER_TOKEN") {
+            let token = token.trim().to_string();
+            if !token.is_empty() {
+                config.taker.coordinator_token = Some(token);
+            }
         }
         if let Ok(addr) = std::env::var("ATTESTATION_VERIFIER_ADDRESS") {
             config.attestation.verifier = addr.parse().map_err(|_| {
