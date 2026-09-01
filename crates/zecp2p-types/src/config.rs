@@ -252,7 +252,63 @@ impl Default for Config {
     }
 }
 
+/// Require https for a service URL, unless it points at this machine.
+///
+/// `BASE_RPC_URL`, `NEAR_API_URL`, `ZKP2P_API_URL` and `ATTESTATION_URL` are all
+/// env-overridable, and `dotenvy::dotenv()` runs unconditionally, so a stray
+/// `.env` in the working directory used to be enough to point any of them at
+/// `http://attacker.example/`. The 1Click endpoint decides which Zcash address a
+/// user is told to send funds to, and the curator endpoint decides the payee hash
+/// that goes on chain, so neither is something to fetch over plaintext.
+///
+/// Loopback stays allowed, because the local mocks and the fork rehearsal use it.
+pub fn validate_service_url(name: &'static str, url: &str) -> Result<(), ConfigError> {
+    let trimmed = url.trim();
+
+    let (scheme, rest) = trimmed
+        .split_once("://")
+        .ok_or_else(|| ConfigError::InsecureUrl(name, trimmed.to_string()))?;
+
+    let host = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .rsplit('@')
+        .next()
+        .unwrap_or("");
+    // Strip the port, and the brackets around an IPv6 literal.
+    let host = if let Some(stripped) = host.strip_prefix('[') {
+        stripped.split(']').next().unwrap_or("")
+    } else {
+        host.split(':').next().unwrap_or("")
+    };
+
+    let is_loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false);
+
+    match scheme {
+        "https" => Ok(()),
+        "http" if is_loopback => Ok(()),
+        _ => Err(ConfigError::InsecureUrl(name, trimmed.to_string())),
+    }
+}
+
 impl Config {
+    /// Check every service URL this config will actually fetch from.
+    pub fn validate_urls(&self) -> Result<(), ConfigError> {
+        validate_service_url("network.base_rpc_url", &self.network.base_rpc_url)?;
+        if let Some(url) = &self.network.base_sepolia_rpc_url {
+            validate_service_url("network.base_sepolia_rpc_url", url)?;
+        }
+        validate_service_url("near.api_url", &self.near.api_url)?;
+        validate_service_url("zkp2p.api_url", &self.zkp2p.api_url)?;
+        validate_service_url("attestation.service_url", &self.attestation.service_url)?;
+        Ok(())
+    }
+
     /// Load configuration from a TOML file
     pub fn load(path: &str) -> Result<Self, ConfigError> {
         let contents = std::fs::read_to_string(path)
@@ -314,6 +370,8 @@ impl Config {
             }
         }
 
+        config.validate_urls()?;
+
         Ok(config)
     }
 }
@@ -329,11 +387,45 @@ pub enum ConfigError {
     InvalidAddress(String),
     #[error("{0} is not a number: {1}")]
     InvalidNumber(&'static str, String),
+    #[error(
+        "{0} must be https (or http on loopback), got '{1}'. This endpoint decides \
+         where a user's funds go; it is not something to fetch over plaintext."
+    )]
+    InsecureUrl(&'static str, String),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// MEDIUM-3: every service URL was env-overridable with no scheme check, and
+    /// `dotenvy::dotenv()` runs unconditionally, so a stray `.env` could point
+    /// 1Click (which supplies the ZEC deposit address) at an attacker.
+    #[test]
+    fn plaintext_service_urls_are_refused() {
+        for bad in [
+            "http://attacker.example/",
+            "http://1click.chaindefuser.com",
+            "ftp://example.com",
+            "not a url",
+            "",
+        ] {
+            assert!(
+                validate_service_url("near.api_url", bad).is_err(),
+                "{bad} should be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn https_and_loopback_are_accepted() {
+        assert!(validate_service_url("near.api_url", "https://1click.chaindefuser.com").is_ok());
+        assert!(validate_service_url("near.api_url", "https://example.com:8443/path").is_ok());
+        // The local mocks and the fork rehearsal need these.
+        assert!(validate_service_url("network.base_rpc_url", "http://127.0.0.1:8545").is_ok());
+        assert!(validate_service_url("network.base_rpc_url", "http://localhost:8545").is_ok());
+        assert!(validate_service_url("network.base_rpc_url", "http://[::1]:8545").is_ok());
+    }
 
     /// The `[keeper]` and `[attestation]` sections are optional, so a config
     /// file written before they existed still loads.
