@@ -108,6 +108,7 @@ contract OfframpGlue {
     error PaymentMethodLengthMismatch();
     error CreditExceedsExpected();
     error Reentrancy();
+    error InvalidIntentRange();
 
     // ============ Modifiers ============
 
@@ -220,6 +221,50 @@ contract OfframpGlue {
         IEscrow.DepositPaymentMethodData[] calldata paymentMethodData,
         IEscrow.Currency[][] calldata currencies
     ) external onlyKeeper nonReentrant returns (uint256 depositId) {
+        // Backwards-compatible default: one intent for the full amount. Passing
+        // (0, 0) selects it inside _processOfframp, which is the exact behaviour
+        // this function had before the range became settable.
+        return _processOfframp(sessionId, paymentMethods, paymentMethodData, currencies, 0, 0);
+    }
+
+    /// @notice Same as `processOfframp`, but sets the deposit's intent amount range.
+    /// @dev The range decides how much of the deposit a single taker may claim.
+    ///      zk-p2p's quoting API only lists a deposit when a fee-inclusive intent
+    ///      amount lands inside `[min, max]`, and a range whose bounds are equal
+    ///      is unreachable in practice: the service fee moves the intent amount by
+    ///      more than one unit per unit of order size, so it steps over a single
+    ///      admissible value. A range therefore makes the deposit discoverable.
+    ///
+    ///      `intentMin` is the floor on any one fill, so it is also the protection
+    ///      against a taker nibbling a trivial slice of the deposit and leaving a
+    ///      dust remainder that nobody will take. Choose it close to the amount.
+    ///
+    ///      Accounting is untouched: the deposit is still funded from, and only
+    ///      from, `session.credited`, and `intentMax` is capped at that amount so
+    ///      the range can never authorise more than the session owns.
+    /// @param intentMin Minimum USDC a single intent may claim (0 selects `amount`)
+    /// @param intentMax Maximum USDC a single intent may claim (0 selects `amount`)
+    function processOfframpWithRange(
+        bytes32 sessionId,
+        bytes32[] calldata paymentMethods,
+        IEscrow.DepositPaymentMethodData[] calldata paymentMethodData,
+        IEscrow.Currency[][] calldata currencies,
+        uint256 intentMin,
+        uint256 intentMax
+    ) external onlyKeeper nonReentrant returns (uint256 depositId) {
+        return _processOfframp(sessionId, paymentMethods, paymentMethodData, currencies, intentMin, intentMax);
+    }
+
+    /// @dev Shared body. `nonReentrant` is applied by both external entry points
+    ///      and deliberately not here, so the latch is taken exactly once.
+    function _processOfframp(
+        bytes32 sessionId,
+        bytes32[] calldata paymentMethods,
+        IEscrow.DepositPaymentMethodData[] calldata paymentMethodData,
+        IEscrow.Currency[][] calldata currencies,
+        uint256 intentMin,
+        uint256 intentMax
+    ) private returns (uint256 depositId) {
         Session storage session = sessions[sessionId];
 
         if (session.user == address(0)) revert SessionNotFound();
@@ -250,6 +295,17 @@ contract OfframpGlue {
         session.processed = true;
         totalCommitted -= amount;
 
+        // Resolve and validate the intent range against the money that actually
+        // backs it. Zero means "no preference", which is the original behaviour:
+        // exactly one intent for the whole deposit.
+        if (intentMin == 0) intentMin = amount;
+        if (intentMax == 0) intentMax = amount;
+        // min > 0 is guaranteed above (amount != 0 was already required).
+        // max may not exceed what this session credited, or the deposit would
+        // advertise a claim larger than the money behind it. min <= max keeps
+        // the range non-empty; EscrowV2 enforces both again on its side.
+        if (intentMin > intentMax || intentMax > amount) revert InvalidIntentRange();
+
         // Approve zk-p2p escrow to spend exactly this session's amount
         usdc.approve(address(zkp2pEscrow), amount);
 
@@ -258,8 +314,8 @@ contract OfframpGlue {
             token: address(usdc),
             amount: amount,
             intentAmountRange: IEscrow.Range({
-                min: amount,  // Single intent for full amount
-                max: amount
+                min: intentMin,
+                max: intentMax
             }),
             paymentMethods: paymentMethods,
             paymentMethodData: paymentMethodData,
@@ -335,6 +391,17 @@ contract OfframpGlue {
 
         session.withdrawn = true;
 
+        // What the escrow still holds for this deposit is what this session is
+        // owed. Read it before the call: once the range may be narrower than the
+        // deposit, a taker can fill part of it, and then the session is owed the
+        // remainder rather than everything it put in. Capping at `deposited`
+        // alone would let a same-transaction arrival top the payout back up to
+        // the original amount out of another session's money.
+        uint256 owed = zkp2pEscrow.getDeposit(session.depositId).remainingDeposits;
+        if (owed > session.deposited) {
+            owed = session.deposited;
+        }
+
         // Measure what the escrow actually returned rather than reading the whole
         // balance, which would include other sessions' credited USDC.
         uint256 before = usdc.balanceOf(address(this));
@@ -344,9 +411,10 @@ contract OfframpGlue {
         // The delta measures every USDC that arrived during the call, not only
         // what the escrow sent back. A NEAR settlement for another session landing
         // in the same transaction would otherwise be paid out here. This session
-        // can never be owed more than it put in, so that is the ceiling.
-        if (returned > session.deposited) {
-            returned = session.deposited;
+        // can never be owed more than the escrow was still holding for it, nor
+        // more than it put in, so that is the ceiling.
+        if (returned > owed) {
+            returned = owed;
         }
 
         if (returned > 0) {
