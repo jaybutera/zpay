@@ -13,6 +13,16 @@
 //! check is: ask the curator for the hash of the username the coordinator gave,
 //! and require it to equal the hash the deposit carries. A wrong username
 //! produces a different hash, and the payment is refused before any money moves.
+//!
+//! `/v2/makers/create` is a write endpoint being used as a lookup, which the
+//! re-audit called out. It is the only one that returns `hashedOnchainId`:
+//! `/v2/makers/validate` answers a bare boolean, `GET /v2/makers/<id>` is 404
+//! unauthenticated, and the query form wants an Authorization header. The call
+//! is idempotent for a username already registered, which is what a real
+//! deposit's payee always is, and the coordinator's own client uses the same
+//! endpoint the same way. A username the curator has never seen would create a
+//! record, so `curator_hash_for` asks `/v2/makers/validate` first and refuses an
+//! unknown handle before writing anything.
 
 use alloy::primitives::B256;
 use anyhow::{bail, Context, Result};
@@ -21,18 +31,23 @@ use serde::{Deserialize, Serialize};
 /// zk-p2p's processor name for Venmo.
 const VENMO_PROCESSOR: &str = "venmo";
 
+/// The body both curator endpoints take.
+///
+/// Flat `offchainId`, not a nested `depositData`. This is the shape
+/// `@zkp2p/sdk` 0.12.1 sends, the shape `zecp2p_coordinator::zkp2p` sends, and
+/// the shape a recorded production call to `/v2/makers/create` used
+/// (`docs/status/zecp2p-e2e-status.md`, maker id 6577).
+///
+/// NEW-2 in the 2026-08-31 re-audit: this was `{processorName, depositData:
+/// {venmoUsername}}`. The live curator answers `"Maker data is invalid"` to
+/// that, so the cross-check bailed and the taker refused every real deposit.
+/// Fail-closed, so it cost availability rather than money, but it also meant
+/// the HIGH-2 fix had never run against the live API.
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct PayeeRequest<'a> {
-    #[serde(rename = "processorName")]
     processor_name: &'a str,
-    #[serde(rename = "depositData")]
-    deposit_data: DepositData<'a>,
-}
-
-#[derive(Debug, Serialize)]
-struct DepositData<'a> {
-    #[serde(rename = "venmoUsername")]
-    venmo_username: &'a str,
+    offchain_id: &'a str,
 }
 
 #[derive(Debug, Deserialize)]
@@ -97,6 +112,42 @@ pub fn parse_payee_hash(value: &str) -> Result<B256> {
     Ok(hash)
 }
 
+/// Ask the curator whether it recognises this username as a Venmo payee.
+///
+/// `POST /v2/makers/validate` answers `responseObject: true|false` and writes
+/// nothing. A real deposit's payee is always already registered, so a `false`
+/// here means the coordinator named a handle this deposit cannot be settled
+/// against, and the taker stops before the write endpoint is touched.
+pub async fn curator_knows(
+    http: &reqwest::Client,
+    curator_url: &str,
+    username: &str,
+) -> Result<bool> {
+    let username = validate_username_shape(username)?;
+    let url = format!("{}/v2/makers/validate", curator_url.trim_end_matches('/'));
+
+    let response = http
+        .post(&url)
+        .json(&PayeeRequest {
+            processor_name: VENMO_PROCESSOR,
+            offchain_id: username,
+        })
+        .send()
+        .await
+        .with_context(|| format!("could not reach the zk-p2p curator at {url}"))?;
+
+    let status = response.status();
+    let text = response.text().await.context("reading curator response")?;
+    if !status.is_success() {
+        bail!("curator returned HTTP {status}: {text}");
+    }
+
+    let parsed: ApiResponse<bool> = serde_json::from_str(&text)
+        .with_context(|| format!("could not parse the curator's response: {text}"))?;
+
+    Ok(parsed.success && parsed.response_object.unwrap_or(false))
+}
+
 /// Ask the curator what `payeeDetails` a username hashes to.
 pub async fn curator_hash_for(
     http: &reqwest::Client,
@@ -104,15 +155,24 @@ pub async fn curator_hash_for(
     username: &str,
 ) -> Result<B256> {
     let username = validate_username_shape(username)?;
+
+    // Read before write. See the module docs: the hash only comes back from a
+    // registering endpoint, so confirm the curator already knows this handle
+    // rather than creating a record for whatever the coordinator named.
+    if !curator_knows(http, curator_url, username).await? {
+        bail!(
+            "the zk-p2p curator does not recognise @{username} as a Venmo payee, so no real \
+             deposit can settle against it. Not paying, and not registering it either."
+        );
+    }
+
     let url = format!("{}/v2/makers/create", curator_url.trim_end_matches('/'));
 
     let response = http
         .post(&url)
         .json(&PayeeRequest {
             processor_name: VENMO_PROCESSOR,
-            deposit_data: DepositData {
-                venmo_username: username,
-            },
+            offchain_id: username,
         })
         .send()
         .await
