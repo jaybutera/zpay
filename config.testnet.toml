@@ -35,6 +35,14 @@ default_timeout = 600
 # hashedOnchainId is the payeeDetails used for the zk-p2p deposit.
 api_url = "https://api.zkp2p.xyz"
 
+[keeper]
+# One offramp at a time. The glue holds every session's USDC in one pot and an
+# ERC-20 transfer names no session, so a delivery is attributed off-chain from
+# what 1Click reports settled. Refusing a second concurrent session means a
+# mistake in that attribution has no second user's money to reach. Set true only
+# as a deliberate choice to rely on the settled-amount rule alone.
+allow_concurrent_sessions = false
+
 [server]
 # Coordinator server host
 host = "127.0.0.1"

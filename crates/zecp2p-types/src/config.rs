@@ -111,6 +111,16 @@ pub struct KeeperConfig {
     /// Blocks to scan back when no cursor is stored yet
     #[serde(default = "default_event_lookback")]
     pub event_lookback_blocks: u64,
+    /// Allow more than one offramp session to be in flight at once.
+    ///
+    /// Off by default. The glue holds every session's USDC in one pot and an
+    /// ERC-20 transfer names no session, so which session a delivery belongs to
+    /// is decided off-chain from what 1Click reports settled. Running one
+    /// session at a time means a mistake in that attribution has no second
+    /// user's money to reach. Turning this on is a deliberate choice to rely on
+    /// the settled-amount rule alone.
+    #[serde(default)]
+    pub allow_concurrent_sessions: bool,
 }
 
 fn default_poll_interval() -> u64 {
@@ -133,6 +143,7 @@ impl Default for KeeperConfig {
             session_timeout_seconds: default_session_timeout(),
             near_intent_timeout_seconds: default_near_timeout(),
             event_lookback_blocks: default_event_lookback(),
+            allow_concurrent_sessions: false,
         }
     }
 }

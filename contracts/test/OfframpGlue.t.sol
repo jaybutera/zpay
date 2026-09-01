@@ -945,6 +945,251 @@ contract OfframpGlueTest is Test {
         assertEq(usdc.balanceOf(user), 40e6, "the user got back only what they deposited");
         assertEq(usdc.balanceOf(address(glue)), 60e6, "the surplus stayed on the contract");
     }
+
+    // ================================================================
+    // NEW-1 in the 2026-08-31 re-audit: the keeper decided how much a
+    // session was owed from the shared unassigned pool rather than from
+    // what 1Click reported that session's own swap settled for.
+    //
+    // The contract cannot catch this by itself. An ERC-20 transfer carries
+    // no session id, so `creditSession` can only bound a credit by the
+    // session's own `expectedAmount` and by the unassigned balance; it has
+    // to take the keeper's word for whose money arrived. These tests run
+    // both keeper rules against the real compiled contract and show the
+    // difference in where the money ends up.
+    //
+    // The scenario is the audit's, with no attacker: Alice quoted 100.00
+    // with a floor of 99.50, Bob quoted 10.00 with a floor of 9.95. Alice's
+    // swap under-fills to 99.50, which 0.5% quote slippage makes ordinary.
+    // Bob's fills in full.
+    // ================================================================
+
+    uint256 internal constant ALICE_EXPECTED = 100e6;
+    uint256 internal constant ALICE_FLOOR = 99_500_000;
+    uint256 internal constant ALICE_SETTLED = 99_500_000;
+    uint256 internal constant BOB_EXPECTED = 10e6;
+    uint256 internal constant BOB_FLOOR = 9_950_000;
+    uint256 internal constant BOB_SETTLED = 10e6;
+
+    /// The rule the keeper used before the fix: credit whatever is unassigned,
+    /// capped at the quote. Mirrors `state.rs` at commit 5b1b6a6.
+    function _creditOldRule(uint256 unassigned, uint256 expected, uint256 floor)
+        internal
+        pure
+        returns (bool credits, uint256 amount)
+    {
+        if (unassigned < floor) return (false, 0);
+        return (true, unassigned < expected ? unassigned : expected);
+    }
+
+    /// The rule the keeper uses now: credit what 1Click reported this session's
+    /// own deposit address settled for, clamped to the quote, with the
+    /// unassigned balance kept only as a sanity bound.
+    function _creditNewRule(uint256 settled, uint256 unassigned, uint256 expected, uint256 floor)
+        internal
+        pure
+        returns (bool credits, uint256 amount)
+    {
+        if (settled < floor) return (false, 0);
+        uint256 credit = settled < expected ? settled : expected;
+        if (unassigned < credit) return (false, 0);
+        return (true, credit);
+    }
+
+    function _openAliceAndBob() internal returns (bytes32 alice, bytes32 bob) {
+        alice = keccak256("alice");
+        bob = keccak256("bob");
+
+        vm.startPrank(keeper);
+        glue.createSession(alice, address(0xA11CE), keccak256("payee:alice"), 1e18, ALICE_EXPECTED);
+        glue.createSession(bob, address(0xB0B), keccak256("payee:bob"), 1e18, BOB_EXPECTED);
+        vm.stopPrank();
+
+        // Both swaps settle and both deliveries land on the one contract.
+        usdc.mint(address(glue), ALICE_SETTLED);
+        usdc.mint(address(glue), BOB_SETTLED);
+    }
+
+    /// NEW-1, reproduced. Under the old rule Alice is credited her full quote out
+    /// of a pool that is 0.50 short of it, Bob is left below his floor and never
+    /// promotes, and his money is stranded: he was never credited, so `rescue`
+    /// reverts and there is no path back to him.
+    function test_NEW1_ShortSettlementStealsFromTheConcurrentSession() public {
+        (bytes32 alice, bytes32 bob) = _openAliceAndBob();
+
+        uint256 pool = glue.unassignedBalance();
+        assertEq(pool, ALICE_SETTLED + BOB_SETTLED, "109.50 sits unassigned");
+
+        // The keeper's tick reaches Alice first. db.rs orders nothing, so which
+        // session that is comes down to SQLite's row order.
+        (bool creditsAlice, uint256 aliceCredit) = _creditOldRule(pool, ALICE_EXPECTED, ALICE_FLOOR);
+        assertTrue(creditsAlice);
+        assertEq(aliceCredit, ALICE_EXPECTED, "the old rule credits the quote, not the fill");
+        assertGt(aliceCredit, ALICE_SETTLED, "0.50 of it was never Alice's");
+
+        vm.prank(keeper);
+        glue.creditSession(alice, aliceCredit);
+
+        // Bob's turn. What is left is below his floor, so he never promotes, on
+        // this tick or any later one.
+        (bool creditsBob,) = _creditOldRule(glue.unassignedBalance(), BOB_EXPECTED, BOB_FLOOR);
+        assertFalse(creditsBob, "Bob is stuck below his floor");
+        assertEq(glue.unassignedBalance(), BOB_SETTLED - 500_000, "9.50 left, floor is 9.95");
+
+        // Bob's escape hatch does not help: it pays `session.credited`, and he
+        // was never credited.
+        vm.prank(address(0xB0B));
+        vm.expectRevert(OfframpGlue.InsufficientBalance.selector);
+        glue.rescue(bob);
+
+        // Alice walks off with the difference.
+        vm.prank(address(0xA11CE));
+        glue.rescue(alice);
+        assertEq(usdc.balanceOf(address(0xA11CE)), ALICE_EXPECTED, "Alice took 100.00");
+        assertEq(usdc.balanceOf(address(0xB0B)), 0, "Bob got nothing");
+        assertEq(usdc.balanceOf(address(glue)), 9_500_000, "Bob's 9.50 is stranded on the glue");
+    }
+
+    /// The same delivery under the fixed rule. Each session is credited its own
+    /// realized fill, and both users get their money back.
+    function test_NEW1_CreditingTheSettledAmountKeepsEachSessionWhole() public {
+        (bytes32 alice, bytes32 bob) = _openAliceAndBob();
+
+        (bool creditsAlice, uint256 aliceCredit) =
+            _creditNewRule(ALICE_SETTLED, glue.unassignedBalance(), ALICE_EXPECTED, ALICE_FLOOR);
+        assertTrue(creditsAlice, "an under-fill above the floor still promotes");
+        assertEq(aliceCredit, ALICE_SETTLED, "Alice is credited what her swap settled for");
+
+        vm.prank(keeper);
+        glue.creditSession(alice, aliceCredit);
+
+        (bool creditsBob, uint256 bobCredit) =
+            _creditNewRule(BOB_SETTLED, glue.unassignedBalance(), BOB_EXPECTED, BOB_FLOOR);
+        assertTrue(creditsBob, "Bob's own money is still there for him");
+        assertEq(bobCredit, BOB_SETTLED);
+
+        vm.prank(keeper);
+        glue.creditSession(bob, bobCredit);
+
+        assertEq(glue.unassignedBalance(), 0, "every unit is assigned to whoever it arrived for");
+        assertEq(glue.totalCommitted(), ALICE_SETTLED + BOB_SETTLED);
+
+        vm.prank(address(0xA11CE));
+        glue.rescue(alice);
+        vm.prank(address(0xB0B));
+        glue.rescue(bob);
+
+        assertEq(usdc.balanceOf(address(0xA11CE)), ALICE_SETTLED, "Alice got her own fill");
+        assertEq(usdc.balanceOf(address(0xB0B)), BOB_SETTLED, "Bob got his, in full");
+        assertEq(usdc.balanceOf(address(glue)), 0, "nothing stranded");
+        assertEq(glue.totalCommitted(), 0);
+    }
+
+    /// The ordering the audit called out. Whichever session the tick reaches
+    /// first, the fixed rule credits the same amounts, because the amounts come
+    /// from 1Click rather than from the pool.
+    function test_NEW1_TheFixIsIndifferentToTickOrder() public {
+        (bytes32 alice, bytes32 bob) = _openAliceAndBob();
+
+        // Bob first this time.
+        (, uint256 bobCredit) =
+            _creditNewRule(BOB_SETTLED, glue.unassignedBalance(), BOB_EXPECTED, BOB_FLOOR);
+        vm.prank(keeper);
+        glue.creditSession(bob, bobCredit);
+
+        (, uint256 aliceCredit) =
+            _creditNewRule(ALICE_SETTLED, glue.unassignedBalance(), ALICE_EXPECTED, ALICE_FLOOR);
+        vm.prank(keeper);
+        glue.creditSession(alice, aliceCredit);
+
+        assertEq(bobCredit, BOB_SETTLED);
+        assertEq(aliceCredit, ALICE_SETTLED);
+        assertEq(glue.getSession(bob).credited, BOB_SETTLED);
+        assertEq(glue.getSession(alice).credited, ALICE_SETTLED);
+        assertEq(glue.unassignedBalance(), 0);
+    }
+
+    /// An over-fill is clamped rather than credited, and the surplus stays
+    /// unassigned. The contract enforces this independently, so the assertion is
+    /// that the keeper never sends a transaction that can only revert.
+    function test_NEW1_AnOverFillIsClampedToTheQuote() public {
+        bytes32 alice = keccak256("alice");
+
+        vm.prank(keeper);
+        glue.createSession(alice, address(0xA11CE), keccak256("payee:alice"), 1e18, ALICE_EXPECTED);
+
+        uint256 overFill = 101e6;
+        usdc.mint(address(glue), overFill);
+
+        (bool credits, uint256 amount) =
+            _creditNewRule(overFill, glue.unassignedBalance(), ALICE_EXPECTED, ALICE_FLOOR);
+        assertTrue(credits);
+        assertEq(amount, ALICE_EXPECTED, "clamped to the quote");
+
+        vm.prank(keeper);
+        glue.creditSession(alice, amount);
+        assertEq(glue.unassignedBalance(), 1e6, "the surplus stays unassigned");
+
+        // And the contract would have refused the unclamped figure anyway.
+        vm.prank(keeper);
+        vm.expectRevert(OfframpGlue.CreditExceedsExpected.selector);
+        glue.creditSession(alice, 1e6);
+    }
+
+    /// A settlement below the guaranteed floor is not credited at all under
+    /// either rule, so a genuinely short delivery cannot promote a session.
+    function test_NEW1_ASettlementBelowTheFloorIsNotCredited() public {
+        uint256 shortFill = 99_000_000; // below Alice's 99.50 floor
+
+        (bool credits,) = _creditNewRule(shortFill, shortFill, ALICE_EXPECTED, ALICE_FLOOR);
+        assertFalse(credits, "under the floor, nothing is credited");
+    }
+
+    /// Fuzzed: across arbitrary fills for two concurrent sessions, no session is
+    /// ever credited more than its own swap settled for, and the sum of the
+    /// credits never exceeds what actually arrived.
+    function testFuzz_NEW1_NoSessionIsCreditedBeyondItsOwnFill(uint64 fillA, uint64 fillB) public {
+        // Keep both inside their quotes and at or above their floors, which is
+        // the band the fix has to be right across.
+        uint256 settledA = ALICE_FLOOR + (uint256(fillA) % (ALICE_EXPECTED - ALICE_FLOOR + 1));
+        uint256 settledB = BOB_FLOOR + (uint256(fillB) % (BOB_EXPECTED - BOB_FLOOR + 1));
+
+        bytes32 alice = keccak256("alice");
+        bytes32 bob = keccak256("bob");
+
+        vm.startPrank(keeper);
+        glue.createSession(alice, address(0xA11CE), keccak256("payee:alice"), 1e18, ALICE_EXPECTED);
+        glue.createSession(bob, address(0xB0B), keccak256("payee:bob"), 1e18, BOB_EXPECTED);
+        vm.stopPrank();
+
+        usdc.mint(address(glue), settledA);
+        usdc.mint(address(glue), settledB);
+
+        (bool okA, uint256 creditA) =
+            _creditNewRule(settledA, glue.unassignedBalance(), ALICE_EXPECTED, ALICE_FLOOR);
+        assertTrue(okA);
+        vm.prank(keeper);
+        glue.creditSession(alice, creditA);
+
+        (bool okB, uint256 creditB) =
+            _creditNewRule(settledB, glue.unassignedBalance(), BOB_EXPECTED, BOB_FLOOR);
+        assertTrue(okB, "the second session is never starved by the first");
+        vm.prank(keeper);
+        glue.creditSession(bob, creditB);
+
+        assertLe(creditA, settledA, "Alice never gets more than her own fill");
+        assertLe(creditB, settledB, "Bob never gets more than his own fill");
+        assertEq(creditA + creditB, settledA + settledB, "and together they get all of it");
+        assertEq(glue.unassignedBalance(), 0);
+
+        // Both recoveries work, which is the property the old rule broke for Bob.
+        vm.prank(address(0xA11CE));
+        glue.rescue(alice);
+        vm.prank(address(0xB0B));
+        glue.rescue(bob);
+        assertEq(usdc.balanceOf(address(0xA11CE)), settledA);
+        assertEq(usdc.balanceOf(address(0xB0B)), settledB);
+    }
 }
 
 /// A token that calls back into the glue on transfer.

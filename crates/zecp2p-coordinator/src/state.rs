@@ -31,6 +31,75 @@ const LAST_PROCESSED_BLOCK_KEY: &str = "last_processed_block";
 // code: 15s poll, 3600s session budget, 302400s for a session still waiting on
 // the NEAR leg, 1000 blocks of lookback.
 
+/// Parse the settled output amount 1Click reports for a swap.
+///
+/// `swapDetails.amountOut` is a decimal string in the destination asset's own
+/// units, so USDC's six decimals here. Returns `Ok(None)` when the field is
+/// absent or empty, which is what a status carrying no settlement looks like.
+/// A present-but-unparseable value is an error rather than a `None`: silently
+/// treating garbage as "not settled yet" would leave a session stuck forever
+/// with no record of why.
+fn settled_output(amount_out: Option<&str>) -> Result<Option<U256>> {
+    let Some(raw) = amount_out.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let parsed = U256::from_str_radix(raw, 10)
+        .map_err(|e| anyhow::anyhow!("1Click reported an unparseable amountOut {raw:?}: {e}"))?;
+    if parsed.is_zero() {
+        return Ok(None);
+    }
+    Ok(Some(parsed))
+}
+
+/// What the keeper should do with a session whose swap 1Click reports settled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CreditDecision {
+    /// Credit this many USDC units to the session.
+    Credit(U256),
+    /// Not yet; the reason is for the log.
+    Wait(&'static str),
+    /// 1Click settled below the floor it guaranteed for this swap.
+    Short { settled: U256, floor: U256 },
+}
+
+/// Decide how much of the glue's USDC belongs to one session.
+///
+/// The rule is: credit what 1Click reported *this session's own deposit address*
+/// settled for, clamped to the quote. The unassigned balance is a sanity bound
+/// only, saying the money has landed, not whose it is.
+///
+/// NEW-1 in the 2026-08-31 re-audit was the previous rule, `min(unassigned,
+/// expected)`. That credited a session out of the shared pool, so with 50 bps of
+/// quote slippage making an under-fill ordinary, the first session the tick
+/// reached was topped up to its full quote out of a concurrent session's USDC.
+/// The victim was then left below its own floor, never promoted, and, never
+/// having been credited, had no working `rescue` either.
+pub fn credit_decision(
+    settled: Option<U256>,
+    unassigned: U256,
+    expected: U256,
+    floor: U256,
+) -> CreditDecision {
+    let Some(settled) = settled else {
+        return CreditDecision::Wait("1Click reports SUCCESS but no settled amountOut yet");
+    };
+
+    if settled < floor {
+        return CreditDecision::Short { settled, floor };
+    }
+
+    // Never take more than the session was quoted. The contract enforces this
+    // too (`CreditExceedsExpected`), but clamping here keeps the keeper from
+    // sending a transaction that can only revert. The surplus stays unassigned.
+    let credit = settled.min(expected);
+
+    if unassigned < credit {
+        return CreditDecision::Wait("the settled USDC has not landed on the glue yet");
+    }
+
+    CreditDecision::Credit(credit)
+}
+
 /// Shared application state
 pub struct AppState {
     pub config: Config,
@@ -65,6 +134,18 @@ impl AppState {
         self: &Arc<Self>,
         request: OfframpRequest,
     ) -> Result<OfframpSession, AppError> {
+        // Defence in depth for NEW-1. The glue holds one pot for every session and
+        // an ERC-20 transfer names no session, so attribution rests entirely on
+        // what 1Click reports settled. Crediting the settled amount is the real
+        // fix; refusing a second concurrent session means a bug in that path has
+        // no second user's money to reach, because there is none on the contract.
+        // This is code rather than operator discipline because the keeper's own
+        // tick is what would do the damage.
+        //
+        // First, before the curator and 1Click round trips, so a refused request
+        // costs nothing and registers nothing.
+        self.refuse_if_a_session_is_in_flight().await?;
+
         // Register the Venmo username with the zk-p2p curator. The hash it
         // returns is the only payeeDetails value the payment verifier accepts;
         // do this before touching the chain so a bad username costs no gas.
@@ -98,6 +179,7 @@ impl AppState {
         }
         crate::near::validate_zec_refund_address(&request.zec_refund_address)
             .map_err(|e| AppError::InvalidRequest(e.to_string()))?;
+
 
         // Get quote from NEAR Intents
         let glue_address = self
@@ -160,6 +242,39 @@ impl AppState {
         }
 
         Ok(session)
+    }
+
+    /// Refuse a new session while another one still has funds in flight.
+    ///
+    /// "In flight" means any session that is not terminal: it may still be owed
+    /// USDC on the glue, or already own a slice of it. Sessions that have
+    /// fulfilled, failed, been rescued or been withdrawn are done and do not
+    /// block anything.
+    ///
+    /// Operators who have satisfied themselves that the settled-amount
+    /// attribution is enough can turn this off with
+    /// `keeper.allow_concurrent_sessions = true`; the default is off.
+    pub async fn refuse_if_a_session_is_in_flight(&self) -> Result<(), AppError> {
+        if self.config.keeper.allow_concurrent_sessions {
+            return Ok(());
+        }
+
+        let active = self
+            .db
+            .get_active_sessions()
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+
+        if let Some(existing) = active.first() {
+            return Err(AppError::InvalidState(format!(
+                "session {} is still in flight ({}); this coordinator runs one offramp at a \
+                 time so a short settlement can never be covered out of another user's USDC. \
+                 Wait for it to finish, or rescue it, before opening another.",
+                existing.id, existing.status
+            )));
+        }
+
+        Ok(())
     }
 
     /// Get session by ID
@@ -412,10 +527,9 @@ impl AppState {
         };
 
         if status.status.is_success() {
-            // The glue is shared, so its balance is not this session's money. What
-            // matters is whether enough USDC has arrived that nobody has claimed
-            // yet to cover what this session is owed. Promoting on any nonzero
-            // balance is how one session used to end up spending another's.
+            // The glue is shared, so nothing about its balance says whose money
+            // is there. The only per-session figure is what 1Click settled for
+            // this session's own deposit address, and that is what gets credited.
             let expected = session
                 .expected_usdc
                 .ok_or_else(|| anyhow::anyhow!("session has no expected USDC amount"))?;
@@ -423,21 +537,30 @@ impl AppState {
             // 1Click quotes an expected output and guarantees only min_amount_out;
             // accept anything at or above that floor and credit what actually arrived.
             let floor = session.min_output_usdc.unwrap_or(expected);
+
+            // What this session's own swap settled for. 1Click reports it per
+            // deposit address, so it is the only figure that says whose money
+            // arrived; the glue's balance cannot, because an ERC-20 transfer
+            // carries no session id.
+            let settled = settled_output(status.output_amount.as_deref())?;
             let unassigned = self.chain.glue_unassigned_balance().await?;
 
-            if unassigned < floor {
-                tracing::debug!(
-                    "Session {} waiting on USDC: {} unassigned on the glue, needs {}",
-                    session.id,
-                    unassigned,
-                    floor
-                );
-                return Ok(());
-            }
-
-            // Never take more than the session was quoted; the surplus belongs to
-            // whichever other session it arrived for.
-            let credit = unassigned.min(expected);
+            let credit = match credit_decision(settled, unassigned, expected, floor) {
+                CreditDecision::Credit(amount) => amount,
+                CreditDecision::Wait(why) => {
+                    tracing::debug!("Session {} not credited yet: {}", session.id, why);
+                    return Ok(());
+                }
+                CreditDecision::Short { settled, floor } => {
+                    tracing::warn!(
+                        "Session {} settled {} USDC, below its guaranteed floor of {}; not crediting",
+                        session.id,
+                        settled,
+                        floor
+                    );
+                    return Ok(());
+                }
+            };
 
             // Claim it on-chain before recording it, so the session's slice of the
             // pot is fixed by the contract rather than by this loop's bookkeeping.
@@ -456,7 +579,8 @@ impl AppState {
             sessions.insert(updated.id, updated);
 
             tracing::info!(
-                "Session {} credited {} USDC (expected {}, floor {})",
+                "Session {} credited {} USDC, which is what 1Click settled \
+                 (expected {}, floor {})",
                 session.id,
                 credit,
                 expected,
@@ -656,5 +780,175 @@ impl AppState {
         }
 
         Ok(session)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The band the fix has to be right across: 1Click quotes `amountOut` and
+    /// guarantees only `minAmountOut`, 50 bps below it, so the fill lands
+    /// anywhere in between.
+    const ALICE_EXPECTED: u64 = 100_000_000; // 100.00 USDC
+    const ALICE_FLOOR: u64 = 99_500_000; // 99.50
+    const BOB_EXPECTED: u64 = 10_000_000; // 10.00
+    const BOB_FLOOR: u64 = 9_950_000; // 9.95
+
+    fn u(n: u64) -> U256 {
+        U256::from(n)
+    }
+
+    #[test]
+    fn an_empty_or_absent_amount_out_is_not_a_settlement() {
+        assert_eq!(settled_output(None).unwrap(), None);
+        assert_eq!(settled_output(Some("")).unwrap(), None);
+        assert_eq!(settled_output(Some("   ")).unwrap(), None);
+        assert_eq!(settled_output(Some("0")).unwrap(), None);
+    }
+
+    #[test]
+    fn a_settled_amount_parses_as_usdc_units() {
+        assert_eq!(settled_output(Some("443561")).unwrap(), Some(u(443_561)));
+        assert_eq!(settled_output(Some(" 99500000 ")).unwrap(), Some(u(99_500_000)));
+    }
+
+    /// Garbage must be an error rather than a silent "not settled yet", which
+    /// would strand the session with nothing in the log to say why.
+    #[test]
+    fn an_unparseable_amount_out_is_an_error() {
+        assert!(settled_output(Some("1.5")).is_err());
+        assert!(settled_output(Some("-1")).is_err());
+        assert!(settled_output(Some("lots")).is_err());
+    }
+
+    /// NEW-1, at the level the bug actually lived. The old rule was
+    /// `min(unassigned, expected)`; this asserts the new rule does not do that.
+    ///
+    /// Alice's swap under-fills to her floor. 109.50 is unassigned, because Bob's
+    /// 10.00 is sitting in the same pot. The old rule credited Alice 100.00, half
+    /// a dollar of which was Bob's.
+    #[test]
+    fn a_short_fill_is_credited_at_the_fill_not_out_of_the_pool() {
+        let pool = u(ALICE_FLOOR + BOB_EXPECTED); // 109.50 unassigned
+
+        // What the old rule would have done, kept here so the regression is legible.
+        let old_rule = pool.min(u(ALICE_EXPECTED));
+        assert_eq!(old_rule, u(ALICE_EXPECTED), "the old rule credited the quote");
+
+        let decision = credit_decision(
+            Some(u(ALICE_FLOOR)),
+            pool,
+            u(ALICE_EXPECTED),
+            u(ALICE_FLOOR),
+        );
+        assert_eq!(
+            decision,
+            CreditDecision::Credit(u(ALICE_FLOOR)),
+            "the fixed rule credits only what Alice's own swap settled for"
+        );
+    }
+
+    /// And the concurrent session is left whole, which is the half the old rule
+    /// broke: Bob used to be stuck below his floor forever.
+    #[test]
+    fn the_concurrent_session_still_clears_its_own_floor() {
+        // Alice has been credited her 99.50; Bob's 10.00 is what remains.
+        let remaining = u(BOB_EXPECTED);
+
+        let decision = credit_decision(
+            Some(u(BOB_EXPECTED)),
+            remaining,
+            u(BOB_EXPECTED),
+            u(BOB_FLOOR),
+        );
+        assert_eq!(decision, CreditDecision::Credit(u(BOB_EXPECTED)));
+
+        // Under the old rule Bob saw only 9.50 of pool against a 9.95 floor.
+        let left_by_old_rule = u(ALICE_FLOOR + BOB_EXPECTED - ALICE_EXPECTED);
+        assert!(
+            left_by_old_rule < u(BOB_FLOOR),
+            "the old rule left Bob below his floor: {left_by_old_rule} < {BOB_FLOOR}"
+        );
+    }
+
+    #[test]
+    fn a_fill_below_the_guaranteed_floor_is_not_credited() {
+        let short = u(99_000_000);
+        assert_eq!(
+            credit_decision(Some(short), short, u(ALICE_EXPECTED), u(ALICE_FLOOR)),
+            CreditDecision::Short {
+                settled: short,
+                floor: u(ALICE_FLOOR)
+            }
+        );
+    }
+
+    #[test]
+    fn an_over_fill_is_clamped_to_the_quote() {
+        let over = u(101_000_000);
+        assert_eq!(
+            credit_decision(Some(over), over, u(ALICE_EXPECTED), u(ALICE_FLOOR)),
+            CreditDecision::Credit(u(ALICE_EXPECTED)),
+            "the surplus stays unassigned rather than being credited"
+        );
+    }
+
+    /// A SUCCESS whose `amountOut` has not been filled in yet must wait rather
+    /// than fall back to the pool, which is what made the pool authoritative.
+    #[test]
+    fn success_without_a_settled_amount_waits() {
+        assert!(matches!(
+            credit_decision(None, u(1_000_000_000), u(ALICE_EXPECTED), u(ALICE_FLOOR)),
+            CreditDecision::Wait(_)
+        ));
+    }
+
+    /// 1Click can report a settlement before the ERC-20 transfer has landed.
+    #[test]
+    fn a_settlement_that_has_not_arrived_on_chain_waits() {
+        assert!(matches!(
+            credit_decision(
+                Some(u(ALICE_EXPECTED)),
+                U256::ZERO,
+                u(ALICE_EXPECTED),
+                u(ALICE_FLOOR)
+            ),
+            CreditDecision::Wait(_)
+        ));
+    }
+
+    /// The property the fix buys: across every fill in the slippage band, and in
+    /// either tick order, each session is credited exactly its own fill and the
+    /// two credits together are exactly what arrived.
+    #[test]
+    fn neither_tick_order_moves_money_between_sessions() {
+        for a_fill in [ALICE_FLOOR, ALICE_FLOOR + 1, 99_750_000, ALICE_EXPECTED] {
+            for b_fill in [BOB_FLOOR, 9_975_000, BOB_EXPECTED] {
+                let arrived = u(a_fill + b_fill);
+
+                // Alice first.
+                let a = credit_decision(Some(u(a_fill)), arrived, u(ALICE_EXPECTED), u(ALICE_FLOOR));
+                assert_eq!(a, CreditDecision::Credit(u(a_fill)));
+                let b = credit_decision(
+                    Some(u(b_fill)),
+                    arrived - u(a_fill),
+                    u(BOB_EXPECTED),
+                    u(BOB_FLOOR),
+                );
+                assert_eq!(b, CreditDecision::Credit(u(b_fill)), "Bob is not starved");
+
+                // Bob first: same answers.
+                let b2 = credit_decision(Some(u(b_fill)), arrived, u(BOB_EXPECTED), u(BOB_FLOOR));
+                assert_eq!(b2, CreditDecision::Credit(u(b_fill)));
+                let a2 = credit_decision(
+                    Some(u(a_fill)),
+                    arrived - u(b_fill),
+                    u(ALICE_EXPECTED),
+                    u(ALICE_FLOOR),
+                );
+                assert_eq!(a2, CreditDecision::Credit(u(a_fill)));
+            }
+        }
     }
 }
