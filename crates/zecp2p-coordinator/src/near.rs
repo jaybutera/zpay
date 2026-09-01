@@ -656,9 +656,18 @@ mod tests {
 
     // ---------------------------------------------------------------------
     // Fixtures captured from a real mainnet ZEC -> USDC swap on 2026-08-31
-    // (52,000 zatoshi, correlationId 00000000-0000-4000-8000-000000000001).
-    // These pin the deserializer to bytes the live service actually sent, so a
-    // schema change breaks a test instead of silently parsing to None.
+    // (52,000 zatoshi). These pin the deserializer to the shape the live service
+    // actually sends, so a schema change breaks a test instead of silently
+    // parsing to None.
+    //
+    // The addresses, transaction hashes, quote signature and correlation ids in
+    // them are stand-ins. The originals tied a real ZEC deposit address and its
+    // refund address to a real Base EOA, with amounts and timings, which is a
+    // linkage this repository has no reason to carry (NEW-6 in the 2026-08-31
+    // re-audit). Everything the deserializer is being tested on is structural:
+    // field names, nesting, arrays of {hash, explorerUrl} objects rather than
+    // bare strings, nulls where a stage has no value yet. None of that depends
+    // on the values being anyone's.
     // ---------------------------------------------------------------------
 
     const LIVE_SUCCESS: &str = include_str!("../tests/fixtures/1click_status_success.json");
@@ -673,7 +682,8 @@ mod tests {
 
         let d = parsed.swap_details.expect("swapDetails present");
         assert_eq!(d.amount_out.as_deref(), Some("443561"));
-        // The real delivery hash, which the pre-fix deserializer recorded as None.
+        // The delivery hash, in the nested array shape the pre-fix
+        // deserializer recorded as None.
         assert_eq!(
             d.destination_chain_tx_hashes.first().map(|t| t.hash.as_str()),
             Some("0x2222222222222222222222222222222222222222222222222222222222222222")
