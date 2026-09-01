@@ -180,7 +180,6 @@ impl AppState {
         crate::near::validate_zec_refund_address(&request.zec_refund_address)
             .map_err(|e| AppError::InvalidRequest(e.to_string()))?;
 
-
         // Get quote from NEAR Intents
         let glue_address = self
             .chain
