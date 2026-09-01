@@ -73,7 +73,15 @@ echo "EscrowV2 depositCounter: $(cast call --rpc-url "$RPC" "$ESCROW" 'depositCo
 
 # ---------------------------------------------------------------- deploy glue
 log "deploying OfframpGlue against USDC $USDC and EscrowV2 $ESCROW"
-DEPLOY_OUT=$(cd "$ROOT/contracts" && PRIVATE_KEY=$KEEPER_KEY forge script script/Deploy.s.sol:DeployOfframpGlue \
+# Deploy.s.sol prefers DEPLOYER_PRIVATE_KEY and only falls back to PRIVATE_KEY.
+# A real deploy exports DEPLOYER_PRIVATE_KEY from .env, so setting only
+# PRIVATE_KEY here would be shadowed: the rehearsal would deploy under the
+# operator's own key, and every later step, which signs as the anvil KEEPER_KEY,
+# would revert Unauthorized. Set both to the throwaway key so the rehearsal
+# never depends on, or touches, the real one.
+DEPLOY_OUT=$(cd "$ROOT/contracts" && \
+  DEPLOYER_PRIVATE_KEY=$KEEPER_KEY PRIVATE_KEY=$KEEPER_KEY \
+  forge script script/Deploy.s.sol:DeployOfframpGlue \
   --rpc-url "$RPC" --broadcast 2>&1)
 GLUE=$(echo "$DEPLOY_OUT" | sed -n 's/.*OfframpGlue deployed at: *\(0x[0-9a-fA-F]\{40\}\).*/\1/p' | head -1)
 [ -n "$GLUE" ] || { echo "$DEPLOY_OUT"; echo "could not find deployed address"; exit 1; }
@@ -173,8 +181,16 @@ EOF
   if curl -sf "$COORD/health" >/dev/null 2>&1; then
     echo "something already answers on $COORD (stale coordinator?); stop it first"; exit 1
   fi
-  # Run from $WORK so the repo's .env (with placeholder addresses) is not loaded
+  # Run from $WORK so the repo's .env (with placeholder addresses) is not loaded.
+  #
+  # The coordinator lets environment variables override the config file, so the
+  # mock URLs written above are only honoured if nothing in the environment
+  # names a real one. Step 05 sources scripts/deploy/lib.sh, which exports
+  # ZKP2P_API_URL and NEAR_API_URL from .env; inherited, they would point this
+  # rehearsal at the live curator and the live 1Click. Pin both to the mocks
+  # explicitly rather than relying on them being unset.
   ( cd "$WORK" && exec env ZECP2P_CONFIG="$WORK/config.toml" GLUE_CONTRACT_ADDRESS="$GLUE" COORDINATOR_PRIVATE_KEY=$KEEPER_KEY \
+      ZKP2P_API_URL="http://127.0.0.1:$ZKP2P_PORT" NEAR_API_URL="http://127.0.0.1:$NEAR_PORT" \
       RUST_LOG=zecp2p_coordinator=info "$ROOT/target/debug/zecp2p-coordinator" > "$WORK/coordinator.log" 2>&1 ) & PIDS+=($!)
   for _ in $(seq 1 30); do sleep 1; curl -sf "$COORD/health" >/dev/null && break; done
   curl -sf "$COORD/health" >/dev/null || { cat "$WORK/coordinator.log"; exit 1; }

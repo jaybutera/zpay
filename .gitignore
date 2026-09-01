@@ -49,6 +49,9 @@ scripts/stageb/live.quote.env
 # it names one specific deployment, so it belongs to the operator, not the repo.
 scripts/deploy/state/
 
+# Launch keystore: the real deployer/keeper/taker private keys. Never commit.
+scripts/deploy/keystore/
+
 # Configs generated from .env by scripts/deploy/03_write_config.sh. Regenerate
 # them rather than committing one deployment's addresses.
 config.generated.toml
