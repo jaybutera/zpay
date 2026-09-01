@@ -171,6 +171,12 @@ struct MockNearState {
     glue_contract: Address,
     /// Track deposit addresses and their completion status
     status_response: std::sync::Arc<std::sync::RwLock<String>>,
+    /// What `swapDetails.amountOut` reports once the swap settles.
+    ///
+    /// The quote handler fills this in with what it quoted, so by default a
+    /// swap settles for exactly its quote. A test that wants an under-fill,
+    /// which 50 bps of quote slippage makes ordinary, sets it lower.
+    settled_amount: std::sync::Arc<std::sync::RwLock<String>>,
 }
 
 impl MockNearState {
@@ -178,11 +184,18 @@ impl MockNearState {
         Self {
             glue_contract,
             status_response: std::sync::Arc::new(std::sync::RwLock::new("PENDING".to_string())),
+            settled_amount: std::sync::Arc::new(std::sync::RwLock::new("0".to_string())),
         }
     }
 
     fn set_status(&self, status: &str) {
         *self.status_response.write().unwrap() = status.to_string();
+    }
+
+    /// Make the swap settle for `amount` USDC units instead of the full quote.
+    #[allow(dead_code)]
+    fn set_settled_amount(&self, amount: &str) {
+        *self.settled_amount.write().unwrap() = amount.to_string();
     }
 }
 
@@ -254,12 +267,15 @@ struct QuoteRequest {
 }
 
 async fn mock_quote_handler(
-    axum::extract::State(_state): axum::extract::State<MockNearState>,
+    axum::extract::State(state): axum::extract::State<MockNearState>,
     Json(request): Json<QuoteRequest>,
 ) -> Json<MockQuoteResponse> {
     let zatoshi: u64 = request.amount.parse().unwrap_or(50_000_000);
     let usdc_out = (zatoshi as f64 / 100_000_000.0 * 30.0 * 1_000_000.0) as u64;
     let deadline = chrono::Utc::now() + chrono::Duration::minutes(10);
+
+    // Unless a test says otherwise, the swap settles for exactly what it quoted.
+    *state.settled_amount.write().unwrap() = usdc_out.to_string();
 
     Json(MockQuoteResponse {
         correlation_id: uuid::Uuid::new_v4().to_string(),
@@ -280,14 +296,47 @@ struct StatusQuery {
     deposit_address: String,
 }
 
+/// The 1Click status shape, as the live API sends it.
+///
+/// This mock used to put `amountOut` and the chain hashes at the top level.
+/// They are not there: they live inside `swapDetails`, and the chain hashes are
+/// arrays of `{hash, explorerUrl}` objects rather than bare strings. The
+/// recorded fixtures under `tests/fixtures/` are the record of that, and
+/// `near.rs` parses accordingly, so the mock's fields silently deserialized to
+/// `None`.
+///
+/// That did not matter while the keeper decided a credit from the glue's
+/// balance. It matters now: the keeper credits what 1Click reports settled, so a
+/// mock that reports nothing is a session that is never credited. A mock written
+/// to our own convenience cannot catch a mismatch between us and the API.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct MockStatusResponse {
     status: String,
-    source_transaction_hash: Option<String>,
-    destination_transaction_hash: Option<String>,
+    swap_details: MockSwapDetails,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MockSwapDetails {
     amount_out: Option<String>,
-    error: Option<String>,
+    refunded_amount: Option<String>,
+    origin_chain_tx_hashes: Vec<MockTxHash>,
+    destination_chain_tx_hashes: Vec<MockTxHash>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MockTxHash {
+    hash: String,
+    explorer_url: String,
+}
+
+fn mock_tx(hash: &str) -> MockTxHash {
+    MockTxHash {
+        hash: hash.to_string(),
+        explorer_url: String::new(),
+    }
 }
 
 async fn mock_status_handler(
@@ -295,13 +344,24 @@ async fn mock_status_handler(
     axum::extract::Query(_query): axum::extract::Query<StatusQuery>,
 ) -> Json<MockStatusResponse> {
     let status = state.status_response.read().unwrap().clone();
+    let settled = state.settled_amount.read().unwrap().clone();
+
+    // Before the swap settles there is no amountOut and no destination hash,
+    // which is what a real PENDING_DEPOSIT and PROCESSING look like.
+    let delivered = status == "SUCCESS";
 
     Json(MockStatusResponse {
         status,
-        source_transaction_hash: Some("0xmocksourcetx".to_string()),
-        destination_transaction_hash: Some("0xmockdesttx".to_string()),
-        amount_out: Some("15000000".to_string()),
-        error: None,
+        swap_details: MockSwapDetails {
+            amount_out: delivered.then_some(settled),
+            refunded_amount: Some("0".to_string()),
+            origin_chain_tx_hashes: vec![mock_tx("0xmocksourcetx")],
+            destination_chain_tx_hashes: if delivered {
+                vec![mock_tx("0xmockdesttx")]
+            } else {
+                vec![]
+            },
+        },
     })
 }
 
@@ -1178,4 +1238,123 @@ async fn test_complete_keeper_driven_flow() {
     println!("\n=== COMPREHENSIVE KEEPER-DRIVEN E2E TEST PASSED! ===");
     println!("The complete offramp flow (ZEC → USDC → Venmo) was executed");
     println!("with ALL state transitions driven by the keeper loop.");
+}
+
+/// NEW-1 end to end, against a real deployment on anvil.
+///
+/// A swap that settles below its quote is the ordinary case: `create_offramp`
+/// asks for the quote with 50 bps of slippage, so 1Click guarantees only
+/// `minAmountOut` and the fill lands somewhere in that band. The keeper used to
+/// credit `min(unassigned, expected)`, which topped the session up to its full
+/// quote out of whatever else was in the pot.
+///
+/// Here the swap settles a dollar under, and more than that arrives on the glue,
+/// standing in for a concurrent session's money sitting in the same pot. The
+/// session must be credited what its own swap settled for, and the surplus must
+/// still be unassigned afterwards, where it is available to whoever it belongs
+/// to. Under the old rule it would have been swept into this session's slice.
+#[tokio::test]
+#[ignore = "requires anvil and forge to be installed"]
+async fn test_a_short_settlement_credits_the_fill_and_leaves_the_rest_unassigned() {
+    let infra = TestInfra::setup().await;
+    std::env::set_var("COORDINATOR_PRIVATE_KEY", KEEPER_PRIVATE_KEY);
+
+    let db = zecp2p_coordinator::db::Database::new(&infra.config.database.path)
+        .await
+        .expect("create db");
+    db.run_migrations().await.expect("run migrations");
+
+    let chain_client = zecp2p_coordinator::chain::ChainClient::new(&infra.config)
+        .await
+        .expect("create chain client");
+
+    let state = std::sync::Arc::new(zecp2p_coordinator::state::AppState::new(
+        infra.config.clone(),
+        db,
+        chain_client,
+        zecp2p_coordinator::near::NearIntentsClient::new(&infra.config.near),
+        zecp2p_coordinator::zkp2p::Zkp2pClient::new(&infra.config.zkp2p),
+    ));
+
+    let request = zecp2p_types::OfframpRequest {
+        zec_amount: 50_000_000,
+        venmo_username: "shortfilltest".to_string(),
+        user_address: TEST_USER.parse().unwrap(),
+        taker_address: None,
+        zec_refund_address: "t1VJnUz9FDy7WfFxqXwMZJWVxzMrRD7MvBA".to_string(),
+        min_rate: U256::from(1_000_000_000_000_000_000u128),
+        timeout_seconds: 600,
+    };
+
+    let session = state.create_offramp(request).await.expect("create offramp");
+    let expected = session.expected_usdc.expect("quoted");
+    let floor = session.min_output_usdc.expect("floor");
+
+    // The swap fills short of the quote but inside the guaranteed band, halfway
+    // between the floor and the quote. That band is what the slippage on the
+    // quote buys, and landing in it is the ordinary outcome, not an edge case.
+    let settled = floor + (expected - floor) / U256::from(2u64);
+    assert!(settled > floor && settled < expected, "an under-fill inside the band");
+    infra.near_state.set_settled_amount(&settled.to_string());
+
+    // The full quote's worth of USDC lands on the glue: this session's own
+    // short fill, plus another session's money in the same shared pot.
+    infra.mint_usdc(infra.glue_addr, expected).await;
+    let surplus = expected - settled;
+
+    infra.near_state.set_status("SUCCESS");
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let keeper_state = state.clone();
+    let keeper = tokio::spawn(async move {
+        keeper_state.run_keeper_loop_with_shutdown(shutdown_rx).await
+    });
+
+    let mut credited = None;
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let current = state.get_session(session.id).await.unwrap().unwrap();
+        if current.received_usdc.is_some() {
+            credited = current.received_usdc;
+            break;
+        }
+    }
+
+    let _ = shutdown_tx.send(true);
+    let _ = keeper.await;
+
+    let credited = credited.expect("an under-fill above the floor must still be credited");
+    assert_eq!(
+        credited, settled,
+        "the session gets what its own swap settled for, not what the pot held"
+    );
+    assert!(
+        credited < expected,
+        "crediting the quote is the bug: {credited} should be under {expected}"
+    );
+
+    // The rest is still nobody's, so it is there for the session it arrived for.
+    // The old rule would have folded it into this session's slice.
+    let unassigned = state
+        .chain
+        .glue_unassigned_balance()
+        .await
+        .expect("read unassigned balance");
+    assert_eq!(
+        unassigned, surplus,
+        "the surplus must stay unassigned rather than being swept into this session"
+    );
+
+    // And the contract agrees about what this session owns.
+    let on_chain = state
+        .chain
+        .get_session(session.session_id)
+        .await
+        .expect("read session");
+    assert!(
+        on_chain.credited == settled || on_chain.deposited == settled,
+        "the contract should hold {settled}, has credited={} deposited={}",
+        on_chain.credited,
+        on_chain.deposited
+    );
 }
