@@ -168,6 +168,37 @@ impl TakerConfig {
                 anyhow::anyhow!("STAKE_VAULT_ADDRESS is not a valid address: {addr}")
             })?;
         }
+
+        config.validate_urls()?;
+
         Ok(config)
+    }
+
+    /// Require https for every service URL this config will fetch from.
+    ///
+    /// NEW-4 in the 2026-08-31 re-audit. MEDIUM-3's fix added
+    /// `zecp2p_types::Config::validate_urls` and wired it into the coordinator's
+    /// `load_with_env`. `TakerConfig::load` is a separate implementation and
+    /// called nothing: `BASE_RPC_URL`, `ATTESTATION_URL` and `ZKP2P_API_URL`
+    /// were applied from the environment with no scheme check at all, and
+    /// `dotenvy::dotenv()` runs unconditionally, so a stray `.env` was enough.
+    ///
+    /// `ZKP2P_API_URL` is the one that matters most, and it is the one the
+    /// earlier fix left open. The whole of NEW-2's payee cross-check rests on
+    /// that endpoint: anyone who can answer a plaintext request to it returns
+    /// any `hashedOnchainId` they like, the hash matches the deposit, and the
+    /// taker pays the attacker's Venmo handle with its own dollars.
+    ///
+    /// Loopback stays allowed; the local mocks and the fork rehearsal use it.
+    pub fn validate_urls(&self) -> anyhow::Result<()> {
+        use zecp2p_types::config::validate_service_url;
+
+        validate_service_url("network.base_rpc_url", &self.network.base_rpc_url)?;
+        validate_service_url("zkp2p.api_url", &self.zkp2p.api_url)?;
+        validate_service_url("attestation.service_url", &self.attestation.service_url)?;
+        if let Some(url) = &self.taker.coordinator_url {
+            validate_service_url("taker.coordinator_url", url)?;
+        }
+        Ok(())
     }
 }
