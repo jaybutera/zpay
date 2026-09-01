@@ -45,7 +45,67 @@ const need = (k) => {
   return v;
 };
 
-const attestationServiceUrl = process.env.ATTESTATION_URL ?? 'https://attestation-service.zkp2p.xyz';
+// The enclaves we will encrypt a live Venmo cookie to, and the PCR8 each one
+// must measure. These are the values @zkp2p/zkp2p-attestation ships in its own
+// bundled table; naming them here means the pin does not depend on that table
+// staying keyed by hostname, and means an unknown host is a refusal rather than
+// a fallback.
+//
+// The fallback is the whole point. The library resolves a pin as: caller pin,
+// then bundled table, then -- unless strictPin is set -- the PCR8 the service
+// advertises about itself. Against an unknown host that last branch compares
+// the enclave measurement to a number the server supplied, which is
+// verification that cannot fail. One line in .env pointing ATTESTATION_URL at
+// an attacker's host was enough to encrypt the cookie to a key they hold, and
+// the cookie is full Venmo account access.
+const TRUSTED_ENCLAVES = {
+  'attestation-service.zkp2p.xyz':
+    '41a4ae0b9b96752cab5addb7d22689b3070e564e29f90a54316fa33fa38ea51387a6e887ea4f5a4b0cc34f69cea3f40e',
+  'attestation-service-staging.zkp2p.xyz':
+    '5636e3bd96f847cf12cfd9de7faa8cad0e6fa00962ce16ba185f8e5ea57105abb3cc9cc34f1e1e4de3444ceabcca7485',
+  'attestation-service-preprod.zkp2p.xyz':
+    '5453c5bfb7d040285be5ba9af142f4fbdd9685d082f244b66c62bf7b22d8d02a638fa2e02b9a6fe8877953a9429209e0',
+};
+
+/// Resolve the attestation URL, refusing anything not on the allowlist.
+///
+/// ATTESTATION_URL stays overridable, because staging and preprod are real
+/// destinations, but only to a host whose expected PCR8 we know. Pointing it
+/// somewhere else now fails here rather than silently downgrading the pin.
+function resolveAttestationService(raw) {
+  let url;
+  try {
+    url = new URL(raw);
+  } catch {
+    console.error(`ATTESTATION_URL is not a valid URL: ${raw}`);
+    process.exit(2);
+  }
+
+  if (url.protocol !== 'https:') {
+    console.error(`ATTESTATION_URL must be https, got ${url.protocol}//. The Venmo cookie`);
+    console.error('is encrypted to the enclave, but the request itself is not something');
+    console.error('to hand to a plaintext connection.');
+    process.exit(2);
+  }
+
+  const hostname = url.hostname.toLowerCase();
+  const expectedPcr8Hex = TRUSTED_ENCLAVES[hostname];
+  if (!expectedPcr8Hex) {
+    console.error(`refusing to send a Venmo cookie to ${hostname}: no PCR8 pin is known for it.`);
+    console.error('Known hosts:');
+    for (const known of Object.keys(TRUSTED_ENCLAVES)) console.error(`  ${known}`);
+    console.error('');
+    console.error('Without a pin, the enclave measurement would be compared against a');
+    console.error('number the server itself supplied, which is not verification. Add the');
+    console.error("host and its PCR8 to TRUSTED_ENCLAVES if it is genuinely yours.");
+    process.exit(2);
+  }
+
+  return { attestationServiceUrl: raw, hostname, expectedPcr8Hex };
+}
+
+const { attestationServiceUrl, hostname: attestationHostname, expectedPcr8Hex } =
+  resolveAttestationService(process.env.ATTESTATION_URL ?? 'https://attestation-service.zkp2p.xyz');
 const chainId = Number(process.env.CHAIN_ID ?? 8453);
 const verifyingContract = process.env.VERIFIER ?? '0xC6F4a193576C60892a47e111Bb5706c30162502B';
 const index = Number(process.env.PAYMENT_INDEX ?? 0);
@@ -101,13 +161,61 @@ console.log('feed index          :', index);
 console.log('cookie              : <%d chars, not logged>', cookie.length);
 
 // Pin the enclave before handing it anything.
-const pinned = await fetchAndVerifyAttestation({ attestationServiceUrl, onWarning: () => {} });
+//
+// strictPin makes an unpinned host throw instead of falling back to the PCR8 the
+// service advertises about itself, and the explicit expectedPcr8Hex is the pin
+// this script is willing to trust rather than whatever table the library ships.
+// Warnings are collected rather than discarded: any of them here is a reason not
+// to send the cookie.
+const pinWarnings = [];
+let pinned;
+try {
+  pinned = await fetchAndVerifyAttestation({
+    attestationServiceUrl,
+    trust: { expectedPcr8Hex, strictPin: true },
+    onWarning: (w) => pinWarnings.push(w?.code ?? String(w)),
+  });
+} catch (e) {
+  console.error('\nenclave attestation FAILED:', e?.message ?? e);
+  if (e?.code) console.error('code              :', e.code);
+  console.error('\nNothing was sent. The cookie has not been read.');
+  process.exit(1);
+}
+
+// Any warning at this stage is about the identity of the thing we are about to
+// hand a live Venmo session to. There is no such thing as a warning here worth
+// proceeding past.
+if (pinWarnings.length) {
+  console.error('\nthe enclave attestation raised warnings:', pinWarnings.join(', '));
+  console.error('refusing to send the cookie. A pin warning means the enclave is not');
+  console.error('the one this script pinned, or could not be checked against it.');
+  process.exit(1);
+}
+
+console.log('attestation pin     : PCR8 verified against the pinned value');
+
 const advertised = pinned?.payload?.advertised ?? {};
 console.log('enclave signer      :', advertised.expectedSigner);
 console.log('enclave chainId     :', advertised.chainId);
+
+// Both of these used to warn and then send the cookie anyway. Spending a cookie
+// exposure on an attestation the script has already predicted will not verify is
+// never right.
 if (advertised.chainId !== chainId) {
-  console.warn(`\n!! the enclave signs for chain ${advertised.chainId}, you asked for ${chainId}.`);
-  console.warn('   the resulting attestation will NOT verify against chain', chainId);
+  console.error(`\nthe enclave signs for chain ${advertised.chainId}, you asked for ${chainId}.`);
+  console.error('the resulting attestation would not verify against chain', chainId);
+  console.error('Nothing was sent.');
+  process.exit(1);
+}
+
+if (
+  advertised.verifyingContract &&
+  advertised.verifyingContract.toLowerCase() !== verifyingContract.toLowerCase()
+) {
+  console.error(`\nthe enclave signs for verifier ${advertised.verifyingContract},`);
+  console.error(`you asked for ${verifyingContract}. The attestation would not verify.`);
+  console.error('Nothing was sent.');
+  process.exit(1);
 }
 
 if (!advertised.expectedSigner) {
@@ -155,7 +263,17 @@ console.log('typedDataSpec     :', attestation.typedDataSpec);
 console.log('typedDataValue    :', JSON.stringify(attestation.typedDataValue));
 console.log('signature         :', attestation.signature);
 if (attestation.metadata) console.log('metadata          :', JSON.stringify(attestation.metadata));
-if (warnings.length) console.log('warnings          :', warnings.join(', '));
+if (warnings.length) {
+  console.error('warnings          :', warnings.join(', '));
+  // TRUST_PIN_NOT_PROVIDED here would mean the pin degraded on this call even
+  // though the fetch above was strict. The cookie is already spent at this
+  // point, but the attestation is not something to trust or submit.
+  if (warnings.some((w) => String(w).startsWith('TRUST_PIN'))) {
+    console.error('\na pin warning on the payment call means the enclave was not the');
+    console.error('pinned one. Refusing to write this attestation out.');
+    process.exit(1);
+  }
+}
 
 // Check the signature ourselves rather than trusting the round trip.
 const verified = verifyBuyerTeePaymentAttestation(attestation, {

