@@ -200,6 +200,7 @@ fn create_test_config(
         server: zecp2p_types::config::ServerConfig {
             host: "127.0.0.1".to_string(),
             port: server_port,
+            ..Default::default()
         },
         database: zecp2p_types::config::DatabaseConfig {
             path: db_path.to_string(),

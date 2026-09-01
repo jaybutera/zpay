@@ -37,6 +37,7 @@ fn test_config() -> Config {
         server: zecp2p_types::config::ServerConfig {
             host: "127.0.0.1".to_string(),
             port: 3000,
+            ..Default::default()
         },
         database: zecp2p_types::config::DatabaseConfig {
             path: ":memory:".to_string(),

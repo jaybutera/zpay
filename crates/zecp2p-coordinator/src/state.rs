@@ -124,6 +124,12 @@ impl AppState {
             U256::from_str_radix(&quote.expected_output, 10)
                 .map_err(|e| AppError::NearIntents(e.to_string()))?,
         );
+        // The guaranteed floor, not the estimate. The keeper waits for this much
+        // before crediting the session, so a short delivery cannot promote it.
+        session.min_output_usdc = Some(
+            U256::from_str_radix(&quote.min_output, 10)
+                .map_err(|e| AppError::NearIntents(e.to_string()))?,
+        );
 
         // Register session on-chain
         let tx_hash = self
@@ -406,22 +412,56 @@ impl AppState {
         };
 
         if status.status.is_success() {
-            // Check USDC balance at GlueContract
-            let balance = self.chain.glue_usdc_balance().await?;
+            // The glue is shared, so its balance is not this session's money. What
+            // matters is whether enough USDC has arrived that nobody has claimed
+            // yet to cover what this session is owed. Promoting on any nonzero
+            // balance is how one session used to end up spending another's.
+            let expected = session
+                .expected_usdc
+                .ok_or_else(|| anyhow::anyhow!("session has no expected USDC amount"))?;
 
-            if balance > U256::ZERO {
-                let mut updated = session.clone();
-                updated.received_usdc = Some(balance);
-                updated.near_tx_hash = status.destination_tx_hash;
-                updated.set_status(OfframpStatus::UsdcReceived);
+            // 1Click quotes an expected output and guarantees only min_amount_out;
+            // accept anything at or above that floor and credit what actually arrived.
+            let floor = session.min_output_usdc.unwrap_or(expected);
+            let unassigned = self.chain.glue_unassigned_balance().await?;
 
-                self.db.update_session(&updated).await?;
-
-                let mut sessions = self.sessions.write().await;
-                sessions.insert(updated.id, updated);
-
-                tracing::info!("Session {} received USDC: {}", session.id, balance);
+            if unassigned < floor {
+                tracing::debug!(
+                    "Session {} waiting on USDC: {} unassigned on the glue, needs {}",
+                    session.id,
+                    unassigned,
+                    floor
+                );
+                return Ok(());
             }
+
+            // Never take more than the session was quoted; the surplus belongs to
+            // whichever other session it arrived for.
+            let credit = unassigned.min(expected);
+
+            // Claim it on-chain before recording it, so the session's slice of the
+            // pot is fixed by the contract rather than by this loop's bookkeeping.
+            self.chain
+                .credit_session(session.session_id, credit)
+                .await?;
+
+            let mut updated = session.clone();
+            updated.received_usdc = Some(credit);
+            updated.near_tx_hash = status.destination_tx_hash;
+            updated.set_status(OfframpStatus::UsdcReceived);
+
+            self.db.update_session(&updated).await?;
+
+            let mut sessions = self.sessions.write().await;
+            sessions.insert(updated.id, updated);
+
+            tracing::info!(
+                "Session {} credited {} USDC (expected {}, floor {})",
+                session.id,
+                credit,
+                expected,
+                floor
+            );
         } else if status.status == IntentStatus::Refunded {
             let mut updated = session.clone();
             updated.fail(match status.refunded_amount {

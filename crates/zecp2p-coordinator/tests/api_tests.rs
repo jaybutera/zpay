@@ -11,9 +11,37 @@ use axum::{
 use std::sync::Arc;
 use tower::ServiceExt;
 use zecp2p_coordinator::{
-    api, chain::ChainClient, db::Database, near::NearIntentsClient, state::AppState, zkp2p::Zkp2pClient,
+    api, auth, chain::ChainClient, db::Database, near::NearIntentsClient, state::AppState,
+    zkp2p::Zkp2pClient,
 };
 use zecp2p_types::Config;
+
+
+/// A fixed test key, and the address the request bodies below name as the user.
+///
+/// `POST /offramp` now requires the caller to prove it holds the key for the
+/// address it names, so every body that reaches validation has to be signed.
+fn test_signer() -> alloy::signers::local::PrivateKeySigner {
+    "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
+        .parse()
+        .expect("valid test key")
+}
+
+fn test_user_address() -> String {
+    format!("{:?}", test_signer().address())
+}
+
+/// The `x-zecp2p-signature` header for a create request over this body.
+fn create_signature(zec_amount: &str, venmo_username: &str) -> String {
+    use alloy::signers::SignerSync;
+    let signer = test_signer();
+    let scope = format!("{}:{}", zec_amount.trim(), venmo_username.trim());
+    let message = auth::ownership_message("create", signer.address(), &scope);
+    signer
+        .sign_message_sync(message.as_bytes())
+        .expect("sign")
+        .to_string()
+}
 
 /// Create a test configuration
 fn test_config() -> Config {
@@ -47,6 +75,7 @@ fn test_config() -> Config {
         server: zecp2p_types::config::ServerConfig {
             host: "127.0.0.1".to_string(),
             port: 3000,
+            ..Default::default()
         },
         database: zecp2p_types::config::DatabaseConfig {
             path: ":memory:".to_string(),
@@ -56,7 +85,17 @@ fn test_config() -> Config {
 
 /// Create a test app with in-memory database
 async fn create_test_app() -> Router {
-    let config = test_config();
+    build_test_app(test_config()).await
+}
+
+/// The same app, with a taker token configured, for the `/deposits/open` tests.
+async fn create_test_app_with_taker_token(token: &str) -> Router {
+    let mut config = test_config();
+    config.server.taker_token = Some(token.to_string());
+    build_test_app(config).await
+}
+
+async fn build_test_app(config: Config) -> Router {
     let db = Database::new(":memory:").await.expect("Failed to create test database");
     db.run_migrations().await.expect("Failed to run migrations");
 
@@ -76,6 +115,9 @@ async fn create_test_app() -> Router {
         .route("/offramp", post(api::create_offramp))
         .route("/offramp/{id}", get(api::get_offramp))
         .route("/offramp/{id}/process", post(api::process_offramp))
+        .route("/deposits/open", get(api::list_open_deposits))
+        .route("/offramp/{id}/rescue", post(api::rescue_offramp))
+        .route("/offramp/{id}/withdraw", post(api::withdraw_offramp))
         .with_state(state)
 }
 
@@ -280,7 +322,7 @@ async fn test_create_offramp_validates_zec_address() {
     let body = serde_json::json!({
         "zec_amount": "0.5",
         "venmo_username": "testuser",
-        "user_address": "0x1234567890123456789012345678901234567890",
+        "user_address": test_user_address(),
         "taker_address": "0x1234567890123456789012345678901234567890",
         "zec_refund_address": "invalid_address"
     });
@@ -291,6 +333,7 @@ async fn test_create_offramp_validates_zec_address() {
                 .method("POST")
                 .uri("/offramp")
                 .header("Content-Type", "application/json")
+                .header(auth::SIGNATURE_HEADER, create_signature("0.5", "testuser"))
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -445,7 +488,7 @@ async fn test_create_offramp_validates_zec_address_length() {
     let body = serde_json::json!({
         "zec_amount": "0.5",
         "venmo_username": "testuser",
-        "user_address": "0x1234567890123456789012345678901234567890",
+        "user_address": test_user_address(),
         "taker_address": "0x1234567890123456789012345678901234567890",
         "zec_refund_address": "t1TooShort"  // Valid prefix but wrong length
     });
@@ -456,6 +499,7 @@ async fn test_create_offramp_validates_zec_address_length() {
                 .method("POST")
                 .uri("/offramp")
                 .header("Content-Type", "application/json")
+                .header(auth::SIGNATURE_HEADER, create_signature("0.5", "testuser"))
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -478,7 +522,7 @@ async fn test_create_offramp_validates_min_rate_negative() {
     let body = serde_json::json!({
         "zec_amount": "0.5",
         "venmo_username": "testuser",
-        "user_address": "0x1234567890123456789012345678901234567890",
+        "user_address": test_user_address(),
         "taker_address": "0x1234567890123456789012345678901234567890",
         "zec_refund_address": "t1VJnUz9FDy7WfFxqXwMZJWVxzMrRD7MvBA",
         "min_rate": "-10"  // Negative rate
@@ -490,6 +534,7 @@ async fn test_create_offramp_validates_min_rate_negative() {
                 .method("POST")
                 .uri("/offramp")
                 .header("Content-Type", "application/json")
+                .header(auth::SIGNATURE_HEADER, create_signature("0.5", "testuser"))
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -502,7 +547,13 @@ async fn test_create_offramp_validates_min_rate_negative() {
         .await
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert!(json["error"].as_str().unwrap().contains("positive"));
+    // A sign is not a digit, so "-10" is refused as malformed rather than as a
+    // non-positive number; either way it never becomes a rate.
+    let message = json["error"].as_str().unwrap();
+    assert!(
+        message.contains("min_rate"),
+        "expected a min_rate rejection, got: {message}"
+    );
 }
 
 /// An offramp with no taker is the normal case now: zk-p2p deposits are open to
@@ -569,4 +620,182 @@ async fn test_create_offramp_still_rejects_a_bad_taker() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+// ================================================================
+// Regression tests for the 2026-08-31 audit findings on the API surface.
+// ================================================================
+
+/// CRITICAL-2, the entry point. `POST /offramp` took a caller-supplied
+/// `user_address` with no authentication at all, so an attacker could open a
+/// session naming a victim, and separately could loop the endpoint to drain the
+/// keeper's gas for free (HIGH-4).
+#[tokio::test]
+async fn creating_an_offramp_without_a_signature_is_refused() {
+    let app = create_test_app().await;
+
+    let body = serde_json::json!({
+        "zec_amount": "0.5",
+        "venmo_username": "testuser",
+        "user_address": test_user_address(),
+        "zec_refund_address": "t1VJnUz9FDy7WfFxqXwMZJWVxzMrRD7MvBA"
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/offramp")
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// CRITICAL-2, the naming-a-victim shape: the attacker holds their own key but
+/// puts the victim's address in the body.
+#[tokio::test]
+async fn opening_a_session_that_names_someone_elses_address_is_refused() {
+    use alloy::signers::SignerSync;
+
+    let app = create_test_app().await;
+
+    let attacker = alloy::signers::local::PrivateKeySigner::random();
+    let victim = test_signer().address();
+
+    // The attacker signs the message naming the victim, with the attacker's key.
+    let scope = format!("{}:{}", "0.5", "testuser");
+    let message = auth::ownership_message("create", victim, &scope);
+    let signature = attacker.sign_message_sync(message.as_bytes()).unwrap();
+
+    let body = serde_json::json!({
+        "zec_amount": "0.5",
+        "venmo_username": "testuser",
+        "user_address": format!("{victim:?}"),
+        "zec_refund_address": "t1VJnUz9FDy7WfFxqXwMZJWVxzMrRD7MvBA"
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/offramp")
+                .header("Content-Type", "application/json")
+                .header(auth::SIGNATURE_HEADER, signature.to_string())
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// A signature for one offramp must not open a different one.
+#[tokio::test]
+async fn a_create_signature_does_not_transfer_to_another_amount() {
+    let app = create_test_app().await;
+
+    let body = serde_json::json!({
+        "zec_amount": "5.0",
+        "venmo_username": "testuser",
+        "user_address": test_user_address(),
+        "zec_refund_address": "t1VJnUz9FDy7WfFxqXwMZJWVxzMrRD7MvBA"
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/offramp")
+                .header("Content-Type", "application/json")
+                // Signed for 0.5 ZEC, sent for 5.0.
+                .header(auth::SIGNATURE_HEADER, create_signature("0.5", "testuser"))
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// HIGH-3. `/deposits/open` published every user's Venmo handle, amount and
+/// timestamp to anyone who asked. It now needs the taker token.
+#[tokio::test]
+async fn the_deposit_listing_needs_a_token() {
+    let app = create_test_app_with_taker_token("s3cret").await;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/deposits/open")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::UNAUTHORIZED,
+        "no token must not list handles"
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/deposits/open")
+                .header("Authorization", "Bearer wrong")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "wrong token too");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/deposits/open")
+                .header("Authorization", "Bearer s3cret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "the right token works");
+}
+
+/// Rescue moves the session's money, so it takes the session owner's signature.
+#[tokio::test]
+async fn rescue_without_a_signature_is_refused() {
+    let app = create_test_app().await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/offramp/{}/rescue", uuid::Uuid::new_v4()))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // No session exists, so a missing signature must not be reported as "not
+    // found" in a way that lets an attacker enumerate; either way it is refused.
+    assert!(
+        response.status() == StatusCode::UNAUTHORIZED || response.status() == StatusCode::NOT_FOUND,
+        "unexpected status {}",
+        response.status()
+    );
 }

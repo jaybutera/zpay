@@ -105,6 +105,12 @@ pub struct OfframpSession {
     pub payee_details_hash: B256,
     /// Expected USDC amount from NEAR Intent (6 decimals)
     pub expected_usdc: Option<U256>,
+    /// Floor 1Click guarantees for this swap (6 decimals), from the quote's
+    /// `minAmountOut`. The keeper waits for at least this much unassigned USDC
+    /// on the glue before it credits the session, so a session is never
+    /// promoted on someone else's smaller delivery.
+    #[serde(default)]
+    pub min_output_usdc: Option<U256>,
     /// Actual USDC received
     pub received_usdc: Option<U256>,
     /// NEAR Intent deposit address (for ZEC)
@@ -142,6 +148,7 @@ impl OfframpSession {
             request,
             payee_details_hash,
             expected_usdc: None,
+            min_output_usdc: None,
             received_usdc: None,
             near_deposit_address: None,
             near_tx_hash: None,

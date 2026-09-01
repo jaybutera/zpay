@@ -183,10 +183,12 @@ sol! {
             bytes32 payeeDetailsHash;
             uint256 minConversionRate;
             uint256 expectedAmount;
+            uint256 credited;
             uint256 depositId;
             bool processed;
             bool fulfilled;
             bool rescued;
+            bool withdrawn;
         }
 
         // State
@@ -205,6 +207,8 @@ sol! {
             uint256 expectedAmount
         );
 
+        event SessionCredited(bytes32 indexed sessionId, uint256 amount, uint256 totalCredited);
+
         event OfframpProcessed(
             bytes32 indexed sessionId,
             uint256 indexed depositId,
@@ -212,6 +216,12 @@ sol! {
         );
 
         event SessionRescued(
+            bytes32 indexed sessionId,
+            address indexed user,
+            uint256 amount
+        );
+
+        event SessionWithdrawn(
             bytes32 indexed sessionId,
             address indexed user,
             uint256 amount
@@ -230,6 +240,8 @@ sol! {
             uint256 expectedAmount
         ) external;
 
+        function creditSession(bytes32 sessionId, uint256 amount) external;
+
         function processOfframp(
             bytes32 sessionId,
             bytes32[] calldata paymentMethods,
@@ -246,6 +258,10 @@ sol! {
         function getSession(bytes32 sessionId) external view returns (Session memory);
 
         function getContractUsdcBalance() external view returns (uint256);
+
+        function totalCommitted() external view returns (uint256);
+
+        function unassignedBalance() external view returns (uint256);
     }
 }
 

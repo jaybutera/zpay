@@ -141,6 +141,36 @@ impl ChainClient {
         Ok(receipt.transaction_hash)
     }
 
+    /// Assign arrived USDC to a session on the glue.
+    ///
+    /// The token transfer that delivers a NEAR Intent carries no session id, so
+    /// the keeper has to say which session the money is for. The contract only
+    /// lets this draw on balance no other session owns, which is what keeps two
+    /// concurrent offramps from spending each other's USDC.
+    pub async fn credit_session(&self, session_id: B256, amount: U256) -> Result<B256> {
+        let glue_addr = self.glue_contract()?;
+        let provider = self.signing_provider()?;
+
+        let glue = OfframpGlue::new(glue_addr, provider);
+
+        let tx = glue
+            .creditSession(session_id, amount)
+            .send()
+            .await
+            .context("Failed to send creditSession transaction")?;
+
+        let receipt = tx.get_receipt().await?;
+        Ok(receipt.transaction_hash)
+    }
+
+    /// USDC on the glue that no session owns yet.
+    pub async fn glue_unassigned_balance(&self) -> Result<U256> {
+        let glue_addr = self.glue_contract()?;
+        let provider = self.provider();
+        let glue = OfframpGlue::new(glue_addr, provider);
+        Ok(glue.unassignedBalance().call().await?)
+    }
+
     /// Process offramp - route USDC to zk-p2p
     pub async fn process_offramp(
         &self,
@@ -295,8 +325,13 @@ impl ChainClient {
         Ok(self.provider().get_block_number().await?)
     }
 
-    /// Rescue funds from GlueContract (user only)
-    /// Returns USDC to the user if processOfframp failed
+    /// Rescue a session's credited USDC back to its user.
+    ///
+    /// Sent with the keeper key. The contract accepts either the session's user
+    /// or the keeper here and pays `session.user` either way, so this is a
+    /// convenience path, not the guarantee: the user's own signed call is the
+    /// escape hatch that survives this coordinator being gone. See
+    /// `docs/ARCHITECTURE.md` and `zecp2p-cli rescue --self-signed`.
     pub async fn rescue(&self, session_id: B256) -> Result<B256> {
         let glue_addr = self.glue_contract()?;
         let provider = self.signing_provider()?;
@@ -313,8 +348,10 @@ impl ChainClient {
         Ok(receipt.transaction_hash)
     }
 
-    /// Withdraw from zk-p2p deposit (user only)
-    /// Withdraws USDC from zk-p2p escrow if no taker signaled intent
+    /// Withdraw a session's zk-p2p deposit back to its user.
+    ///
+    /// Same shape as [`ChainClient::rescue`]: keeper-sent, always paying
+    /// `session.user`, with the user's own signed call as the real fallback.
     pub async fn withdraw_from_zkp2p(&self, session_id: B256) -> Result<B256> {
         let glue_addr = self.glue_contract()?;
         let provider = self.signing_provider()?;

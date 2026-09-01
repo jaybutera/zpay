@@ -168,6 +168,36 @@ pub struct ServerConfig {
     pub host: String,
     /// Port to listen on
     pub port: u16,
+    /// Shared bearer token takers present to read `/deposits/open`.
+    ///
+    /// That endpoint is the one place a Venmo username leaves the coordinator,
+    /// so it is not public. `None` is allowed only on a loopback bind; the
+    /// coordinator refuses to start bound anywhere else without one.
+    #[serde(default)]
+    pub taker_token: Option<String>,
+    /// How recently a deposit must have been updated to appear in the listing.
+    #[serde(default = "default_deposit_listing_max_age")]
+    pub deposit_listing_max_age_seconds: i64,
+    /// Browser origins allowed to call the API cross-origin. Empty by default:
+    /// the CLI and the taker send no Origin header and are unaffected.
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
+}
+
+fn default_deposit_listing_max_age() -> i64 {
+    3600
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            host: "127.0.0.1".to_string(),
+            port: 3000,
+            taker_token: None,
+            deposit_listing_max_age_seconds: default_deposit_listing_max_age(),
+            allowed_origins: Vec::new(),
+        }
+    }
 }
 
 /// Database configuration
@@ -211,6 +241,9 @@ impl Default for Config {
             server: ServerConfig {
                 host: "127.0.0.1".to_string(),
                 port: 3000,
+                taker_token: None,
+                deposit_listing_max_age_seconds: default_deposit_listing_max_age(),
+                allowed_origins: Vec::new(),
             },
             database: DatabaseConfig {
                 path: "zecp2p.db".to_string(),
@@ -256,6 +289,12 @@ impl Config {
             config.contracts.stake_vault = addr
                 .parse()
                 .map_err(|_| ConfigError::InvalidAddress(addr))?;
+        }
+        if let Ok(token) = std::env::var("COORDINATOR_TAKER_TOKEN") {
+            let token = token.trim().to_string();
+            if !token.is_empty() {
+                config.server.taker_token = Some(token);
+            }
         }
         if let Ok(secs) = std::env::var("KEEPER_POLL_INTERVAL_SECONDS") {
             config.keeper.poll_interval_seconds = secs

@@ -20,6 +20,9 @@ pub enum AppError {
     #[error("Invalid request: {0}")]
     InvalidRequest(String),
 
+    #[error("Unauthorized: {0}")]
+    Unauthorized(String),
+
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
 
@@ -46,17 +49,23 @@ impl IntoResponse for AppError {
             AppError::SessionExists => (StatusCode::CONFLICT, self.to_string()),
             AppError::InvalidState(_) => (StatusCode::BAD_REQUEST, self.to_string()),
             AppError::InvalidRequest(_) => (StatusCode::BAD_REQUEST, self.to_string()),
+            AppError::Unauthorized(_) => (StatusCode::UNAUTHORIZED, self.to_string()),
             AppError::Database(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Database error".to_string()),
-            AppError::Chain(_) => (StatusCode::BAD_GATEWAY, self.to_string()),
-            AppError::NearIntents(_) => (StatusCode::BAD_GATEWAY, self.to_string()),
-            AppError::Zkp2p(_) => (StatusCode::BAD_GATEWAY, self.to_string()),
+            // The full text carries RPC endpoints, revert data and sometimes the
+            // sender address. Log it, return the category.
+            AppError::Chain(_) => (StatusCode::BAD_GATEWAY, "Chain error".to_string()),
+            AppError::NearIntents(_) => (StatusCode::BAD_GATEWAY, "NEAR Intents error".to_string()),
+            AppError::Zkp2p(_) => (StatusCode::BAD_GATEWAY, "zk-p2p curator error".to_string()),
             AppError::Config(_) => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
             AppError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Internal error".to_string()),
         };
 
         // Log errors with appropriate level
         match &self {
-            AppError::SessionNotFound | AppError::InvalidState(_) | AppError::InvalidRequest(_) => {
+            AppError::SessionNotFound
+            | AppError::InvalidState(_)
+            | AppError::InvalidRequest(_)
+            | AppError::Unauthorized(_) => {
                 warn!(error = %self, status = %status, "Client error")
             }
             _ => {

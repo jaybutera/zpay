@@ -5,6 +5,7 @@ use std::sync::Arc;
 use alloy::primitives::U256;
 use axum::{
     extract::{Path, Query, State},
+    http::HeaderMap,
     Json,
 };
 use chrono::Utc;
@@ -12,7 +13,7 @@ use serde::Deserialize;
 use tracing::{info, instrument};
 use zecp2p_types::{OfframpRequest, OfframpResponse, QuoteResponse};
 
-use crate::{error::AppError, state::AppState};
+use crate::{auth, error::AppError, state::AppState};
 
 /// Health check
 pub async fn health() -> Json<serde_json::Value> {
@@ -142,6 +143,7 @@ pub struct CreateOfframpBody {
 #[instrument(skip(state, body), fields(zec_amount = %body.zec_amount, venmo = %body.venmo_username))]
 pub async fn create_offramp(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(body): Json<CreateOfframpBody>,
 ) -> Result<Json<OfframpResponse>, AppError> {
     info!(
@@ -171,6 +173,15 @@ pub async fn create_offramp(
         .map(str::parse)
         .transpose()
         .map_err(|_| AppError::InvalidState("Invalid taker address".to_string()))?;
+
+    // The caller names the address that will own this session and, through it,
+    // the address rescue and withdraw pay. Naming it is not enough: without this
+    // check anyone could open a session against a victim's address, or spend the
+    // keeper's gas in a loop for free.
+    // Scoped to the amount and the payee, so a signature captured for one
+    // offramp cannot open a different one.
+    let create_scope = format!("{}:{}", body.zec_amount.trim(), body.venmo_username.trim());
+    auth::require_owner(&headers, "create", user_address, &create_scope)?;
 
     // Parse min rate (default to reasonable value)
     let min_rate = parse_min_rate(body.min_rate.as_deref())?;
@@ -222,6 +233,7 @@ pub async fn get_offramp(
 #[instrument(skip(state), fields(session_id = %id))]
 pub async fn process_offramp(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<OfframpResponse>, AppError> {
     info!("Processing offramp for session {}", id);
@@ -229,6 +241,11 @@ pub async fn process_offramp(
     let uuid = id
         .parse()
         .map_err(|_| AppError::InvalidState("Invalid session ID".to_string()))?;
+
+    // Manual trigger for the session's own keeper work; it spends keeper gas, so
+    // it is the session owner's to call.
+    let session = state.get_session(uuid).await?.ok_or(AppError::SessionNotFound)?;
+    auth::require_owner(&headers, "process", session.request.user_address, &id)?;
 
     let session = state.process_offramp(uuid).await?;
 
@@ -257,33 +274,46 @@ pub struct OpenDeposit {
     pub venmo_username: String,
     /// USDC held in the deposit, 6 decimals.
     pub amount: Option<String>,
-    /// The address the offramp named as its expected taker, if any. Advisory
-    /// only: the deposit is ungated and anyone may claim it.
-    pub preferred_taker: Option<String>,
 }
 
 /// List deposits that are up for grabs.
 ///
-/// Anyone may call this; the deposits it describes are open on-chain to any
-/// staked taker, so there is nothing here a taker could not already see.
-#[instrument(skip(state))]
+/// Authenticated. The deposit ids and amounts here are on-chain and public, but
+/// the Venmo username is not, and that is the whole point of `payeeDetails`
+/// being an opaque curator hash: an observer watching Base can see what to pay
+/// and to which deposit, but not who. Serving the username to anyone who asks
+/// undoes that, joining a real-world identity to an exact amount and a
+/// timestamp, for a product whose users chose ZEC for privacy.
+///
+/// So: a bearer token, and only deposits still live enough to be worth paying.
+/// `preferred_taker` is not returned at all; `offramp.rs` documents it as
+/// advisory and zk-p2p enforces nothing about it, so it was a linkable
+/// identifier that bought nothing.
+#[instrument(skip(state, headers))]
 pub async fn list_open_deposits(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
 ) -> Result<Json<Vec<OpenDeposit>>, AppError> {
+    auth::require_taker_token(&headers, state.config.server.taker_token.as_deref())?;
+
     let sessions = state
         .db
         .get_sessions_by_status(zecp2p_types::OfframpStatus::Zkp2pDeposited)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
+    // A deposit nobody took hours ago is not a listing a taker needs, and every
+    // extra row is one more handle exposed for longer than necessary.
+    let cutoff = Utc::now() - chrono::Duration::seconds(state.config.server.deposit_listing_max_age_seconds);
+
     let deposits: Vec<OpenDeposit> = sessions
         .iter()
+        .filter(|session| session.updated_at >= cutoff)
         .filter_map(|session| {
             session.zkp2p_deposit_id.map(|deposit_id| OpenDeposit {
                 deposit_id: deposit_id.to_string(),
                 venmo_username: session.request.venmo_username.clone(),
                 amount: session.received_usdc.map(|a| a.to_string()),
-                preferred_taker: session.request.taker_address.map(|a| a.to_string()),
             })
         })
         .collect();
@@ -297,6 +327,7 @@ pub async fn list_open_deposits(
 #[instrument(skip(state), fields(session_id = %id))]
 pub async fn rescue_offramp(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<OfframpResponse>, AppError> {
     info!("Rescuing offramp for session {}", id);
@@ -304,6 +335,11 @@ pub async fn rescue_offramp(
     let uuid = id
         .parse()
         .map_err(|_| AppError::InvalidState("Invalid session ID".to_string()))?;
+
+    // This moves the session's USDC. Only the address the session names may ask
+    // for it, and the contract pays that same address regardless.
+    let session = state.get_session(uuid).await?.ok_or(AppError::SessionNotFound)?;
+    auth::require_owner(&headers, "rescue", session.request.user_address, &id)?;
 
     let session = state.rescue(uuid).await?;
 
@@ -321,6 +357,7 @@ pub async fn rescue_offramp(
 #[instrument(skip(state), fields(session_id = %id))]
 pub async fn withdraw_offramp(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<OfframpResponse>, AppError> {
     info!("Withdrawing offramp for session {}", id);
@@ -328,6 +365,9 @@ pub async fn withdraw_offramp(
     let uuid = id
         .parse()
         .map_err(|_| AppError::InvalidState("Invalid session ID".to_string()))?;
+
+    let session = state.get_session(uuid).await?.ok_or(AppError::SessionNotFound)?;
+    auth::require_owner(&headers, "withdraw", session.request.user_address, &id)?;
 
     let session = state.withdraw(uuid).await?;
 
@@ -461,34 +501,139 @@ fn validate_zec_address(address: &str) -> Result<(), AppError> {
 /// Parse min_rate (USD per USDC the zk-p2p taker must pay) from a decimal
 /// string to U256 with 18 decimals
 fn parse_min_rate(rate_str: Option<&str>) -> Result<U256, AppError> {
-    match rate_str {
-        Some(s) => {
-            let rate: f64 = s
-                .parse()
-                .map_err(|_| AppError::InvalidState("Invalid min_rate".to_string()))?;
+    const ONE: u128 = 1_000_000_000_000_000_000; // 1e18
 
-            if rate <= 0.0 {
-                return Err(AppError::InvalidState("min_rate must be positive".to_string()));
-            }
-            if rate > 1_000_000.0 {
-                return Err(AppError::InvalidState("min_rate is unreasonably high".to_string()));
-            }
+    let Some(s) = rate_str else {
+        // Default: 1 USD per USDC
+        return Ok(U256::from(ONE));
+    };
 
-            // Convert to 18-decimal precision safely
-            // Split into integer and fractional parts to avoid precision loss
-            let int_part = rate.trunc() as u128;
-            let frac_part = ((rate.fract()) * 1e18) as u128;
+    parse_decimal_18(s.trim())
+}
 
-            let scaled = int_part
-                .checked_mul(10u128.pow(18))
-                .and_then(|i| i.checked_add(frac_part))
-                .ok_or_else(|| AppError::InvalidState("min_rate overflow".to_string()))?;
+/// Parse a decimal string to 18-decimal fixed point, without going through f64.
+///
+/// The float path this replaces accepted "NaN": every comparison against NaN is
+/// false, so it passed both the `<= 0` and `> 1_000_000` guards and then
+/// truncated to a min_rate of 0, a deposit any taker could fill by paying
+/// nothing. It also could not round-trip the precision it claimed to keep;
+/// 0.999999999999999999 does not survive an f64. Parsing the digits directly
+/// has neither problem.
+fn parse_decimal_18(input: &str) -> Result<U256, AppError> {
+    const SCALE: u32 = 18;
+    const MAX_UNITS: u128 = 1_000_000; // same ceiling the float version enforced
 
-            Ok(U256::from(scaled))
+    let invalid = || AppError::InvalidState("Invalid min_rate".to_string());
+
+    if input.is_empty() {
+        return Err(invalid());
+    }
+    // No sign, no exponent, no "NaN", no "inf": digits and at most one point.
+    if !input
+        .chars()
+        .all(|c| c.is_ascii_digit() || c == '.')
+    {
+        return Err(invalid());
+    }
+
+    let mut parts = input.split('.');
+    let whole_str = parts.next().unwrap_or("");
+    let frac_str = parts.next().unwrap_or("");
+    if parts.next().is_some() {
+        return Err(invalid());
+    }
+    if whole_str.is_empty() && frac_str.is_empty() {
+        return Err(invalid());
+    }
+    if frac_str.len() > SCALE as usize {
+        return Err(AppError::InvalidState(
+            "min_rate has more than 18 decimal places".to_string(),
+        ));
+    }
+
+    let whole: u128 = if whole_str.is_empty() {
+        0
+    } else {
+        whole_str.parse().map_err(|_| invalid())?
+    };
+    if whole > MAX_UNITS {
+        return Err(AppError::InvalidState(
+            "min_rate is unreasonably high".to_string(),
+        ));
+    }
+
+    let frac: u128 = if frac_str.is_empty() {
+        0
+    } else {
+        let padded = format!("{:0<width$}", frac_str, width = SCALE as usize);
+        padded.parse().map_err(|_| invalid())?
+    };
+
+    let scaled = whole
+        .checked_mul(10u128.pow(SCALE))
+        .and_then(|w| w.checked_add(frac))
+        .ok_or_else(|| AppError::InvalidState("min_rate overflow".to_string()))?;
+
+    if scaled == 0 {
+        return Err(AppError::InvalidState(
+            "min_rate must be positive".to_string(),
+        ));
+    }
+    if scaled > MAX_UNITS * 10u128.pow(SCALE) {
+        return Err(AppError::InvalidState(
+            "min_rate is unreasonably high".to_string(),
+        ));
+    }
+
+    Ok(U256::from(scaled))
+}
+
+#[cfg(test)]
+mod min_rate_tests {
+    use super::*;
+
+    fn rate(s: &str) -> Result<U256, AppError> {
+        parse_min_rate(Some(s))
+    }
+
+    #[test]
+    fn the_default_is_one_dollar_per_usdc() {
+        assert_eq!(parse_min_rate(None).unwrap(), U256::from(10u64).pow(U256::from(18u64)));
+    }
+
+    #[test]
+    fn ordinary_rates_scale_to_eighteen_decimals() {
+        assert_eq!(rate("1").unwrap(), U256::from(1_000_000_000_000_000_000u128));
+        assert_eq!(rate("1.0").unwrap(), U256::from(1_000_000_000_000_000_000u128));
+        assert_eq!(rate("0.98").unwrap(), U256::from(980_000_000_000_000_000u128));
+        assert_eq!(rate("1.05").unwrap(), U256::from(1_050_000_000_000_000_000u128));
+    }
+
+    /// The finding: NaN passed every guard and produced a zero floor, which is a
+    /// deposit a taker can fill by paying nothing.
+    #[test]
+    fn nan_and_infinity_are_refused() {
+        for bad in ["NaN", "nan", "NAN", "inf", "-inf", "Infinity", "1e5", "-1"] {
+            assert!(rate(bad).is_err(), "{bad} should be rejected");
         }
-        None => {
-            // Default: 1 USD per USDC
-            Ok(U256::from(10u64).pow(U256::from(18u64)))
+    }
+
+    #[test]
+    fn a_zero_floor_is_refused() {
+        for bad in ["0", "0.0", "0.000000000000000000", "."] {
+            assert!(rate(bad).is_err(), "{bad} should be rejected");
         }
+    }
+
+    #[test]
+    fn precision_the_float_path_lost_is_kept() {
+        // 0.999999999999999999 does not round-trip through f64.
+        assert_eq!(rate("0.999999999999999999").unwrap(), U256::from(999_999_999_999_999_999u128));
+    }
+
+    #[test]
+    fn absurd_rates_are_refused() {
+        assert!(rate("1000001").is_err());
+        assert!(rate("0.9999999999999999999").is_err()); // 19 decimals
     }
 }

@@ -8,6 +8,7 @@
 //! - Monitors zk-p2p for fulfillment
 
 mod api;
+mod auth;
 mod chain;
 mod db;
 mod error;
@@ -24,7 +25,7 @@ use axum::{
 };
 use tokio::net::TcpListener;
 use tokio::sync::watch;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::CorsLayer;
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -96,7 +97,9 @@ async fn main() -> Result<()> {
         .route("/deposits/open", get(api::list_open_deposits))
         .route("/offramp/{id}/rescue", post(api::rescue_offramp))
         .route("/offramp/{id}/withdraw", post(api::withdraw_offramp))
-        .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any))
+        // An explicit list, not Any. With Any, any page a user visits could drive
+        // a loopback coordinator through their browser.
+        .layer(cors_layer(&config))
         .layer(TraceLayer::new_for_http())
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
@@ -129,6 +132,30 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// CORS for the frontend, restricted to the origins the operator names.
+///
+/// `allowed_origins` empty means no cross-origin browser access at all, which is
+/// right for a coordinator driven by the CLI.
+fn cors_layer(config: &Config) -> CorsLayer {
+    use axum::http::HeaderValue;
+
+    let origins: Vec<HeaderValue> = config
+        .server
+        .allowed_origins
+        .iter()
+        .filter_map(|o| o.parse().ok())
+        .collect();
+
+    CorsLayer::new()
+        .allow_origin(origins)
+        .allow_methods([axum::http::Method::GET, axum::http::Method::POST])
+        .allow_headers([
+            axum::http::header::CONTENT_TYPE,
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderName::from_static(crate::auth::SIGNATURE_HEADER),
+        ])
+}
+
 /// Validate configuration at startup
 fn validate_config(config: &Config) -> Result<()> {
     // Check that required addresses are valid
@@ -147,15 +174,61 @@ fn validate_config(config: &Config) -> Result<()> {
         tracing::warn!("GlueContract address not configured - some operations will fail");
     }
 
-    // Validate chain ID
+    // A chain id we do not recognise means the addresses in this config belong to
+    // a different chain than the RPC is pointed at. Every one of them, USDC and
+    // the escrow included, would be wrong. Refuse rather than warn.
     if config.network.chain_id != 8453 && config.network.chain_id != 84532 {
-        tracing::warn!(
-            "Unexpected chain ID: {}. Expected 8453 (Base mainnet) or 84532 (Base Sepolia)",
+        anyhow::bail!(
+            "Unexpected chain ID {}. Expected 8453 (Base mainnet) or 84532 (Base Sepolia)",
             config.network.chain_id
         );
     }
 
+    // Four endpoints spend the keeper's key and two of them move a user's USDC.
+    // Reachable from off the machine, they need the ownership signatures and the
+    // taker token to be configured; on loopback a developer can run without.
+    if !is_loopback(&config.server.host) && config.server.taker_token.is_none() {
+        anyhow::bail!(
+            "server.host is {} (not loopback) but server.taker_token is unset. \
+             Set it, or set COORDINATOR_TAKER_TOKEN, before binding a reachable address.",
+            config.server.host
+        );
+    }
+
     Ok(())
+}
+
+/// Whether a bind address only accepts connections from this machine.
+fn is_loopback(host: &str) -> bool {
+    let host = host.trim().trim_start_matches('[').trim_end_matches(']');
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_loopback;
+
+    #[test]
+    fn loopback_binds_are_recognised() {
+        assert!(is_loopback("127.0.0.1"));
+        assert!(is_loopback("127.0.0.5"));
+        assert!(is_loopback("::1"));
+        assert!(is_loopback("[::1]"));
+        assert!(is_loopback("localhost"));
+    }
+
+    #[test]
+    fn anything_reachable_is_not_loopback() {
+        assert!(!is_loopback("0.0.0.0"));
+        assert!(!is_loopback("::"));
+        assert!(!is_loopback("192.168.1.10"));
+        assert!(!is_loopback("example.com"));
+    }
 }
 
 /// Wait for shutdown signal (Ctrl+C or SIGTERM)

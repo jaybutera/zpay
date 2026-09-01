@@ -3,6 +3,7 @@
 //! This module exposes the coordinator's internal modules for testing.
 
 pub mod api;
+pub mod auth;
 pub mod chain;
 pub mod db;
 pub mod error;

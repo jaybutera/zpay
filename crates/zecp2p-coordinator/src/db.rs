@@ -34,6 +34,7 @@ impl Database {
                 request_json TEXT NOT NULL,
                 payee_details_hash TEXT NOT NULL,
                 expected_usdc TEXT,
+                min_output_usdc TEXT,
                 received_usdc TEXT,
                 near_deposit_address TEXT,
                 near_tx_hash TEXT,
@@ -108,10 +109,10 @@ impl Database {
             r#"
             INSERT INTO sessions (
                 id, session_id, status, request_json, payee_details_hash,
-                expected_usdc, received_usdc, near_deposit_address, near_tx_hash,
+                expected_usdc, min_output_usdc, received_usdc, near_deposit_address, near_tx_hash,
                 zkp2p_deposit_id, zkp2p_intent_hash, create_session_tx, process_offramp_tx,
                 error, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(session.id.to_string())
@@ -120,6 +121,7 @@ impl Database {
         .bind(&request_json)
         .bind(format!("{:?}", session.payee_details_hash))
         .bind(session.expected_usdc.map(|u| u.to_string()))
+        .bind(session.min_output_usdc.map(|u| u.to_string()))
         .bind(session.received_usdc.map(|u| u.to_string()))
         .bind(&session.near_deposit_address)
         .bind(&session.near_tx_hash)
@@ -142,6 +144,7 @@ impl Database {
             UPDATE sessions SET
                 status = ?,
                 expected_usdc = ?,
+                min_output_usdc = ?,
                 received_usdc = ?,
                 near_deposit_address = ?,
                 near_tx_hash = ?,
@@ -156,6 +159,7 @@ impl Database {
         )
         .bind(session.status.to_string())
         .bind(session.expected_usdc.map(|u| u.to_string()))
+        .bind(session.min_output_usdc.map(|u| u.to_string()))
         .bind(session.received_usdc.map(|u| u.to_string()))
         .bind(&session.near_deposit_address)
         .bind(&session.near_tx_hash)
@@ -223,6 +227,7 @@ struct SessionRow {
     request_json: String,
     payee_details_hash: String,
     expected_usdc: Option<String>,
+    min_output_usdc: Option<String>,
     received_usdc: Option<String>,
     near_deposit_address: Option<String>,
     near_tx_hash: Option<String>,
@@ -271,6 +276,7 @@ impl SessionRow {
             request,
             payee_details_hash: parse_b256(&self.payee_details_hash)?,
             expected_usdc: self.expected_usdc.as_ref().map(|s| parse_u256(s)).transpose()?,
+            min_output_usdc: self.min_output_usdc.as_ref().map(|s| parse_u256(s)).transpose()?,
             received_usdc: self.received_usdc.as_ref().map(|s| parse_u256(s)).transpose()?,
             near_deposit_address: self.near_deposit_address,
             near_tx_hash: self.near_tx_hash,
