@@ -138,8 +138,17 @@ contract MockEscrow is IEscrow {
 /// @notice Deployment script for local anvil testing with mocks
 /// @dev Run with: forge script script/DeployLocal.s.sol:DeployLocal --rpc-url http://localhost:8545 --broadcast
 contract DeployLocal is Script {
-    // Anvil's default private key (account[0])
+    // Anvil's default private key (account[0]): the deployer, and so the owner.
     uint256 constant ANVIL_PRIVATE_KEY = 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80;
+
+    // Anvil account[2]. The keeper is a separate address on purpose.
+    //
+    // It used to be account[0], the same key the tests signed the user's rescue
+    // with, which meant every "the user recovers their funds" test was really
+    // the keeper recovering them. That is what hid HIGH-1 in the 2026-08-31
+    // audit: on mainnet the keeper is not the user and both calls reverted.
+    // Three distinct roles here, so a test that conflates them fails.
+    address constant LOCAL_KEEPER = 0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC;
 
     function run() external returns (address usdc, address escrow, address glue) {
         vm.startBroadcast(ANVIL_PRIVATE_KEY);
@@ -155,6 +164,10 @@ contract DeployLocal is Script {
         // Deploy OfframpGlue
         OfframpGlue offrampGlue = new OfframpGlue(address(mockUsdc), address(mockEscrow));
         console.log("OfframpGlue deployed at:", address(offrampGlue));
+
+        // Separate the keeper from the owner and from the user.
+        offrampGlue.setKeeper(LOCAL_KEEPER);
+
         console.log("Owner:", offrampGlue.owner());
         console.log("Keeper:", offrampGlue.keeper());
 

@@ -14,16 +14,34 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
-/// Anvil's default private key for account[0]
+// Three roles, three keys. They are deliberately distinct.
+//
+// The harness used to sign the user's rescue with the same key it gave the
+// coordinator, so "the user recovers their funds" tests were really the keeper
+// recovering them, and the 2026-08-31 audit's HIGH-1 (rescue and withdraw
+// always revert on mainnet, because keeper is not user) passed every test.
+// DeployLocal now points the glue's keeper at account[2], so a test that
+// conflates the roles fails instead of passing.
+
+/// Anvil account[0]. Deploys the contracts, so it is the glue's owner.
 pub const ANVIL_PRIVATE_KEY: &str =
     "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 
 /// Test user address (anvil account[1])
 pub const TEST_USER: &str = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
 
-/// Test user private key (anvil account[1])
+/// Test user private key (anvil account[1]). The session owner: the only key
+/// that may sign the user's own escape hatch.
 pub const TEST_USER_PRIVATE_KEY: &str =
     "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
+
+/// Anvil account[2]. What `DeployLocal` sets as the glue's keeper, and what the
+/// coordinator runs as. Not the owner and not the user.
+pub const KEEPER_PRIVATE_KEY: &str =
+    "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a";
+
+/// Address of [`KEEPER_PRIVATE_KEY`].
+pub const KEEPER_ADDRESS: &str = "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC";
 
 /// Atomic counter for unique port allocation
 static PORT_COUNTER: AtomicU16 = AtomicU16::new(8700);

@@ -25,7 +25,31 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 use tempfile::TempDir;
-use test_utils::{deploy_contracts, AnvilInstance, MockZkp2pServer, ANVIL_PRIVATE_KEY, TEST_USER};
+use test_utils::{
+    deploy_contracts, AnvilInstance, MockZkp2pServer, ANVIL_PRIVATE_KEY, KEEPER_PRIVATE_KEY,
+    TEST_USER, TEST_USER_PRIVATE_KEY,
+};
+
+/// Header the coordinator reads the ownership signature from.
+const SIGNATURE_HEADER: &str = "x-zecp2p-signature";
+
+/// The user's key signs these requests. The coordinator requires proof that the
+/// caller holds the key for the address the session names, so an unsigned
+/// request is refused: that is CRITICAL-2 in the 2026-08-31 audit, where anyone
+/// could open a session naming a victim.
+fn user_signer() -> alloy::signers::local::PrivateKeySigner {
+    TEST_USER_PRIVATE_KEY.parse().expect("valid test key")
+}
+
+fn sign_ownership(action: &str, scope: &str) -> String {
+    use alloy::signers::SignerSync;
+    let signer = user_signer();
+    let message = format!("zecp2p:{action}:{:?}:{scope}", signer.address());
+    signer
+        .sign_message_sync(message.as_bytes())
+        .expect("sign")
+        .to_string()
+}
 use tokio::net::TcpListener;
 use zecp2p_types::abi::MockUSDC;
 
@@ -246,7 +270,7 @@ impl HttpTestInfra {
         let server_url = format!("http://127.0.0.1:{}", server_port);
 
         // Set the private key for the coordinator
-        std::env::set_var("COORDINATOR_PRIVATE_KEY", ANVIL_PRIVATE_KEY);
+        std::env::set_var("COORDINATOR_PRIVATE_KEY", KEEPER_PRIVATE_KEY);
 
         // Start the actual HTTP server
         let server_handle = {
@@ -414,6 +438,7 @@ async fn test_http_full_offramp_flow() {
 
     let resp = client
         .post(format!("{}/offramp", infra.server_url))
+        .header(SIGNATURE_HEADER, sign_ownership("create", "0.5:httptest"))
         .json(&create_body)
         .send()
         .await
@@ -593,6 +618,7 @@ async fn test_http_rescue_requires_valid_state() {
 
     let resp = client
         .post(format!("{}/offramp", infra.server_url))
+        .header(SIGNATURE_HEADER, sign_ownership("create", "0.25:rescuetest"))
         .json(&create_body)
         .send()
         .await
@@ -601,10 +627,12 @@ async fn test_http_rescue_requires_valid_state() {
     let create_resp: serde_json::Value = resp.json().await.expect("json");
     let session_id = create_resp["session_id"].as_str().expect("session_id");
 
-    // Try to rescue in near_intent_pending state (should fail)
+    // Try to rescue in near_intent_pending state (should fail on state, not auth,
+    // so sign it properly first).
     println!("Attempting rescue in near_intent_pending state...");
     let resp = client
         .post(format!("{}/offramp/{}/rescue", infra.server_url, session_id))
+        .header(SIGNATURE_HEADER, sign_ownership("rescue", session_id))
         .send()
         .await
         .expect("request");

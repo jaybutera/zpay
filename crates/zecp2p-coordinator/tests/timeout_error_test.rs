@@ -18,7 +18,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration as StdDuration;
 use tempfile::TempDir;
-use test_utils::{MockZkp2pServer, ANVIL_PRIVATE_KEY};
+use test_utils::{MockZkp2pServer, KEEPER_PRIVATE_KEY};
 use tokio::net::TcpListener;
 use zecp2p_types::OfframpStatus;
 
@@ -421,7 +421,7 @@ impl TestInfra {
 #[ignore = "requires anvil and forge to be installed"]
 async fn test_session_timeout_detection() {
     let infra = TestInfra::setup().await;
-    std::env::set_var("COORDINATOR_PRIVATE_KEY", ANVIL_PRIVATE_KEY);
+    std::env::set_var("COORDINATOR_PRIVATE_KEY", KEEPER_PRIVATE_KEY);
 
     let db = zecp2p_coordinator::db::Database::new(&infra.config.database.path)
         .await
@@ -464,7 +464,15 @@ async fn test_session_timeout_detection() {
     println!("\nStep 2: Simulating timeout by backdating created_at...");
 
     // We need to update directly in the database since OfframpSession::created_at is set at creation
-    let old_created_at = Utc::now() - Duration::hours(2); // 2 hours ago (well past 1 hour timeout)
+    //
+    // A session still waiting on the ZEC deposit gets the longer
+    // `keeper.near_intent_timeout_seconds` budget (3.5 days by default), not the
+    // 1-hour session budget, because that leg is bounded by 1Click's deposit
+    // deadline rather than by anything the coordinator controls. Backdate past
+    // the budget that actually applies.
+    let near_intent_budget =
+        Duration::seconds(zecp2p_types::config::KeeperConfig::default().near_intent_timeout_seconds);
+    let old_created_at = Utc::now() - near_intent_budget - Duration::hours(1);
     sqlx::query(
         "UPDATE sessions SET created_at = ? WHERE id = ?",
     )
@@ -522,7 +530,7 @@ async fn test_session_timeout_detection() {
 #[ignore = "requires anvil and forge to be installed"]
 async fn test_near_api_failure_during_quote() {
     let infra = TestInfra::setup().await;
-    std::env::set_var("COORDINATOR_PRIVATE_KEY", ANVIL_PRIVATE_KEY);
+    std::env::set_var("COORDINATOR_PRIVATE_KEY", KEEPER_PRIVATE_KEY);
 
     let db = zecp2p_coordinator::db::Database::new(&infra.config.database.path)
         .await
@@ -581,7 +589,7 @@ async fn test_near_api_failure_during_quote() {
 #[ignore = "requires anvil and forge to be installed"]
 async fn test_near_status_failure_during_keeper() {
     let infra = TestInfra::setup().await;
-    std::env::set_var("COORDINATOR_PRIVATE_KEY", ANVIL_PRIVATE_KEY);
+    std::env::set_var("COORDINATOR_PRIVATE_KEY", KEEPER_PRIVATE_KEY);
 
     let db = zecp2p_coordinator::db::Database::new(&infra.config.database.path)
         .await
@@ -655,7 +663,7 @@ async fn test_near_status_failure_during_keeper() {
 #[ignore = "requires anvil and forge to be installed"]
 async fn test_terminal_state_no_processing() {
     let infra = TestInfra::setup().await;
-    std::env::set_var("COORDINATOR_PRIVATE_KEY", ANVIL_PRIVATE_KEY);
+    std::env::set_var("COORDINATOR_PRIVATE_KEY", KEEPER_PRIVATE_KEY);
 
     let db = zecp2p_coordinator::db::Database::new(&infra.config.database.path)
         .await
@@ -735,7 +743,7 @@ async fn test_terminal_state_no_processing() {
 #[ignore = "requires anvil and forge to be installed"]
 async fn test_concurrent_reads_during_keeper() {
     let infra = TestInfra::setup().await;
-    std::env::set_var("COORDINATOR_PRIVATE_KEY", ANVIL_PRIVATE_KEY);
+    std::env::set_var("COORDINATOR_PRIVATE_KEY", KEEPER_PRIVATE_KEY);
 
     let db = zecp2p_coordinator::db::Database::new(&infra.config.database.path)
         .await
@@ -829,7 +837,7 @@ async fn test_concurrent_reads_during_keeper() {
 #[ignore = "requires anvil and forge to be installed"]
 async fn test_cache_db_consistency() {
     let infra = TestInfra::setup().await;
-    std::env::set_var("COORDINATOR_PRIVATE_KEY", ANVIL_PRIVATE_KEY);
+    std::env::set_var("COORDINATOR_PRIVATE_KEY", KEEPER_PRIVATE_KEY);
 
     let db = zecp2p_coordinator::db::Database::new(&infra.config.database.path)
         .await
@@ -908,7 +916,7 @@ async fn test_cache_db_consistency() {
 #[ignore = "requires anvil and forge to be installed"]
 async fn test_session_at_timeout_boundary() {
     let infra = TestInfra::setup().await;
-    std::env::set_var("COORDINATOR_PRIVATE_KEY", ANVIL_PRIVATE_KEY);
+    std::env::set_var("COORDINATOR_PRIVATE_KEY", KEEPER_PRIVATE_KEY);
 
     let db = zecp2p_coordinator::db::Database::new(&infra.config.database.path)
         .await

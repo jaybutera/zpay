@@ -284,8 +284,13 @@ contract MockEscrowWithOrchestrator is IEscrow {
 /// @notice Deployment script for enhanced local testing with Orchestrator mock
 /// @dev Run with: forge script script/DeployLocalEnhanced.s.sol:DeployLocalEnhanced --rpc-url http://localhost:8545 --broadcast
 contract DeployLocalEnhanced is Script {
-    // Anvil's default private key (account[0])
+    // Anvil's default private key (account[0]): the deployer, and so the owner.
     uint256 constant ANVIL_PRIVATE_KEY = 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80;
+
+    // Anvil account[2], matching DeployLocal. The keeper is a separate address
+    // so the tests cannot pass by signing the user's recovery with the
+    // coordinator's key, which is how the 2026-08-31 audit's HIGH-1 survived.
+    address constant LOCAL_KEEPER = 0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC;
 
     function run() external returns (address usdc, address escrow, address glue) {
         vm.startBroadcast(ANVIL_PRIVATE_KEY);
@@ -301,6 +306,9 @@ contract DeployLocalEnhanced is Script {
         // Deploy OfframpGlue
         OfframpGlue offrampGlue = new OfframpGlue(address(mockUsdc), address(mockEscrow));
         console.log("OfframpGlue deployed at:", address(offrampGlue));
+
+        offrampGlue.setKeeper(LOCAL_KEEPER);
+
         console.log("Owner:", offrampGlue.owner());
         console.log("Keeper:", offrampGlue.keeper());
 

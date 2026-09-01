@@ -26,7 +26,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 use tempfile::TempDir;
-use test_utils::{deploy_contracts, AnvilInstance, MockZkp2pServer, ANVIL_PRIVATE_KEY, TEST_USER};
+use test_utils::{deploy_contracts, AnvilInstance, MockZkp2pServer, ANVIL_PRIVATE_KEY, TEST_USER, KEEPER_PRIVATE_KEY};
 use tokio::net::TcpListener;
 use zecp2p_types::abi::MockUSDC;
 
@@ -280,6 +280,26 @@ impl TestInfra {
             .connect_http(self.anvil.rpc_url().parse().expect("valid url"))
     }
 
+    /// Deliver USDC for a session the way the real flow does: the tokens arrive,
+    /// then the keeper assigns them to one session.
+    ///
+    /// Minting alone leaves the money unassigned, which no session may spend.
+    /// That separation is what keeps two concurrent sessions from taking each
+    /// other's funds, so tests have to do both halves.
+    async fn deliver_usdc_for(&self, session_id: alloy::primitives::B256, amount: U256) {
+        self.mint_usdc(self.glue_addr, amount).await;
+
+        let provider = self.get_signing_provider().await;
+        let glue = zecp2p_types::abi::OfframpGlue::new(self.glue_addr, &provider);
+        glue.creditSession(session_id, amount)
+            .send()
+            .await
+            .expect("creditSession send")
+            .get_receipt()
+            .await
+            .expect("creditSession receipt");
+    }
+
     /// Mint USDC to an address (simulating NEAR Intent delivery)
     async fn mint_usdc(&self, to: Address, amount: U256) {
         let provider = self.get_signing_provider().await;
@@ -302,7 +322,7 @@ async fn test_coordinator_full_flow() {
     let infra = TestInfra::setup().await;
 
     // Set the private key for the coordinator
-    std::env::set_var("COORDINATOR_PRIVATE_KEY", ANVIL_PRIVATE_KEY);
+    std::env::set_var("COORDINATOR_PRIVATE_KEY", KEEPER_PRIVATE_KEY);
 
     // Initialize coordinator components
     let db = zecp2p_coordinator::db::Database::new(&infra.config.database.path)
@@ -357,9 +377,9 @@ async fn test_coordinator_full_flow() {
     println!("\nStep 2: Simulating USDC arrival from NEAR Intent...");
 
     let usdc_amount = session.expected_usdc.unwrap();
-    infra.mint_usdc(infra.glue_addr, usdc_amount).await;
+    infra.deliver_usdc_for(session.session_id, usdc_amount).await;
 
-    println!("  Minted {} USDC to GlueContract", usdc_amount);
+    println!("  Delivered and credited {} USDC to the session", usdc_amount);
 
     // Step 3: Update session status to UsdcReceived (normally the keeper would do this)
     // For testing, we manually transition the state
@@ -412,7 +432,7 @@ async fn test_coordinator_rescue_state_validation() {
     // rescue() directly on the contract.
 
     let infra = TestInfra::setup().await;
-    std::env::set_var("COORDINATOR_PRIVATE_KEY", ANVIL_PRIVATE_KEY);
+    std::env::set_var("COORDINATOR_PRIVATE_KEY", KEEPER_PRIVATE_KEY);
 
     let db = zecp2p_coordinator::db::Database::new(&infra.config.database.path)
         .await
@@ -456,8 +476,8 @@ async fn test_coordinator_rescue_state_validation() {
 
     // Mint USDC to GlueContract
     let usdc_amount = session.expected_usdc.unwrap();
-    infra.mint_usdc(infra.glue_addr, usdc_amount).await;
-    println!("Minted {} USDC to GlueContract", usdc_amount);
+    infra.deliver_usdc_for(session.session_id, usdc_amount).await;
+    println!("Delivered and credited {} USDC to the session", usdc_amount);
 
     // Update to UsdcReceived state
     let mut updated_session = state
@@ -488,7 +508,7 @@ async fn test_coordinator_withdraw_state_validation() {
     // The coordinator tracks state but the user must call withdraw directly.
 
     let infra = TestInfra::setup().await;
-    std::env::set_var("COORDINATOR_PRIVATE_KEY", ANVIL_PRIVATE_KEY);
+    std::env::set_var("COORDINATOR_PRIVATE_KEY", KEEPER_PRIVATE_KEY);
 
     let db = zecp2p_coordinator::db::Database::new(&infra.config.database.path)
         .await
@@ -532,7 +552,7 @@ async fn test_coordinator_withdraw_state_validation() {
 
     // Mint USDC and update to UsdcReceived
     let usdc_amount = session.expected_usdc.unwrap();
-    infra.mint_usdc(infra.glue_addr, usdc_amount).await;
+    infra.deliver_usdc_for(session.session_id, usdc_amount).await;
 
     let mut updated_session = state.get_session(session.id).await.expect("get").expect("exists");
     updated_session.received_usdc = Some(usdc_amount);
@@ -563,7 +583,7 @@ async fn test_coordinator_withdraw_state_validation() {
 #[ignore = "requires anvil and forge to be installed"]
 async fn test_coordinator_state_validation() {
     let infra = TestInfra::setup().await;
-    std::env::set_var("COORDINATOR_PRIVATE_KEY", ANVIL_PRIVATE_KEY);
+    std::env::set_var("COORDINATOR_PRIVATE_KEY", KEEPER_PRIVATE_KEY);
 
     let db = zecp2p_coordinator::db::Database::new(&infra.config.database.path)
         .await

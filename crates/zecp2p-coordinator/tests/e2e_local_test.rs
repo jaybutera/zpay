@@ -91,6 +91,18 @@ async fn test_full_offramp_flow_local() {
     let receipt = tx.get_receipt().await.expect("Failed to get receipt");
     println!("mint tx: {:?}", receipt.transaction_hash);
 
+    // The keeper assigns the arrived USDC to this session. Nothing is spendable
+    // until it does: the glue accounts per session, so a bare transfer is
+    // unassigned balance that no session owns.
+    glue
+        .creditSession(session_id, expected_amount)
+        .send()
+        .await
+        .expect("Failed to creditSession")
+        .get_receipt()
+        .await
+        .expect("Failed to get receipt");
+
     // Verify USDC balance
     let balance = glue
         .getContractUsdcBalance()
@@ -195,6 +207,18 @@ async fn test_rescue_flow_local() {
         .await
         .expect("Failed to get receipt");
 
+    // The keeper assigns the arrived USDC to this session. Nothing is spendable
+    // until it does: the glue accounts per session, so a bare transfer is
+    // unassigned balance that no session owns.
+    glue_owner
+        .creditSession(session_id, expected_amount)
+        .send()
+        .await
+        .expect("Failed to creditSession")
+        .get_receipt()
+        .await
+        .expect("Failed to get receipt");
+
     // Step 3: User rescues the funds (before processOfframp)
     println!("\n=== Testing Rescue Flow ===");
 
@@ -282,6 +306,18 @@ async fn test_withdraw_from_zkp2p_flow_local() {
         .send()
         .await
         .expect("Failed to mint")
+        .get_receipt()
+        .await
+        .expect("Failed to get receipt");
+
+    // The keeper assigns the arrived USDC to this session. Nothing is spendable
+    // until it does: the glue accounts per session, so a bare transfer is
+    // unassigned balance that no session owns.
+    glue_owner
+        .creditSession(session_id, expected_amount)
+        .send()
+        .await
+        .expect("Failed to creditSession")
         .get_receipt()
         .await
         .expect("Failed to get receipt");
@@ -378,6 +414,15 @@ async fn test_session_cannot_process_twice() {
         .await
         .unwrap();
 
+    glue
+        .creditSession(session_id, expected_amount)
+        .send()
+        .await
+        .unwrap()
+        .get_receipt()
+        .await
+        .unwrap();
+
     // Process offramp
     let payment_methods = vec![venmo_payment_method()];
     let payment_method_data = vec![OfframpGlue::DepositPaymentMethodData {
@@ -416,4 +461,168 @@ async fn test_session_cannot_process_twice() {
 
     assert!(result.is_err(), "Should not be able to process twice");
     println!("Correctly prevented double processing");
+}
+
+/// HIGH-1, against real deployed bytecode: the user recovers their own funds
+/// with their own key, with the keeper doing nothing.
+///
+/// This is the test the old harness could not have failed, because it signed
+/// the user's rescue with the coordinator's key. Here the three roles are three
+/// different Anvil accounts, and the keeper's key is never used after the
+/// session is set up. If the contract still required msg.sender == session.user
+/// while the coordinator sent with the keeper key, the keeper leg below would
+/// revert and the user leg would be the only thing that worked; both are
+/// asserted explicitly.
+#[tokio::test]
+#[ignore = "requires anvil and forge to be installed"]
+async fn test_user_escape_hatch_without_the_keeper() {
+    let anvil = AnvilInstance::start();
+    let rpc_url = anvil.rpc_url();
+
+    let (usdc_addr, _escrow_addr, glue_addr) = deploy_contracts(rpc_url);
+
+    // Three distinct roles.
+    let owner_provider = get_signing_provider(rpc_url, ANVIL_PRIVATE_KEY).await;
+    let keeper_provider = get_signing_provider(rpc_url, test_utils::KEEPER_PRIVATE_KEY).await;
+    let user_provider = get_signing_provider(rpc_url, TEST_USER_PRIVATE_KEY).await;
+
+    let glue_keeper = OfframpGlue::new(glue_addr, &keeper_provider);
+    let glue_user = OfframpGlue::new(glue_addr, &user_provider);
+    let usdc = MockUSDC::new(usdc_addr, &owner_provider);
+
+    let user: Address = TEST_USER.parse().unwrap();
+    let keeper: Address = test_utils::KEEPER_ADDRESS.parse().unwrap();
+
+    // The deploy really did separate them.
+    let on_chain_keeper = glue_keeper.keeper().call().await.expect("read keeper");
+    assert_eq!(on_chain_keeper, keeper, "DeployLocal must set a distinct keeper");
+    assert_ne!(on_chain_keeper, user, "keeper must not be the user");
+
+    let session_id = B256::from([9u8; 32]);
+    let venmo_hash = alloy::primitives::keccak256(b"escapehatch");
+    let min_rate = U256::from(1_000_000_000_000_000_000u128);
+    let amount = U256::from(25_000_000u64); // 25 USDC
+
+    // Keeper sets the session up and credits the delivery.
+    glue_keeper
+        .createSession(session_id, user, venmo_hash, min_rate, amount)
+        .send()
+        .await
+        .expect("createSession as keeper")
+        .get_receipt()
+        .await
+        .expect("receipt");
+
+    usdc.mint(glue_addr, amount)
+        .send()
+        .await
+        .expect("mint")
+        .get_receipt()
+        .await
+        .expect("receipt");
+
+    glue_keeper
+        .creditSession(session_id, amount)
+        .send()
+        .await
+        .expect("creditSession as keeper")
+        .get_receipt()
+        .await
+        .expect("receipt");
+
+    // From here the keeper is out of the picture: the user signs for themselves.
+    let before = usdc.balanceOf(user).call().await.expect("balance");
+
+    glue_user
+        .rescue(session_id)
+        .send()
+        .await
+        .expect("the user must be able to rescue with their own key")
+        .get_receipt()
+        .await
+        .expect("receipt");
+
+    let after = usdc.balanceOf(user).call().await.expect("balance");
+    assert_eq!(after - before, amount, "the user got their own USDC back");
+
+    let session = glue_user.getSession(session_id).call().await.expect("session");
+    assert!(session.rescued);
+    assert_eq!(session.credited, U256::ZERO);
+
+    println!("User recovered {amount} USDC units with no keeper transaction.");
+}
+
+/// The other half of HIGH-1: the coordinator's keeper-signed rescue has to work
+/// too, since that is the path `POST /offramp/{id}/rescue` takes. It used to
+/// revert on mainnet for exactly the reason the user's path did not exist.
+#[tokio::test]
+#[ignore = "requires anvil and forge to be installed"]
+async fn test_keeper_signed_rescue_pays_the_user() {
+    let anvil = AnvilInstance::start();
+    let rpc_url = anvil.rpc_url();
+
+    let (usdc_addr, _escrow_addr, glue_addr) = deploy_contracts(rpc_url);
+
+    let owner_provider = get_signing_provider(rpc_url, ANVIL_PRIVATE_KEY).await;
+    let keeper_provider = get_signing_provider(rpc_url, test_utils::KEEPER_PRIVATE_KEY).await;
+
+    let glue_keeper = OfframpGlue::new(glue_addr, &keeper_provider);
+    let usdc = MockUSDC::new(usdc_addr, &owner_provider);
+
+    let user: Address = TEST_USER.parse().unwrap();
+    let keeper: Address = test_utils::KEEPER_ADDRESS.parse().unwrap();
+
+    let session_id = B256::from([10u8; 32]);
+    let amount = U256::from(12_000_000u64);
+
+    glue_keeper
+        .createSession(
+            session_id,
+            user,
+            alloy::primitives::keccak256(b"keeperrescue"),
+            U256::from(1_000_000_000_000_000_000u128),
+            amount,
+        )
+        .send()
+        .await
+        .expect("createSession")
+        .get_receipt()
+        .await
+        .expect("receipt");
+
+    usdc.mint(glue_addr, amount)
+        .send()
+        .await
+        .expect("mint")
+        .get_receipt()
+        .await
+        .expect("receipt");
+
+    glue_keeper
+        .creditSession(session_id, amount)
+        .send()
+        .await
+        .expect("creditSession")
+        .get_receipt()
+        .await
+        .expect("receipt");
+
+    let user_before = usdc.balanceOf(user).call().await.expect("balance");
+    let keeper_before = usdc.balanceOf(keeper).call().await.expect("balance");
+
+    // The keeper sends it, exactly as the coordinator does.
+    glue_keeper
+        .rescue(session_id)
+        .send()
+        .await
+        .expect("keeper-signed rescue must not revert")
+        .get_receipt()
+        .await
+        .expect("receipt");
+
+    let user_after = usdc.balanceOf(user).call().await.expect("balance");
+    let keeper_after = usdc.balanceOf(keeper).call().await.expect("balance");
+
+    assert_eq!(user_after - user_before, amount, "the user is paid");
+    assert_eq!(keeper_after, keeper_before, "the keeper takes nothing");
 }

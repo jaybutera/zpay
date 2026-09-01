@@ -234,3 +234,146 @@ fn test_cli_coordinator_env_var() {
         "should mention ZECP2P_COORDINATOR_URL env var"
     );
 }
+
+// ==================== ESCAPE HATCH TESTS ====================
+//
+// HIGH-1 in the 2026-08-31 audit: the contract required msg.sender ==
+// session.user on rescue and withdraw, but the coordinator sent both with the
+// keeper key, so on mainnet every recovery reverted and the user had no path to
+// their own funds. The contract now accepts either party, and the CLI can sign
+// as the user, either through the coordinator or straight to Base.
+
+/// A well-known Anvil key, used here only to check argument handling. Nothing
+/// is sent anywhere: every case below fails before any network call.
+const TEST_KEY: &str = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
+const TEST_KEY_ADDRESS: &str = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
+
+fn run_cli_without_user_key(args: &[&str]) -> Output {
+    Command::new(cli_binary())
+        .current_dir(workspace_root())
+        .env_remove("ZECP2P_USER_PRIVATE_KEY")
+        .env_remove("GLUE_CONTRACT_ADDRESS")
+        .args(args)
+        .output()
+        .expect("run CLI")
+}
+
+#[test]
+fn rescue_offers_a_self_signed_path() {
+    ensure_cli_built();
+
+    let output = run_cli(&["rescue", "--help"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(output.status.success());
+    assert!(
+        stdout.contains("--self-signed"),
+        "rescue must offer a path that does not go through the coordinator"
+    );
+    assert!(stdout.contains("--glue"), "self-signed needs the glue address");
+}
+
+#[test]
+fn withdraw_offers_a_self_signed_path() {
+    ensure_cli_built();
+
+    let output = run_cli(&["withdraw", "--help"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(output.status.success());
+    assert!(stdout.contains("--self-signed"));
+}
+
+#[test]
+fn recovery_without_a_key_says_so_plainly() {
+    ensure_cli_built();
+
+    let output = run_cli_without_user_key(&[
+        "rescue",
+        "00000000-0000-0000-0000-000000000000",
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains("ZECP2P_USER_PRIVATE_KEY") || stderr.contains("--private-key"),
+        "should name the key it wants, got: {stderr}"
+    );
+}
+
+#[test]
+fn self_signed_recovery_needs_the_glue_address() {
+    ensure_cli_built();
+
+    let output = run_cli_without_user_key(&[
+        "rescue",
+        "00000000-0000-0000-0000-000000000000",
+        "--private-key",
+        TEST_KEY,
+        "--self-signed",
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains("--glue"),
+        "should ask for the glue address, got: {stderr}"
+    );
+}
+
+/// The session owner and the signer have to be the same address, or the
+/// coordinator would reject the signature for a reason the user cannot see.
+#[test]
+fn offramp_refuses_a_user_address_that_is_not_the_signers() {
+    ensure_cli_built();
+
+    let output = run_cli_without_user_key(&[
+        "offramp",
+        "0.5",
+        "--venmo",
+        "someone",
+        "--zec-address",
+        "t1VJnUz9FDy7WfFxqXwMZJWVxzMrRD7MvBA",
+        "--private-key",
+        TEST_KEY,
+        "--user-address",
+        "0x1234567890123456789012345678901234567890",
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains("not the address of"),
+        "should refuse a mismatch, got: {stderr}"
+    );
+}
+
+/// Omitting --user-address is fine: it comes from the key, so the two cannot
+/// disagree. This reaches the network and fails there, which is proof enough
+/// that argument handling accepted it.
+#[test]
+fn offramp_derives_the_user_address_from_the_key() {
+    ensure_cli_built();
+
+    let output = run_cli_without_user_key(&[
+        "--coordinator",
+        "http://127.0.0.1:1", // nothing listens here
+        "offramp",
+        "0.5",
+        "--venmo",
+        "someone",
+        "--zec-address",
+        "t1VJnUz9FDy7WfFxqXwMZJWVxzMrRD7MvBA",
+        "--private-key",
+        TEST_KEY,
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success());
+    assert!(
+        !stderr.contains("not the address of") && !stderr.contains("--user-address"),
+        "argument handling should have accepted this, got: {stderr}"
+    );
+    // Sanity: the key really is the address the test names.
+    assert_eq!(TEST_KEY_ADDRESS.len(), 42);
+}

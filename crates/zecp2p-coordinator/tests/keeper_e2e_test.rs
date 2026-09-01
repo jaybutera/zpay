@@ -25,7 +25,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 use tempfile::TempDir;
-use test_utils::{MockZkp2pServer, ANVIL_PRIVATE_KEY};
+use test_utils::{MockZkp2pServer, ANVIL_PRIVATE_KEY, KEEPER_PRIVATE_KEY};
 use tokio::net::TcpListener;
 use zecp2p_types::abi::{
     usd_currency_code, venmo_payment_method, MockEscrowWithOrchestrator, MockUSDC,
@@ -418,6 +418,26 @@ impl TestInfra {
         get_signing_provider(self.anvil.rpc_url(), TEST_USER_PRIVATE_KEY).await
     }
 
+    /// Deliver USDC and assign it to a session, the way the keeper does.
+    ///
+    /// Tests that fast-forward a session past the keeper's own detection have to
+    /// do this themselves: a bare mint leaves the money unassigned, which no
+    /// session may spend. That separation is what stops concurrent sessions
+    /// taking each other's funds, so processOfframp rightly refuses without it.
+    async fn deliver_usdc_for(&self, session_id: alloy::primitives::B256, amount: U256) {
+        self.mint_usdc(self.glue_addr, amount).await;
+
+        let provider = self.get_signing_provider().await;
+        let glue = zecp2p_types::abi::OfframpGlue::new(self.glue_addr, &provider);
+        glue.creditSession(session_id, amount)
+            .send()
+            .await
+            .expect("creditSession send")
+            .get_receipt()
+            .await
+            .expect("creditSession receipt");
+    }
+
     /// Mint USDC to an address (simulating NEAR Intent delivery)
     async fn mint_usdc(&self, to: Address, amount: U256) {
         let provider = self.get_signing_provider().await;
@@ -438,7 +458,7 @@ impl TestInfra {
 #[ignore = "requires anvil and forge to be installed"]
 async fn test_keeper_auto_processes_on_usdc_arrival() {
     let infra = TestInfra::setup().await;
-    std::env::set_var("COORDINATOR_PRIVATE_KEY", ANVIL_PRIVATE_KEY);
+    std::env::set_var("COORDINATOR_PRIVATE_KEY", KEEPER_PRIVATE_KEY);
 
     // Initialize coordinator components
     let db = zecp2p_coordinator::db::Database::new(&infra.config.database.path)
@@ -551,7 +571,7 @@ async fn test_keeper_auto_processes_on_usdc_arrival() {
 #[ignore = "requires anvil and forge to be installed"]
 async fn test_full_event_driven_flow() {
     let infra = TestInfra::setup().await;
-    std::env::set_var("COORDINATOR_PRIVATE_KEY", ANVIL_PRIVATE_KEY);
+    std::env::set_var("COORDINATOR_PRIVATE_KEY", KEEPER_PRIVATE_KEY);
 
     let db = zecp2p_coordinator::db::Database::new(&infra.config.database.path)
         .await
@@ -591,7 +611,7 @@ async fn test_full_event_driven_flow() {
     // Step 2: Mint USDC to GlueContract and update status
     println!("\nStep 2: Simulating USDC arrival...");
     let usdc_amount = session.expected_usdc.unwrap();
-    infra.mint_usdc(infra.glue_addr, usdc_amount).await;
+    infra.deliver_usdc_for(session.session_id, usdc_amount).await;
     infra.near_state.set_status("SUCCESS");
 
     // Step 3: Manually update session to UsdcReceived (simulating what keeper does)
@@ -702,7 +722,7 @@ async fn test_full_event_driven_flow() {
 #[ignore = "requires anvil and forge to be installed"]
 async fn test_keeper_detects_intent_signaled() {
     let infra = TestInfra::setup().await;
-    std::env::set_var("COORDINATOR_PRIVATE_KEY", ANVIL_PRIVATE_KEY);
+    std::env::set_var("COORDINATOR_PRIVATE_KEY", KEEPER_PRIVATE_KEY);
 
     let db = zecp2p_coordinator::db::Database::new(&infra.config.database.path)
         .await
@@ -737,7 +757,7 @@ async fn test_keeper_detects_intent_signaled() {
 
     let session = state.create_offramp(request).await.expect("create");
     let usdc_amount = session.expected_usdc.unwrap();
-    infra.mint_usdc(infra.glue_addr, usdc_amount).await;
+    infra.deliver_usdc_for(session.session_id, usdc_amount).await;
     infra.near_state.set_status("SUCCESS");
 
     // Fast-forward to UsdcReceived
@@ -814,7 +834,7 @@ async fn test_keeper_detects_intent_signaled() {
 #[ignore = "requires anvil and forge to be installed"]
 async fn test_keeper_detects_intent_fulfilled() {
     let infra = TestInfra::setup().await;
-    std::env::set_var("COORDINATOR_PRIVATE_KEY", ANVIL_PRIVATE_KEY);
+    std::env::set_var("COORDINATOR_PRIVATE_KEY", KEEPER_PRIVATE_KEY);
 
     let db = zecp2p_coordinator::db::Database::new(&infra.config.database.path)
         .await
@@ -849,7 +869,7 @@ async fn test_keeper_detects_intent_fulfilled() {
 
     let session = state.create_offramp(request).await.expect("create");
     let usdc_amount = session.expected_usdc.unwrap();
-    infra.mint_usdc(infra.glue_addr, usdc_amount).await;
+    infra.deliver_usdc_for(session.session_id, usdc_amount).await;
     infra.near_state.set_status("SUCCESS");
 
     let mut s = state.get_session(session.id).await.unwrap().unwrap();
@@ -963,7 +983,7 @@ async fn test_keeper_detects_intent_fulfilled() {
 #[ignore = "requires anvil and forge to be installed"]
 async fn test_complete_keeper_driven_flow() {
     let infra = TestInfra::setup().await;
-    std::env::set_var("COORDINATOR_PRIVATE_KEY", ANVIL_PRIVATE_KEY);
+    std::env::set_var("COORDINATOR_PRIVATE_KEY", KEEPER_PRIVATE_KEY);
 
     let db = zecp2p_coordinator::db::Database::new(&infra.config.database.path)
         .await
