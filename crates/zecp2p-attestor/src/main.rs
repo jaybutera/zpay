@@ -152,6 +152,32 @@ async fn main() {
         .expect("build the chain client")
         .expect("chain client");
 
+    // A `test-signer` build may be told to trust another enclave key, which is
+    // what a regtest run needs: a real attestation requires a real Venmo
+    // payment through the pinned prover, and that is the mainnet leg. A
+    // production build has no such field and no such option.
+    #[cfg(feature = "test-signer")]
+    let service = Arc::new(match std::env::var("ZECP2P_TEST_ENCLAVE_SIGNER") {
+        Ok(hex_addr) => {
+            let bytes: [u8; 20] = hex::decode(hex_addr.trim())
+                .expect("ZECP2P_TEST_ENCLAVE_SIGNER is 40 hex characters")
+                .try_into()
+                .expect("ZECP2P_TEST_ENCLAVE_SIGNER is 20 bytes");
+            tracing::warn!(
+                signer = %hex::encode(bytes),
+                "TEST BUILD: trusting a non-production enclave key; this proves the plumbing \
+                 and nothing about the enclave"
+            );
+            AttestorService::with_trusted_signer(
+                db, d, chain, SystemClock, token,
+                env!("CARGO_PKG_VERSION").to_string(), bytes,
+            )
+        }
+        Err(_) => AttestorService::new(
+            db, d, chain, SystemClock, token, env!("CARGO_PKG_VERSION").to_string(),
+        ),
+    });
+    #[cfg(not(feature = "test-signer"))]
     let service = Arc::new(AttestorService::new(
         db,
         d,

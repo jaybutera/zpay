@@ -409,3 +409,38 @@ pub fn serialize_refund(
         script_sig,
     )
 }
+
+/// The txid of a transaction, computed before it is broadcast.
+///
+/// Spec 4.2 rests on this: ZIP 244 txids do not commit to signatures, so the
+/// client knows the funding outpoint before the funding transaction is signed,
+/// and the pre-signature can therefore commit to it. Round 7 noted that nothing
+/// in the repo exercised it - every txid in the regtest run was read back from
+/// the node afterwards.
+///
+/// The bytes returned are **internal order**. Every Zcash RPC and every
+/// explorer prints the reverse; `rpc::txid_to_rpc_hex` converts.
+pub fn txid_of_signed(raw_tx: &[u8]) -> Result<[u8; 32], TxError> {
+    use zcash_primitives::transaction::Transaction;
+    use zcash_protocol::consensus::BranchId;
+
+    // The branch id only selects the parser; a v5 transaction carries its own.
+    let tx = Transaction::read(raw_tx, BranchId::Nu5)
+        .map_err(|e| TxError::Serialize(format!("could not parse the transaction: {e}")))?;
+    Ok(*tx.txid().as_ref())
+}
+
+/// The txid a *signed* release will have, computed from the unsigned form plus
+/// the signatures that will go into it.
+///
+/// Used to check the ZIP 244 property directly: sign the same transaction two
+/// ways and the txid must not move.
+pub fn release_txid(
+    terms: &EscrowTerms,
+    lp_output_script: &[u8],
+    fee_zat: u64,
+    script_sig: &[u8],
+) -> Result<[u8; 32], TxError> {
+    let raw = serialize_release(terms, lp_output_script, fee_zat, script_sig)?;
+    txid_of_signed(&raw)
+}

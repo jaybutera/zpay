@@ -15,6 +15,7 @@ pub mod dlc;
 pub mod fees;
 pub mod funding;
 pub mod lp;
+pub mod lp_client;
 pub mod payment_details;
 pub mod rpc;
 pub mod script;

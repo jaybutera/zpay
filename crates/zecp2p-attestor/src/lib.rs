@@ -648,6 +648,30 @@ pub fn attest_decide_and_sign(
     )
 }
 
+/// As [`attest_decide_and_sign`], against a caller-supplied enclave key.
+/// Test builds only.
+#[cfg(feature = "test-signer")]
+#[allow(clippy::too_many_arguments)]
+pub fn attest_decide_and_sign_against_signer(
+    db: &mut db::SqliteEventStore,
+    secp: &Secp256k1<secp256k1_zkp::All>,
+    d: &SecretKey,
+    clock: &impl Clock,
+    event_id: &[u8; 32],
+    terms: &CanonicalTerms,
+    attestation: &PaymentAttestation,
+    signature: &[u8],
+    encoded_payment_details: &[u8],
+    observation: &ChainObservation,
+    rate: &RatePolicy,
+    trusted_signer: &[u8; 20],
+) -> Result<SecretKey, AttestorError> {
+    decide_and_sign_with_signer(
+        db, secp, d, clock, event_id, terms, attestation, signature,
+        encoded_payment_details, observation, rate, trusted_signer,
+    )
+}
+
 /// The shared body of the signing phase. `attest_over_db_with_signer` reads the
 /// chain itself and then calls this; the service reads the chain between two
 /// lock acquisitions and calls it directly.

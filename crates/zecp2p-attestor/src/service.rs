@@ -46,6 +46,16 @@ pub struct AttestorService<C, K> {
     clock: K,
     bearer_token: String,
     build_id: String,
+    /// The enclave key this service trusts.
+    ///
+    /// Always `ENCLAVE_SIGNER` in a production build - the field only exists
+    /// under `test-signer`, and `new` is the only constructor without it. A
+    /// regtest run needs it because a real attestation requires a real Venmo
+    /// payment through the pinned prover, which is the mainnet leg; running the
+    /// plumbing against a test key proves the plumbing and nothing about the
+    /// enclave.
+    #[cfg(feature = "test-signer")]
+    trusted_signer: [u8; 20],
 }
 
 impl<C, K> std::fmt::Debug for AttestorService<C, K> {
@@ -74,6 +84,26 @@ impl<C: ChainClient, K: Clock> AttestorService<C, K> {
             clock,
             bearer_token,
             build_id,
+            #[cfg(feature = "test-signer")]
+            trusted_signer: zecp2p_escrow::attestation::ENCLAVE_SIGNER,
+        }
+    }
+
+    /// As [`new`], trusting a caller-supplied enclave key. Test builds only.
+    #[cfg(feature = "test-signer")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_trusted_signer(
+        db: SqliteEventStore,
+        d: SecretKey,
+        chain: C,
+        clock: K,
+        bearer_token: String,
+        build_id: String,
+        trusted_signer: [u8; 20],
+    ) -> Self {
+        Self {
+            trusted_signer,
+            ..Self::new(db, d, chain, clock, bearer_token, build_id)
         }
     }
 
@@ -480,19 +510,17 @@ where
                 confirmations: u32::MAX,
                 earliest_acceptable_payment_ms: announced,
             };
-            Some(crate::attest_decide_and_sign(
-                &mut db,
-                &svc_r.secp,
-                &svc_r.d,
-                &svc_r.clock,
-                &derived,
-                &terms_r,
-                &att_r,
-                &sig_r,
-                &det_r,
-                &obs,
-                &RatePolicy::production(),
-            ))
+            #[cfg(feature = "test-signer")]
+            let out = crate::attest_decide_and_sign_against_signer(
+                &mut db, &svc_r.secp, &svc_r.d, &svc_r.clock, &derived, &terms_r, &att_r,
+                &sig_r, &det_r, &obs, &RatePolicy::production(), &svc_r.trusted_signer,
+            );
+            #[cfg(not(feature = "test-signer"))]
+            let out = crate::attest_decide_and_sign(
+                &mut db, &svc_r.secp, &svc_r.d, &svc_r.clock, &derived, &terms_r, &att_r,
+                &sig_r, &det_r, &obs, &RatePolicy::production(),
+            );
+            Some(out)
         })
         .await
         .ok()
@@ -552,19 +580,18 @@ where
     let svc3 = svc.clone();
     let s = tokio::task::spawn_blocking(move || {
         let mut db = svc3.db.blocking_lock();
-        crate::attest_decide_and_sign(
-            &mut db,
-            &svc3.secp,
-            &svc3.d,
-            &svc3.clock,
-            &derived,
-            &terms,
-            &attestation,
-            &signature,
-            &details,
-            &observation,
-            &RatePolicy::production(),
-        )
+        #[cfg(feature = "test-signer")]
+        let out = crate::attest_decide_and_sign_against_signer(
+            &mut db, &svc3.secp, &svc3.d, &svc3.clock, &derived, &terms, &attestation,
+            &signature, &details, &observation, &RatePolicy::production(),
+            &svc3.trusted_signer,
+        );
+        #[cfg(not(feature = "test-signer"))]
+        let out = crate::attest_decide_and_sign(
+            &mut db, &svc3.secp, &svc3.d, &svc3.clock, &derived, &terms, &attestation,
+            &signature, &details, &observation, &RatePolicy::production(),
+        );
+        out
     })
     .await
     .map_err(|_| {
