@@ -43,6 +43,8 @@ pub enum TxError {
     EmptyOutputScript,
     #[error("the transparent input index is out of range")]
     BadInputIndex,
+    #[error("could not serialize the transaction: {0}")]
+    Serialize(String),
 }
 
 /// Everything both parties need to rebuild the same transaction.
@@ -284,4 +286,107 @@ pub fn encode_signature(sig: &secp256k1::ecdsa::Signature) -> Vec<u8> {
 /// fee arithmetic is the library's, not a bare integer.
 pub fn zat(v: u64) -> ZatBalance {
     ZatBalance::const_from_i64(v as i64)
+}
+
+/// Serializes a fully signed escrow spend into the bytes a node accepts.
+///
+/// The escrow's two spending transactions have exactly one transparent input
+/// and one output and no shielded bundle, so this rebuilds the same
+/// `TransactionData` with an authorized transparent bundle and freezes it.
+/// Going back through the library rather than hand-rolling the v5 format means
+/// ZIP 225 field ordering, the version group id and the branch id come from the
+/// same code that computed the sighash.
+pub fn serialize_signed(
+    terms: &EscrowTerms,
+    output_script: &[u8],
+    output_value: u64,
+    sequence: u32,
+    lock_time: u32,
+    script_sig: &[u8],
+) -> Result<Vec<u8>, TxError> {
+    use zcash_primitives::transaction::Authorized as TxAuthorized;
+    use zcash_transparent::bundle::Authorized as TransparentAuthorized;
+
+    if output_script.is_empty() {
+        return Err(TxError::EmptyOutputScript);
+    }
+
+    let bundle = Bundle::<TransparentAuthorized> {
+        vin: vec![zcash_transparent::bundle::TxIn::from_parts(
+            terms.outpoint(),
+            Script(Code(script_sig.to_vec())),
+            sequence,
+        )],
+        vout: vec![TxOut::new(
+            Zatoshis::const_from_u64(output_value),
+            Script(Code(output_script.to_vec())),
+        )],
+        authorization: TransparentAuthorized,
+    };
+
+    let data = TransactionData::<TxAuthorized>::from_parts(
+        TxVersion::V5,
+        BranchId::try_from(terms.consensus_branch_id)
+            .map_err(|_| TxError::BadInputIndex)?,
+        lock_time,
+        0.into(),
+        Some(bundle),
+        None,
+        None,
+        None,
+    );
+
+    let tx = data.freeze().map_err(|e| TxError::Serialize(e.to_string()))?;
+    let mut bytes = Vec::new();
+    tx.write(&mut bytes)
+        .map_err(|e| TxError::Serialize(e.to_string()))?;
+    Ok(bytes)
+}
+
+/// Serializes a signed release (spec 4.3).
+pub fn serialize_release(
+    terms: &EscrowTerms,
+    lp_output_script: &[u8],
+    fee_zat: u64,
+    script_sig: &[u8],
+) -> Result<Vec<u8>, TxError> {
+    let value = terms
+        .amount_zat
+        .checked_sub(fee_zat)
+        .ok_or(TxError::BelowFee {
+            amount: terms.amount_zat,
+            fee: fee_zat,
+        })?;
+    serialize_signed(
+        terms,
+        lp_output_script,
+        value,
+        RELEASE_SEQUENCE,
+        0,
+        script_sig,
+    )
+}
+
+/// Serializes a signed refund (spec 4.4).
+pub fn serialize_refund(
+    terms: &EscrowTerms,
+    user_output_script: &[u8],
+    fee_zat: u64,
+    script_sig: &[u8],
+) -> Result<Vec<u8>, TxError> {
+    let value = terms
+        .amount_zat
+        .checked_sub(fee_zat)
+        .ok_or(TxError::BelowFee {
+            amount: terms.amount_zat,
+            fee: fee_zat,
+        })?;
+    serialize_signed(
+        terms,
+        user_output_script,
+        value,
+        REFUND_SEQUENCE,
+        u32::try_from(terms.refund_height).map_err(|_| TxError::BadInputIndex)?,
+        script_sig,
+    )
 }
