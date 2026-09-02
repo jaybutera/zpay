@@ -155,9 +155,24 @@ impl EventStore {
         self.events.get(event_id)
     }
 
-    /// Returns `k` bound to its event. Fails if the event is unknown or already
-    /// signed, which is what stops a second signature under the same nonce.
+    /// Removes `k` and returns it bound to its event.
+    ///
+    /// `take` is now literal (round 3 finding 5): the nonce leaves the store on
+    /// the first call, so a second one finds nothing whatever the caller does
+    /// next. That is a deliberate change of recovery semantics - a signing run
+    /// that crashes after taking the nonce and before `mark_signed` cannot be
+    /// retried, and the event is dead. That is the safe direction: the
+    /// alternative is a window in which two signings under one nonce are
+    /// possible, and two signatures under one nonce publish `d`.
+    #[cfg(feature = "test-signer")]
     pub fn take_nonce_for_signing(
+        &mut self,
+        event_id: &[u8; 32],
+    ) -> Result<BoundNonce, StoreError> {
+        self.take_nonce_inner(event_id)
+    }
+
+    fn take_nonce_inner(
         &mut self,
         event_id: &[u8; 32],
     ) -> Result<BoundNonce, StoreError> {
@@ -166,13 +181,20 @@ impl EventStore {
             return Err(StoreError::AlreadySigned);
         }
         self.nonces
-            .get(event_id)
-            .copied()
+            .remove(event_id)
             .map(|k| BoundNonce {
                 event_id: *event_id,
                 k,
             })
             .ok_or(StoreError::AlreadySigned)
+    }
+
+    #[cfg(not(feature = "test-signer"))]
+    pub(crate) fn take_nonce_for_signing(
+        &mut self,
+        event_id: &[u8; 32],
+    ) -> Result<BoundNonce, StoreError> {
+        self.take_nonce_inner(event_id)
     }
 
     /// Whether this payment has already released an escrow.

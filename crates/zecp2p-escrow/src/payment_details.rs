@@ -310,12 +310,22 @@ pub const IDENTITY_RATE_18DEC: u128 = 1_000_000_000_000_000_000;
 /// `Unenforced` reachable in a shipped binary would resurrect the round-1
 /// exploit, where an LP picks a rate that makes a micro-payment look
 /// sufficient.
+/// Round 3 finding 3 closed the last way to name a weak one. `Exact(u128)` took
+/// any value in a default build, and `Exact(1)` reproduces the round-1 theft:
+/// at `conversionRate = 1` the enclave's
+/// `min(fiat * 1e18 / rate, intent.amount)` saturates at the intent for a
+/// one-cent payment. So the variants carry no payload a caller chooses.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RatePolicy {
-    Exact(u128),
-    /// Requires the rate to be at least this.
+    /// The rate must be exactly `IDENTITY_RATE_18DEC`. The only policy a
+    /// production build can construct.
+    Identity,
+    /// Requires the rate to be at least the given value.
     #[cfg(feature = "loose-rate-policy")]
     AtLeast(u128),
+    /// Requires exactly the given value.
+    #[cfg(feature = "loose-rate-policy")]
+    Exact(u128),
     /// Accepts any rate. Development only; see the type documentation.
     #[cfg(feature = "loose-rate-policy")]
     Unenforced,
@@ -324,13 +334,20 @@ pub enum RatePolicy {
 impl RatePolicy {
     /// The policy every production escrow uses.
     pub fn production() -> Self {
-        RatePolicy::Exact(IDENTITY_RATE_18DEC)
+        RatePolicy::Identity
     }
 }
 
 impl RatePolicy {
     fn check(&self, got: u128) -> Result<(), PaymentDetailsError> {
         match self {
+            RatePolicy::Identity if got != IDENTITY_RATE_18DEC => {
+                Err(PaymentDetailsError::RateMismatch {
+                    got,
+                    expected: IDENTITY_RATE_18DEC,
+                })
+            }
+            #[cfg(feature = "loose-rate-policy")]
             RatePolicy::Exact(expected) if got != *expected => {
                 Err(PaymentDetailsError::RateMismatch {
                     got,

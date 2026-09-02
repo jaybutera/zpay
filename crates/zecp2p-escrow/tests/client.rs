@@ -81,6 +81,9 @@ fn quote(c: &CanonicalTerms) -> AcceptedQuote {
         usd_amount_6dec: c.usd_amount_6dec,
         payee_hash: c.payee_hash,
         rate_18dec: c.rate_18dec,
+        refund_height: c.refund_height,
+        l_pub: c.l_pub,
+        amount_zat: c.amount_zat,
     }
 }
 
@@ -105,9 +108,11 @@ fn the_record_is_on_disk_before_any_pre_signature_exists() {
     prepare_escrow(
         &secp,
         &mut store,
-        &terms,
-        &canonical(&terms),
+        TXID,
+        0,
+        NU6_3,
         &quote(&canonical(&terms)),
+        &canonical(&terms),
         &u_priv,
         &ann,
         &d.public_key(&secp),
@@ -134,9 +139,11 @@ fn a_failed_write_stops_the_handshake_before_a_pre_signature_is_produced() {
     let err = prepare_escrow(
         &secp,
         &mut store,
-        &terms,
-        &canonical(&terms),
+        TXID,
+        0,
+        NU6_3,
         &quote(&canonical(&terms)),
+        &canonical(&terms),
         &u_priv,
         &ann,
         &d.public_key(&secp),
@@ -203,12 +210,14 @@ fn the_handshake_refuses_an_unpinned_attestor_before_saving_anything() {
 
     assert_eq!(
         prepare_escrow(
-        &secp,
-        &mut store,
-        &terms,
-        &canonical(&terms),
-        &quote(&canonical(&terms)),
-        &u_priv,
+            &secp,
+            &mut store,
+            TXID,
+            0,
+            NU6_3,
+            &quote(&canonical(&terms)),
+            &canonical(&terms),
+            &u_priv,
             &ann,
             &impostor,
             &p2pkh([0x09; 20]),
@@ -325,12 +334,14 @@ fn the_user_verifies_its_own_pre_signature_before_handing_it_over() {
     let mut store = MemoryRecordStore::default();
     let fee = release_fee_to_transparent_zat(terms.redeem_script().unwrap().len());
 
-    let (pre_sig, y) = prepare_escrow(
+    let prepared = prepare_escrow(
         &secp,
         &mut store,
-        &terms,
-        &canonical(&terms),
+        TXID,
+        0,
+        NU6_3,
         &quote(&canonical(&terms)),
+        &canonical(&terms),
         &u_priv,
         &ann,
         &d.public_key(&secp),
@@ -346,10 +357,10 @@ fn the_user_verifies_its_own_pre_signature_before_handing_it_over() {
         .unwrap();
     zecp2p_escrow::dlc::verify_pre_signature(
         &secp,
-        &pre_sig,
+        &prepared.pre_signature,
         &digest,
         &u_priv.public_key(&secp),
-        &y,
+        &prepared.outcome_point,
     )
     .expect("the LP must accept the pre-signature the client produced");
 }
@@ -399,9 +410,11 @@ fn the_handshake_refuses_a_foreign_announcement_before_saving_or_signing() {
     let err = prepare_escrow(
         &secp,
         &mut store,
-        &terms,
-        &canonical(&terms),
+        TXID,
+        0,
+        NU6_3,
         &quote(&canonical(&terms)),
+        &canonical(&terms),
         &u_priv,
         &foreign,
         &d.public_key(&secp),

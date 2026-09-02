@@ -145,7 +145,7 @@ pub fn verify(
     expected_intent_hash: &[u8; 32],
     minimum_release_amount: u128,
 ) -> Result<(), AttestationError> {
-    verify_with_signer(
+    verify_inner(
         a,
         signature,
         encoded_payment_details,
@@ -184,10 +184,30 @@ pub fn verify_against_signer(
 
 /// Verification against an explicitly supplied signer.
 ///
-/// This is the shared implementation. The public, caller-chooses-the-signer
-/// entry point is [`verify_against_signer`] and is feature-gated; the attestor
-/// calls this with the pinned key on its production path.
+/// Round 3 finding 7: this was public and ungated beneath the gated wrapper, so
+/// spec 15.7's claim that a production build has no path trusting an untrusted
+/// key was false at the API level. It is now gated the same way, and the
+/// attestor reaches it through the same feature.
+#[cfg(feature = "test-signer")]
 pub fn verify_with_signer(
+    a: &PaymentAttestation,
+    signature: &[u8],
+    encoded_payment_details: &[u8],
+    expected_intent_hash: &[u8; 32],
+    minimum_release_amount: u128,
+    trusted_signer: &[u8; 20],
+) -> Result<(), AttestationError> {
+    verify_inner(
+        a,
+        signature,
+        encoded_payment_details,
+        expected_intent_hash,
+        minimum_release_amount,
+        trusted_signer,
+    )
+}
+
+fn verify_inner(
     a: &PaymentAttestation,
     signature: &[u8],
     encoded_payment_details: &[u8],

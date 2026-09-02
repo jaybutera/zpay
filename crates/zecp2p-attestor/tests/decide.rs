@@ -13,7 +13,7 @@ use sha3::{Digest, Keccak256};
 
 use zecp2p_attestor::store::{EventStore, StoreError};
 use zecp2p_attestor::{
-    decide, decide_against_signer, required_depth, AttestorError, ChainObservation,
+    decide_against_signer, required_depth, AttestorError, ChainObservation,
 };
 use zecp2p_escrow::attestation::{eip712_digest, AttestationError, PaymentAttestation};
 use zecp2p_escrow::payment_details::{
@@ -153,7 +153,7 @@ fn run(
     signer: &[u8; 20],
 ) -> Result<[u8; 32], AttestorError> {
     run_with(t, announced, already_signed, att, sig, det, obs, signer,
-             &RatePolicy::Exact(t.rate_18dec), false)
+             &RatePolicy::production(), false)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -384,18 +384,22 @@ fn a_larger_escrow_demands_a_deeper_confirmation() {
 
 #[test]
 fn the_production_path_pins_the_real_enclave_signer() {
-    // `decide` must not accept the test key. This is the check that the
-    // injectable signer above is a testing affordance and not a hole.
+    // Passing the real pinned signer must refuse an attestation made by the
+    // test key. Round 3 finding 6 made `decide` crate-private, so this now goes
+    // through the same entry point with `ENCLAVE_SIGNER` supplied explicitly -
+    // which is exactly what the production path does internally.
+    use zecp2p_escrow::attestation::ENCLAVE_SIGNER;
     let (t, att, sig, det, obs, _) = valid();
-    let err = decide(
+    let err = run_with(
+        &t,
         &t.terms_hash(),
         false,
-        &t,
         &att,
         &sig,
         &det,
         &obs,
-        &RatePolicy::Exact(t.rate_18dec),
+        &ENCLAVE_SIGNER,
+        &RatePolicy::production(),
         false,
     )
     .unwrap_err();
@@ -404,7 +408,7 @@ fn the_production_path_pins_the_real_enclave_signer() {
             err,
             AttestorError::Attestation(AttestationError::WrongSigner { .. })
         ),
-        "the default decide() must only trust the real enclave, got {err}"
+        "the pinned enclave signer must refuse the test key, got {err}"
     );
 }
 
@@ -630,7 +634,7 @@ fn the_only_production_rate_policy_is_the_identity_rate() {
     use zecp2p_escrow::payment_details::IDENTITY_RATE_18DEC;
 
     assert_eq!(IDENTITY_RATE_18DEC, 1_000_000_000_000_000_000);
-    assert_eq!(RatePolicy::production(), RatePolicy::Exact(IDENTITY_RATE_18DEC));
+    assert_eq!(RatePolicy::production(), RatePolicy::production());
 
     // An escrow priced at the identity rate verifies.
     let mut t = terms();
@@ -786,7 +790,7 @@ fn a_payment_already_used_for_another_escrow_is_refused() {
         &det,
         &observation(),
         &signer,
-        &RatePolicy::Exact(t.rate_18dec),
+        &RatePolicy::production(),
         true,
     )
     .unwrap_err();

@@ -15,9 +15,10 @@
 pub mod store;
 
 use secp256k1_zkp::{PublicKey, Secp256k1, SecretKey};
-use zecp2p_escrow::attestation::{
-    verify_with_signer, AttestationError, PaymentAttestation, ENCLAVE_SIGNER,
-};
+use zecp2p_escrow::chain::ChainClient;
+#[cfg(not(feature = "test-signer"))]
+use zecp2p_escrow::attestation::verify;
+use zecp2p_escrow::attestation::{AttestationError, PaymentAttestation, ENCLAVE_SIGNER};
 use zecp2p_escrow::payment_details::{
     payment_nullifier, PaymentDetails, PaymentDetailsError, RatePolicy,
 };
@@ -71,6 +72,16 @@ pub enum AttestorError {
         "this Venmo payment has already released another escrow; one payment releases one escrow"
     )]
     PaymentAlreadyConsumed,
+    #[error(
+        "the requested event id {got} is not the one this outpoint produces, {expected}"
+    )]
+    EventIdMismatch { got: String, expected: String },
+    #[error("the clock returned zero, which would make every recency bound vacuous")]
+    ZeroClock,
+    #[error("the escrow output does not exist on the attestor's own node")]
+    EscrowNotFound,
+    #[error("chain error: {0}")]
+    Chain(String),
 }
 
 /// The confirmation depth table of spec section 7, applied by the attestor
@@ -88,6 +99,10 @@ pub use zecp2p_escrow::depth::required_depth;
 /// and in Phase 7 measured. A branch that depended on hidden state could not be
 /// audited from the outside.
 #[allow(clippy::too_many_arguments)]
+/// The pinned-signer decision path. Test-only: production callers go through
+/// [`handle_attest`], which sequences the store operations around it (round 3
+/// finding 6).
+#[cfg(feature = "test-signer")]
 pub fn decide(
     announced_terms_hash: &[u8; 32],
     already_signed: bool,
@@ -177,7 +192,11 @@ fn decide_inner(
     // 3 and 4. The enclave signature, the pinned signer and domain, and the
     //    amount. `verify` also re-derives dataHash from the payment details, so
     //    a caller cannot present values that disagree with what was signed.
-    verify_with_signer(
+    // The pinned enclave key on the production path. `trusted_signer` only
+    // diverges from it under the `test-signer` feature, and the branch below is
+    // the only place that can happen (round 3 finding 7).
+    #[cfg(feature = "test-signer")]
+    zecp2p_escrow::attestation::verify_against_signer(
         attestation,
         signature,
         encoded_payment_details,
@@ -185,6 +204,17 @@ fn decide_inner(
         terms.usd_amount_6dec as u128,
         trusted_signer,
     )?;
+    #[cfg(not(feature = "test-signer"))]
+    {
+        debug_assert_eq!(trusted_signer, &ENCLAVE_SIGNER);
+        verify(
+            attestation,
+            signature,
+            encoded_payment_details,
+            &intent,
+            terms.usd_amount_6dec as u128,
+        )?;
+    }
 
     // 3b. The signature above proves the enclave signed *these bytes*. It says
     //     nothing about what the bytes claim. Until the payment itself is
@@ -247,6 +277,9 @@ fn decide_inner(
 /// The caller must delete `k` immediately afterwards and mark the event signed.
 /// Signing twice under one `k` with two different challenges exposes `d`, which
 /// is demonstrated in the escrow crate's `dlc` tests.
+/// Test-only: production signing happens inside [`handle_attest`], which holds
+/// the store across the whole sequence.
+#[cfg(feature = "test-signer")]
 pub fn sign_decided_outcome(
     secp: &Secp256k1<secp256k1_zkp::All>,
     k: &SecretKey,
@@ -423,4 +456,139 @@ fn map_store_error(e: store::StoreError) -> AttestorError {
             AttestorError::DuplicateAnnouncement
         }
     }
+}
+
+/// A clock the handler owns.
+///
+/// Round 3 finding 4: `announced_at_ms` gained a column in round 2 but nothing
+/// ever stamped it, so a row announced with `0` narrowed nothing and the
+/// month-old payment of round 2's PoC came back. The stamp has to come from
+/// something the attestor holds, not from a caller argument, so it is a trait
+/// the handler calls rather than a number it is handed.
+pub trait Clock {
+    /// Wall-clock milliseconds. Must be non-zero.
+    fn now_ms(&self) -> u64;
+}
+
+/// The system clock.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now_ms(&self) -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+}
+
+/// A fixed clock, for tests.
+#[derive(Debug, Clone, Copy)]
+pub struct FixedClock(pub u64);
+
+impl Clock for FixedClock {
+    fn now_ms(&self) -> u64 {
+        self.0
+    }
+}
+
+/// The `/announce` handler, spec 5.1.
+///
+/// Stamps `announced_at_ms` from the handler's own clock, refuses a zero stamp,
+/// and checks that the requested `event_id` is the one this outpoint actually
+/// produces - so a caller cannot announce under an id belonging to a different
+/// escrow and have the store's later checks compare against the wrong row.
+pub fn handle_announce(
+    store: &mut store::EventStore,
+    secp: &Secp256k1<secp256k1_zkp::All>,
+    clock: &impl Clock,
+    event_id: &[u8; 32],
+    terms: &CanonicalTerms,
+    k: &SecretKey,
+) -> Result<PublicKey, AttestorError> {
+    let expected = zecp2p_escrow::dlc::event_id(&terms.funding_txid, terms.vout);
+    if event_id != &expected {
+        return Err(AttestorError::EventIdMismatch {
+            got: hex::encode(event_id),
+            expected: hex::encode(expected),
+        });
+    }
+
+    let announced_at_ms = clock.now_ms();
+    if announced_at_ms == 0 {
+        return Err(AttestorError::ZeroClock);
+    }
+
+    let r = k.public_key(secp);
+    store
+        .announce(
+            *event_id,
+            terms.terms_hash(),
+            r.serialize(),
+            terms.funding_txid,
+            k.secret_bytes(),
+            announced_at_ms,
+        )
+        .map_err(map_store_error)?;
+    Ok(r)
+}
+
+/// Reads the escrow output from the attestor's own node.
+///
+/// Round 3 finding 4: `handle_attest` took a `ChainObservation` from its
+/// caller, so the script, the amount and the confirmation depth were all
+/// whatever the caller said. Spec 5.5 step 5 says the attestor confirms these
+/// *on its own zebrad*; this is that.
+pub fn observe_escrow(
+    chain: &impl ChainClient,
+    terms: &CanonicalTerms,
+    earliest_acceptable_payment_ms: u64,
+) -> Result<ChainObservation, AttestorError> {
+    let utxo = chain
+        .utxo(&terms.funding_txid, terms.vout)
+        .map_err(|e| AttestorError::Chain(e.to_string()))?
+        .ok_or(AttestorError::EscrowNotFound)?;
+
+    Ok(ChainObservation {
+        script_pubkey: utxo.script_pubkey,
+        amount_zat: utxo.amount_zat,
+        confirmations: utxo.confirmations,
+        earliest_acceptable_payment_ms,
+    })
+}
+
+/// The `/attest` handler that reads the chain itself.
+///
+/// This is the shape a service should call: the only chain facts it uses come
+/// from its own node, and the recency bound comes from its own store.
+#[allow(clippy::too_many_arguments)]
+pub fn handle_attest_with_chain(
+    store: &mut store::EventStore,
+    chain: &impl ChainClient,
+    secp: &Secp256k1<secp256k1_zkp::All>,
+    d: &SecretKey,
+    event_id: &[u8; 32],
+    terms: &CanonicalTerms,
+    attestation: &PaymentAttestation,
+    signature: &[u8],
+    encoded_payment_details: &[u8],
+) -> Result<SecretKey, AttestorError> {
+    let announced_at_ms = store
+        .get(event_id)
+        .ok_or(AttestorError::UnknownEvent)?
+        .announced_at_ms;
+    let observation = observe_escrow(chain, terms, announced_at_ms)?;
+    handle_attest(
+        store,
+        secp,
+        d,
+        event_id,
+        terms,
+        attestation,
+        signature,
+        encoded_payment_details,
+        &observation,
+        &RatePolicy::production(),
+    )
 }

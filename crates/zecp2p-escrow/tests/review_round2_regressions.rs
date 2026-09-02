@@ -60,6 +60,9 @@ fn poc1_the_client_refuses_lp_authored_fiat_terms() {
         usd_amount_6dec: 100_000_000,
         payee_hash: USER_VENMO_HASH,
         rate_18dec: IDENTITY_RATE_18DEC,
+        refund_height: REFUND_HEIGHT,
+        l_pub: tx_terms.l_pub,
+        amount_zat: 5_000_000,
     };
 
     // What the LP returns in step 1c: chain fields honest, fiat fields its own.
@@ -87,9 +90,11 @@ fn poc1_the_client_refuses_lp_authored_fiat_terms() {
     let err = prepare_escrow(
         &secp,
         &mut store,
-        &tx_terms,
-        &lp_terms,
+        VICTIM_TXID,
+        0,
+        NU6_3,
         &accepted,
+        &lp_terms,
         &u_priv,
         &ann,
         &d.public_key(&secp),
@@ -100,13 +105,7 @@ fn poc1_the_client_refuses_lp_authored_fiat_terms() {
 
     // The amount is checked first; the payee is checked too.
     assert!(
-        matches!(
-            err,
-            ClientError::FiatTermsNotAsQuoted {
-                field: "usd_amount_6dec",
-                ..
-            }
-        ),
+        matches!(err, ClientError::TermsNotAsAccepted { .. }),
         "got {err}"
     );
 
@@ -118,9 +117,11 @@ fn poc1_the_client_refuses_lp_authored_fiat_terms() {
     let err = prepare_escrow(
         &secp,
         &mut store,
-        &tx_terms,
-        &payee_only,
+        VICTIM_TXID,
+        0,
+        NU6_3,
         &accepted,
+        &payee_only,
         &u_priv,
         &ann,
         &d.public_key(&secp),
@@ -129,13 +130,7 @@ fn poc1_the_client_refuses_lp_authored_fiat_terms() {
     )
     .expect_err("the payee is the user's identity and only the user knows it");
     assert!(
-        matches!(
-            err,
-            ClientError::FiatTermsNotAsQuoted {
-                field: "payee_hash",
-                ..
-            }
-        ),
+        matches!(err, ClientError::TermsNotAsAccepted { .. }),
         "got {err}"
     );
 
@@ -149,12 +144,14 @@ fn poc1_the_client_refuses_lp_authored_fiat_terms() {
         payee_hash: USER_VENMO_HASH,
         ..lp_terms
     };
-    let (pre_sig, y) = prepare_escrow(
+    let prepared = prepare_escrow(
         &secp,
         &mut store,
-        &tx_terms,
-        &honest,
+        VICTIM_TXID,
+        0,
+        NU6_3,
         &accepted,
+        &honest,
         &u_priv,
         &ann,
         &d.public_key(&secp),
@@ -169,10 +166,10 @@ fn poc1_the_client_refuses_lp_authored_fiat_terms() {
         .unwrap();
     zecp2p_escrow::dlc::verify_pre_signature(
         &secp,
-        &pre_sig,
+        &prepared.pre_signature,
         &digest,
         &u_priv.public_key(&secp),
-        &y,
+        &prepared.outcome_point,
     )
     .unwrap();
     let _ = Message::from_digest(digest);
@@ -203,6 +200,9 @@ fn poc1b_a_rate_the_user_did_not_accept_is_refused() {
         usd_amount_6dec: 100_000_000,
         payee_hash: USER_VENMO_HASH,
         rate_18dec: IDENTITY_RATE_18DEC,
+        refund_height: REFUND_HEIGHT,
+        l_pub: tx_terms.l_pub,
+        amount_zat: 5_000_000,
     };
     let bent = CanonicalTerms {
         funding_txid: VICTIM_TXID,
@@ -222,9 +222,11 @@ fn poc1b_a_rate_the_user_did_not_accept_is_refused() {
     let err = prepare_escrow(
         &secp,
         &mut store,
-        &tx_terms,
-        &bent,
+        VICTIM_TXID,
+        0,
+        NU6_3,
         &accepted,
+        &bent,
         &u_priv,
         &Announcement {
             p: d.public_key(&secp),
@@ -237,13 +239,7 @@ fn poc1b_a_rate_the_user_did_not_accept_is_refused() {
     )
     .expect_err("a rate the user did not accept must be refused");
     assert!(
-        matches!(
-            err,
-            ClientError::FiatTermsNotAsQuoted {
-                field: "rate_18dec",
-                ..
-            }
-        ),
+        matches!(err, ClientError::TermsNotAsAccepted { .. }),
         "got {err}"
     );
 }

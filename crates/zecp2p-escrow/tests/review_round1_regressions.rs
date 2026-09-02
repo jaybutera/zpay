@@ -48,6 +48,9 @@ fn quote(c: &CanonicalTerms) -> AcceptedQuote {
         usd_amount_6dec: c.usd_amount_6dec,
         payee_hash: c.payee_hash,
         rate_18dec: c.rate_18dec,
+        refund_height: c.refund_height,
+        l_pub: c.l_pub,
+        amount_zat: c.amount_zat,
     }
 }
 
@@ -100,9 +103,11 @@ fn poc_b_a_foreign_announcement_no_longer_reaches_a_pre_signature() {
     let err = prepare_escrow(
         &secp,
         &mut store,
-        &terms,
-        &canonical,
+        VICTIM_TXID,
+        0,
+        NU6_3,
         &quote(&canonical),
+        &canonical,
         &u_priv,
         &foreign,
         &d.public_key(&secp),
@@ -121,12 +126,14 @@ fn poc_b_a_foreign_announcement_no_longer_reaches_a_pre_signature() {
         r: k.public_key(&secp),
         event_id: event_id(&VICTIM_TXID, 0),
     };
-    let (pre_sig, _) = prepare_escrow(
+    let prepared = prepare_escrow(
         &secp,
         &mut store,
-        &terms,
-        &canonical,
+        VICTIM_TXID,
+        0,
+        NU6_3,
         &quote(&canonical),
+        &canonical,
         &u_priv,
         &honest,
         &d.public_key(&secp),
@@ -143,7 +150,7 @@ fn poc_b_a_foreign_announcement_no_longer_reaches_a_pre_signature() {
         &canonical.terms_hash(),
     )
     .unwrap();
-    let sig = decrypt_pre_signature(&pre_sig, &attacker_scalar).unwrap();
+    let sig = decrypt_pre_signature(&prepared.pre_signature, &attacker_scalar).unwrap();
     let digest = build_release(&terms, &p2pkh([0x09; 20]), fee)
         .unwrap()
         .sighash()
@@ -209,9 +216,15 @@ fn poc_c_the_lp_is_not_ready_to_pay_at_the_refund_height() {
 /// derived `T` from policy instead of reading the stored redeem script.
 #[test]
 fn poc_f_the_refund_gate_uses_the_stored_t() {
+    // The record's key and its script must agree, or the round 3 finding 1
+    // check refuses it before the height is even consulted.
+    let secp = Secp256k1::new();
+    let u_priv = SecretKey::from_slice(&[0x11; 32]).unwrap();
+    let u_pub = u_priv.public_key(&secp).serialize();
+
     let record = EscrowRecord {
-        u_priv: [0x11; 32],
-        redeem_script: redeem_script(&U_PUB, &L_PUB, REFUND_HEIGHT).unwrap(),
+        u_priv: u_priv.secret_bytes(),
+        redeem_script: redeem_script(&u_pub, &L_PUB, REFUND_HEIGHT).unwrap(),
         refund_height: REFUND_HEIGHT,
         funding_txid: VICTIM_TXID,
         vout: 0,

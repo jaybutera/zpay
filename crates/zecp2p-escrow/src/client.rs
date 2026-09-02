@@ -46,8 +46,20 @@ pub enum ClientError {
     ForeignAnnouncement { announced: String, expected: String },
     #[error("the escrow record was not persisted before funding")]
     NotPersisted,
-    #[error("the canonical terms and the transaction terms describe different escrows")]
-    TermsDisagree,
+    #[error(
+        "the stored redeem script's user slot is not this record's own key, so the escrow it \
+         describes cannot be refunded"
+    )]
+    RecordKeyMismatch,
+    #[error(
+        "the LP's terms hash to {got}, but the terms this client accepted hash to {expected}"
+    )]
+    TermsNotAsAccepted { expected: String, got: String },
+    #[error(
+        "refund height {got} is outside the usable range; the maximum this client will accept \
+         is {max}"
+    )]
+    RefundHeightOutOfRange { got: u64, max: u64 },
     #[error(
         "the LP's terms say {field} is {got}, but the user accepted {expected}; the fiat side \
          of an escrow is the user's to state, not the LP's"
@@ -98,14 +110,30 @@ impl EscrowRecord {
         if self.redeem_script.is_empty() {
             return Err(ClientError::IncompleteRecord("redeem_script is empty"));
         }
-        if self.refund_height == 0 {
-            return Err(ClientError::IncompleteRecord("refund_height is unset"));
+        if self.refund_height == 0 || self.refund_height > MAX_REFUND_HEIGHT {
+            return Err(ClientError::RefundHeightOutOfRange {
+                got: self.refund_height,
+                max: MAX_REFUND_HEIGHT,
+            });
         }
         if self.amount_zat == 0 {
             return Err(ClientError::IncompleteRecord("amount_zat is zero"));
         }
         if self.consensus_branch_id == 0 {
             return Err(ClientError::IncompleteRecord("consensus_branch_id is unset"));
+        }
+
+        // The stored script's user slot must be the key this record carries.
+        // `prepare_escrow` derives it so it cannot be otherwise, but a record
+        // read back from disk has been outside this process, and a record whose
+        // script does not answer to its own key is a record that cannot refund
+        // (round 3 finding 1).
+        let secp = secp256k1_zkp::Secp256k1::signing_only();
+        let u_priv = SecretKey::from_slice(&self.u_priv)
+            .map_err(|_| ClientError::IncompleteRecord("u_priv is not a valid key"))?;
+        let expected = u_priv.public_key(&secp).serialize();
+        if crate::client::u_pub_in_script(&self.redeem_script)? != expected {
+            return Err(ClientError::RecordKeyMismatch);
         }
         Ok(())
     }
@@ -117,14 +145,26 @@ pub trait RecordStore {
     fn load(&self, funding_txid: &[u8; 32]) -> Option<EscrowRecord>;
 }
 
+/// The largest refund height the client will accept.
+///
+/// Round 3 finding 2: `refund_height` was LP-chosen and unbounded, so terms
+/// carrying `T = 2^62` locked the escrow for centuries, and any `T` above
+/// `u32::MAX` produced a refund the client could never even build. Mainnet is
+/// near 3.47M and gains roughly 420k blocks a year, so this is centuries of
+/// headroom and still far below the CLTV threshold at which a locktime is read
+/// as a Unix timestamp rather than a height.
+pub const MAX_REFUND_HEIGHT: u64 = 500_000_000;
+
 /// What the user accepted before it agreed to fund anything.
 ///
-/// Round 2 finding 1: the LP returns `terms` in step 1c of spec 5.3, and
-/// nothing compared the fiat side of them to anything the user held. An LP
-/// could return chain fields that are honest and fiat fields that are its own -
-/// its Venmo hash, and an amount of one micro-dollar - and every check
-/// downstream would honestly verify the LP paying itself. The client must
-/// therefore hold its own view of what it agreed to, and compare.
+/// Round 2 finding 1 and round 3 findings 1 and 2: the LP returns `terms` in
+/// step 1c of spec 5.3, and every field of them the user does not check is a
+/// field the LP has written. Rather than accumulate one comparison per round,
+/// the client now *derives* the whole canonical terms from this quote plus the
+/// escrow's own chain facts - see [`CanonicalTerms`] construction in
+/// [`prepare_escrow`]. Anything the LP sends is compared against what the
+/// client built, so a field nobody thought to check cannot silently be the
+/// LP's.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcceptedQuote {
     /// The dollars the user expects to receive, 6 decimals.
@@ -136,6 +176,18 @@ pub struct AcceptedQuote {
     /// The rate the escrow is priced at. For a ZEC escrow this must be the
     /// identity rate; see `payment_details::IDENTITY_RATE_18DEC`.
     pub rate_18dec: u128,
+    /// The absolute height at which the user may reclaim the escrow.
+    ///
+    /// The user agrees to a timeout, not just a price. Without it here the LP
+    /// picks how long the money is locked.
+    pub refund_height: u64,
+    /// The LP's key in the 2-of-2. The user has no way to verify this key is
+    /// the LP's rather than a second key it also holds - that is inherent to
+    /// the two-signer design - but it must be the key the user was quoted, so
+    /// that the escrow address the user funds is the one both parties agreed.
+    pub l_pub: [u8; 33],
+    /// The escrow amount in zatoshis.
+    pub amount_zat: u64,
 }
 
 /// The attestor announcement the user receives (spec 5.1).
@@ -193,71 +245,92 @@ pub fn verify_announcement(
 pub fn prepare_escrow(
     secp: &Secp256k1<secp256k1_zkp::All>,
     store: &mut impl RecordStore,
-    terms: &EscrowTerms,
-    canonical: &crate::terms::CanonicalTerms,
+    funding_txid: [u8; 32],
+    vout: u32,
+    consensus_branch_id: u32,
     quote: &AcceptedQuote,
+    lp_terms: &crate::terms::CanonicalTerms,
     u_priv: &SecretKey,
     announcement: &Announcement,
     pinned_attestor_key: &PublicKey,
     lp_output_script: &[u8],
     fee_zat: u64,
-) -> Result<(secp256k1_zkp::EcdsaAdaptorSignature, PublicKey), ClientError> {
-    // The fiat side of the terms is the user's to state. Comparing it against
-    // what the user actually accepted is what stops an LP writing its own
-    // payee and amount into an otherwise honest escrow (round 2 finding 1).
-    if canonical.usd_amount_6dec != quote.usd_amount_6dec {
-        return Err(ClientError::FiatTermsNotAsQuoted {
-            field: "usd_amount_6dec",
-            got: canonical.usd_amount_6dec.to_string(),
-            expected: quote.usd_amount_6dec.to_string(),
-        });
-    }
-    if canonical.payee_hash != quote.payee_hash {
-        return Err(ClientError::FiatTermsNotAsQuoted {
-            field: "payee_hash",
-            got: hex::encode(canonical.payee_hash),
-            expected: hex::encode(quote.payee_hash),
-        });
-    }
-    if canonical.rate_18dec != quote.rate_18dec {
-        return Err(ClientError::FiatTermsNotAsQuoted {
-            field: "rate_18dec",
-            got: canonical.rate_18dec.to_string(),
-            expected: quote.rate_18dec.to_string(),
+) -> Result<PreparedEscrow, ClientError> {
+    // 1. The user's key is derived, never accepted.
+    //
+    //    Round 3 finding 1: nothing compared `terms.u_pub` to `u_priv`. An LP
+    //    that returned a second key of its own in that slot got the user to
+    //    fund a 2-of-2 the LP held both halves of - spendable at any height
+    //    with no attestor and no payment - while the user's refund at `T`
+    //    failed, because the script wanted a key the user does not have. That
+    //    is the "timeout refund needs nobody" invariant of spec section 1,
+    //    gone. Deriving it means the slot cannot be anything else.
+    let u_pub = u_priv.public_key(secp).serialize();
+
+    // 2. The timeout is the user's to accept, and must be usable.
+    if quote.refund_height == 0 || quote.refund_height > MAX_REFUND_HEIGHT {
+        return Err(ClientError::RefundHeightOutOfRange {
+            got: quote.refund_height,
+            max: MAX_REFUND_HEIGHT,
         });
     }
 
-    // The canonical terms and the transaction terms must describe the same
-    // escrow, or the user would be signing for one and quoting the other.
-    if canonical.funding_txid != terms.funding_txid
-        || canonical.vout != terms.vout
-        || canonical.amount_zat != terms.amount_zat
-        || canonical.u_pub != terms.u_pub
-        || canonical.l_pub != terms.l_pub
-        || canonical.refund_height != terms.refund_height
-    {
-        return Err(ClientError::TermsDisagree);
-    }
-    verify_announcement(
-        announcement,
-        pinned_attestor_key,
-        &terms.funding_txid,
-        terms.vout,
-    )?;
+    // 3. Build the terms the user is willing to fund, from the quote it
+    //    accepted and the chain facts it observed. Nothing here originates with
+    //    the LP except `l_pub`, which is in the quote because the user agreed
+    //    to it.
+    let canonical = crate::terms::CanonicalTerms {
+        funding_txid,
+        vout,
+        amount_zat: quote.amount_zat,
+        u_pub,
+        l_pub: quote.l_pub,
+        refund_height: quote.refund_height,
+        usd_amount_6dec: quote.usd_amount_6dec,
+        rate_18dec: quote.rate_18dec,
+        payee_hash: quote.payee_hash,
+        lock_confirmed_ms: lp_terms.lock_confirmed_ms,
+    };
 
+    // 4. Whatever the LP sent must be exactly that. One comparison over the
+    //    whole structure, so a field added later is covered without anyone
+    //    remembering to check it.
+    if lp_terms != &canonical {
+        return Err(ClientError::TermsNotAsAccepted {
+            expected: hex::encode(canonical.terms_hash()),
+            got: hex::encode(lp_terms.terms_hash()),
+        });
+    }
+
+    let terms = EscrowTerms {
+        funding_txid,
+        vout,
+        amount_zat: quote.amount_zat,
+        u_pub,
+        l_pub: quote.l_pub,
+        refund_height: quote.refund_height,
+        consensus_branch_id,
+    };
+
+    // 5. The announcement must be for this outpoint and from the pinned
+    //    attestor (round 1 finding 2).
+    verify_announcement(announcement, pinned_attestor_key, &funding_txid, vout)?;
+
+    // 6. Persist before anything cryptographic exists, so a crash between here
+    //    and broadcast still leaves a refundable escrow (spec 5.3).
     let record = EscrowRecord {
         u_priv: u_priv.secret_bytes(),
         redeem_script: terms.redeem_script().map_err(TxError::from)?,
-        refund_height: terms.refund_height,
-        funding_txid: terms.funding_txid,
-        vout: terms.vout,
-        amount_zat: terms.amount_zat,
-        consensus_branch_id: terms.consensus_branch_id,
+        refund_height: quote.refund_height,
+        funding_txid,
+        vout,
+        amount_zat: quote.amount_zat,
+        consensus_branch_id,
     };
     record.validate()?;
     store.save(&record)?;
 
-    // Only now is anything cryptographic produced.
+    // 7. Only now is a pre-signature produced.
     let y = outcome_point(
         secp,
         &announcement.r,
@@ -265,15 +338,39 @@ pub fn prepare_escrow(
         &announcement.event_id,
         &canonical.terms_hash(),
     )?;
-    let digest = build_release(terms, lp_output_script, fee_zat)?.sighash()?;
+    let digest = build_release(&terms, lp_output_script, fee_zat)?.sighash()?;
     let pre_sig = pre_sign(secp, &digest, u_priv, &y);
 
     // The user verifies its own pre-signature before handing it over, so a
     // failure surfaces here rather than as an LP that will not pay.
-    let u_pub = u_priv.public_key(secp);
-    verify_pre_signature(secp, &pre_sig, &digest, &u_pub, &y)?;
+    verify_pre_signature(secp, &pre_sig, &digest, &u_priv.public_key(secp), &y)?;
 
-    Ok((pre_sig, y))
+    Ok(PreparedEscrow {
+        pre_signature: pre_sig,
+        outcome_point: y,
+        terms,
+        canonical,
+    })
+}
+
+/// What the client holds after a successful handshake.
+///
+/// The terms are returned rather than taken, so a caller cannot act on a
+/// different set from the ones the pre-signature commits to.
+pub struct PreparedEscrow {
+    pub pre_signature: secp256k1_zkp::EcdsaAdaptorSignature,
+    pub outcome_point: PublicKey,
+    pub terms: EscrowTerms,
+    pub canonical: crate::terms::CanonicalTerms,
+}
+
+impl core::fmt::Debug for PreparedEscrow {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PreparedEscrow")
+            .field("terms_hash", &hex::encode(self.canonical.terms_hash()))
+            .field("refund_height", &self.terms.refund_height)
+            .finish()
+    }
 }
 
 /// The guard on broadcasting the funding transaction.
@@ -331,6 +428,11 @@ pub fn refund_when_due(
     };
 
     Ok(crate::tx::build_refund(&terms, user_output_script, fee_zat)?)
+}
+
+/// `u_pub` as it appears in a redeem script.
+pub(crate) fn u_pub_in_script(redeem_script: &[u8]) -> Result<[u8; 33], ClientError> {
+    extract_u_pub(redeem_script)
 }
 
 /// `u_pub` sits at a fixed offset in the redeem script of spec 4.1: after

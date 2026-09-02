@@ -222,7 +222,7 @@ terms = {
   "usd_amount_6dec":   integer,      // what the LP must send, in 6-decimal USD
   "rate_18dec":        integer,      // USD per ZEC, 18 decimals, quoted by LP
   "payee_hash":        bytes32,      // zk-p2p curator hashedOnchainId of the user's Venmo
-  "lock_confirmed_ms": integer       // set after confirmation depth reached
+  "lock_confirmed_ms": integer       // fixed at announcement; see 5.4 step 1
 }
 intentHash = sha256("zecp2p-intent-v1" || canonical_json(terms))
 ```
@@ -266,7 +266,17 @@ before broadcasting. Losing `u_priv` loses the refund path.
 ### 5.4 Payment and attestation
 
 1. LP's zebrad reports the escrow output at confirmation depth per section 7.
-   LP records `lock_confirmed_ms` and finalises `terms`.
+   The terms are **not** finalised here: `terms_hash` was pinned by the
+   announcement in 5.1, before the user pre-signed, so no field of `terms` can
+   change afterwards without invalidating both the announcement and the
+   pre-signature. `lock_confirmed_ms` is therefore fixed at announcement time
+   and is the LP's estimate of when the lock will confirm, not an observation
+   made later.
+
+   It is also not what bounds payment recency. The attestor uses its own
+   `announced_at_ms` for that; see 16.2. `lock_confirmed_ms` survives only as
+   the value `INTENT_TIMESTAMP_MS` must equal, so that word 12 of the
+   attestation ties back to these terms.
 2. LP sends the Venmo payment for `usd_amount_6dec` to the user's Venmo
    account using the existing taker flow.
 3. LP runs the existing prover (`scripts/proof/prove_payment.mjs`) with:
@@ -893,10 +903,11 @@ paid, in 6-decimal USD** - which is precisely what the attestor's
 honest mainnet fill.
 
 `INTENT_RATE` is therefore always `1e18`, `rate_18dec` never reaches the prover,
-and `RatePolicy::production()` is `Exact(IDENTITY_RATE_18DEC)`. `AtLeast` and
-`Unenforced` are behind the `loose-rate-policy` feature: an `Unenforced`
-reachable in a shipped binary would resurrect the round-1 exploit, where the LP
-picks a rate that makes a micro-payment look large enough.
+and `RatePolicy::production()` is `RatePolicy::Identity`. Round 3 finished the
+job: `Exact(u128)` still took a caller-chosen value in a default build, and
+`Exact(1)` reproduces the round-1 theft, so the only variant a production build
+can name is now `Identity`, which carries no payload. `Exact`, `AtLeast` and
+`Unenforced` are all behind the `loose-rate-policy` feature.
 
 ### 16.4 The nullifier was checked too late (medium)
 
@@ -951,3 +962,90 @@ for, so a provider that invented a confirmed output could induce the attestor to
 sign for an escrow that does not exist - and the LP, having already paid Venmo,
 is the party out of pocket. That is not a reason to distrust any particular
 provider; it is the reason the production attestor runs its own node.
+
+## 17. Review round 3: the client stops validating and starts deriving
+
+A third review confirmed all nine round-2 fixes closed and found the same theft
+class one field further over. The pattern across three rounds is the finding:
+every field of the LP's terms the client did not explicitly check turned out to
+be a field the LP controlled. Round 1 was the payment, round 2 the fiat terms,
+round 3 the user's own key. So the fix this round is structural rather than
+another comparison.
+
+### 17.1 The LP wrote the user's key slot (high)
+
+Nothing compared `terms.u_pub` to `u_priv`. An LP that returned a second key of
+its own in that slot got the user to fund a 2-of-2 the LP held **both** halves
+of: spendable at any height, with no attestor and no payment, while the user's
+refund at `T` failed because the script wanted a key the user does not have.
+
+That is spec section 1's first and highest-priority property - "timeout refund
+to the user needs nobody" - destroyed outright. The reviewer demonstrated it
+through the consensus interpreter, so it was not theoretical.
+
+### 17.2 The client now derives the terms it is willing to fund
+
+`prepare_escrow` no longer takes terms and validates them. It takes an
+`AcceptedQuote` - what the user agreed to - plus the outpoint and branch id it
+observed, **builds** the canonical terms itself, and compares the LP's copy
+against that whole structure in one equality. `u_pub` comes from
+`u_priv.public_key()` and can be nothing else.
+
+The point is that a field nobody thinks to check is now covered by
+construction. Three rounds of one-comparison findings at the same choke point
+is a design signal, not three separate mistakes.
+
+`AcceptedQuote` therefore carries everything the user must agree to: the dollars,
+its own payee hash, the rate, the timeout, the LP's key and the amount.
+
+### 17.3 The timeout is bounded (medium)
+
+`refund_height` was LP-chosen and unbounded. `T` above `u32::MAX` produced a
+refund the client could never build; `T = 2^62` locked the escrow for
+centuries. The user now states the timeout it accepted, and both
+`prepare_escrow` and `EscrowRecord::validate` cap it at
+`MAX_REFUND_HEIGHT = 500_000_000` - centuries of headroom above mainnet's
+current 3.47M, and below the threshold at which a locktime is read as a Unix
+timestamp rather than a height.
+
+`EscrowRecord::validate` also checks that the stored script's user slot answers
+to the record's own key, so a record that cannot refund is refused when read
+back rather than discovered at `T`.
+
+### 17.4 The attestor stamps its own clock (medium)
+
+Round 2 moved the recency bound to `events.announced_at_ms`, but **nothing ever
+wrote that column**, so a row announced with `0` narrowed nothing and the
+month-old payment of round 2's PoC came back. `handle_announce` now stamps it
+from a `Clock` the handler owns, refuses a zero stamp, and checks that the
+requested `event_id` is the one the outpoint produces.
+
+`handle_attest_with_chain` reads the escrow's script, amount and depth from the
+attestor's own `ChainClient` rather than from a caller-supplied
+`ChainObservation`, which is what spec 5.5 step 5 asks for.
+
+### 17.5 The unsequenced signing path is gone (low)
+
+`decide`, `sign_decided_outcome` and `take_nonce_for_signing` are no longer
+public outside the `test-signer` feature; production callers reach the store
+only through `handle_attest`. `take_nonce_for_signing` now genuinely removes
+`k`, so a second signing finds nothing whatever the caller does next.
+
+That is a deliberate change of recovery semantics: a signing run that crashes
+after taking the nonce and before `mark_signed` cannot be retried, and the event
+is dead. That is the safe direction. The alternative is a window in which two
+signings under one nonce are possible, and two signatures under one nonce
+publish `d`.
+
+`escrow::attestation::verify_with_signer` was public and ungated beneath its
+gated wrapper, so section 15.7's claim was false at the API level. It is gated
+now, and the attestor's production path calls `verify` with the pinned key.
+
+### 17.6 Spec 5.4 step 1 corrected (low)
+
+It said the LP "records `lock_confirmed_ms` and finalises `terms`" after
+confirmation depth. That contradicted 5.1: `terms_hash` is pinned by the
+announcement, before the user pre-signs, so no field can change afterwards.
+`lock_confirmed_ms` is fixed at announcement time and is the LP's estimate; it
+does not bound recency (16.2) and survives only as the value
+`INTENT_TIMESTAMP_MS` must equal.
