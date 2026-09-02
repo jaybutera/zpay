@@ -735,14 +735,24 @@ live chain.
 Two limits, both real:
 
 - **5 requests per minute.** Enough for a gate, not for a polling daemon.
-- **`sendrawtransaction` is blocked at the provider's WAF**, returning
-  Cloudflare `403 error code: 1010` for a two-character payload as readily as a
-  real one. It is the method that is blocked, not the size.
+- `sendrawtransaction` **works**. An earlier run of this document said it was
+  blocked at the provider's WAF; that was a transient Cloudflare episode and the
+  conclusion was wrong. Re-probed 2026-09-02 at payload sizes from 64 to 730 hex
+  characters, every one reached the node.
 
-The second means **Phase 1's mempool gate and criterion 12's mempool rejection
-remain unmet.** `crates/zecp2p-escrow/tests/mempool_gate.rs` is written and runs
-unchanged against a real node; the `dump_release` example prints the same bytes
-for submitting by other means.
+**Phase 1's mempool gate is met.** A live Zcash testnet node returned, for the
+real signed transactions this repo builds:
+
+- release: `could not find transparent input UTXO in the best chain or mempool`
+- refund: `transaction is locked until after block height 4320000`
+
+Both are consensus rejections of a *fully parsed* transaction - the node read
+the v5 header, the NU5 version group id, the NU6.3 branch id, the P2SH scriptSig
+and the nLockTime, and objected only to the fictional outpoint and to our own
+timelock. A malformed transaction never reaches those errors; it stops at
+`parse error: bad tx header`, which is what an all-zero payload of identical
+length receives. What remains for criterion 12 is the same rejection against a
+*funded* escrow, which needs a funded testnet outpoint.
 
 ## 15. Review round 1: what was found and what changed
 
