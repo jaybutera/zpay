@@ -1,0 +1,21 @@
+[network]
+network = "Regtest"
+listen_addr = "127.0.0.1:18244"
+cache_dir = false
+
+[state]
+cache_dir = "./regtest-state"
+ephemeral = false
+delete_old_database = true
+
+[rpc]
+listen_addr = "127.0.0.1:18232"
+enable_cookie_auth = false
+parallel_cpu_threads = 1
+
+[mining]
+internal_miner = true
+miner_address = "tmVHejhMFq979Z7oRwseWMW7snYoQsj22yn"
+
+[tracing]
+filter = "info"
