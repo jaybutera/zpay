@@ -61,7 +61,13 @@ propagation, fee pressure - and it is not the acceptance run. Spec section 10
 asks for mainnet, and the testnet run stays the step before it. Both need coin
 this host does not have.
 
-One difference to keep in mind: regtest activates Canopy at height 1 and
-reports branch id `e9ff75a6`, where mainnet is on NU6.3 (`37a5165b`). Nothing in
-this repo hard-codes a branch - it is read from the node per spec 4.3 - and the
-regtest run exercises that path rather than bypassing it.
+With the activation heights above the node reports `37a5165b`, the same branch
+id as mainnet. A *default* Regtest node does not: it runs Canopy and reports
+`e9ff75a6`, and rejects every v5 transaction this repo builds - which is what
+the section at the top of this file is about. Nothing here hard-codes a branch;
+it is read from the node per spec 4.3, so the run exercises that path rather
+than bypassing it.
+
+Coin is no longer the blocker it was when this file was written: the chain is
+mined locally, so there is always coin. What remains unavailable on this host is
+testnet TAZ and a mainnet balance.
