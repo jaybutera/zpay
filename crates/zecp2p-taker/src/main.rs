@@ -186,6 +186,21 @@ enum Commands {
         amount: String,
     },
 
+    /// Ask the live feed which entry a payment is, without attesting anything.
+    FindPayment {
+        #[arg(long)]
+        recipient: String,
+        #[arg(long)]
+        amount: String,
+        /// Only entries at or after this time, e.g. 2026-09-02T15:55:00.
+        ///
+        /// The same account pays the same handle the same dollar repeatedly, so
+        /// amount and recipient alone are ambiguous. The daemon cuts at the
+        /// intent's signal time; this is the manual equivalent.
+        #[arg(long)]
+        after: Option<String>,
+    },
+
     /// Report an intent's terms as the daemon reads them, and stop.
     ///
     /// Touches no cookie and sends nothing. Useful for checking what the
@@ -229,6 +244,22 @@ async fn main() -> Result<()> {
     // and sends nothing on-chain.
     if let Commands::TestPay { recipient, amount } = &cli.command {
         return run_test_pay(&config, recipient, amount).await;
+    }
+    if let Commands::FindPayment {
+        recipient,
+        amount,
+        after,
+    } = &cli.command
+    {
+        let after = match after {
+            Some(text) => Some(
+                chrono::NaiveDateTime::parse_from_str(text.trim(), "%Y-%m-%dT%H:%M:%S")
+                    .context("--after wants a naive time like 2026-09-02T15:55:00")?
+                    .and_utc(),
+            ),
+            None => None,
+        };
+        return run_find_payment(&config, recipient, amount, after).await;
     }
 
     // Attest and Terms are read-only and need no key: they read the chain and,
@@ -291,7 +322,9 @@ async fn main() -> Result<()> {
     );
 
     match cli.command {
-        Commands::CheckVenmo | Commands::TestPay { .. } => unreachable!("handled above"),
+        Commands::CheckVenmo | Commands::TestPay { .. } | Commands::FindPayment { .. } => {
+            unreachable!("handled above")
+        }
 
         Commands::Run { dry_run, recipient } => {
             let mode = if dry_run {
@@ -1004,6 +1037,12 @@ async fn run_fill<P: alloy::providers::Provider + Clone>(
     .await
     .context("could not read back the intent we just signalled")?;
     record.signalled_at_ms = Some(terms.timestamp_ms());
+    // The cut for finding this payment in the feed later. The payment cannot
+    // predate the intent it pays for, so the signal time is a sound lower bound;
+    // a minute of slack absorbs clock skew between the chain and Venmo.
+    let signalled_at = chrono::DateTime::from_timestamp_millis(terms.timestamp_ms() as i64)
+        .unwrap_or_else(chrono::Utc::now)
+        - chrono::Duration::minutes(1);
     journal.record(record)?;
 
     // Gate two. Real dollars, and nothing recalls them.
@@ -1080,13 +1119,31 @@ async fn run_fill<P: alloy::providers::Provider + Clone>(
         config.network.chain_id,
     );
     let out = std::path::PathBuf::from(format!("attestation.{}.json", plan.deposit.deposit_id));
+    // Which feed entry the enclave should attest. Not 0: the enclave selects by
+    // raw position with no filter of its own, and index 0 is whatever happened
+    // most recently on the account, which an incoming transfer can make someone
+    // else's money. Located by direction, amount and recipient instead.
+    let payment_index = zecp2p_taker::auto::attest::feed::locate_payment(
+        &reqwest::Client::new(),
+        &material,
+        &request.recipient,
+        &request.amount,
+        // Only entries newer than the intent we just signalled. The same account
+        // pays the same handle the same dollar repeatedly, and without this cut
+        // a $1.00 run is ambiguous against every earlier $1.00 payment.
+        Some(signalled_at),
+    )
+    .await
+    .context("could not tell which Venmo feed entry this payment is")?;
+    println!("the payment is at feed index {payment_index}");
+
     let attest_request = AttestRequest {
         intent_hash: intent.intent_hash,
         amount: terms.amount,
         conversion_rate: terms.conversion_rate,
         timestamp_ms: terms.timestamp_ms(),
         payee_hash: terms.payee_hash,
-        payment_index: 0,
+        payment_index,
     };
     let attested = attester
         .attest(&attest_request, &material, &out)
@@ -1118,4 +1175,42 @@ async fn run_fill<P: alloy::providers::Provider + Clone>(
     println!("fulfilled, tx {tx}");
 
     Ok(Outcome::Fulfilled)
+}
+
+/// Ask the live Venmo feed which entry a payment is, and print it.
+///
+/// Read-only: sends the cookie to Venmo's own API and nothing else. Exists so
+/// the index the attestation will use can be checked before a payment is made,
+/// rather than discovered afterwards.
+async fn run_find_payment(
+    config: &TakerConfig,
+    recipient: &str,
+    amount: &str,
+    after: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<()> {
+    let store = CookieStore::new(&config.session.path, config.session.max_age_hours)
+        .with_identity(
+            config.session.sender_id.clone(),
+            config.session.user_agent.clone(),
+        );
+    let health = store.health()?;
+    if !health.is_usable() {
+        bail!("{}", health.explain());
+    }
+    let material = store
+        .load()?
+        .ok_or_else(|| anyhow::anyhow!("no session material at {}", config.session.path))?;
+    println!("session : {material}");
+
+    let index = zecp2p_taker::auto::attest::feed::locate_payment(
+        &reqwest::Client::new(),
+        &material,
+        recipient,
+        amount,
+        after,
+    )
+    .await?;
+    println!("an outgoing ${amount} to @{recipient} is at feed index {index}");
+    println!("(the enclave would be given PAYMENT_INDEX={index})");
+    Ok(())
 }

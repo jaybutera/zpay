@@ -428,3 +428,253 @@ mod tests {
         assert!(err.to_string().contains("Snapshot rate mismatch"), "{err}");
     }
 }
+
+/// Finding which entry of the Venmo feed is the payment we just made.
+///
+/// The enclave selects `$.stories[INDEX]` by raw position and applies no filter
+/// of its own: not on direction, not on amount, not on recipient. So a
+/// hardcoded index 0 attests "the most recent thing that happened on this
+/// account", which is only our payment if nothing else landed first. An
+/// incoming transfer arriving between the send and the attestation silently
+/// shifts our payment to index 1, and index 0 is then a real, correctly signed
+/// attestation of somebody else's money.
+///
+/// `check_binds` does not catch that. It compares the attested `releaseAmount`
+/// against the intent, and the enclave computes `releaseAmount` from the entry
+/// it was pointed at, so a wrong entry with a coincidentally equal amount
+/// passes. The defence has to be choosing the right index in the first place.
+pub mod feed {
+    use anyhow::{bail, Context, Result};
+    use serde::Deserialize;
+
+    use super::SessionMaterial;
+
+    #[derive(Debug, Deserialize)]
+    struct Stories {
+        #[serde(default)]
+        stories: Vec<Story>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct Story {
+        /// Rendered with a sign and a currency symbol: "- $4.84", "+ $1.00".
+        #[serde(default)]
+        amount: String,
+        /// ISO 8601, e.g. "2026-09-02T02:21:39". Local to Venmo, no zone.
+        #[serde(default)]
+        date: String,
+        #[serde(default)]
+        title: Title,
+    }
+
+    #[derive(Debug, Default, Deserialize)]
+    struct Title {
+        #[serde(default)]
+        receiver: Party,
+    }
+
+    #[derive(Debug, Default, Deserialize)]
+    struct Party {
+        #[serde(default)]
+        username: String,
+    }
+
+    /// The feed entry that is our payment: outgoing, for this amount, to this
+    /// handle.
+    ///
+    /// Returns the index the enclave should be given. Refuses rather than
+    /// guessing when nothing matches, because the alternative is attesting a
+    /// stranger's transaction, and refuses when more than one entry matches,
+    /// because then position alone cannot say which is ours.
+    pub async fn locate_payment(
+        http: &reqwest::Client,
+        material: &SessionMaterial,
+        recipient: &str,
+        amount: &str,
+        after: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<u32> {
+        let url = format!(
+            "https://account.venmo.com/api/stories?feedType=me&externalId={}",
+            material.sender_id
+        );
+        let mut request = http
+            .get(&url)
+            .header("Cookie", &material.cookie)
+            .header("accept", "application/json");
+        if let Some(agent) = &material.user_agent {
+            request = request.header("User-Agent", agent.clone());
+        }
+
+        let response = request
+            .send()
+            .await
+            .context("could not read the Venmo feed to locate the payment")?;
+        if !response.status().is_success() {
+            bail!(
+                "the Venmo feed answered {} when asked which entry the payment is. \
+                 The cookie may have expired between the payment and the attestation.",
+                response.status()
+            );
+        }
+        let body: Stories = response
+            .json()
+            .await
+            .context("the Venmo feed did not answer with the story list")?;
+
+        // Amount and recipient are not enough on their own. The same account
+        // pays the same handle the same dollar repeatedly: on 2026-09-02 the
+        // live feed held three $1.00 payments to test-payee, and the run being
+        // attested was about to add a fourth. What separates ours from the
+        // others is that it is newer than the moment we signalled, so that
+        // moment is the cut.
+        let matches: Vec<usize> = body
+            .stories
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| is_our_payment(s, recipient, amount))
+            .filter(|(_, s)| after.is_none_or(|cut| is_after(s, cut)))
+            .map(|(i, _)| i)
+            .collect();
+
+        match matches.as_slice() {
+            [only] => u32::try_from(*only)
+                .context("the matching feed entry is further down than an index can express"),
+            [] => bail!(
+                "no outgoing payment of ${amount} to @{recipient}{} is in the Venmo feed. \
+                 The payment may not have registered yet, or it went to a different \
+                 handle. Refusing to attest by position: index 0 is whatever happened \
+                 most recently on this account, which may be someone else's money.",
+                match after {
+                    Some(cut) => format!(" after {cut}"),
+                    None => String::new(),
+                }
+            ),
+            many => bail!(
+                "{} feed entries look like a ${amount} payment to @{recipient} (indices {:?}). \
+                 Position alone cannot say which one this intent paid for, so this needs \
+                 an operator and an explicit --index.",
+                many.len(),
+                many
+            ),
+        }
+    }
+
+    /// Whether this entry is newer than the cut.
+    ///
+    /// Venmo stamps stories with a naive local time ("2026-09-02T02:21:39"), so
+    /// it is read as naive and compared in UTC. An unparseable date is treated
+    /// as not matching: the cost of dropping a real entry is a refusal that asks
+    /// for an operator, and the cost of keeping a wrong one is attesting the
+    /// wrong payment.
+    fn is_after(story: &Story, cut: chrono::DateTime<chrono::Utc>) -> bool {
+        chrono::NaiveDateTime::parse_from_str(story.date.trim(), "%Y-%m-%dT%H:%M:%S")
+            .map(|naive| naive.and_utc() >= cut)
+            .unwrap_or(false)
+    }
+
+    /// Outgoing, right amount, right recipient.
+    ///
+    /// Venmo renders the amount with a sign and a symbol and the sign is the
+    /// direction: "- $4.84" left the account, "+ $1.00" arrived. Matching on the
+    /// digits alone would accept a payment *to* us of the same size.
+    fn is_our_payment(story: &Story, recipient: &str, amount: &str) -> bool {
+        let rendered = story.amount.trim();
+        let Some(rest) = rendered.strip_prefix('-') else {
+            return false;
+        };
+        let digits: String = rest
+            .chars()
+            .filter(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        digits == amount && story.title.receiver.username.eq_ignore_ascii_case(recipient)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn story(amount: &str, receiver: &str) -> Story {
+            dated_story(amount, receiver, "2026-09-02T02:21:39")
+        }
+
+        fn dated_story(amount: &str, receiver: &str, date: &str) -> Story {
+            Story {
+                amount: amount.into(),
+                date: date.into(),
+                title: Title {
+                    receiver: Party {
+                        username: receiver.into(),
+                    },
+                },
+            }
+        }
+
+        fn utc(s: &str) -> chrono::DateTime<chrono::Utc> {
+            chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S")
+                .unwrap()
+                .and_utc()
+        }
+
+        /// The ambiguity this exists for, taken from the live feed: on
+        /// 2026-09-02 three $1.00 payments to test-payee were already in it, and
+        /// the run being attested was about to add a fourth. Only the cut
+        /// separates them.
+        #[test]
+        fn the_signal_time_separates_todays_payment_from_last_weeks() {
+            let old = dated_story("- $1.00", "test-payee", "2026-08-31T17:40:25");
+            let ours = dated_story("- $1.00", "test-payee", "2026-09-02T16:00:00");
+            let cut = utc("2026-09-02T15:55:00");
+
+            assert!(is_our_payment(&old, "test-payee", "1.00"));
+            assert!(is_our_payment(&ours, "test-payee", "1.00"));
+            // but only one of them is after the cut
+            assert!(!is_after(&old, cut));
+            assert!(is_after(&ours, cut));
+        }
+
+        /// A date Venmo renders in a shape we do not expect must not be treated
+        /// as recent. Dropping a real entry costs a refusal; keeping a wrong one
+        /// costs the payment.
+        #[test]
+        fn an_unparseable_date_is_not_treated_as_ours() {
+            let odd = dated_story("- $1.00", "test-payee", "yesterday");
+            assert!(!is_after(&odd, utc("2020-01-01T00:00:00")));
+        }
+
+        /// The live feed on 2026-09-02, shape and all: index 0 was an *incoming*
+        /// $1.00 and the outgoing $4.84 fill was at index 1.
+        #[test]
+        fn an_incoming_payment_at_index_zero_is_not_ours() {
+            assert!(!is_our_payment(
+                &story("+ $1.00", "test-payer"),
+                "test-payee",
+                "1.00"
+            ));
+            assert!(is_our_payment(
+                &story("- $4.84", "test-payee"),
+                "test-payee",
+                "4.84"
+            ));
+        }
+
+        /// The direction check is the point: a payment *to* us of the same size
+        /// must not be mistaken for the one we sent.
+        #[test]
+        fn the_sign_decides_direction() {
+            assert!(is_our_payment(&story("- $1.00", "test-payee"), "test-payee", "1.00"));
+            assert!(!is_our_payment(&story("+ $1.00", "test-payee"), "test-payee", "1.00"));
+        }
+
+        #[test]
+        fn the_recipient_must_match_and_case_does_not() {
+            assert!(is_our_payment(&story("- $1.00", "test-payee"), "test-payee", "1.00"));
+            assert!(!is_our_payment(&story("- $1.00", "someone-else"), "test-payee", "1.00"));
+        }
+
+        #[test]
+        fn the_amount_must_match_exactly() {
+            assert!(!is_our_payment(&story("- $10.00", "test-payee"), "test-payee", "1.00"));
+            assert!(!is_our_payment(&story("- $1.01", "test-payee"), "test-payee", "1.00"));
+        }
+    }
+}
