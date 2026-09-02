@@ -594,3 +594,58 @@ bracket, so no escrow written today changes price at that boundary.
   the next blocker, not a protocol question.
 - The consensus branch id must still be read from the node at runtime per 4.3.
   Mainnet was at height 3469623 when this was written, on the NU6.3 branch.
+
+## 13. Build status
+
+Updated 2026-09-02. Phase numbering follows section 9.
+
+| Phase | State | Where |
+|---|---|---|
+| 0 Recon | Done | Section 12; `crates/zecp2p-escrow/tests/phase0_librustzcash.rs`, `attestation_vectors.rs` |
+| 1 Transactions | Code done, testnet gate not met | `crates/zecp2p-escrow/src/{script,tx,fees}.rs` |
+| 2 Attestor core | Decision path done, HTTP surface not built | `crates/zecp2p-attestor/src/{lib,store}.rs` |
+| 3 Adaptor | Done | `crates/zecp2p-escrow/src/dlc.rs` |
+| 4 Client handshake | Not started | |
+| 5 Testnet end to end | Blocked, see below | |
+| 6 Mainnet $1 | Blocked on 5 | |
+| 7 Nitro attestor | Not started | |
+
+What is proved, and by what:
+
+- Both branches of the redeem script run under the same consensus interpreter
+  zebrad uses, with the mempool's standardness flags. The refund is rejected at
+  `T - 1` and accepted at `T`; the LP cannot spend either branch alone; a
+  redeem script with a different `T` does not satisfy the committed hash.
+- The ZIP 244 digest changes when any committed field changes: outpoint, input
+  value, `T`, `l_pub`, branch id, payout script, output value. This is the
+  property the pre-signature rests on.
+- The full path runs in `tests/end_to_end.rs`: the user pre-signs the real
+  release digest, a production attestation gates the outcome scalar, the
+  decrypted signature goes into a scriptSig, and the interpreter accepts it.
+  Three fabricated scalars each yield a release the script rejects.
+- The attestor refuses a mismatched intent, an underpayment, a wrong signer,
+  altered terms, a wrong escrow script, a wrong amount, and insufficient depth,
+  each tested with an otherwise-valid request.
+
+### 13.1 What blocks the acceptance criteria
+
+The gate is a Zcash node. No `zebrad` or `zcashd` is installed on this host and
+no RPC endpoint is configured, so these criteria cannot be met yet:
+
+- Phase 1's hard gate: mempool acceptance of both branches on testnet via
+  `sendrawtransaction`. Section 4.6 calls this a hard gate and it is not met.
+  The script tests execute the same interpreter zebrad links, which is strong
+  evidence and is not the same thing as a node accepting the transaction.
+- Criterion 12's mempool rejection of a fabricated release. The rejection is
+  demonstrated at the script and cryptographic layers, not at a node.
+- Everything in criteria 1 to 11 and 13, all of which need a funded wallet on
+  testnet and then mainnet.
+
+Nothing about the funding transaction is built. Spec 4.2 needs a shielded spend
+from the user's wallet, which needs a wallet, a node, and the Orchard proving
+path; `tx.rs` covers only the two transactions that spend the escrow.
+
+The remaining code work before a testnet run is Phase 4: the client handshake,
+durable key storage, refund automation at `T`, and the LP daemon that watches
+depth, honours `PAY_DEADLINE` and `BROADCAST_DEADLINE`, calls the existing
+prover, and broadcasts. None of it is written.
