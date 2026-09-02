@@ -6,6 +6,7 @@ members = [
     "crates/zecp2p-cli",
     "crates/zecp2p-taker",
     "crates/zecp2p-escrow",
+    "crates/zecp2p-attestor",
 ]
 
 [workspace.package]

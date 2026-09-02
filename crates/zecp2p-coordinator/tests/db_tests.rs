@@ -155,3 +155,48 @@ async fn test_session_with_all_fields() {
     assert_eq!(retrieved.error, session.error);
     assert_eq!(retrieved.status, OfframpStatus::Failed);
 }
+
+#[tokio::test]
+async fn test_stats_counts_by_status_and_sums_settled() {
+    let (db, _tmp) = setup_db().await;
+
+    // Empty database: every counter is zero and there is no last fill.
+    let empty = db.stats().await.unwrap();
+    assert_eq!(empty.fulfilled, 0);
+    assert_eq!(empty.open_deposits, 0);
+    assert_eq!(empty.in_flight, 0);
+    assert_eq!(empty.settled_usdc, "0");
+    assert_eq!(empty.last_fulfilled_at, None);
+
+    let mut open = OfframpSession::new(create_test_request(), test_payee_hash());
+    open.set_status(OfframpStatus::Zkp2pDeposited);
+    db.insert_session(&open).await.unwrap();
+
+    let pending = OfframpSession::new(create_test_request(), test_payee_hash());
+    db.insert_session(&pending).await.unwrap();
+
+    let mut failed = OfframpSession::new(create_test_request(), test_payee_hash());
+    failed.set_status(OfframpStatus::Failed);
+    db.insert_session(&failed).await.unwrap();
+
+    // Two fills: the 2026-09-01 mainnet amount and one with no recorded amount.
+    let mut filled = OfframpSession::new(create_test_request(), test_payee_hash());
+    filled.set_status(OfframpStatus::Fulfilled);
+    filled.received_usdc = Some(U256::from(4_875_437u64));
+    db.insert_session(&filled).await.unwrap();
+
+    let mut filled_no_amount = OfframpSession::new(create_test_request(), test_payee_hash());
+    filled_no_amount.set_status(OfframpStatus::Fulfilled);
+    db.insert_session(&filled_no_amount).await.unwrap();
+
+    let stats = db.stats().await.unwrap();
+    assert_eq!(stats.fulfilled, 2);
+    assert_eq!(stats.open_deposits, 1);
+    // `created` counts as in flight; `failed` counts nowhere.
+    assert_eq!(stats.in_flight, 1);
+    assert_eq!(stats.settled_usdc, "4875437");
+    assert_eq!(
+        stats.last_fulfilled_at.as_deref(),
+        Some(filled_no_amount.updated_at.max(filled.updated_at).to_rfc3339().as_str())
+    );
+}

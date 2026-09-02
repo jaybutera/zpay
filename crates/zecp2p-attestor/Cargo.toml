@@ -1,0 +1,29 @@
+[package]
+name = "zecp2p-attestor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Outcome attestor for the ZEC-native escrow: verifies a zk-p2p enclave payment attestation and signs the DLC outcome"
+
+[dependencies]
+zecp2p-escrow = { path = "../zecp2p-escrow" }
+tokio = { workspace = true }
+axum = { workspace = true }
+sqlx = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+hex = { workspace = true }
+secp256k1 = { version = "0.30", features = ["rand", "global-context"] }
+secp256k1-zkp = { version = "0.11", features = ["rand", "rand-std", "std", "hashes", "global-context"] }
+sha2 = "0.10"
+rand = { workspace = true }
+
+[dev-dependencies]
+sha3 = "0.10"
+tempfile = { workspace = true }
+hex = { workspace = true }
+serde_json = { workspace = true }

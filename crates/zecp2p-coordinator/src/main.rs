@@ -90,6 +90,7 @@ async fn main() -> Result<()> {
     // 5. Handler
     let app = Router::new()
         .route("/health", get(api::health))
+        .route("/stats", get(api::stats))
         .route("/quote", get(api::get_quote))
         .route("/offramp", post(api::create_offramp))
         .route("/offramp/{id}", get(api::get_offramp))

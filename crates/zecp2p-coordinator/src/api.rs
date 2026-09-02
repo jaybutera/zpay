@@ -23,6 +23,31 @@ pub async fn health() -> Json<serde_json::Value> {
     }))
 }
 
+/// Public counters for the launch page.
+///
+/// Deliberately coarse: counts and a total, never a handle or a session id.
+/// The one per-session fact it reveals, that a fulfilment happened at a given
+/// time, is already in the glue's `OfframpProcessed` logs.
+pub async fn stats(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let s = state
+        .db
+        .stats()
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    Ok(Json(serde_json::json!({
+        "fulfilled": s.fulfilled,
+        "settled_usdc": s.settled_usdc,
+        "open_deposits": s.open_deposits,
+        "in_flight": s.in_flight,
+        "last_fulfilled_at": s.last_fulfilled_at,
+        "chain_id": state.config.network.chain_id,
+        "glue_contract": state.config.contracts.glue_contract,
+    })))
+}
+
 /// Transparent stand-in refund address used for price quotes only.
 ///
 /// `/quote` runs before the user has given a refund address, but 1Click still

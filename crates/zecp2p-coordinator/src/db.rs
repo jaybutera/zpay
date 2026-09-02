@@ -217,6 +217,77 @@ impl Database {
 
         rows.into_iter().map(|r| r.into_session()).collect()
     }
+
+    /// Aggregate counts for the public `/stats` endpoint.
+    ///
+    /// Sums `received_usdc` in Rust rather than SQL: the column is a decimal
+    /// string, and SQLite's SUM over text silently truncates to a double.
+    pub async fn stats(&self) -> Result<SessionStats> {
+        use alloy::primitives::U256;
+
+        let rows: Vec<StatusCount> = sqlx::query_as(
+            r#"
+            SELECT status, COUNT(*) AS count FROM sessions GROUP BY status
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut stats = SessionStats::default();
+        for row in rows {
+            match row.status.as_str() {
+                "fulfilled" => stats.fulfilled = row.count as u64,
+                "zkp2p_deposited" => stats.open_deposits = row.count as u64,
+                "failed" | "rescued" | "withdrawn" => {}
+                _ => stats.in_flight += row.count as u64,
+            }
+        }
+
+        let fulfilled: Vec<(Option<String>, String)> = sqlx::query_as(
+            r#"
+            SELECT received_usdc, updated_at FROM sessions WHERE status = 'fulfilled'
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut settled = U256::ZERO;
+        let mut last: Option<String> = None;
+        for (amount, updated_at) in fulfilled {
+            if let Some(a) = amount {
+                settled = settled.saturating_add(a.parse::<U256>().unwrap_or(U256::ZERO));
+            }
+            if last.as_deref().is_none_or(|l| updated_at.as_str() > l) {
+                last = Some(updated_at);
+            }
+        }
+        stats.settled_usdc = settled.to_string();
+        stats.last_fulfilled_at = last;
+
+        Ok(stats)
+    }
+}
+
+/// Counts served by `/stats`. No handles, no session ids, no amounts per
+/// session: everything here is already derivable from the glue's logs.
+#[derive(Debug, Default, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct SessionStats {
+    /// Sessions that ended with a Venmo payment proven on chain.
+    pub fulfilled: u64,
+    /// Total USDC released to takers across fulfilled sessions, 6 decimals.
+    pub settled_usdc: String,
+    /// Deposits sitting in EscrowV2 waiting for a taker.
+    pub open_deposits: u64,
+    /// Sessions somewhere between creation and the escrow deposit.
+    pub in_flight: u64,
+    /// RFC 3339 timestamp of the most recent fulfilment, if any.
+    pub last_fulfilled_at: Option<String>,
+}
+
+#[derive(sqlx::FromRow)]
+struct StatusCount {
+    status: String,
+    count: i64,
 }
 
 #[derive(sqlx::FromRow)]

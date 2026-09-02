@@ -133,7 +133,7 @@ pub fn recover_signer(
     Ok(addr)
 }
 
-/// Full verification, spec 5.5 steps 2 to 4.
+/// Full verification, spec 5.5 steps 2 to 4, against the pinned enclave signer.
 ///
 /// `encoded_payment_details` is the preimage the signature actually commits to
 /// through `dataHash`; checking it here means a caller cannot pass a
@@ -144,6 +144,31 @@ pub fn verify(
     encoded_payment_details: &[u8],
     expected_intent_hash: &[u8; 32],
     minimum_release_amount: u128,
+) -> Result<(), AttestationError> {
+    verify_against_signer(
+        a,
+        signature,
+        encoded_payment_details,
+        expected_intent_hash,
+        minimum_release_amount,
+        &ENCLAVE_SIGNER,
+    )
+}
+
+/// As [`verify`], but against a caller-supplied trusted signer.
+///
+/// Spec section 8 lists enclave signer rotation as a config change rather than
+/// a protocol change, so the signer is a parameter here and pinned by the
+/// caller. Production callers use [`verify`]; tests use this to construct
+/// attestations bound to terms they control, which the real enclave key
+/// obviously cannot be made to sign.
+pub fn verify_against_signer(
+    a: &PaymentAttestation,
+    signature: &[u8],
+    encoded_payment_details: &[u8],
+    expected_intent_hash: &[u8; 32],
+    minimum_release_amount: u128,
+    trusted_signer: &[u8; 20],
 ) -> Result<(), AttestationError> {
     if keccak(encoded_payment_details) != a.data_hash {
         return Err(AttestationError::DataHashMismatch);
@@ -161,10 +186,10 @@ pub fn verify(
         });
     }
     let signer = recover_signer(&eip712_digest(a), signature)?;
-    if signer != ENCLAVE_SIGNER {
+    if &signer != trusted_signer {
         return Err(AttestationError::WrongSigner {
             got: hex::encode(signer),
-            expected: hex::encode(ENCLAVE_SIGNER),
+            expected: hex::encode(trusted_signer),
         });
     }
     Ok(())

@@ -10,4 +10,5 @@ pub mod attestation;
 pub mod dlc;
 pub mod fees;
 pub mod script;
+pub mod terms;
 pub mod tx;
