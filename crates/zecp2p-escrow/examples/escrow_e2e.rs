@@ -184,7 +184,13 @@ fn main() {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(200_000);
-            let refund_height = policy.proposed_refund_height(height);
+            // ZECP2P_REFUND_DELAY lets a regtest run reach T by mining a few
+            // blocks instead of 1152. Criterion 13 asks that every height be
+            // derived from config, and this is that config.
+            let refund_height = match std::env::var("ZECP2P_REFUND_DELAY") {
+                Ok(d) => height + d.parse::<u32>().expect("ZECP2P_REFUND_DELAY"),
+                Err(_) => policy.proposed_refund_height(height),
+            };
             let plan =
                 escrow_address(&u_pub, &l_pub, refund_height as u64, amount_zat, addr_network)
                     .expect("escrow address");

@@ -93,6 +93,14 @@ pub struct EscrowEffects {
     inputs: Vec<TxOut>,
 }
 
+impl EscrowEffects {
+    /// Builds the effects for a set of spent outputs. Used by the regtest
+    /// funding helper, which signs a P2PKH input rather than the escrow.
+    pub fn for_inputs(inputs: Vec<TxOut>) -> Self {
+        Self { inputs }
+    }
+}
+
 impl zcash_transparent::bundle::Authorization for EscrowEffects {
     type ScriptSig = ();
 }

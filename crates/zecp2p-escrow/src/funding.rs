@@ -136,3 +136,60 @@ fn base58check(prefix: &[u8; 2], hash: &[u8]) -> String {
     }
     out
 }
+
+
+/// The ZIP 244 sighash for a P2PKH input, for the regtest funding helper.
+///
+/// Not part of the protocol: the escrow never spends P2PKH. It exists so a
+/// regtest run can move mined coin into an escrow address without a wallet.
+pub fn p2pkh_sighash(
+    branch_id: u32,
+    outpoint: &zcash_transparent::bundle::OutPoint,
+    script_pubkey: &[u8],
+    value_zat: u64,
+    vout: &[zcash_transparent::bundle::TxOut],
+) -> Result<[u8; 32], String> {
+    use zcash_primitives::transaction::sighash::{signature_hash, SignableInput};
+    use zcash_primitives::transaction::txid::TxIdDigester;
+    use zcash_primitives::transaction::{TransactionData, TxVersion};
+    use zcash_protocol::consensus::BranchId;
+    use zcash_protocol::value::Zatoshis;
+    use zcash_script::script::Code;
+    use zcash_transparent::address::Script;
+    use zcash_transparent::bundle::{Bundle, TxIn, TxOut};
+    use zcash_transparent::sighash::{SighashType, SignableInput as TSignable};
+
+    let prev = TxOut::new(
+        Zatoshis::const_from_u64(value_zat),
+        Script(Code(script_pubkey.to_vec())),
+    );
+    let bundle = Bundle::<crate::tx::EscrowEffects> {
+        vin: vec![TxIn::from_parts(outpoint.clone(), (), 0xffff_ffff)],
+        vout: vout.to_vec(),
+        authorization: crate::tx::EscrowEffects::for_inputs(vec![prev]),
+    };
+    let data = TransactionData::<crate::tx::EscrowUnauthorized>::from_parts(
+        TxVersion::V5,
+        BranchId::try_from(branch_id).map_err(|_| "unknown branch id".to_string())?,
+        0,
+        0.into(),
+        Some(bundle),
+        None,
+        None,
+        None,
+    );
+    let b = data.transparent_bundle().ok_or("no transparent bundle")?;
+    let code = Script(Code(script_pubkey.to_vec()));
+    let spk = Script(Code(script_pubkey.to_vec()));
+    let input = TSignable::from_parts(
+        b,
+        SighashType::ALL,
+        0,
+        &code,
+        &spk,
+        Zatoshis::const_from_u64(value_zat),
+    )
+    .map_err(|_| "bad input index".to_string())?;
+    let parts = data.digest(TxIdDigester);
+    Ok(*signature_hash(&data, &SignableInput::Transparent(input), &parts).as_ref())
+}
