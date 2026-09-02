@@ -616,11 +616,11 @@ Updated 2026-09-02. Phase numbering follows section 9.
 | Phase | State | Where |
 |---|---|---|
 | 0 Recon | Done | Section 12; `crates/zecp2p-escrow/tests/phase0_librustzcash.rs`, `attestation_vectors.rs` |
-| 1 Transactions | Code done, testnet gate not met | `crates/zecp2p-escrow/src/{script,tx,fees}.rs` |
-| 2 Attestor core | Decision path done, HTTP surface not built | `crates/zecp2p-attestor/src/{lib,store}.rs` |
+| 1 Transactions | Done, mempool gate met on testnet | `crates/zecp2p-escrow/src/{script,tx,fees}.rs` |
+| 2 Attestor core | Done: decision path, HTTP surface, SQLite | `crates/zecp2p-attestor/src/{lib,store,db,service}.rs` |
 | 3 Adaptor | Done | `crates/zecp2p-escrow/src/dlc.rs` |
-| 4 Client handshake | Logic done against a node trait; no RPC adapter | `crates/zecp2p-escrow/src/{client,lp,chain,deadlines}.rs` |
-| 5 Testnet end to end | Blocked, see below | |
+| 4 Client handshake | Done; RPC adapter live against testnet | `crates/zecp2p-escrow/src/{client,lp,chain,rpc,funding,deadlines}.rs` |
+| 5 Testnet end to end | Blocked on funded testnet coin | `crates/zecp2p-escrow/examples/escrow_e2e.rs` |
 | 6 Mainnet $1 | Blocked on 5 | |
 | 7 Nitro attestor | Not started | |
 
@@ -1059,3 +1059,61 @@ announcement, before the user pre-signs, so no field can change afterwards.
 `lock_confirmed_ms` is fixed at announcement time and is the LP's estimate; it
 does not bound recency (16.2) and survives only as the value
 `INTENT_TIMESTAMP_MS` must equal.
+
+## 18. Where the live test stands
+
+Updated 2026-09-02.
+
+### 18.1 Done since round 4
+
+- **Phase 1's mempool gate is met.** Section 14 has the verdicts. The earlier
+  claim that the hosted endpoint blocked `sendrawtransaction` was wrong: it was
+  a transient Cloudflare episode, and the method works at every payload size.
+- The attestor has its HTTP surface and its SQLite table. Every uniqueness rule
+  is a schema constraint, so it survives a restart, and a test opens the file in
+  a fresh process to check.
+- The nonce is drawn inside the attestor from the OS RNG, and a repeated `R` is
+  refused by a UNIQUE index.
+- `AcceptedQuote::new` refuses a zero amount, an escrow below the 0.001 ZEC
+  floor, a non-identity rate, an unusable timeout, and an `l_pub` that is not a
+  curve point.
+- `escrow_e2e` computes a fundable address from live chain state and can sweep
+  the escrow back with the user key alone.
+
+### 18.2 The blocker: a funded testnet coin
+
+Everything that does not require coin is built. What remains needs an output at
+an escrow address, and this host has none:
+
+- no reachable Zcash testnet faucet (three tried, all down or unroutable);
+- the hosted RPC has no wallet, so it cannot create one;
+- there is no funded testnet key on this machine.
+
+**What unblocks it.** Any of:
+
+1. **Testnet TAZ** sent to an address `escrow_e2e plan` prints. About 0.002 TAZ
+   covers an escrow plus fees. This is the smallest ask and unblocks the whole
+   testnet run: lock, refund-at-`T`, and criterion 12's mempool rejection
+   against a *funded* escrow.
+2. **A lightwalletd endpoint**, which additionally unblocks the shielded funding
+   leg of 4.2 through `zcash_client_backend` - the note discovery and witness
+   path that plain RPC cannot provide.
+3. **A zebrad with a wallet**, which covers both and is what production needs
+   anyway.
+
+For the mainnet $1 run, additionally: a funded mainnet key, the LP's Venmo
+session for the existing prover, and the attestor deployed with its bearer
+token.
+
+### 18.3 What a broadcast-capable endpoint needs
+
+For the record, since an earlier version of this document said no such endpoint
+existed. The requirement is small:
+
+- `getblockchaininfo` for the height and the consensus branch id;
+- `gettxout` for the escrow output's script, value and depth;
+- `sendrawtransaction`.
+
+`https://api.tatum.io/v3/blockchain/node/zcash-{testnet,mainnet}` serves all
+three keyless, at 5 requests a minute. It does **not** serve `z_gettreestate`,
+which is why the shielded funding leg needs something else.
