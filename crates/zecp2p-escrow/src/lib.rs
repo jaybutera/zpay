@@ -7,6 +7,7 @@
 //! sides sign.
 
 pub mod attestation;
+pub mod deadlines;
 pub mod dlc;
 pub mod fees;
 pub mod script;
