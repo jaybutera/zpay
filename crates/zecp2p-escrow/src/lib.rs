@@ -14,6 +14,7 @@ pub mod depth;
 pub mod dlc;
 pub mod fees;
 pub mod lp;
+pub mod rpc;
 pub mod script;
 pub mod terms;
 pub mod tx;
