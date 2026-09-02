@@ -16,7 +16,7 @@
 //
 // Env:
 //   VENMO_COOKIE      required. The Cookie header from a logged-in account.venmo.com request.
-//   VENMO_SENDER_ID   required. Casper's NUMERIC Venmo id (not the @handle).
+//   VENMO_SENDER_ID   required. the payer's NUMERIC Venmo id (not the @handle).
 //   VENMO_USER_AGENT  the browser UA that cookie was captured with.
 //   PAYMENT_INDEX     which entry in the feed, 0 = most recent (default 0).
 //   INTENT_HASH       required. The intent to bind the attestation to, as it

@@ -44,6 +44,10 @@ scripts/stageb/*.key
 scripts/stageb/quote.json
 scripts/stageb/poll.log
 scripts/stageb/live.quote.env
+# Every staged live run, not just the first one named. These record one
+# operator's deposit address, refund address and session id: no keys, but a
+# public repo has no business carrying a person's Zcash addresses.
+scripts/stageb/live.*.env
 
 # Deploy state: addresses recorded per chain by scripts/deploy/*. No keys, but
 # it names one specific deployment, so it belongs to the operator, not the repo.

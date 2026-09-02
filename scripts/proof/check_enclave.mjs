@@ -1,6 +1,6 @@
 // Read-only: proves the Peer TEE attestation service is reachable and that its
 // AWS Nitro attestation document verifies to the AWS Nitro root. Sends no
-// cookies, no payment data, and nothing about Casper. Costs nothing.
+// cookies, no payment data, and nothing about the operator. Costs nothing.
 import { fetchAndVerifyAttestation, getUnifiedPaymentVerifierDomainSeparator } from '@zkp2p/zkp2p-attestation';
 
 // The enclaves we trust, and the PCR8 each must measure. Same table as
