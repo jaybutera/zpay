@@ -529,7 +529,25 @@ impl AppState {
     }
 
     async fn process_session(self: &Arc<Self>, session: &OfframpSession) -> Result<()> {
-        // Check for timeout first
+        // A session whose USDC is already committed on chain has an outcome the
+        // clock cannot overrule. Read that outcome before considering the
+        // timeout, or a fill that lands after the budget expires is recorded as
+        // a failure while the escrow says it settled: on 2026-09-02 session
+        // 866dda19 filled for the full 5,057,401 and still read "Session timed
+        // out", because the timeout arm returned before the fulfilment check
+        // ever ran. The intent is the last word, so ask it first.
+        if session.status == OfframpStatus::IntentSignaled {
+            self.check_zkp2p_fulfillment(session).await?;
+            // Re-read: the check above may have just settled it, and a settled
+            // session is terminal and must not then be failed.
+            if let Some(latest) = self.db.get_session(session.id).await? {
+                if latest.status == OfframpStatus::Fulfilled {
+                    return Ok(());
+                }
+            }
+        }
+
+        // Check for timeout
         if self.is_session_timed_out(session) {
             tracing::warn!(
                 "Session {} timed out after {} seconds",
