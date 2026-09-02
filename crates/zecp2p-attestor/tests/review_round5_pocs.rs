@@ -173,7 +173,6 @@ fn attest_body(t: &CanonicalTerms) -> Value {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "R5-1: SQLITE_BUSY on announce is reported as DuplicateEvent"]
 fn r5_1_a_busy_database_is_not_a_duplicate_announcement() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("attestor.sqlite");
@@ -197,7 +196,6 @@ fn r5_1_a_busy_database_is_not_a_duplicate_announcement() {
 }
 
 #[test]
-#[ignore = "R5-1: SQLITE_BUSY on sign_and_record is reported as UnknownEvent"]
 fn r5_1b_a_busy_database_is_not_an_unknown_event() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("attestor.sqlite");
@@ -220,7 +218,6 @@ fn r5_1b_a_busy_database_is_not_an_unknown_event() {
 }
 
 #[tokio::test]
-#[ignore = "R5-1: the HTTP layer turns a locked database into a 409"]
 async fn r5_1c_over_http_a_locked_database_answers_409() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("attestor.sqlite");
@@ -261,7 +258,6 @@ async fn r5_1c_over_http_a_locked_database_answers_409() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "R5-2: the nonce bytes remain in the database file after signing"]
 fn r5_2_the_nonce_is_gone_from_disk_after_signing() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("attestor.sqlite");
@@ -312,7 +308,6 @@ fn r5_2_the_nonce_is_gone_from_disk_after_signing() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "R5-3: a repeated /attest returns 200 with the scalar rather than refusing"]
 fn r5_3_a_second_attest_for_one_event_is_refused() {
     let secp = Secp256k1::new();
     let d = SecretKey::from_slice(&[0xd1; 32]).unwrap();
@@ -394,7 +389,6 @@ async fn mock_rpc(axum::Json(req): axum::Json<Value>) -> axum::Json<Value> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "R5-4: /attest panics on the first chain call with RpcChainClient and poisons the store"]
 async fn r5_4_the_real_rpc_adapter_can_be_driven_from_inside_the_service() {
     use zecp2p_escrow::rpc::{Network, RpcChainClient, RpcConfig};
 

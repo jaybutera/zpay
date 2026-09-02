@@ -229,15 +229,41 @@ async fn announce_returns_a_nonce_point_the_caller_did_not_choose() {
     );
 }
 
+/// R6-2: a repeat with the *same* terms returns the announcement that exists,
+/// because a lost response otherwise stranded an escrow the user may already
+/// have funded. A repeat with different terms is still a 409 - one escrow, one
+/// nonce.
 #[tokio::test]
-async fn a_second_announcement_for_one_escrow_is_refused() {
+async fn a_second_announcement_replays_for_the_same_terms_and_is_refused_otherwise() {
     let svc = service(funded_chain(10));
     let t = terms();
-    let (status, _) = call(svc.clone(), "POST", "/announce", Some(TOKEN), Some(announce_body(&t))).await;
+
+    let (status, first) =
+        call(svc.clone(), "POST", "/announce", Some(TOKEN), Some(announce_body(&t))).await;
     assert_eq!(status, StatusCode::OK);
 
-    let (status, body) =
+    let (status, replay) =
         call(svc.clone(), "POST", "/announce", Some(TOKEN), Some(announce_body(&t))).await;
+    assert_eq!(status, StatusCode::OK, "an identical repeat must replay");
+    assert_eq!(
+        first["r"].as_str().unwrap(),
+        replay["r"].as_str().unwrap(),
+        "the replay must return the nonce point already announced, not a new one"
+    );
+    assert_eq!(first["terms_hash"], replay["terms_hash"]);
+
+    // Different terms over the same outpoint: the event id is the same, the
+    // terms hash is not, so this is refused.
+    let mut other = terms();
+    other.usd_amount_6dec = 1;
+    let (status, body) = call(
+        svc.clone(),
+        "POST",
+        "/announce",
+        Some(TOKEN),
+        Some(announce_body(&other)),
+    )
+    .await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert!(body["error"].as_str().unwrap().contains("announcement"));
 }

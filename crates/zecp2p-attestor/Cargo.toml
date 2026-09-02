@@ -31,6 +31,7 @@ hex = { workspace = true }
 secp256k1 = { version = "0.30", features = ["rand", "global-context"] }
 secp256k1-zkp = { version = "0.11", features = ["rand", "rand-std", "std", "hashes", "global-context"] }
 sha2 = "0.10"
+libc = "0.2"
 rusqlite = { version = "0.32", features = ["bundled"] }
 rand = { workspace = true }
 

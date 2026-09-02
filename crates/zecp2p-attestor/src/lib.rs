@@ -723,23 +723,21 @@ fn attest_over_db_with_signer(
     rate: &RatePolicy,
     trusted_signer: &[u8; 20],
 ) -> Result<SecretKey, AttestorError> {
-    // Acceptance criterion 8: "a second /attest for the same event_id is
-    // refused". R5-3 found this returning the stored scalar with 200, before
-    // any check on the request - so a bearer-token holder could read `s` for an
-    // event whose release had not been broadcast yet, by sending a zero
-    // signature and a zero blob.
+    // Criterion 8, and the recovery path R6-2 found missing.
     //
-    // The criterion wins over the convenience. An LP that lost the response
-    // recovers by broadcasting the release it already has, or by reading `s`
-    // off the chain once any release is mined; it does not need the attestor to
-    // hand the scalar out a second time.
-    if db
+    // R5-3 was right that returning the stored scalar *before checking the
+    // request* is wrong: a bearer-token holder could read `s` for an event whose
+    // release was not yet broadcast by sending a zero signature and a zero blob.
+    // But refusing outright, which is what that fix did, left the LP with no way
+    // back from a lost response - and the comment claiming it could read `s` off
+    // the chain was wrong, because no release reaches the chain without `s`.
+    //
+    // So the repeat is idempotent only on an exact match: the same terms as the
+    // announcement, and the same payment. That is checked below, after the
+    // request has been validated, not before. See spec 19.1.
+    let already_signed = db
         .signed_outcome(event_id)
-        .map_err(|e| AttestorError::Unavailable(e.to_string()))?
-        .is_some()
-    {
-        return Err(AttestorError::AlreadySigned);
-    }
+        .map_err(|e| AttestorError::Unavailable(e.to_string()))?;
 
     let event = db
         .get(event_id)
@@ -754,9 +752,17 @@ fn attest_over_db_with_signer(
         .payment_is_consumed(&nullifier)
         .map_err(|e| AttestorError::Unavailable(e.to_string()))?;
 
+    // A replay of the signed request is not a second consumption of the payment.
+    let is_replay_of_this_event = already_signed.is_some()
+        && event.payment_nullifier == Some(nullifier)
+        && event.terms_hash == terms.terms_hash();
+
     decide_inner(
         &event.terms_hash,
-        event.signed_s.is_some(),
+        // Never treat the event as signed when this is a faithful replay: the
+        // request still has to pass every other check before it earns the
+        // stored scalar.
+        event.signed_s.is_some() && !is_replay_of_this_event,
         terms,
         attestation,
         signature,
@@ -764,8 +770,19 @@ fn attest_over_db_with_signer(
         &observation,
         trusted_signer,
         rate,
-        already_consumed,
+        already_consumed && !is_replay_of_this_event,
     )?;
+
+    // The request was valid *and* identical to the one already signed, so hand
+    // back the same scalar rather than signing again. Nothing new is published:
+    // this is the value this same request already produced (R6-2).
+    if let Some(existing) = already_signed {
+        if is_replay_of_this_event {
+            return SecretKey::from_slice(&existing)
+                .map_err(|e| AttestorError::Dlc(DlcError::Secp(e.to_string())));
+        }
+        return Err(AttestorError::AlreadySigned);
+    }
 
     let signed_at_ms = clock.now_ms();
     let terms_hash = event.terms_hash;

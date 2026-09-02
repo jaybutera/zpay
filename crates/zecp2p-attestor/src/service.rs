@@ -336,10 +336,40 @@ where
         )
     })?;
 
-    result.map_err(|e| {
+    // R6-2: a lost /announce response left the LP with no `R` and no way to ask
+    // for it, and with an external wallet the escrow may already be funded - so
+    // that escrow waits until `T` for nothing. A repeat carrying the same terms
+    // returns the announcement that exists. Different terms for the same escrow
+    // stay a 409, which is the rule that matters: one escrow, one nonce.
+    if let Err(e) = result {
         let err = crate::map_store_error(e);
-        reject(status_for(&err), &err.to_string())
-    })?;
+        let svc3 = svc.clone();
+        let replay = tokio::task::spawn_blocking(move || {
+            let db = svc3.db.blocking_lock();
+            db.get(&event_id).ok().flatten()
+        })
+        .await
+        .ok()
+        .flatten();
+
+        match replay {
+            Some(row) if row.terms_hash == terms.terms_hash() => {
+                tracing::info!(
+                    event_id = %hex::encode(event_id),
+                    decision = "replayed",
+                    "announce"
+                );
+                return Ok(Json(AnnounceResponse {
+                    event_id: hex::encode(event_id),
+                    r: hex::encode(row.r),
+                    p: hex::encode(svc.public_key().serialize()),
+                    terms_hash: hex::encode(row.terms_hash),
+                    outcome: zecp2p_escrow::dlc::OUTCOME_PAID,
+                }));
+            }
+            _ => return Err(reject(status_for(&err), &err.to_string())),
+        }
+    }
 
     // Spec section 6: log the event id and the decision. Never `k`, never the
     // terms beyond their hash (criterion 14).

@@ -181,9 +181,13 @@ fn the_sqlite_path_produces_a_scalar_that_opens_the_outcome_point() {
     assert_eq!(db.signed_outcome(&ev).unwrap(), Some(s.secret_bytes()));
 }
 
+/// R6-2 changed this: an identical repeat now returns the same scalar, because
+/// refusing it left an LP who had paid Venmo with no way to collect. A repeat
+/// that is *not* identical is still refused, which is what criterion 8 is for.
+/// See `lost_response_recovery.rs` for the full set.
 #[test]
-fn a_second_attest_over_sqlite_is_refused() {
-    // Criterion 8, on the persistent path (R5-3).
+fn a_second_attest_over_sqlite_replays_only_for_an_identical_request() {
+    // Criterion 8, on the persistent path (R5-3, amended by R6-2).
     let secp = Secp256k1::new();
     let d = SecretKey::from_slice(&[0xd1; 32]).unwrap();
     let k = SecretKey::from_slice(&[0x4b; 32]).unwrap();
@@ -212,8 +216,32 @@ fn a_second_attest_over_sqlite_is_refused() {
         )
     };
 
-    run(&mut db).expect("the first attest signs");
-    assert_eq!(run(&mut db).unwrap_err(), AttestorError::AlreadySigned);
+    let first = run(&mut db).expect("the first attest signs");
+    let replay = run(&mut db).expect("an identical repeat returns the same scalar");
+    assert_eq!(first.secret_bytes(), replay.secret_bytes());
+
+    // A repeat under different terms is refused.
+    let mut other = t.clone();
+    other.usd_amount_6dec = 1;
+    let err = attest_over_db_against_signer(
+        &mut db,
+        &funded_chain(30),
+        &secp,
+        &d,
+        &FixedClock(NOW_MS),
+        &ev,
+        &other,
+        &att,
+        &sig,
+        &det,
+        &RatePolicy::production(),
+        &signer,
+    )
+    .expect_err("different terms must not replay");
+    assert!(
+        matches!(err, AttestorError::TermsChanged | AttestorError::AlreadySigned),
+        "got {err}"
+    );
 }
 
 #[test]

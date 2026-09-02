@@ -20,6 +20,10 @@
 //! file is what an operator backs up - and, per R5-2, it is as sensitive as the
 //! database.
 
+use std::fs::OpenOptions;
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -48,17 +52,58 @@ fn load_or_create_key(path: &str) -> SecretKey {
     }
 
     let key = SecretKey::new(&mut secp256k1_zkp::rand::thread_rng());
-    std::fs::write(path, hex::encode(key.secret_bytes())).expect("write attestor key");
 
+    // R6-4: `std::fs::write` creates at 0666 masked by the umask and only then
+    // narrows it, so `d` is world-readable for an instant - long enough for a
+    // reader with an inotify watch. `create_new` also closes the exists-then-
+    // create race above.
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true);
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            .expect("restrict attestor key permissions");
-    }
+    opts.mode(0o600);
+    let mut f = opts.open(path).expect("create attestor key file");
+    f.write_all(hex::encode(key.secret_bytes()).as_bytes())
+        .expect("write attestor key");
+    f.sync_all().expect("sync attestor key");
 
     tracing::info!(path, "generated a new attestor key on first boot");
     key
+}
+
+/// Refuses to start on a secret file any other account can read.
+///
+/// R6-3: the SQLite file, its WAL and its shm were created 0644, and `k` sits in
+/// that file in plaintext until signing - with the later published `s` that is
+/// `d`. This laptop is shared.
+#[cfg(unix)]
+fn require_owner_only(path: &str, what: &str) {
+    let mode = std::fs::metadata(path)
+        .unwrap_or_else(|e| panic!("stat {what} at {path}: {e}"))
+        .permissions()
+        .mode()
+        & 0o777;
+    if mode & 0o077 != 0 {
+        panic!(
+            "{what} at {path} is mode {mode:o}; it holds key material and must be 0600. \
+             Fix it with: chmod 600 {path}"
+        );
+    }
+}
+
+/// Creates the database file at 0600 before SQLite first opens it.
+///
+/// SQLite gives the WAL and the shm the main file's permissions, so getting the
+/// main file right before the first open fixes all three.
+fn precreate_db(path: &str) {
+    if !Path::new(path).exists() {
+        let mut opts = OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        opts.mode(0o600);
+        opts.open(path).expect("create attestor database file");
+    }
+    #[cfg(unix)]
+    require_owner_only(path, "the attestor database");
 }
 
 #[tokio::main]
@@ -84,7 +129,18 @@ async fn main() {
         panic!("ZECP2P_ATTESTOR_TOKEN must be at least 16 characters");
     }
 
+    // Umask first: SQLite creates the WAL and shm itself, and a 002 umask would
+    // otherwise make them group-writable (R6-3).
+    #[cfg(unix)]
+    unsafe {
+        libc::umask(0o077);
+    }
+
     let d = load_or_create_key(&key_path);
+    #[cfg(unix)]
+    require_owner_only(&key_path, "the attestor key");
+
+    precreate_db(&db_path);
     let db = SqliteEventStore::open(&db_path).expect("open attestor database");
 
     // `RpcChainClient` builds a blocking reqwest client, which panics if it is

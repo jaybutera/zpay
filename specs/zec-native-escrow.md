@@ -696,9 +696,8 @@ two signatures under one nonce expose `d`.
 - The funding transaction of 4.2: a shielded spend needs a wallet, note
   management and the Orchard proving path. `tx.rs` builds only the two
   transactions that spend the escrow.
-- The attestor's HTTP surface: `/identity`, `/announce`, `/attest`, the bearer
-  token, the SQLite table behind `EventStore`, and rate limiting. The decision
-  logic those endpoints would call is written and tested.
+- Rate limiting on `/announce`. The endpoints themselves, the bearer token and
+  the SQLite table are built; see section 19.
 - The BIP340 `announce_sig` of 5.1. The user verifies the attestor's key
   against a pin; it does not yet verify a signature over the announcement.
 - Phase 7 in full.
@@ -1117,3 +1116,59 @@ existed. The requirement is small:
 `https://api.tatum.io/v3/blockchain/node/zcash-{testnet,mainnet}` serves all
 three keyless, at 5 requests a minute. It does **not** serve `z_gettreestate`,
 which is why the shielded funding leg needs something else.
+
+## 19. Review rounds 5 and 6: the service layer in practice
+
+## 19.1 Criterion 8, restated
+
+Criterion 8 says "a second `/attest` for the same `event_id` is refused". Two
+review rounds pulled it in opposite directions, and the resolution is worth
+recording because the criterion as written is ambiguous about *which* second
+request.
+
+Round 5 (R5-3) found the handler returning the stored scalar before it looked
+at the request at all. That let anyone holding the bearer token read `s` for an
+event whose release had not been broadcast, by sending a zero signature and a
+zero blob. Refusing outright fixed it.
+
+Round 6 (R6-2) found what refusing outright cost. The LP calls `/attest` after
+it has paid Venmo. If the response is lost - a client timeout shorter than the
+attestor's chain round trip is enough - the signing has already committed, the
+nonce is gone and the payment nullifier is recorded. The LP holds no `s`, and
+`s` is the only thing that completes the user's pre-signature. The comment in
+the code claimed the LP could read `s` off the chain instead; that was wrong,
+because no release reaches the chain without `s` in the first place. So the LP
+was out the fiat with no exit, and the user refunded at `T`.
+
+**The rule now: a repeat is answered with the stored scalar if and only if it is
+the same request.** Same terms as the announcement pinned, same payment
+nullifier, and every other check passed - the replay is decided *after* the
+request is validated, not before. Anything else is 409.
+
+Criterion 8 should be read as: **a second `/attest` under different terms or a
+different payment is refused.** That is what it is protecting. The properties
+the original wording was standing in for all hold:
+
+- No second signature is ever produced. The nonce is gone after the first, and
+  a replay returns the recorded value rather than signing.
+- Nothing new is published. The scalar handed back is one this same request
+  already produced.
+- The R5-3 attack fails: a zero signature and a zero blob hash to a different
+  payment, so they are not a replay, and the event is signed.
+- One payment still releases one escrow: the `payment_nullifier` UNIQUE
+  constraint is untouched, and a replay is not counted as a fresh consumption.
+
+`/announce` gets the same treatment for the same reason: a repeat carrying the
+terms the announcement pinned returns the existing `R`, and different terms over
+one outpoint stay a 409. Without it a lost announcement stranded an escrow the
+user may already have funded.
+
+## 19.2 The regtest node
+
+See `scripts/regtest/README.md`. The one thing that belongs here: a default
+Regtest node runs Canopy, where ZIP 225 v5 transactions do not exist, so it
+rejects every transaction this repo builds at parse. The node must activate NU5
+through NU6.3 at height 1, which puts it on branch `37a5165b` - the same as
+mainnet. The transaction builder is not the place to accommodate this; a v4
+fallback would mean the run exercised a different sighash from the one mainnet
+will see.
