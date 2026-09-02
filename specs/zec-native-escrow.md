@@ -1,0 +1,465 @@
+# ZEC-native escrow: 2-of-2 + CLTV with adaptor-signature release
+
+Status: approved design, 2026-09-02. Nothing here is built. This document is
+the build spec; an implementer should not need the design conversation.
+
+## 1. What this replaces and why
+
+Today's offramp is: shielded ZEC -> 1Click swap to Base USDC -> zk-p2p
+EscrowV2 deposit -> our taker pays Venmo -> zk-p2p's Nitro enclave attests the
+payment -> `fulfillIntent` releases the USDC. The user pays 1Click's fee, waits
+for the swap, and is subject to zk-p2p's $30 de facto floor on outside fills.
+
+The native design removes the USDC leg. The user locks ZEC on Zcash in a
+transparent P2SH escrow whose two signers are the user and the LP. The LP pays
+Venmo. The LP obtains the same zk-p2p enclave attestation it obtains today and
+presents it to an attestor service, which signs an outcome. That signature is
+the scalar that completes a signature the user handed over at lock time. The LP
+broadcasts the release. If the LP never proves payment, the user reclaims the
+ZEC after an absolute block height with no one's cooperation.
+
+Properties the design must keep, in priority order:
+
+1. **Timeout refund to the user needs nobody.** After height `T` the user's
+   key alone spends the escrow.
+2. **The user signs nothing after funding.** A user who has received dollars
+   cannot grief the LP by withholding a signature.
+3. **The attestor holds no escrow-specific secret and no key over the funds.**
+   It signs statements. Its refusal or outage means the LP cannot claim; the
+   user still refunds.
+4. **The on-chain release is an ordinary 2-of-2 spend.** No hashlock or oracle
+   key is visible.
+
+What the design does not achieve, stated plainly: an attestor that signs a
+false "paid" outcome, in collusion with the LP, takes the user's ZEC. With two
+signers and no post-hoc user veto this cannot be removed; it is the same power
+zk-p2p's enclave has over an EscrowV2 depositor today. Section 8 says how it is
+constrained.
+
+## 2. Parties and roles
+
+| Party | Holds | Does |
+|---|---|---|
+| User | ephemeral secp256k1 key `u` per escrow; ZEC | Funds escrow, hands LP an adaptor pre-signature, refunds after `T` if unpaid |
+| LP | secp256k1 key `l`; Venmo balance; zebrad | Watches escrow, pays Venmo, obtains enclave attestation, completes and broadcasts release |
+| Attestor | long-lived secp256k1 key `d` (pubkey `P`), per-event nonce `k` | Announces `R` per escrow, verifies the zk-p2p attestation, signs the outcome |
+| zk-p2p enclave | signer `0xe078d93bfdd87a8c5c5cca5905dcba0dd7a1f0bd` | Replays Venmo feed, signs `PaymentAttestation(intentHash, releaseAmount, dataHash)` |
+
+The LP and the attestor may be operated by the same organisation in Phase 1.
+That collapses property 3 into "trust the operator" until Phase 7 (Nitro).
+
+## 3. Parameters
+
+| Name | Value | Notes |
+|---|---|---|
+| Block time | 75 s mainnet | NU7 proposes 25 s; all heights below are derived from `BLOCK_SECONDS`, not hard-coded |
+| `REFUND_DELAY` | 1152 blocks (24 h) | `T = lock_height + REFUND_DELAY` |
+| `PAY_DEADLINE` | `T - 60` blocks | LP must not send Venmo at or after this height |
+| `BROADCAST_DEADLINE` | `T - 40` blocks | Release must be broadcast by here |
+| Confirmation depth | see section 7 | Before LP pays |
+| Reorg finality | 100 blocks | zcashd and zebrad refuse deeper reorgs |
+| Fee | ZIP 317, 5000 zat per logical action, 2 grace actions | A 1-in 1-out or 1-in 2-out transparent spend is 10000 zat |
+| Release tx `nExpiryHeight` | 0 | No expiry; see section 4.5 |
+| Refund tx `nExpiryHeight` | 0 | |
+| Attestation service | `https://attestation-service.zkp2p.xyz` | PCR8 pin `41a4ae0b9b96752cab5addb7d22689b3070e564e29f90a54316fa33fa38ea51387a6e887ea4f5a4b0cc34f69cea3f40e` |
+| Enclave signer | `0xe078d93bfdd87a8c5c5cca5905dcba0dd7a1f0bd` | Also read from the attestation document's `expectedSigner`; both must match |
+| Enclave EIP-712 domain | chainId 8453, verifyingContract `0xC6F4a193576C60892a47e111Bb5706c30162502B` | Domain constants only; nothing is submitted to Base |
+| Minimum escrow | 0.001 ZEC above fees | Dust and fee floor |
+
+## 4. Transactions
+
+### 4.1 Redeem script
+
+```
+OP_IF
+    OP_2 <u_pub> <l_pub> OP_2 OP_CHECKMULTISIG
+OP_ELSE
+    <T> OP_CHECKLOCKTIMEVERIFY OP_DROP
+    <u_pub> OP_CHECKSIG
+OP_ENDIF
+```
+
+- Both pubkeys compressed (33 bytes).
+- `<T>` is a minimally encoded script number (CLTV requires it; use 3 or 4
+  bytes for mainnet heights).
+- Order in CHECKMULTISIG is `u_pub` then `l_pub`; signatures in the scriptSig
+  must be in the same order.
+- Zcash script is Bitcoin script circa 2015: P2SH and CLTV are enforced
+  unconditionally, CSV does not exist, OP_CAT is disabled, no SegWit or
+  Taproot. `nLockTime` compares against block height, not median time past.
+
+scriptPubKey: `OP_HASH160 <hash160(redeemScript)> OP_EQUAL`, address prefix
+`t3`.
+
+### 4.2 Funding transaction
+
+Built and broadcast by the user's client. A v5 transaction spending from the
+user's shielded pool (Orchard or Ironwood; librustzcash support for Ironwood
+outputs must be confirmed in Phase 0) with one transparent output to the P2SH
+address for `amount_zat`. Any change stays shielded.
+
+Because ZIP 244 txids do not commit to signatures, the client computes the
+funding txid before broadcast. The escrow outpoint is therefore known when the
+pre-signature is produced.
+
+### 4.3 Release transaction
+
+Built by the LP, signed by both parties, broadcast by the LP.
+
+- Version 5, `consensusBranchId` = current mainnet branch (read from zebrad
+  `getblockchaininfo`, never hard-coded; NU6.3 Ironwood is current).
+- One input: escrow outpoint, `nSequence = 0xffffffff`.
+- Outputs: `amount_zat - fee` to the LP's address (t1 or shielded).
+- `nLockTime = 0`, `nExpiryHeight = 0`.
+- scriptSig: `OP_0 <sig_u> <sig_l> OP_1 <redeemScript>`; the `OP_1` selects the
+  IF branch. `OP_0` is the CHECKMULTISIG dummy.
+
+### 4.4 Refund transaction
+
+Built and broadcast by the user's client at or after height `T`.
+
+- One input: escrow outpoint, `nSequence = 0xfffffffe` (CLTV fails if the
+  input is final).
+- `nLockTime = T`.
+- Output to a user address; a shielded output is preferred and is possible in a
+  v5 transaction.
+- scriptSig: `<sig_u> OP_0 <redeemScript>`.
+
+### 4.5 Expiry choice
+
+The release carries no `nExpiryHeight` so that a release delayed by mempool
+congestion is still minable. After `T` both refund and release are valid and
+the miner picks. That race is the LP's loss and is why `PAY_DEADLINE` and
+`BROADCAST_DEADLINE` exist.
+
+### 4.6 ZIP 244 sighash
+
+Both parties must produce the identical 32-byte digest for the release input.
+Use librustzcash:
+
+```
+zcash_primitives::transaction::sighash::signature_hash(
+    &unsigned_tx_data,
+    &SignableInput::Transparent {
+        hash_type: SIGHASH_ALL,     // 0x01
+        index: 0,
+        script_code: &redeem_script,
+        script_pubkey: &p2sh_script_pubkey,
+        value: amount_zat,
+    },
+    &txid_parts_cache,
+)
+```
+
+Facts the implementer must not get wrong:
+
+- The digest is BLAKE2b-256 with personalization `ZcashSigHash` followed by the
+  4-byte consensus branch id, over the ZIP 244 tree. The transparent input
+  digest commits to the prevout, value, spent scriptPubKey and nSequence.
+- Signatures are DER-encoded ECDSA plus the sighash-type byte `0x01`.
+- Zcash enforces `SCRIPT_VERIFY_LOW_S` as a standardness rule. A signature
+  produced by adaptor decryption may be high-S; normalise `s` to `s' = n - s`
+  before encoding. This does not change validity.
+- Phase 1 must produce a test vector (unsigned tx, digest, both signatures) and
+  confirm it by mempool acceptance on testnet via zebrad `sendrawtransaction`.
+  A digest disagreement between the user client and the LP is a silent
+  funds-lock for the LP, so the vector is a hard gate.
+
+## 5. Adaptor / DLC protocol
+
+### 5.1 Attestor announcement
+
+Before the user funds, the LP requests an announcement for the escrow it is
+about to serve:
+
+```
+POST /announce
+{
+  "event_id":   sha256("zecp2p-escrow-v1" || funding_txid || vout),
+  "terms":      { ... canonical terms from 5.2 ... }
+}
+->
+{
+  "P":          33-byte attestor pubkey,
+  "R":          33-byte nonce point R = k*G, fresh per event_id,
+  "outcome":    "paid",
+  "event_id":   ...,
+  "terms_hash": sha256(canonical terms),
+  "announce_sig": BIP340 Schnorr signature by d over
+                  sha256("zecp2p-announce-v1" || event_id || terms_hash || R)
+}
+```
+
+The attestor stores `(event_id, k, terms_hash)` and refuses a second
+announcement for the same `event_id`. There is exactly one outcome, `paid`.
+A `not paid` outcome is never signed because the refund path is CLTV; this
+removes any possibility of the attestor equivocating between outcomes.
+
+Outcome point, computed by everyone from public data:
+
+```
+e = tagged_hash("zecp2p-outcome-v1", R || P || event_id || "paid")   (mod n)
+Y = R + e*P
+```
+
+When the attestor later signs, it publishes `s = k + e*d (mod n)`, and
+`s*G == Y` holds. `s` is the adaptor secret `y`.
+
+### 5.2 Canonical terms and intentHash
+
+```
+terms = {
+  "funding_txid":      hex,
+  "vout":              integer,
+  "amount_zat":        integer,
+  "u_pub":             hex,
+  "l_pub":             hex,
+  "refund_height":     T,
+  "usd_amount_6dec":   integer,      // what the LP must send, in 6-decimal USD
+  "rate_18dec":        integer,      // USD per ZEC, 18 decimals, quoted by LP
+  "payee_hash":        bytes32,      // zk-p2p curator hashedOnchainId of the user's Venmo
+  "lock_confirmed_ms": integer       // set after confirmation depth reached
+}
+intentHash = sha256("zecp2p-intent-v1" || canonical_json(terms))
+```
+
+`canonical_json` is JSON with sorted keys, no whitespace, integers as decimal
+strings. `intentHash` is what the LP passes to the enclave as `INTENT_HASH`;
+the enclave signs for any 32-byte value the caller supplies.
+
+### 5.3 Pre-signature handshake
+
+1. LP quotes: `rate_18dec`, `usd_amount_6dec` for the user's `amount_zat`,
+   `l_pub`, `refund_height` policy, and returns the attestor announcement for
+   the event id the user's funding txid will have. Because the user does not
+   know the txid until it has built the funding tx, the sequence is:
+   a. user builds the funding tx and computes `funding_txid`;
+   b. user sends `funding_txid`, `vout`, `u_pub`, `amount_zat` to LP;
+   c. LP fetches the announcement, returns `R`, `P`, `announce_sig`, `terms`.
+2. User verifies `announce_sig` against `P`, checks `P` against the attestor
+   identity it has pinned (Phase 7: against the Nitro attestation document),
+   recomputes `Y`.
+3. User builds the release tx exactly as the LP will (deterministic
+   construction from `terms` and the LP's stated output script), computes the
+   ZIP 244 digest `m`, and produces the ECDSA adaptor pre-signature:
+
+   ```
+   pre_sig = EcdsaAdaptorSignature::encrypt(secp, m, u_priv, Y)
+   ```
+
+   using `secp256k1-zkp` 0.11 (crate `secp256k1-zkp`, module `ecdsa_adaptor`).
+   The pre-signature carries a DLEQ proof, so the LP can verify it against
+   `u_pub` and `Y` without knowing `y`.
+4. User sends `pre_sig` to the LP, then broadcasts the funding tx. Sending
+   the pre-signature first is safe: it is useless without `y`, and the LP
+   pays nothing until the lock is confirmed.
+5. LP verifies `pre_sig.verify(secp, m, u_pub, Y)`. If it fails, LP does not
+   proceed and the user refunds at `T`.
+
+The user client stores `(u_priv, redeem_script, T, funding_txid)` durably
+before broadcasting. Losing `u_priv` loses the refund path.
+
+### 5.4 Payment and attestation
+
+1. LP's zebrad reports the escrow output at confirmation depth per section 7.
+   LP records `lock_confirmed_ms` and finalises `terms`.
+2. LP sends the Venmo payment for `usd_amount_6dec` to the user's Venmo
+   account using the existing taker flow.
+3. LP runs the existing prover (`scripts/proof/prove_payment.mjs`) with:
+   - `INTENT_HASH` = `intentHash` from 5.2
+   - `INTENT_AMOUNT` = `usd_amount_6dec`
+   - `PAYEE_HASH` = `payee_hash`
+   - `INTENT_TIMESTAMP_MS` = `lock_confirmed_ms` (the enclave only matches
+     payments at or after this snapshot)
+   - `INTENT_RATE` = `rate_18dec`
+   The prover already pins the enclave PCR8 and signer and verifies the
+   signature locally. Output is the attestation JSON.
+4. LP sends `POST /attest { event_id, terms, attestation }` to the attestor.
+
+### 5.5 Attestor outcome signing
+
+The attestor, on `/attest`:
+
+1. Looks up `event_id`; refuses if unknown, already signed, or
+   `sha256(canonical terms) != terms_hash` from the announcement.
+2. Recomputes `intentHash` from `terms` and requires
+   `attestation.typedDataValue.intentHash == intentHash`.
+3. Verifies the enclave signature with
+   `verifyBuyerTeePaymentAttestation(attestation, { expectedPlatform: 'venmo',
+   expectedActionType: 'transfer_venmo', expectedDomain: { chainId: 8453,
+   verifyingContract: '0xC6F4...502B' }, expectedIntentHash: intentHash,
+   trustedSigners: ['0xe078d93bfdd87a8c5c5cca5905dcba0dd7a1f0bd'] })`, or an
+   equivalent ecrecover in the attestor's language against the same domain
+   separator and struct hash. Phase 0 records the domain name and version and
+   the exact `dataHash` derivation from a captured attestation.
+4. Requires `releaseAmount >= usd_amount_6dec`.
+5. Confirms on its own zebrad that `funding_txid:vout` exists, pays the
+   expected P2SH scriptPubKey with `amount_zat`, and has at least the
+   confirmation depth for that size.
+6. Computes `e`, signs `s = k + e*d mod n`, deletes `k`, marks the event
+   signed, returns `{ "s": hex }`.
+
+The attestor never sees a Venmo cookie, never signs a Zcash sighash, and
+never holds a value that alone moves funds.
+
+### 5.6 Release
+
+1. LP checks `s*G == Y`.
+2. `sig_u = pre_sig.decrypt(s)`; normalise to low-S; DER-encode; append `0x01`.
+3. `sig_l = ecdsa_sign(m, l_priv)`; low-S; DER; append `0x01`.
+4. Assemble scriptSig from 4.3, broadcast via zebrad, confirm.
+
+The LP can also run `EcdsaAdaptorSignature::recover(sig_u, pre_sig, Y)` to
+re-derive `s` from the on-chain signature; this is not needed in the protocol
+but is a useful test.
+
+## 6. Attestor service
+
+Language: Rust, sharing `zcash_primitives` and `secp256k1-zkp` with the LP.
+
+Endpoints: `GET /identity` (returns `P`, build id, and in Phase 7 the Nitro
+attestation document), `POST /announce`, `POST /attest`. Authenticated by a
+shared bearer token in Phase 1; in Phase 7 the enclave attestation document
+is the authentication the user relies on.
+
+State: one table `events(event_id PRIMARY KEY, terms_hash, R, k_sealed,
+announced_at, signed_at, s)`. `k` is generated from the OS RNG per event, never
+derived from `d`. On sign, `k` is overwritten. The attestor key `d` is
+generated at first boot and in Phase 7 sealed to the enclave.
+
+Policy is deterministic and published: an announcement is issued for any
+well-formed request; an outcome is signed if and only if steps 1 to 5 of 5.5
+pass. There is no manual override endpoint.
+
+Rate limits and abuse: announcements are cheap and unbounded requests only
+cost storage; cap at one announcement per `funding_txid`.
+
+Logging: log `event_id`, decision, and the enclave attestation signature.
+Never log `k`, `d`, or anything from the attestation payload beyond
+`intentHash`, `releaseAmount` and the signer.
+
+## 7. Confirmation depth and margin policy
+
+Confirmation depth before the LP pays Venmo, by USD size of the escrow:
+
+| USD amount | Depth | Wall time at 75 s |
+|---|---|---|
+| up to 50 | 10 | 12.5 min |
+| 50 to 500 | 30 | 37.5 min |
+| over 500 | 100 | 125 min, protocol-final |
+
+Margins, all in blocks before `T`:
+
+- LP does not send Venmo at or after `PAY_DEADLINE = T - 60`. If the LP has
+  not paid by then it does nothing; the user refunds.
+- LP must broadcast the release by `BROADCAST_DEADLINE = T - 40`. If the
+  attestor has not answered by then the LP escalates operationally; the
+  release is still valid after `T` but competes with the refund.
+- Release fee: ZIP 317 conventional fee. Zcash has no RBF; a stuck release
+  cannot be bumped, so do not underpay.
+- The attestor applies the same depth table independently in step 5 of 5.5.
+
+If a reorg drops the funding tx below the required depth after the LP has
+paid, the LP waits for re-inclusion; the funding tx is not invalidated by a
+reorg unless the user double-spends the shielded input, which requires the
+user to have prepared for a reorg deeper than the depth table. The 100-block
+tier makes that impossible by protocol.
+
+## 8. Failure modes
+
+| Failure | Who loses | Why bounded |
+|---|---|---|
+| LP never pays | Nobody | User refunds at `T` |
+| LP pays, attestor down or refuses | LP | User refunds at `T`; LP is out the Venmo amount |
+| LP pays, enclave service down | LP | Same; the enclave is the only source of Venmo truth |
+| LP pays too close to `T`, release loses the race | LP | `PAY_DEADLINE` exists to prevent this |
+| User withholds pre-signature | Nobody | LP does not pay |
+| User sends a bad pre-signature | Nobody | LP verifies DLEQ before paying |
+| User loses `u_priv` | User | Refund path unusable; release still works if LP pays; client stores key before broadcast |
+| Sighash mismatch between client and LP | LP | Decrypted `sig_u` invalid; caught by Phase 1 test vector |
+| Attestor signs `paid` for an unpaid escrow | User | Requires a forged enclave signature or modified attestor code; see below |
+| Attestor + LP collude | User | Same as above; the honest limit of the two-signer design |
+| Enclave attests a payment that did not happen | User | Identical to today's zk-p2p exposure |
+| Enclave signer key rotates | LP (cannot claim) | Attestor pins the signer; rotation is a config change, not a protocol change |
+| Zcash retires new value into the transparent pool | Everyone (no new escrows) | Existing escrows unaffected; forum proposal only, not a ZIP |
+| NU7 changes block time to 25 s | Nobody if `BLOCK_SECONDS` is a parameter | Heights must be re-derived at activation |
+
+Constraining the "attestor lies" row: the attestor's signing path is a few
+hundred lines that verify one ECDSA signature against a pinned key and one
+outpoint against a local node. Phase 7 runs it in AWS Nitro with a reproducible
+EIF; the user client verifies the attestation document and PCR8 when it accepts
+`P` and `R`. That turns "trust the operator" into "trust the measured code and
+AWS", which is the same trust class as the zk-p2p enclave the user already
+relies on for Venmo truth.
+
+## 9. Build plan
+
+| Phase | Scope | Estimate |
+|---|---|---|
+| 0 Recon | Capture a real attestation JSON; record EIP-712 domain name and version, `dataHash` derivation, `releaseAmount` semantics. Confirm librustzcash builds v5 tx with Ironwood outputs and P2SH transparent inputs. Confirm current consensus branch id. | 3 days |
+| 1 Transactions | Redeem script builder, P2SH address, funding tx from shielded, release and refund builders, ZIP 244 digest via `signature_hash`, low-S normalisation, DER. Testnet test vector accepted by zebrad mempool for both branches. | 1 week |
+| 2 Attestor core | `/identity`, `/announce`, `/attest` with steps 1 to 5 of 5.5, event table, enclave signature verification with pinned signer and domain. Unit tests with the Phase 0 attestation. | 1 week |
+| 3 Adaptor | BIP340 announcement and outcome signing, `Y` derivation, `secp256k1-zkp` encrypt, verify, decrypt, recover; property test that decrypt then normalise yields a signature zebrad accepts. | 1.5 weeks |
+| 4 Client handshake | User client: build funding tx, precompute txid, receive announcement, verify, produce pre-signature, durable key storage, refund automation at `T`. LP daemon: watcher, depth policy, deadlines, Venmo send via existing taker, prover invocation, attestor call, release broadcast. | 1.5 weeks |
+| 5 Testnet end to end | Paid path and refund path on Zcash testnet against the preprod attestation service; deadline and race tests by manipulating `T`. | 0.5 week |
+| 6 Mainnet $1 | Section 10. | 2 days |
+| 7 Nitro attestor | Reproducible EIF, key sealed to enclave, attestation document on `/identity`, client PCR8 pin. | 1 week |
+
+Total to a live $1 mainnet test: about 6 weeks. Phase 7 adds one.
+
+## 10. Acceptance criteria for the $1 mainnet test
+
+Two escrows, each for the ZEC equivalent of 1 USD at the quoted rate, run on
+Zcash mainnet against the production attestation service.
+
+Paid path:
+
+1. Funding tx is a v5 transaction from a shielded input to a `t3` address
+   whose redeem script decodes to section 4.1 with the expected keys and `T`.
+2. The LP daemon logs the escrow at the depth from section 7 and does not
+   pay before that.
+3. A Venmo payment of exactly 1.00 USD is sent to the test payee; its Venmo
+   payment id is recorded.
+4. The prover returns an attestation whose `typedDataValue.intentHash` equals
+   the `intentHash` recomputed from the recorded `terms`, whose signer is
+   `0xe078d93bfdd87a8c5c5cca5905dcba0dd7a1f0bd`, and whose `releaseAmount` is
+   at least 1000000.
+5. The attestor returns `s` with `s*G == Y` for the announced `R`.
+6. The release tx confirms with scriptSig `OP_0 <sig_u> <sig_l> OP_1
+   <redeemScript>`, both signatures low-S, and pays `amount_zat - 10000` to
+   the LP output. `recover(sig_u, pre_sig, Y)` reproduces `s`.
+7. The release confirms before `BROADCAST_DEADLINE`.
+8. A second `/attest` for the same `event_id` is refused.
+
+Refund path:
+
+9. A second escrow is funded; the LP daemon is configured not to pay.
+10. No Venmo payment is made and no `/attest` call occurs.
+11. At height `T` the user client broadcasts the refund with `nLockTime = T`
+    and `nSequence = 0xfffffffe`; it confirms and pays to a shielded output.
+12. A release tx assembled with a fabricated `s` is rejected by zebrad
+    mempool before `T` (invalid signature), demonstrating the pre-signature is
+    inert without the attestor.
+
+Both:
+
+13. Every height in the run was derived from `BLOCK_SECONDS` and
+    `REFUND_DELAY` config, and the same binary passes the run on testnet with
+    a different `REFUND_DELAY`.
+14. Nothing in any log matches the Venmo cookie, `k`, `d`, `u_priv`, or
+    `l_priv`.
+
+## 11. Open items
+
+- Exact EIP-712 domain name and version for `PaymentAttestation`, and the
+  `dataHash` derivation, are read from a live attestation in Phase 0 and then
+  pinned in the attestor.
+- Whether the user client should be a Zashi plugin or a standalone binary.
+  The spec assumes standalone; it needs shielded spend capability and a
+  secp256k1 key store.
+- Refund to a shielded output requires the client to build a v5 transaction
+  with a transparent input and an Ironwood or Orchard output; confirm in
+  Phase 0.
+- Transparent-pool retirement is a live community proposal with a
+  2026-10-28 target and no ZIP. If a ZIP-211-style rule activates, new escrows
+  cannot be funded; existing ones are unaffected.
