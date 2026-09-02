@@ -13,6 +13,7 @@ pub mod deadlines;
 pub mod depth;
 pub mod dlc;
 pub mod fees;
+pub mod funding;
 pub mod lp;
 pub mod payment_details;
 pub mod rpc;
