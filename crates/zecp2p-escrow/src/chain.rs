@@ -63,7 +63,9 @@ pub struct FakeChain {
     rejections: Vec<(Vec<u8>, String)>,
     /// Set when the node should behave as if it were down.
     pub offline: bool,
-    accepted: std::cell::RefCell<Vec<Vec<u8>>>,
+    /// A Mutex rather than a RefCell so the fake can back a service under test
+    /// (`ChainClient` is shared across threads there).
+    accepted: std::sync::Mutex<Vec<Vec<u8>>>,
 }
 
 impl FakeChain {
@@ -99,7 +101,7 @@ impl FakeChain {
     }
 
     pub fn accepted_transactions(&self) -> Vec<Vec<u8>> {
-        self.accepted.borrow().clone()
+        self.accepted.lock().expect("fake chain lock").clone()
     }
 }
 
@@ -134,7 +136,7 @@ impl ChainClient for FakeChain {
                 return Err(ChainError::Rejected(reason.clone()));
             }
         }
-        self.accepted.borrow_mut().push(raw_tx.to_vec());
+        self.accepted.lock().expect("fake chain lock").push(raw_tx.to_vec());
         let mut txid = [0u8; 32];
         let n = raw_tx.len().min(32);
         txid[..n].copy_from_slice(&raw_tx[..n]);

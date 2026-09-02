@@ -12,6 +12,8 @@
 //! is why `decide` below is a pure function of the request and the pinned
 //! constants, with no manual override and no path that skips the enclave check.
 
+pub mod db;
+pub mod service;
 pub mod store;
 
 use secp256k1_zkp::{PublicKey, Secp256k1, SecretKey};
@@ -447,7 +449,7 @@ pub(crate) fn handle_attest_with_signer(
     Ok(s)
 }
 
-fn map_store_error(e: store::StoreError) -> AttestorError {
+pub(crate) fn map_store_error(e: store::StoreError) -> AttestorError {
     match e {
         store::StoreError::UnknownEvent => AttestorError::UnknownEvent,
         store::StoreError::AlreadySigned => AttestorError::AlreadySigned,
@@ -622,4 +624,78 @@ pub fn handle_attest_with_chain(
         &observation,
         &RatePolicy::production(),
     )
+}
+
+/// The `/attest` sequence over the persistent store.
+///
+/// Same ordering as [`handle_attest`], with the store's own transaction doing
+/// the work that the in-memory version does under a `&mut` borrow: the nonce is
+/// taken, the outcome signed and the payment consumed in one SQLite
+/// transaction, so a crash cannot leave a usable nonce beside a published
+/// scalar.
+///
+/// Every chain fact comes from `chain`, and the recency bound from the store's
+/// own `announced_at_ms`. Nothing here is a caller's word for anything.
+#[allow(clippy::too_many_arguments)]
+pub fn attest_over_db(
+    db: &mut db::SqliteEventStore,
+    chain: &impl ChainClient,
+    secp: &Secp256k1<secp256k1_zkp::All>,
+    d: &SecretKey,
+    clock: &impl Clock,
+    event_id: &[u8; 32],
+    terms: &CanonicalTerms,
+    attestation: &PaymentAttestation,
+    signature: &[u8],
+    encoded_payment_details: &[u8],
+    rate: &RatePolicy,
+) -> Result<SecretKey, AttestorError> {
+    // A repeated /attest returns what was published rather than signing again.
+    if let Some(existing) = db
+        .signed_outcome(event_id)
+        .map_err(|e| AttestorError::Chain(e.to_string()))?
+    {
+        return SecretKey::from_slice(&existing)
+            .map_err(|e| AttestorError::Dlc(DlcError::Secp(e.to_string())));
+    }
+
+    let event = db
+        .get(event_id)
+        .map_err(|e| AttestorError::Chain(e.to_string()))?
+        .ok_or(AttestorError::UnknownEvent)?;
+
+    let observation = observe_escrow(chain, terms, event.announced_at_ms)?;
+
+    let details = PaymentDetails::decode(encoded_payment_details)?;
+    let nullifier = payment_nullifier(&details);
+    let already_consumed = db
+        .payment_is_consumed(&nullifier)
+        .map_err(|e| AttestorError::Chain(e.to_string()))?;
+
+    decide_inner(
+        &event.terms_hash,
+        event.signed_s.is_some(),
+        terms,
+        attestation,
+        signature,
+        encoded_payment_details,
+        &observation,
+        &ENCLAVE_SIGNER,
+        rate,
+        already_consumed,
+    )?;
+
+    let signed_at_ms = clock.now_ms();
+    let terms_hash = event.terms_hash;
+    let s_bytes = db
+        .sign_and_record(event_id, nullifier, signed_at_ms, |k| {
+            let k = SecretKey::from_slice(k).map_err(|_| store::StoreError::AlreadySigned)?;
+            let s = sign_outcome(secp, &k, d, event_id, &terms_hash)
+                .map_err(|_| store::StoreError::AlreadySigned)?;
+            Ok(s.secret_bytes())
+        })
+        .map_err(map_store_error)?;
+
+    SecretKey::from_slice(&s_bytes)
+        .map_err(|e| AttestorError::Dlc(DlcError::Secp(e.to_string())))
 }
