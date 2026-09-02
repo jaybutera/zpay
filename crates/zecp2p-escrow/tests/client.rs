@@ -10,6 +10,7 @@ use secp256k1_zkp::{Secp256k1, SecretKey};
 
 use zecp2p_escrow::chain::FakeChain;
 use zecp2p_escrow::client::{
+    AcceptedQuote,
     may_broadcast_funding, prepare_escrow, refund_when_due, verify_announcement, Announcement,
     ClientError, EscrowRecord, MemoryRecordStore, RecordStore,
 };
@@ -73,6 +74,16 @@ fn canonical(t: &EscrowTerms) -> CanonicalTerms {
     }
 }
 
+/// What the user accepted before funding. Round 2 finding 1: the client must
+/// hold its own view of the fiat side, or the LP writes it.
+fn quote(c: &CanonicalTerms) -> AcceptedQuote {
+    AcceptedQuote {
+        usd_amount_6dec: c.usd_amount_6dec,
+        payee_hash: c.payee_hash,
+        rate_18dec: c.rate_18dec,
+    }
+}
+
 fn p2pkh(hash: [u8; 20]) -> Vec<u8> {
     let mut s = vec![0x76, 0xa9, 20];
     s.extend_from_slice(&hash);
@@ -96,6 +107,7 @@ fn the_record_is_on_disk_before_any_pre_signature_exists() {
         &mut store,
         &terms,
         &canonical(&terms),
+        &quote(&canonical(&terms)),
         &u_priv,
         &ann,
         &d.public_key(&secp),
@@ -124,6 +136,7 @@ fn a_failed_write_stops_the_handshake_before_a_pre_signature_is_produced() {
         &mut store,
         &terms,
         &canonical(&terms),
+        &quote(&canonical(&terms)),
         &u_priv,
         &ann,
         &d.public_key(&secp),
@@ -194,6 +207,7 @@ fn the_handshake_refuses_an_unpinned_attestor_before_saving_anything() {
         &mut store,
         &terms,
         &canonical(&terms),
+        &quote(&canonical(&terms)),
         &u_priv,
             &ann,
             &impostor,
@@ -316,6 +330,7 @@ fn the_user_verifies_its_own_pre_signature_before_handing_it_over() {
         &mut store,
         &terms,
         &canonical(&terms),
+        &quote(&canonical(&terms)),
         &u_priv,
         &ann,
         &d.public_key(&secp),
@@ -386,6 +401,7 @@ fn the_handshake_refuses_a_foreign_announcement_before_saving_or_signing() {
         &mut store,
         &terms,
         &canonical(&terms),
+        &quote(&canonical(&terms)),
         &u_priv,
         &foreign,
         &d.public_key(&secp),

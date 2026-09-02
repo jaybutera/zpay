@@ -58,7 +58,7 @@ That collapses property 3 into "trust the operator" until Phase 7 (Nitro).
 | `BROADCAST_DEADLINE` | `T - 40` blocks | Release must be broadcast by here |
 | Confirmation depth | see section 7 | Before LP pays |
 | Reorg finality | 100 blocks | zcashd and zebrad refuse deeper reorgs |
-| Fee | ZIP 317, 5000 zat per logical action, 2 grace actions | A 1-in 1-out or 1-in 2-out transparent spend is 10000 zat |
+| Fee | ZIP 317, 5000 zat per logical action, 2 grace actions | The escrow's release is 15000 zat and its shielded refund 20000; see 12.3 |
 | Release tx `nExpiryHeight` | 0 | No expiry; see section 4.5 |
 | Refund tx `nExpiryHeight` | 0 | |
 | Attestation service | `https://attestation-service.zkp2p.xyz` | PCR8 pin `41a4ae0b9b96752cab5addb7d22689b3070e564e29f90a54316fa33fa38ea51387a6e887ea4f5a4b0cc34f69cea3f40e` |
@@ -172,6 +172,9 @@ Facts the implementer must not get wrong:
 Before the user funds, the LP requests an announcement for the escrow it is
 about to serve:
 
+`terms_hash` is in the preimage so that `Y` commits to the terms and not merely
+to the outpoint; see section 15.3.
+
 ```
 POST /announce
 {
@@ -198,7 +201,8 @@ removes any possibility of the attestor equivocating between outcomes.
 Outcome point, computed by everyone from public data:
 
 ```
-e = tagged_hash("zecp2p-outcome-v1", R || P || event_id || "paid")   (mod n)
+e = tagged_hash("zecp2p-outcome-v1",
+                R || P || event_id || terms_hash || "paid")          (mod n)
 Y = R + e*P
 ```
 
@@ -798,18 +802,10 @@ from the payment's own digest, payee, index and timestamp, and the store records
 it atomically with the signature. `mark_signed` refuses a nullifier already
 consumed by a different event.
 
-### 15.6 `INTENT_RATE` semantics, unresolved and now explicit
+### 15.6 `INTENT_RATE` semantics: left open in round 1, settled in round 2
 
-Word 11 is `conversionRate`. The LP passes `INTENT_RATE` as USD per ZEC; the
-captured $4.87 attestation carries `990881148896019200`, which is 0.99 in 18
-decimals, because that fill was a **USDC** fill where the rate is dollars per
-USDC-like unit. Nothing captured establishes what the value must be for a ZEC
-escrow.
-
-Rather than guess, the check is a policy: `RatePolicy::Exact` (production, once
-the semantics are settled), `AtLeast`, or `Unenforced` (development). The
-attestor requires the caller to state which. **This remains an open item**, and
-it must be settled to `Exact` before mainnet.
+Round 1 recorded this as unresolved. Round 2 settled it from evidence already in
+the repo, and the answer is section 16.3.
 
 ### 15.7 Smaller items
 
@@ -842,3 +838,116 @@ the record, the stored txid names an escrow that will never exist.
 `may_broadcast_funding` takes the txid actually about to be broadcast and
 refuses when no record matches it, so the mismatch is caught before the money
 moves rather than discovered at `T`.
+
+## 16. Review round 2: the same theft, one layer up
+
+A second adversarial review confirmed all eleven round-1 fixes closed and found
+nine more issues. The top two are the round-1 theft class moved up a level: the
+LP no longer forges the *payment*, it writes the *terms* the payment is checked
+against. All are fixed, each with a test that fails without it, and the
+reviewer's PoCs are kept as `review_round2_regressions.rs` in both crates.
+
+### 16.1 The client accepted LP-authored fiat terms (high)
+
+Spec 5.3 step 1c has the LP return `terms`. Nothing compared the fiat side of
+them to anything the user held. An LP could return chain fields that were
+entirely honest and fiat fields that were its own - `payee_hash` its own Venmo,
+`usd_amount_6dec` one micro-dollar - and every check downstream then honestly
+verified the LP paying itself. The client signed, the attestor approved, the
+release spent.
+
+**Spec 5.3 gains a step.** The user holds an `AcceptedQuote`: the dollars it
+expects, its own Venmo hash, and the rate. `prepare_escrow` compares all three
+against the terms the LP returned and refuses on any mismatch, before it
+persists anything or produces a pre-signature. The payee is the field that
+matters most, because it is the user's identity and the user is the only party
+that knows it.
+
+### 16.2 `lock_confirmed_ms` was the LP's number (high)
+
+The attestor bounded payment recency against `terms.lock_confirmed_ms`. The LP
+writes the terms. An LP that set the lock time a month back could take a payment
+it genuinely made to that same user for an earlier trade, re-prove it under this
+escrow's intent hash, and land inside the backdating tolerance.
+
+The bound now comes from the attestor's own clock:
+`ChainObservation::earliest_acceptable_payment_ms`, which must be
+`events.announced_at_ms` from the store or the funding block's timestamp from
+the attestor's node. `handle_attest` narrows any caller-supplied value to the
+store's announcement time, so a generous caller cannot widen it.
+`terms.lock_confirmed_ms` is still checked - word 12 must agree with it - but it
+no longer bounds anything.
+
+### 16.3 The rate is settled: `Exact(1e18)`, and nothing else is constructible
+
+The enclave computes `releaseAmount = min(fiat_paid * 1e18 / conversionRate,
+intent.amount)`. Both fixtures satisfy it, and
+`docs/status/auto-taker-daemon-design.md` records the same relation from the
+other side: with the rate left at its `1e18` default, a 4.84 USD payment
+returned `releaseAmount 4,840,000`.
+
+So at `rate = 1e18`, and only there, **`releaseAmount` is the fiat actually
+paid, in 6-decimal USD** - which is precisely what the attestor's
+`releaseAmount >= usd_amount_6dec` check assumes. A USD-per-ZEC rate would make
+`releaseAmount` a divided quantity that is not dollars, and would refuse every
+honest mainnet fill.
+
+`INTENT_RATE` is therefore always `1e18`, `rate_18dec` never reaches the prover,
+and `RatePolicy::production()` is `Exact(IDENTITY_RATE_18DEC)`. `AtLeast` and
+`Unenforced` are behind the `loose-rate-policy` feature: an `Unenforced`
+reachable in a shipped binary would resurrect the round-1 exploit, where the LP
+picks a rate that makes a micro-payment look large enough.
+
+### 16.4 The nullifier was checked too late (medium)
+
+`decide` returned a nullifier for the *caller* to check. Two handlers could both
+pass, both compute a scalar, and only the second `mark_signed` refuse - by which
+point the second scalar existed and whether it reached the LP was a handler's
+problem.
+
+`handle_attest` now owns the sequence: read the announcement, run every check
+including the store's own consumed-payment set, then take the nonce, sign, and
+record - returning the scalar only after `mark_signed` commits. The store is
+borrowed mutably throughout; a persistent implementation must hold the
+equivalent lock across the same span. `mark_signed` keeps its own check as a
+second line of defence.
+
+### 16.5 The `events` schema, spec section 6, revised
+
+```
+events(event_id PRIMARY KEY, terms_hash, R, k_sealed, funding_txid,
+       announced_at_ms, signed_at, s, payment_nullifier)
+```
+
+`announced_at_ms` is the recency bound of 16.2. `payment_nullifier` is unique
+across the table and survives restart, so one Venmo payment releases one escrow
+even across a process boundary. Both were missing.
+
+### 16.6 Smaller items
+
+- A JSON-RPC error on a *read* is `Unreachable`, not `Rejected`. Only
+  `sendrawtransaction` can produce a chain verdict; classifying a provider
+  outage as one would have an LP treat it as a decision and stop.
+- `check_network` existed but nothing called it, so a testnet config pointed at
+  a mainnet URL relied on the caller remembering. Every trait method now checks
+  once and caches.
+- Words 2, 5, 12 and 13 were carried but unchecked. Word 12 must equal the
+  terms' lock time in seconds; `window_s` may not be zero, which would make the
+  too-late bound vacuous; numeric words with non-zero high bytes are refused
+  rather than truncated; and the two copies of `releaseAmount` - the signed one
+  and word 7 - must agree.
+- `decide` derives the expected `scriptPubKey` from the terms rather than taking
+  it from the caller, and reads `already_signed` and the announced terms hash
+  from the store.
+- Spec 5.1's challenge preimage now shows `terms_hash`, which 15.3 added but
+  this section did not reflect. `chain.rs` no longer claims no adapter exists.
+
+### 16.7 The hosted-mode caveat, restated where it costs money
+
+Section 14 says a hosted provider's chain view is trusted. The consequence worth
+naming: **in hosted mode the attestor's chain view is the provider's too.** The
+confirmation depth of section 7 is exactly the number the provider is trusted
+for, so a provider that invented a confirmed output could induce the attestor to
+sign for an escrow that does not exist - and the LP, having already paid Venmo,
+is the party out of pocket. That is not a reason to distrust any particular
+provider; it is the reason the production attestor runs its own node.

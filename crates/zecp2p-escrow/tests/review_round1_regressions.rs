@@ -9,7 +9,7 @@ use secp256k1_zkp::{Message, Secp256k1, SecretKey};
 
 use zecp2p_escrow::chain::{FakeChain, Utxo};
 use zecp2p_escrow::client::{
-    prepare_escrow, refund_when_due, Announcement, ClientError, EscrowRecord, MemoryRecordStore,
+    prepare_escrow, AcceptedQuote, refund_when_due, Announcement, ClientError, EscrowRecord, MemoryRecordStore,
     RecordStore,
 };
 use zecp2p_escrow::deadlines::EscrowPolicy;
@@ -38,6 +38,16 @@ fn canonical_terms() -> CanonicalTerms {
         rate_18dec: 990_881_148_896_019_200,
         payee_hash: [0x85; 32],
         lock_confirmed_ms: 1_788_315_013_000,
+    }
+}
+
+/// What the user accepted before funding. Round 2 finding 1: the client must
+/// hold its own view of the fiat side, or the LP writes it.
+fn quote(c: &CanonicalTerms) -> AcceptedQuote {
+    AcceptedQuote {
+        usd_amount_6dec: c.usd_amount_6dec,
+        payee_hash: c.payee_hash,
+        rate_18dec: c.rate_18dec,
     }
 }
 
@@ -92,6 +102,7 @@ fn poc_b_a_foreign_announcement_no_longer_reaches_a_pre_signature() {
         &mut store,
         &terms,
         &canonical,
+        &quote(&canonical),
         &u_priv,
         &foreign,
         &d.public_key(&secp),
@@ -115,6 +126,7 @@ fn poc_b_a_foreign_announcement_no_longer_reaches_a_pre_signature() {
         &mut store,
         &terms,
         &canonical,
+        &quote(&canonical),
         &u_priv,
         &honest,
         &d.public_key(&secp),

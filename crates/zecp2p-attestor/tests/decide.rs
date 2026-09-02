@@ -35,7 +35,7 @@ fn terms() -> CanonicalTerms {
         l_pub: L_PUB,
         refund_height: REFUND_HEIGHT,
         usd_amount_6dec: 1_000_000,
-        rate_18dec: 990_881_148_896_019_200,
+        rate_18dec: 1_000_000_000_000_000_000,
         payee_hash: [0x85; 32],
         lock_confirmed_ms: 1_788_315_013_000,
     }
@@ -45,11 +45,15 @@ fn script_pubkey() -> Vec<u8> {
     p2sh_script_pubkey(&redeem_script(&U_PUB, &L_PUB, REFUND_HEIGHT).unwrap())
 }
 
+/// The attestor's own view. `earliest_acceptable_payment_ms` is the attestor's
+/// clock, never `terms.lock_confirmed_ms` (round 2 finding 2); in these tests
+/// the two coincide so that the *other* checks are what is under test.
 fn observation() -> ChainObservation {
     ChainObservation {
         script_pubkey: script_pubkey(),
         amount_zat: 5_000_000,
         confirmations: 10,
+        earliest_acceptable_payment_ms: terms().lock_confirmed_ms,
     }
 }
 
@@ -112,7 +116,9 @@ fn details_with(t: &CanonicalTerms, bend: impl FnOnce(&mut [[u8; 32]; 14])) -> V
         USD_FIAT_CURRENCY,
         t.payee_hash,
         word_u(t.rate_18dec),
-        word_u((payment_ms / 1000) as u128),
+        // Word 12 is INTENT_TIMESTAMP_MS in seconds, which spec 5.4 step 3 sets
+        // to the lock-confirmed time - not to when the payment happened.
+        word_u((t.lock_confirmed_ms / 1000) as u128),
         word_u(1_209_600),
     ];
     bend(&mut words);
@@ -171,7 +177,6 @@ fn run_with(
         sig,
         det,
         obs,
-        &script_pubkey(),
         signer,
         rate,
         consumed,
@@ -220,10 +225,32 @@ fn an_underpayment_is_refused() {
 
 #[test]
 fn an_overpayment_is_accepted() {
-    // The rule is `releaseAmount >= usd_amount_6dec`, so paying more is fine.
+    // The rule is `releaseAmount >= usd_amount_6dec`, so paying more is fine -
+    // but the two copies of the amount must agree, so word 7 moves with the
+    // signed value.
+    let (t, _, _, _, obs, signer) = valid();
+    let over = (t.usd_amount_6dec + 1) as u128;
+    let det = details_with(&t, |w| w[7] = word_u(over));
+    let (att, sig) = attest_for(t.intent_hash(), over, &det);
+    run(&t, &t.terms_hash(), false, &att, &sig, &det, &obs, &signer).unwrap();
+}
+
+/// Round 2 finding 7: the amount appears in the signed `typedDataValue` and
+/// again in word 7. A caller that raised one without the other would be
+/// presenting two different payments as one.
+#[test]
+fn a_release_amount_that_disagrees_with_the_payment_details_is_refused() {
     let (t, _, _, det, obs, signer) = valid();
     let (att, sig) = attest_for(t.intent_hash(), (t.usd_amount_6dec + 1) as u128, &det);
-    run(&t, &t.terms_hash(), false, &att, &sig, &det, &obs, &signer).unwrap();
+
+    let err = run(&t, &t.terms_hash(), false, &att, &sig, &det, &obs, &signer).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            AttestorError::PaymentDetails(PaymentDetailsError::ReleaseAmountDisagreement { .. })
+        ),
+        "got {err}"
+    );
 }
 
 #[test]
@@ -368,7 +395,6 @@ fn the_production_path_pins_the_real_enclave_signer() {
         &sig,
         &det,
         &obs,
-        &script_pubkey(),
         &RatePolicy::Exact(t.rate_18dec),
         false,
     )
@@ -398,9 +424,9 @@ fn the_depth_table_matches_spec_section_7() {
 #[test]
 fn the_store_refuses_a_second_announcement_for_one_event() {
     let mut store = EventStore::new();
-    store.announce([1; 32], [2; 32], [3; 33], [4; 32], [5; 32]).unwrap();
+    store.announce([1; 32], [2; 32], [3; 33], [4; 32], [5; 32], 1_788_315_013_000).unwrap();
     assert_eq!(
-        store.announce([1; 32], [9; 32], [9; 33], [9; 32], [9; 32]),
+        store.announce([1; 32], [9; 32], [9; 33], [9; 32], [9; 32], 1_788_315_013_000),
         Err(StoreError::DuplicateEvent),
         "a second announcement would mean a second nonce for one escrow"
     );
@@ -409,9 +435,9 @@ fn the_store_refuses_a_second_announcement_for_one_event() {
 #[test]
 fn the_store_refuses_a_second_announcement_for_one_funding_transaction() {
     let mut store = EventStore::new();
-    store.announce([1; 32], [2; 32], [3; 33], [4; 32], [5; 32]).unwrap();
+    store.announce([1; 32], [2; 32], [3; 33], [4; 32], [5; 32], 1_788_315_013_000).unwrap();
     assert_eq!(
-        store.announce([9; 32], [2; 32], [3; 33], [4; 32], [6; 32]),
+        store.announce([9; 32], [2; 32], [3; 33], [4; 32], [6; 32], 1_788_315_013_000),
         Err(StoreError::DuplicateFundingTx)
     );
 }
@@ -421,7 +447,7 @@ fn the_nonce_is_destroyed_when_the_outcome_is_signed() {
     // The rule that stops `d` leaking. The escrow crate's dlc tests show what
     // reusing a nonce actually costs.
     let mut store = EventStore::new();
-    store.announce([1; 32], [2; 32], [3; 33], [4; 32], [5; 32]).unwrap();
+    store.announce([1; 32], [2; 32], [3; 33], [4; 32], [5; 32], 1_788_315_013_000).unwrap();
 
     assert!(store.holds_nonce(&[1; 32]));
     let bound = store.take_nonce_for_signing(&[1; 32]).unwrap();
@@ -452,7 +478,7 @@ fn a_signed_event_returns_the_same_scalar_rather_than_signing_again() {
     // published is safe, since it is public once the release is broadcast;
     // signing again under a fresh nonce would not be.
     let mut store = EventStore::new();
-    store.announce([1; 32], [2; 32], [3; 33], [4; 32], [5; 32]).unwrap();
+    store.announce([1; 32], [2; 32], [3; 33], [4; 32], [5; 32], 1_788_315_013_000).unwrap();
     store.mark_signed(&[1; 32], [7; 32], [0x9a; 32]).unwrap();
 
     assert_eq!(store.signed_outcome(&[1; 32]), Some([7; 32]));
@@ -586,16 +612,36 @@ fn a_payment_at_a_rate_the_lp_chose_is_refused() {
     );
 }
 
+/// Round 2 finding 3 settled the rate question, and the settlement is that the
+/// only admissible policy is `Exact(1e18)`.
+///
+/// The enclave computes `releaseAmount = min(fiat_paid * 1e18 / rate, intent)`.
+/// At `rate = 1e18` that makes `releaseAmount` the dollars actually paid in
+/// 6-decimal USD, which is exactly what the
+/// `releaseAmount >= usd_amount_6dec` check assumes. Any other rate turns it
+/// into a divided quantity that no longer means dollars.
+///
+/// So the loose variants are behind a feature and a production build cannot
+/// construct one; leaving `Unenforced` reachable would resurrect the round-1
+/// exploit, where the LP picks a rate that makes a micro-payment look large
+/// enough.
 #[test]
-fn the_rate_policy_can_be_relaxed_but_says_so_explicitly() {
-    // Finding 6: word 11's semantics for a ZEC escrow are not settled by
-    // anything captured, so the policy is a value rather than a silent
-    // omission. Unenforced is the development stance; Exact is production.
-    let t = terms();
-    let det = details_with(&t, |w| w[11] = word_u(1));
+fn the_only_production_rate_policy_is_the_identity_rate() {
+    use zecp2p_escrow::payment_details::IDENTITY_RATE_18DEC;
+
+    assert_eq!(IDENTITY_RATE_18DEC, 1_000_000_000_000_000_000);
+    assert_eq!(RatePolicy::production(), RatePolicy::Exact(IDENTITY_RATE_18DEC));
+
+    // An escrow priced at the identity rate verifies.
+    let mut t = terms();
+    t.rate_18dec = IDENTITY_RATE_18DEC;
+    let det = details_for(&t);
     let (att, sig) = attest_for(t.intent_hash(), t.usd_amount_6dec as u128, &det);
     let (_, signer) = test_enclave();
-
+    let obs = ChainObservation {
+        earliest_acceptable_payment_ms: t.lock_confirmed_ms,
+        ..observation()
+    };
     run_with(
         &t,
         &t.terms_hash(),
@@ -603,12 +649,38 @@ fn the_rate_policy_can_be_relaxed_but_says_so_explicitly() {
         &att,
         &sig,
         &det,
-        &observation(),
+        &obs,
         &signer,
-        &RatePolicy::Unenforced,
+        &RatePolicy::production(),
         false,
     )
-    .expect("an explicitly unenforced rate policy accepts any rate");
+    .expect("the identity rate is what an honest ZEC fill carries");
+
+    // A payment proved at any other rate is refused under the production policy.
+    let mut bent = terms();
+    bent.rate_18dec = IDENTITY_RATE_18DEC;
+    let det2 = details_with(&bent, |w| w[11] = word_u(990_881_148_896_019_200));
+    let (att2, sig2) = attest_for(bent.intent_hash(), bent.usd_amount_6dec as u128, &det2);
+    let err = run_with(
+        &bent,
+        &bent.terms_hash(),
+        false,
+        &att2,
+        &sig2,
+        &det2,
+        &obs,
+        &signer,
+        &RatePolicy::production(),
+        false,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            AttestorError::PaymentDetails(PaymentDetailsError::RateMismatch { .. })
+        ),
+        "got {err}"
+    );
 }
 
 #[test]
@@ -745,8 +817,8 @@ fn the_store_refuses_to_consume_one_payment_for_two_events() {
     let mut store = EventStore::new();
     let nullifier = [0x9a; 32];
 
-    store.announce([1; 32], [2; 32], [3; 33], [4; 32], [5; 32]).unwrap();
-    store.announce([6; 32], [7; 32], [8; 33], [9; 32], [10; 32]).unwrap();
+    store.announce([1; 32], [2; 32], [3; 33], [4; 32], [5; 32], 1_788_315_013_000).unwrap();
+    store.announce([6; 32], [7; 32], [8; 33], [9; 32], [10; 32], 1_788_315_013_000).unwrap();
 
     store.mark_signed(&[1; 32], [7; 32], nullifier).unwrap();
     assert!(store.payment_is_consumed(&nullifier));
@@ -756,5 +828,90 @@ fn the_store_refuses_to_consume_one_payment_for_two_events() {
         store.mark_signed(&[6; 32], [8; 32], nullifier),
         Err(StoreError::PaymentAlreadyConsumed),
         "one payment must not release a second escrow"
+    );
+}
+
+// --- Round 2 finding 7: words 2, 5, 12 and 13 were carried but never checked.
+
+#[test]
+fn an_intent_timestamp_that_does_not_match_the_terms_is_refused() {
+    // Word 12 is INTENT_TIMESTAMP_MS in seconds, which spec 5.4 sets to the
+    // lock-confirmed time. An attestation proved against a different snapshot
+    // than these terms describe is not an attestation for this escrow.
+    let (t, _, _, _, obs, signer) = valid();
+    let det = details_with(&t, |w| w[12] = word_u(1_700_000_000));
+    let (att, sig) = attest_for(t.intent_hash(), t.usd_amount_6dec as u128, &det);
+
+    let err = run(&t, &t.terms_hash(), false, &att, &sig, &det, &obs, &signer).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            AttestorError::PaymentDetails(PaymentDetailsError::IntentTimestampMismatch { .. })
+        ),
+        "got {err}"
+    );
+}
+
+#[test]
+fn a_zero_validity_window_is_refused() {
+    // window_s = 0 would make the "payment not too late" bound vacuous, so a
+    // payment from any future time would pass.
+    let (t, _, _, _, obs, signer) = valid();
+    let det = details_with(&t, |w| w[13] = word_u(0));
+    let (att, sig) = attest_for(t.intent_hash(), t.usd_amount_6dec as u128, &det);
+
+    let err = run(&t, &t.terms_hash(), false, &att, &sig, &det, &obs, &signer).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            AttestorError::PaymentDetails(PaymentDetailsError::ZeroWindow)
+        ),
+        "got {err}"
+    );
+}
+
+#[test]
+fn a_word_with_non_zero_high_bytes_is_refused_rather_than_truncated() {
+    // Every numeric word is decoded from its low 16 bytes. Truncating the high
+    // ones would let a caller hide a large value behind a small-looking one.
+    let (t, _, _, _, obs, signer) = valid();
+    let det = details_with(&t, |w| {
+        w[7][0] = 0x01; // releaseAmount, high byte set
+    });
+    let (att, sig) = attest_for(t.intent_hash(), t.usd_amount_6dec as u128, &det);
+
+    let err = run(&t, &t.terms_hash(), false, &att, &sig, &det, &obs, &signer).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            AttestorError::PaymentDetails(PaymentDetailsError::OversizedWord { index: 7 })
+        ),
+        "got {err}"
+    );
+}
+
+/// Round 2 finding 8: `decide` derives the escrow's scriptPubKey from the terms
+/// rather than taking it from the caller.
+///
+/// A caller that supplied both could supply a matching pair describing an
+/// escrow that is not the one the terms name.
+#[test]
+fn the_expected_script_is_derived_from_the_terms_not_supplied() {
+    let (t, att, sig, det, _, signer) = valid();
+
+    // An observation of some other P2SH output. There is no longer any argument
+    // through which a caller could declare this to be the expected script.
+    let obs = ChainObservation {
+        script_pubkey: p2sh_script_pubkey(
+            &redeem_script(&[0x04; 33], &[0x05; 33], REFUND_HEIGHT).unwrap(),
+        ),
+        amount_zat: 5_000_000,
+        confirmations: 10,
+        earliest_acceptable_payment_ms: t.lock_confirmed_ms,
+    };
+
+    assert_eq!(
+        run(&t, &t.terms_hash(), false, &att, &sig, &det, &obs, &signer).unwrap_err(),
+        AttestorError::WrongScriptPubkey
     );
 }

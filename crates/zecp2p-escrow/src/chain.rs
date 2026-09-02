@@ -6,9 +6,12 @@
 //! `lp.rs` is exercised against a chain whose reorgs and confirmation depths a
 //! test controls, rather than against whatever a live node happened to be doing.
 //!
-//! The real adapter over zebrad's `getblockchaininfo`, `gettxout` and
-//! `sendrawtransaction` is not written; nothing in this crate has ever spoken
-//! to a node.
+//! The adapter over `getblockchaininfo`, `gettxout` and `sendrawtransaction`
+//! lives in `rpc.rs` and speaks the zcashd/zebrad dialect, so the same code
+//! points at a hosted endpoint today and at our own node later. What it has
+//! *not* done is get a transaction accepted: the hosted provider blocks
+//! `sendrawtransaction`, so Phase 1's mempool gate is still unmet. See spec
+//! section 14.
 
 use std::collections::HashMap;
 

@@ -10,6 +10,10 @@ authors.workspace = true
 # Tests need it to bind attestations to terms they control; production builds
 # must not have that path at all.
 test-signer = []
+# Exposes RatePolicy::AtLeast and ::Unenforced. Round 2 settled that a ZEC
+# escrow must use Exact(1e18); anything looser resurrects the round-1 exploit,
+# so a production build cannot construct one.
+loose-rate-policy = []
 
 [dependencies]
 zcash_primitives = { version = "0.30", features = ["transparent-inputs", "circuits"] }

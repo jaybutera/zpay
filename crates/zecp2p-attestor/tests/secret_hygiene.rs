@@ -18,7 +18,7 @@ fn leaks(text: &str, secret: &[u8; 32]) -> bool {
 fn the_event_store_never_prints_the_nonce() {
     let mut store = EventStore::new();
     store
-        .announce([1; 32], [2; 32], [3; 33], [4; 32], NONCE)
+        .announce([1; 32], [2; 32], [3; 33], [4; 32], NONCE, 1_788_315_013_000)
         .unwrap();
 
     let text = format!("{store:?}");
@@ -37,7 +37,9 @@ fn an_event_row_carries_no_nonce_at_all() {
         terms_hash: [2; 32],
         r: [3; 33],
         funding_txid: [4; 32],
+        announced_at_ms: 1_788_315_013_000,
         signed_s: Some([5; 32]),
+        payment_nullifier: Some([6; 32]),
     };
     let text = format!("{event:?}");
     assert!(!leaks(&text, &NONCE));
@@ -50,7 +52,7 @@ fn an_event_row_carries_no_nonce_at_all() {
 fn the_nonce_is_not_recoverable_from_the_store_after_signing() {
     let mut store = EventStore::new();
     store
-        .announce([1; 32], [2; 32], [3; 33], [4; 32], NONCE)
+        .announce([1; 32], [2; 32], [3; 33], [4; 32], NONCE, 1_788_315_013_000)
         .unwrap();
     store.mark_signed(&[1; 32], [7; 32], [0x9a; 32]).unwrap();
 

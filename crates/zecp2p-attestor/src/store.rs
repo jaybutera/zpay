@@ -18,8 +18,18 @@ pub struct Event {
     /// The funding transaction, so a second announcement for the same escrow
     /// can be refused (spec 6, rate limits).
     pub funding_txid: [u8; 32],
+    /// When the attestor issued this announcement, in milliseconds.
+    ///
+    /// This is the attestor's own clock, and it is what bounds how old a
+    /// payment may be. A payment for this escrow cannot predate the moment the
+    /// attestor first heard of it, so `terms.lock_confirmed_ms` - which the LP
+    /// writes - is never used for that (round 2 finding 2).
+    pub announced_at_ms: u64,
     /// Present once the outcome has been signed. `k` is gone by then.
     pub signed_s: Option<[u8; 32]>,
+    /// The payment that released this escrow, once it has been signed. One
+    /// Venmo payment releases one escrow, and this is the record of which.
+    pub payment_nullifier: Option<[u8; 32]>,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -108,6 +118,7 @@ impl EventStore {
 
     /// Records an announcement. Refuses a second one for the same event or the
     /// same funding transaction.
+    #[allow(clippy::too_many_arguments)]
     pub fn announce(
         &mut self,
         event_id: [u8; 32],
@@ -115,6 +126,7 @@ impl EventStore {
         r: [u8; 33],
         funding_txid: [u8; 32],
         k: [u8; 32],
+        announced_at_ms: u64,
     ) -> Result<(), StoreError> {
         if self.events.contains_key(&event_id) {
             return Err(StoreError::DuplicateEvent);
@@ -129,7 +141,9 @@ impl EventStore {
                 terms_hash,
                 r,
                 funding_txid,
+                announced_at_ms,
                 signed_s: None,
+                payment_nullifier: None,
             },
         );
         self.nonces.insert(event_id, k);
@@ -196,6 +210,7 @@ impl EventStore {
             return Err(StoreError::AlreadySigned);
         }
         event.signed_s = Some(s);
+        event.payment_nullifier = Some(payment_nullifier);
         self.consumed_payments.insert(payment_nullifier, *event_id);
         // The nonce is gone from here on. A later signing attempt finds no `k`
         // and cannot proceed even if some other check were bypassed.

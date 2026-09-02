@@ -48,6 +48,15 @@ pub enum ClientError {
     NotPersisted,
     #[error("the canonical terms and the transaction terms describe different escrows")]
     TermsDisagree,
+    #[error(
+        "the LP's terms say {field} is {got}, but the user accepted {expected}; the fiat side \
+         of an escrow is the user's to state, not the LP's"
+    )]
+    FiatTermsNotAsQuoted {
+        field: &'static str,
+        got: String,
+        expected: String,
+    },
     #[error("it is height {current}, the refund is not spendable until {refund_height}")]
     TooEarlyToRefund { current: u32, refund_height: u32 },
     #[error("dlc error: {0}")]
@@ -108,6 +117,27 @@ pub trait RecordStore {
     fn load(&self, funding_txid: &[u8; 32]) -> Option<EscrowRecord>;
 }
 
+/// What the user accepted before it agreed to fund anything.
+///
+/// Round 2 finding 1: the LP returns `terms` in step 1c of spec 5.3, and
+/// nothing compared the fiat side of them to anything the user held. An LP
+/// could return chain fields that are honest and fiat fields that are its own -
+/// its Venmo hash, and an amount of one micro-dollar - and every check
+/// downstream would honestly verify the LP paying itself. The client must
+/// therefore hold its own view of what it agreed to, and compare.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptedQuote {
+    /// The dollars the user expects to receive, 6 decimals.
+    pub usd_amount_6dec: u64,
+    /// The user's own Venmo, as the zk-p2p curator's `hashedOnchainId`. This is
+    /// the field that matters most: it is the user's identity, and the user is
+    /// the only party that knows it.
+    pub payee_hash: [u8; 32],
+    /// The rate the escrow is priced at. For a ZEC escrow this must be the
+    /// identity rate; see `payment_details::IDENTITY_RATE_18DEC`.
+    pub rate_18dec: u128,
+}
+
 /// The attestor announcement the user receives (spec 5.1).
 #[derive(Debug, Clone)]
 pub struct Announcement {
@@ -165,12 +195,38 @@ pub fn prepare_escrow(
     store: &mut impl RecordStore,
     terms: &EscrowTerms,
     canonical: &crate::terms::CanonicalTerms,
+    quote: &AcceptedQuote,
     u_priv: &SecretKey,
     announcement: &Announcement,
     pinned_attestor_key: &PublicKey,
     lp_output_script: &[u8],
     fee_zat: u64,
 ) -> Result<(secp256k1_zkp::EcdsaAdaptorSignature, PublicKey), ClientError> {
+    // The fiat side of the terms is the user's to state. Comparing it against
+    // what the user actually accepted is what stops an LP writing its own
+    // payee and amount into an otherwise honest escrow (round 2 finding 1).
+    if canonical.usd_amount_6dec != quote.usd_amount_6dec {
+        return Err(ClientError::FiatTermsNotAsQuoted {
+            field: "usd_amount_6dec",
+            got: canonical.usd_amount_6dec.to_string(),
+            expected: quote.usd_amount_6dec.to_string(),
+        });
+    }
+    if canonical.payee_hash != quote.payee_hash {
+        return Err(ClientError::FiatTermsNotAsQuoted {
+            field: "payee_hash",
+            got: hex::encode(canonical.payee_hash),
+            expected: hex::encode(quote.payee_hash),
+        });
+    }
+    if canonical.rate_18dec != quote.rate_18dec {
+        return Err(ClientError::FiatTermsNotAsQuoted {
+            field: "rate_18dec",
+            got: canonical.rate_18dec.to_string(),
+            expected: quote.rate_18dec.to_string(),
+        });
+    }
+
     // The canonical terms and the transaction terms must describe the same
     // escrow, or the user would be signing for one and quoting the other.
     if canonical.funding_txid != terms.funding_txid

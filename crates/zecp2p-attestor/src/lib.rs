@@ -25,12 +25,22 @@ use zecp2p_escrow::dlc::{outcome_point, sign_outcome, DlcError};
 use zecp2p_escrow::terms::CanonicalTerms;
 
 /// A funded escrow output as the attestor's own node reports it (spec 5.5
-/// step 5).
+/// step 5), together with the attestor's own view of when this escrow could
+/// first have been paid.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChainObservation {
     pub script_pubkey: Vec<u8>,
     pub amount_zat: u64,
     pub confirmations: u32,
+    /// The earliest wall-clock time, in milliseconds, at which a payment for
+    /// this escrow could plausibly have been made.
+    ///
+    /// This must come from something the attestor observed: the moment it
+    /// issued the announcement (`events.announced_at_ms`), or the funding
+    /// block's own timestamp read from its node. It must never be
+    /// `terms.lock_confirmed_ms`, which the LP writes - bounding recency
+    /// against a number the adversary chose bounds nothing (round 2 finding 2).
+    pub earliest_acceptable_payment_ms: u64,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -86,7 +96,6 @@ pub fn decide(
     signature: &[u8],
     encoded_payment_details: &[u8],
     observation: &ChainObservation,
-    expected_script_pubkey: &[u8],
     rate: &RatePolicy,
     payment_already_consumed: bool,
 ) -> Result<[u8; 32], AttestorError> {
@@ -98,7 +107,6 @@ pub fn decide(
         signature,
         encoded_payment_details,
         observation,
-        expected_script_pubkey,
         &ENCLAVE_SIGNER,
         rate,
         payment_already_consumed,
@@ -119,7 +127,6 @@ pub fn decide_against_signer(
     signature: &[u8],
     encoded_payment_details: &[u8],
     observation: &ChainObservation,
-    expected_script_pubkey: &[u8],
     trusted_signer: &[u8; 20],
     rate: &RatePolicy,
     payment_already_consumed: bool,
@@ -132,7 +139,6 @@ pub fn decide_against_signer(
         signature,
         encoded_payment_details,
         observation,
-        expected_script_pubkey,
         trusted_signer,
         rate,
         payment_already_consumed,
@@ -148,7 +154,6 @@ fn decide_inner(
     signature: &[u8],
     encoded_payment_details: &[u8],
     observation: &ChainObservation,
-    expected_script_pubkey: &[u8],
     trusted_signer: &[u8; 20],
     rate: &RatePolicy,
     payment_already_consumed: bool,
@@ -192,6 +197,9 @@ fn decide_inner(
         &intent,
         &terms.payee_hash,
         terms.usd_amount_6dec as u128,
+        attestation.release_amount,
+        // The attestor's own clock, not the LP's claim. See round 2 finding 2.
+        observation.earliest_acceptable_payment_ms,
         terms.lock_confirmed_ms,
         rate,
     )?;
@@ -203,7 +211,15 @@ fn decide_inner(
         return Err(AttestorError::PaymentAlreadyConsumed);
     }
 
-    // 5. The escrow itself, on the attestor's own node.
+    // 5. The escrow itself, on the attestor's own node. The script is derived
+    //    from the terms here rather than taken from the caller (round 2
+    //    finding 8): a caller that passes both the terms and the script it
+    //    expects them to produce can pass a matching pair that is not this
+    //    escrow.
+    let derived =
+        zecp2p_escrow::script::redeem_script(&terms.u_pub, &terms.l_pub, terms.refund_height)
+            .map_err(|_| AttestorError::WrongScriptPubkey)?;
+    let expected_script_pubkey = zecp2p_escrow::script::p2sh_script_pubkey(&derived);
     if observation.script_pubkey != expected_script_pubkey {
         return Err(AttestorError::WrongScriptPubkey);
     }
@@ -250,4 +266,161 @@ pub fn announced_outcome_point(
     terms_hash: &[u8; 32],
 ) -> Result<PublicKey, AttestorError> {
     Ok(outcome_point(secp, r, p, event_id, terms_hash)?)
+}
+
+/// The whole `/attest` handler, spec 5.5, as one operation over the store.
+///
+/// Round 2 finding 4: `decide` returning a nullifier that the *caller* then
+/// checked left a window in which two handlers both passed, both computed a
+/// scalar, and only the second `mark_signed` refused. By then the second scalar
+/// existed in memory, and whether it reached the LP was up to a handler that
+/// had not been written. The ordering here removes the question:
+///
+/// 1. read the announcement from the store,
+/// 2. run every check, consulting the store's own consumed-payment set,
+/// 3. take the nonce, sign, and record - returning the scalar only once
+///    `mark_signed` has committed.
+///
+/// The store is borrowed mutably for the whole call, so the sequence is atomic
+/// against anything else holding it. A persistent implementation must take the
+/// equivalent lock across the same span.
+#[allow(clippy::too_many_arguments)]
+pub fn handle_attest(
+    store: &mut store::EventStore,
+    secp: &Secp256k1<secp256k1_zkp::All>,
+    d: &SecretKey,
+    event_id: &[u8; 32],
+    terms: &CanonicalTerms,
+    attestation: &PaymentAttestation,
+    signature: &[u8],
+    encoded_payment_details: &[u8],
+    observation: &ChainObservation,
+    rate: &RatePolicy,
+) -> Result<SecretKey, AttestorError> {
+    handle_attest_with_signer(
+        store,
+        secp,
+        d,
+        event_id,
+        terms,
+        attestation,
+        signature,
+        encoded_payment_details,
+        observation,
+        rate,
+        &ENCLAVE_SIGNER,
+    )
+}
+
+/// As [`handle_attest`], against a caller-supplied enclave signer. Test only.
+#[cfg(feature = "test-signer")]
+#[allow(clippy::too_many_arguments)]
+pub fn handle_attest_against_signer(
+    store: &mut store::EventStore,
+    secp: &Secp256k1<secp256k1_zkp::All>,
+    d: &SecretKey,
+    event_id: &[u8; 32],
+    terms: &CanonicalTerms,
+    attestation: &PaymentAttestation,
+    signature: &[u8],
+    encoded_payment_details: &[u8],
+    observation: &ChainObservation,
+    rate: &RatePolicy,
+    trusted_signer: &[u8; 20],
+) -> Result<SecretKey, AttestorError> {
+    handle_attest_with_signer(
+        store,
+        secp,
+        d,
+        event_id,
+        terms,
+        attestation,
+        signature,
+        encoded_payment_details,
+        observation,
+        rate,
+        trusted_signer,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn handle_attest_with_signer(
+    store: &mut store::EventStore,
+    secp: &Secp256k1<secp256k1_zkp::All>,
+    d: &SecretKey,
+    event_id: &[u8; 32],
+    terms: &CanonicalTerms,
+    attestation: &PaymentAttestation,
+    signature: &[u8],
+    encoded_payment_details: &[u8],
+    observation: &ChainObservation,
+    rate: &RatePolicy,
+    trusted_signer: &[u8; 20],
+) -> Result<SecretKey, AttestorError> {
+    // An event already signed returns what it published rather than signing
+    // again. The scalar is public the moment the release is broadcast, so this
+    // is idempotent, not a leak.
+    if let Some(existing) = store.signed_outcome(event_id) {
+        return SecretKey::from_slice(&existing)
+            .map_err(|e| AttestorError::Dlc(DlcError::Secp(e.to_string())));
+    }
+
+    let event = store.get(event_id).ok_or(AttestorError::UnknownEvent)?.clone();
+
+    // The recency bound is the attestor's own announcement time, not anything
+    // the LP wrote. An observation claiming an earlier bound than the store
+    // knows is narrowed to the store's (round 2 finding 2).
+    let observation = ChainObservation {
+        earliest_acceptable_payment_ms: observation
+            .earliest_acceptable_payment_ms
+            .max(event.announced_at_ms),
+        ..observation.clone()
+    };
+
+    // `already_signed` and the announced terms hash come from the store, not
+    // from the caller (round 2 finding 8).
+    let nullifier = decide_inner(
+        &event.terms_hash,
+        event.signed_s.is_some(),
+        terms,
+        attestation,
+        signature,
+        encoded_payment_details,
+        &observation,
+        trusted_signer,
+        rate,
+        store.payment_is_consumed(&payment_nullifier(&PaymentDetails::decode(
+            encoded_payment_details,
+        )?)),
+    )?;
+
+    // Only now is a nonce touched.
+    let bound = store
+        .take_nonce_for_signing(event_id)
+        .map_err(map_store_error)?;
+    let k_bytes = bound
+        .secret_for(event_id)
+        .ok_or(AttestorError::UnknownEvent)?;
+    let k = SecretKey::from_slice(k_bytes)
+        .map_err(|e| AttestorError::Dlc(DlcError::Secp(e.to_string())))?;
+
+    let s = sign_outcome(secp, &k, d, event_id, &event.terms_hash)?;
+
+    // Record before returning. If this refuses, the scalar never leaves.
+    store
+        .mark_signed(event_id, s.secret_bytes(), nullifier)
+        .map_err(map_store_error)?;
+
+    Ok(s)
+}
+
+fn map_store_error(e: store::StoreError) -> AttestorError {
+    match e {
+        store::StoreError::UnknownEvent => AttestorError::UnknownEvent,
+        store::StoreError::AlreadySigned => AttestorError::AlreadySigned,
+        store::StoreError::PaymentAlreadyConsumed => AttestorError::PaymentAlreadyConsumed,
+        store::StoreError::DuplicateEvent | store::StoreError::DuplicateFundingTx => {
+            AttestorError::DuplicateAnnouncement
+        }
+    }
 }

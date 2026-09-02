@@ -14,6 +14,15 @@
 //! and the branch id against what the transaction was built for. So a provider
 //! that reports the wrong *escrow* is caught; a provider that reports the wrong
 //! *chain* is not. Section 14 of the spec says which criteria that leaves open.
+//!
+//! One consequence is worth stating separately, because it is the one that
+//! costs money. **In hosted mode the attestor's chain view is the provider's
+//! too.** The confirmation depth of section 7 is exactly the number the
+//! provider is trusted for, so a provider that invented a confirmed output
+//! could induce the attestor to sign for an escrow that does not exist - and
+//! the LP, having already paid Venmo, is the party out of pocket. That is not a
+//! reason to distrust any particular provider; it is a reason the production
+//! attestor runs its own node.
 
 use std::time::Duration;
 
@@ -82,6 +91,10 @@ impl RpcConfig {
 pub struct RpcChainClient {
     config: RpcConfig,
     http: reqwest::blocking::Client,
+    /// Set once the endpoint has confirmed it serves the configured network, so
+    /// the check happens automatically rather than relying on a caller to
+    /// remember it (round 2 finding 6).
+    network_checked: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for RpcChainClient {
@@ -92,6 +105,12 @@ impl std::fmt::Debug for RpcChainClient {
             .field("url", &self.config.url)
             .field("network", &self.config.network)
             .field("authenticated", &self.config.user.is_some())
+            .field(
+                "network_checked",
+                &self
+                    .network_checked
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
             .finish()
     }
 }
@@ -142,7 +161,26 @@ impl RpcChainClient {
             .timeout(config.timeout)
             .build()
             .map_err(|e| ChainError::Unreachable(e.to_string()))?;
-        Ok(Self { config, http })
+        Ok(Self {
+            config,
+            http,
+            network_checked: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    /// Runs [`check_network`] once, then remembers.
+    ///
+    /// Every trait method calls this first. Without it, pointing a testnet
+    /// config at a mainnet URL is a typo that spends real money and nothing
+    /// catches it unless the caller happens to have called `check_network`.
+    fn ensure_network(&self) -> Result<(), ChainError> {
+        use std::sync::atomic::Ordering;
+        if self.network_checked.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        self.check_network()?;
+        self.network_checked.store(true, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Confirms the endpoint serves the network the caller expects.
@@ -208,12 +246,19 @@ impl RpcChainClient {
         })?;
 
         if let Some(err) = parsed.error {
-            // A node's own verdict. `sendrawtransaction` reports an invalid
-            // signature here, which is what criterion 12 is asking to see.
-            return Err(ChainError::Rejected(format!(
-                "{} (code {})",
-                err.message, err.code
-            )));
+            // `Rejected` means *the chain refused this transaction*, and the LP
+            // treats it as a verdict rather than something to retry. Only
+            // `sendrawtransaction` can produce one. An error on a read call is
+            // the provider or the node failing to answer - a method it does not
+            // expose, a malformed request - and must read as unreachable, or a
+            // provider outage would look like a chain decision (round 2
+            // finding 6).
+            let text = format!("{} (code {})", err.message, err.code);
+            return Err(if method == "sendrawtransaction" {
+                ChainError::Rejected(text)
+            } else {
+                ChainError::Unreachable(format!("{method}: {text}"))
+            });
         }
 
         parsed
@@ -298,11 +343,13 @@ pub fn rpc_hex_to_txid(s: &str) -> Result<[u8; 32], ChainError> {
 
 impl ChainClient for RpcChainClient {
     fn height(&self) -> Result<u32, ChainError> {
+        self.ensure_network()?;
         let info: ChainInfo = self.call("getblockchaininfo", serde_json::json!([]))?;
         Ok(info.blocks)
     }
 
     fn consensus_branch_id(&self) -> Result<u32, ChainError> {
+        self.ensure_network()?;
         // Spec 4.3: read from the node, never hard-coded.
         let info: ChainInfo = self.call("getblockchaininfo", serde_json::json!([]))?;
         u32::from_str_radix(&info.consensus.chaintip, 16).map_err(|e| {
@@ -314,6 +361,7 @@ impl ChainClient for RpcChainClient {
     }
 
     fn utxo(&self, txid: &[u8; 32], vout: u32) -> Result<Option<Utxo>, ChainError> {
+        self.ensure_network()?;
         // `gettxout` returns null for an output that does not exist or has been
         // spent, and by default does not consider the mempool - which is what
         // the escrow wants, since an unconfirmed lock is not a lock.
@@ -341,6 +389,7 @@ impl ChainClient for RpcChainClient {
     }
 
     fn broadcast(&self, raw_tx: &[u8]) -> Result<[u8; 32], ChainError> {
+        self.ensure_network()?;
         let txid: String =
             self.call("sendrawtransaction", serde_json::json!([hex::encode(raw_tx)]))?;
         rpc_hex_to_txid(&txid)

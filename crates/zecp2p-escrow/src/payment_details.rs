@@ -68,6 +68,20 @@ pub enum PaymentDetailsError {
     PaymentTooLate { payment_ms: u64, window_ms: u64 },
     #[error("the two copies of {field} inside the payment details disagree")]
     InternalDisagreement { field: &'static str },
+    #[error(
+        "the payment details were proved against intent timestamp {got_s} s, but these terms \
+         claim the lock confirmed at {expected_s} s"
+    )]
+    IntentTimestampMismatch { got_s: u64, expected_s: u64 },
+    #[error("the validity window is zero, which would admit a payment from any time")]
+    ZeroWindow,
+    #[error(
+        "the signed releaseAmount is {signed} but the payment details say {in_details}; the two \
+         must describe one payment"
+    )]
+    ReleaseAmountDisagreement { signed: u128, in_details: u128 },
+    #[error("word {index} has non-zero high bytes, so it does not fit the value it should hold")]
+    OversizedWord { index: usize },
 }
 
 /// The 14 words of spec 12.1, named.
@@ -100,12 +114,15 @@ fn word(blob: &[u8], i: usize) -> [u8; 32] {
     w
 }
 
-fn word_u128(blob: &[u8], i: usize) -> u128 {
+fn word_u128(blob: &[u8], i: usize) -> Result<u128, PaymentDetailsError> {
     let w = word(blob, i);
-    // The high 16 bytes must be zero for the value to fit; every quantity here
-    // is an amount, a rate or a timestamp, none of which legitimately exceeds
-    // 2^128.
-    u128::from_be_bytes(w[16..].try_into().expect("16 bytes"))
+    // The high 16 bytes must be zero for the value to fit. Silently truncating
+    // them would let a caller hide a huge value behind a small-looking one
+    // (round 2 finding 7).
+    if w[..16].iter().any(|b| *b != 0) {
+        return Err(PaymentDetailsError::OversizedWord { index: i });
+    }
+    Ok(u128::from_be_bytes(w[16..].try_into().expect("16 bytes")))
 }
 
 impl PaymentDetails {
@@ -116,33 +133,53 @@ impl PaymentDetails {
         Ok(Self {
             payment_method: word(blob, 0),
             payee_details: word(blob, 1),
-            payment_index: word_u128(blob, 2),
+            payment_index: word_u128(blob, 2)?,
             fiat_currency: word(blob, 3),
-            payment_timestamp_ms: word_u128(blob, 4) as u64,
+            payment_timestamp_ms: u64::try_from(word_u128(blob, 4)?)
+                .map_err(|_| PaymentDetailsError::OversizedWord { index: 4 })?,
             payment_digest: word(blob, 5),
             intent_hash: word(blob, 6),
-            release_amount: word_u128(blob, 7),
+            release_amount: word_u128(blob, 7)?,
             payment_method_2: word(blob, 8),
             fiat_currency_2: word(blob, 9),
             payee_details_2: word(blob, 10),
-            conversion_rate: word_u128(blob, 11),
-            intent_timestamp_s: word_u128(blob, 12) as u64,
-            window_s: word_u128(blob, 13) as u64,
+            conversion_rate: word_u128(blob, 11)?,
+            intent_timestamp_s: u64::try_from(word_u128(blob, 12)?)
+                .map_err(|_| PaymentDetailsError::OversizedWord { index: 12 })?,
+            window_s: u64::try_from(word_u128(blob, 13)?)
+                .map_err(|_| PaymentDetailsError::OversizedWord { index: 13 })?,
         })
     }
 
     /// What the attestor requires of the payment before it will sign.
     ///
-    /// `expected_rate` is optional because the semantics of word 11 are not yet
-    /// settled: see `RatePolicy`.
+    /// `earliest_acceptable_payment_ms` must come from something the attestor
+    /// observed itself - the time it issued the announcement, or the funding
+    /// block's own timestamp - and never from `terms.lock_confirmed_ms`. Round 2
+    /// finding 2: the LP writes the terms, so an LP that set the lock time a
+    /// month back could re-prove a month-old payment it made to the same user
+    /// for an earlier trade, under this escrow's intent hash. Bounding recency
+    /// against a number the LP chose bounds nothing.
+    #[allow(clippy::too_many_arguments)]
     pub fn check_against_terms(
         &self,
         expected_intent_hash: &[u8; 32],
         expected_payee_hash: &[u8; 32],
         minimum_release_amount: u128,
-        lock_confirmed_ms: u64,
+        signed_release_amount: u128,
+        earliest_acceptable_payment_ms: u64,
+        claimed_lock_confirmed_ms: u64,
         rate: &RatePolicy,
     ) -> Result<(), PaymentDetailsError> {
+        // The released amount appears in the signed typedDataValue and again in
+        // word 7. They must agree, or the two halves of the attestation
+        // describe different payments (round 2 finding 7).
+        if self.release_amount != signed_release_amount {
+            return Err(PaymentDetailsError::ReleaseAmountDisagreement {
+                signed: signed_release_amount,
+                in_details: self.release_amount,
+            });
+        }
         // The blob repeats method, currency and payee. If the two copies ever
         // disagree, the blob is not one the enclave produced from a single
         // payment, and nothing further should be trusted.
@@ -202,17 +239,38 @@ impl PaymentDetails {
         // not the same clock. A strict comparison would reject genuine
         // attestations, so the window is wide enough to cover that skew and far
         // too narrow to admit the month-old payment of the review PoC.
-        let earliest = lock_confirmed_ms.saturating_sub(BACKDATE_TOLERANCE_MS);
+        let earliest = earliest_acceptable_payment_ms.saturating_sub(BACKDATE_TOLERANCE_MS);
         if self.payment_timestamp_ms < earliest {
             return Err(PaymentDetailsError::PaymentPredatesLock {
                 payment_ms: self.payment_timestamp_ms,
-                lock_confirmed_ms,
+                lock_confirmed_ms: earliest_acceptable_payment_ms,
                 tolerance_ms: BACKDATE_TOLERANCE_MS,
             });
         }
+
+        // Word 12 is the intent timestamp the LP handed the prover as
+        // INTENT_TIMESTAMP_MS, in seconds. It must agree with the lock time the
+        // terms claim, or the attestation was proved against a different
+        // snapshot than the one these terms describe (round 2 finding 7).
+        let claimed_s = claimed_lock_confirmed_ms / 1000;
+        if self.intent_timestamp_s != claimed_s {
+            return Err(PaymentDetailsError::IntentTimestampMismatch {
+                got_s: self.intent_timestamp_s,
+                expected_s: claimed_s,
+            });
+        }
+
+        // The blob reports the released amount twice: once in word 7 and once
+        // in the signed typedDataValue the caller already checked. A
+        // disagreement means the two halves describe different payments.
+        if self.window_s == 0 {
+            return Err(PaymentDetailsError::ZeroWindow);
+        }
         let window_ms = self.window_s.saturating_mul(1000);
-        if window_ms > 0
-            && self.payment_timestamp_ms.saturating_sub(lock_confirmed_ms) > window_ms
+        if self
+            .payment_timestamp_ms
+            .saturating_sub(earliest_acceptable_payment_ms)
+            > window_ms
         {
             return Err(PaymentDetailsError::PaymentTooLate {
                 payment_ms: self.payment_timestamp_ms,
@@ -225,30 +283,49 @@ impl PaymentDetails {
     }
 }
 
+/// The 18-decimal identity rate.
+///
+/// `INTENT_RATE` must be exactly this for a ZEC escrow, and the reason is
+/// arithmetic rather than convention. The enclave computes
+/// `releaseAmount = min(fiat_paid * 1e18 / conversionRate, intent.amount)`.
+/// Both captured attestations satisfy that: the 1.00 USD fill carries
+/// `rate = 1e18` and `releaseAmount = 1000000`, and the 4.875437 fill carries
+/// `rate = 990881148896019200` with `releaseAmount` pinned at the intent cap.
+/// `docs/status/auto-taker-daemon-design.md` records the same thing from the
+/// other side: with the rate left at its `1e18` default, a 4.84 USD payment
+/// returned `releaseAmount 4,840,000`.
+///
+/// So at `rate = 1e18`, and only there, `releaseAmount` *is* the fiat actually
+/// paid, in 6-decimal USD. That is what the attestor's
+/// `releaseAmount >= usd_amount_6dec` check assumes. Feed a USD-per-ZEC rate
+/// instead and `releaseAmount` becomes a divided quantity that no longer means
+/// dollars, and every honest fill is refused.
+pub const IDENTITY_RATE_18DEC: u128 = 1_000_000_000_000_000_000;
+
 /// What word 11, `conversionRate`, must equal.
 ///
-/// Finding 6 in review round 1: the LP passes `INTENT_RATE` to the prover as
-/// USD per ZEC, and the enclave records it as `conversionRate` without
-/// interpreting it. On the captured $4.87 attestation the value was
-/// `990881148896019200`, which is 0.99 in 18 decimals - that is dollars per
-/// *USDC-like unit*, not dollars per ZEC, because that fill was a USDC fill.
-///
-/// So the correct value for a ZEC escrow is not established by anything we have
-/// captured, and guessing it would be worse than admitting it. The policy is
-/// therefore explicit:
-///
-/// - `Exact` is what a production ZEC escrow must use once the semantics are
-///   settled: the attestor requires the rate the terms quoted, so an LP cannot
-///   claim a $100 escrow with a payment its own rate makes look sufficient.
-/// - `Unenforced` is the development stance, and it is recorded in the spec as
-///   an open item rather than left implicit.
+/// Round 2 settled this. `Exact(IDENTITY_RATE_18DEC)` is the only policy a
+/// production escrow may use, so it is the only variant a production build can
+/// construct: the other two are behind the `loose-rate-policy` feature.
+/// `Unenforced` reachable in a shipped binary would resurrect the round-1
+/// exploit, where an LP picks a rate that makes a micro-payment look
+/// sufficient.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RatePolicy {
     Exact(u128),
-    /// Requires the rate to be at least this, which is the direction that
-    /// protects the user when higher means more dollars per ZEC.
+    /// Requires the rate to be at least this.
+    #[cfg(feature = "loose-rate-policy")]
     AtLeast(u128),
+    /// Accepts any rate. Development only; see the type documentation.
+    #[cfg(feature = "loose-rate-policy")]
     Unenforced,
+}
+
+impl RatePolicy {
+    /// The policy every production escrow uses.
+    pub fn production() -> Self {
+        RatePolicy::Exact(IDENTITY_RATE_18DEC)
+    }
 }
 
 impl RatePolicy {
@@ -260,6 +337,7 @@ impl RatePolicy {
                     expected: *expected,
                 })
             }
+            #[cfg(feature = "loose-rate-policy")]
             RatePolicy::AtLeast(expected) if got < *expected => {
                 Err(PaymentDetailsError::RateMismatch {
                     got,
