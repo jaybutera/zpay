@@ -62,7 +62,7 @@ fn every_single_character_typo_is_caught() {
     let mut caught = 0;
     let mut tried = 0;
     for i in 0..REAL.len() {
-        for replacement in [b'1', b'z', b'Q', b'9'] {
+        for replacement in *b"1zQ9" {
             let mut bytes = REAL.as_bytes().to_vec();
             if bytes[i] == replacement {
                 continue;
