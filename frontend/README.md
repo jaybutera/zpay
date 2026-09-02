@@ -55,9 +55,10 @@ Nothing on the front door posts. Starting an offramp hands off to `app/` with
 ## The social card
 
 `og.png` is a screenshot of a 1200x630 HTML page with the hero headline on
-it. The `og:image` and `twitter:image` tags point at it by relative path;
-set them to the absolute URL once the site has a domain, since Twitter's
-scraper does not resolve relative paths.
+it. `og:image`, `twitter:image` and `og:url` carry absolute URLs on the
+CloudFront domain, because scrapers do not resolve relative paths. When a real
+domain replaces the CloudFront one, those three tags in `index.html` change
+with it.
 
 ## The SITE block
 
@@ -79,3 +80,44 @@ through the statuses.
 
 **03 / manage** exposes `process`, `rescue` and `withdraw`, each signed by the
 session owner's key.
+
+## Deploying
+
+```bash
+./scripts/deploy-site.sh
+```
+
+Live at <https://d2acgjt7j1yqe8.cloudfront.net/>.
+
+The site is a private S3 bucket (`zpay-site-<account-id>`) behind CloudFront
+distribution `<distribution-id>`, which reads it through an origin access
+control; the bucket denies everything else, so the S3 URLs are not reachable.
+Viewers get HTTPS on the default `*.cloudfront.net` certificate, and CloudFront
+compresses text on the way out.
+
+The script syncs in four passes, because the `Cache-Control` differs by file
+and `aws s3 sync` sets one value per invocation:
+
+| pass | files | max-age |
+| --- | --- | --- |
+| 1 | css, js | 1 day |
+| 2 | `fonts/`, `og.png` | 1 year, immutable |
+| 3 | html | 60s, must-revalidate |
+| 4 | deletes only | |
+
+HTML goes up after the assets it references, so a page is never live pointing
+at something that has not landed. The fourth pass removes keys that are gone
+from `frontend/`; it exists because the earlier passes filter, and a filtered
+`aws s3 sync --delete` skips excluded keys when deciding what to delete. The
+invalidation covers the short-TTL paths only, since the year-long assets are
+content-stable.
+
+`README.md` and the `shot-*.png` screenshots stay local; nothing on the site
+links to them.
+
+Both the bucket and the distribution can be overridden with
+`ZPAY_SITE_BUCKET` and `ZPAY_SITE_DISTRIBUTION`.
+
+Directory URLs (`/takers/`, `/app/`) work through a CloudFront function that
+appends `index.html`; an S3 REST origin does not do that on its own, and the
+S3 website endpoint that would cannot sit behind an origin access control.
