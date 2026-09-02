@@ -1,4 +1,4 @@
-/* zecp2p frontend — plain ES2020, no build step, no dependencies.
+/* zpay app (formerly zecp2p): plain ES2020, no build step, no dependencies.
    Talks to the Axum coordinator described in crates/zecp2p-coordinator/src/api.rs */
 
 'use strict';
@@ -539,8 +539,14 @@ loadAdv();
 checkHealth();
 setInterval(checkHealth, 30000);
 
+// Deep links from the front door: ?zec=<amount> and ?venmo=<handle> prefill the
+// form. Values are set on inputs, never rendered as markup.
+const deepParams = new URLSearchParams(location.search);
+if (deepParams.get('zec')) $('zec').value = deepParams.get('zec');
+if (deepParams.get('venmo')) $('venmo').value = deepParams.get('venmo').replace(/^@/, '');
+
 // Deep link: ?session=<uuid> opens straight into watch.
-const deepSession = new URLSearchParams(location.search).get('session');
+const deepSession = deepParams.get('session');
 if (deepSession) {
   $('session_id').value = deepSession;
   $('manage_id').value = deepSession;

@@ -1,65 +1,81 @@
-# zecp2p frontend
+# zpay frontend
 
-Static terminal-style UI for the coordinator API. No build step, no dependencies:
-three files, plain ES2020, served as-is.
+Static, no build step, no dependencies. Three pages share one stylesheet and
+one script; the app keeps its own.
 
 ```
 frontend/
-  index.html    markup and the three views
-  styles.css    palette, layout, terminal styling
-  app.js        API calls, validation, polling
+  index.html        the front door: hero, live numbers, quote, how it works,
+                    custody, fees, limits, taker band
+  site.css          palette and layout for the front door and takers/
+  site.js           live numbers, the quote widget, the platform picker,
+                    and the SITE block every link and number fills from
+  fonts/            Inter and JetBrains Mono, latin subsets, self-hosted so
+                    the page makes no third-party request
+  og.png            the 1200x630 social card the meta tags point at
+  takers/index.html how to run the auto-taker daemon
+  app/index.html    the offramp terminal: create, watch, manage
+  app/app.js        API calls, validation, polling
+  app/styles.css    the terminal's own styling
 ```
 
 ## Running
 
-Any static server works. From the repo root, with the coordinator on its default
-`127.0.0.1:3000`:
+Any static server works. From the repo root, with the coordinator on its
+default `127.0.0.1:3000`:
 
 ```bash
 python3 -m http.server 8080 --directory frontend
 ```
 
-Open <http://127.0.0.1:8080>. On port 8080 (and 5173, and `file://`) the UI
-defaults to `http://127.0.0.1:3000` for the API. The coordinator already sends
-`CorsLayer::new().allow_origin(Any)`, so cross-origin calls work without changes.
+Open <http://127.0.0.1:8080>. On port 8080 (and 5173, and `file://`) both the
+front door and the app default to `http://127.0.0.1:3000` for the API. The
+coordinator has to list the page's origin in `[server] allowed_origins` or the
+browser blocks the calls.
 
-Point it at a different coordinator with `?api=`, which persists in localStorage:
+The app accepts `?api=` to point at a different coordinator, confirmed and not
+persisted unless it is loopback. The front door does not accept `?api=` at all;
+it reads only, and it reuses whatever loopback the app saved.
 
-```
-http://127.0.0.1:8080/?api=https://coordinator.example.com
-```
+Served from the coordinator's own origin, everything calls same-origin paths
+and needs no configuration.
 
-Served from the coordinator's own origin, the UI calls same-origin paths and
-needs no configuration.
+## What the front door reads
 
-## Views
+- `GET /stats` every 30 seconds: fills, USDC settled, open orders, last fill,
+  and the contract address. The address in the markup is a fallback; the
+  coordinator's answer overrides it.
+- `GET /quote?zec_amount=1` every two minutes for the rate cell and the quote
+  card's header, and once per pause in typing for the quote card itself. A
+  reply that arrives after a newer keystroke is dropped.
+
+Nothing on the front door posts. Starting an offramp hands off to `app/` with
+`?zec=` and optionally `?venmo=` prefilled.
+
+## The social card
+
+`og.png` is a screenshot of a 1200x630 HTML page with the hero headline on
+it. The `og:image` and `twitter:image` tags point at it by relative path;
+set them to the absolute URL once the site has a domain, since Twitter's
+scraper does not resolve relative paths.
+
+## The SITE block
+
+The top of `site.js` holds every value the copy leans on: the fee percent, the
+contract address, the GitHub URLs, the block explorer links, and the platform
+list. The repositories do not exist yet; the URLs there are placeholders. The
+fee is a placeholder too. Change them there and both pages update.
+
+## App views
 
 **01 / offramp** takes a Venmo handle and a ZEC amount. `get quote` hits
 `GET /quote`; `create offramp` posts to `POST /offramp` and jumps to watch.
 
 The API also requires a Base address, a taker address and a ZEC refund address.
-Those live in the *advanced* disclosure, since they change rarely, and
-`remember these on this device` keeps them in localStorage. `min_rate` is
-optional; left blank the coordinator applies its own default of 20 USDC/ZEC, and
-after a quote the field shows a suggestion 2% under the quoted rate.
+Those live under **advanced** and persist in localStorage.
 
-**02 / watch** polls `GET /offramp/{id}` every 5 seconds, stopping on any
-terminal state (`fulfilled`, `failed`, `rescued`, `withdrawn`). It shows the
-deposit address, a progress ladder over the state machine, and an activity log.
-`?session=<uuid>` opens straight into this view.
+**02 / watch** polls `GET /offramp/{id}` and renders the session as it moves
+through the statuses.
 
-**03 / manage** posts to the `/process`, `/rescue` and `/withdraw` endpoints.
-Rescue and withdraw confirm first, since both end the session.
-
-## Notes
-
-Amounts: `expected_usdc` arrives as a raw 6-decimal integer and is divided by
-1e6 for display. Quote fields are already decimal strings.
-
-Input is validated client-side against the same rules as
-`crates/zecp2p-coordinator/src/api.rs` (handle charset and length, 8-decimal ZEC
-cap, address prefixes and lengths) so mistakes surface before a round trip. The
-server revalidates regardless.
-
-Coordinator responses are escaped before rendering, so a hostile or compromised
-API cannot inject markup into the page.
+**03 / manage** exposes `process`, `rescue` and `withdraw`, each signed by the
+session owner's key.

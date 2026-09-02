@@ -148,6 +148,7 @@ forge test
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/health` | GET | Health check |
+| `/stats` | GET | Public counters for the launch page: fills, USDC settled, open orders, last fill, contract address |
 | `/quote?zec_amount=0.5` | GET | Get conversion quote |
 | `/offramp` | POST | Create new offramp session |
 | `/offramp/{id}` | GET | Get session status |
