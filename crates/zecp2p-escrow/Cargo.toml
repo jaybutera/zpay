@@ -1,0 +1,32 @@
+[package]
+name = "zecp2p-escrow"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+zcash_primitives = { version = "0.30", features = ["transparent-inputs", "circuits"] }
+zcash_protocol = { version = "0.10", features = ["local-consensus"] }
+zcash_transparent = { version = "0.10", features = ["transparent-inputs"] }
+zcash_address = "0.13"
+zcash_encoding = "0.5"
+orchard = "0.15"
+secp256k1 = { version = "0.30", features = ["rand", "recovery", "global-context"] }
+secp256k1-zkp = { version = "0.11", features = ["rand", "std"] }
+ripemd = "0.1"
+sha3 = "0.10"
+sha2 = "0.10"
+hex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+hex-literal = "0.4"
+zcash_script = { version = "0.4", features = ["signature-validation", "test-dependencies"] }
+sha3 = "0.10"
+sapling = { package = "sapling-crypto", version = "0.7", features = ["circuit"] }
+jubjub = "0.10"
+bls12_381 = "0.8"

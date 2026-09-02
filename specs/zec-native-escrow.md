@@ -463,3 +463,134 @@ Both:
 - Transparent-pool retirement is a live community proposal with a
   2026-10-28 target and no ZIP. If a ZIP-211-style rule activates, new escrows
   cannot be funded; existing ones are unaffected.
+
+## 12. Phase 0 findings
+
+Recorded 2026-09-02 against `zcash_primitives` 0.30.1, `zcash_protocol` 0.10.5,
+`orchard` 0.15.5, `zcash_script` 0.4.5 and `secp256k1-zkp` 0.11.0. Every claim
+below is pinned by a test in `crates/zecp2p-escrow/tests/`, so a dependency bump
+that changes one fails the suite rather than surfacing on mainnet.
+
+### 12.1 EIP-712 domain and dataHash (closes open item 1)
+
+Read from two live attestations already in the repo,
+`scripts/proof/attestation.json` and `scripts/proof/attestation_4499.json`; no
+new payment was needed.
+
+| Field | Value |
+|---|---|
+| Domain name | `UnifiedPaymentVerifier` |
+| Domain version | `1` |
+| chainId | 8453 |
+| verifyingContract | `0xC6F4a193576C60892a47e111Bb5706c30162502B` |
+| domainSeparator | `0xe27fb63a4c62dd4015ccc6378579f3bb3759a7fc50a072a670cb7d0fc0f164f9` |
+| typeHash | `0x3fbf9df18b1c2ca7c48d809a8d8c6bbf8d7ac33f3741ab78dac072aba0f77103` |
+
+The domain has no `salt`; the four-field EIP-712 domain above reproduces the
+recorded `domainSeparator` exactly. `typeHash` is
+`keccak256("PaymentAttestation(bytes32 intentHash,uint256 releaseAmount,bytes32 dataHash)")`.
+
+**`dataHash` = `keccak256(encodedPaymentDetails)`.** Confirmed on both
+attestations. Three plausible alternatives were checked and rejected: hashing
+the metadata, hashing the concatenation of details and metadata, and hashing the
+ABI encoding of the two hashes. Recovering the signer from the full EIP-712
+digest yields `0xe078d93bfdd87a8c5c5cca5905dcba0dd7a1f0bd`, the pinned enclave
+signer, for both.
+
+`encodedPaymentDetails` is 14 abi words. The attestor's step 2 of 5.5 should
+check the intent binding inside this preimage, not only in `typedDataValue`,
+since it is the preimage that the signature actually commits to:
+
+| Word | Meaning |
+|---|---|
+| 0, 8 | `paymentMethod`, `keccak("venmo")` |
+| 1, 10 | `payeeDetails`, the curator `hashedOnchainId` |
+| 2 | payment id / index (484 in the sample) |
+| 3, 9 | `fiatCurrency` |
+| 4 | payment timestamp, ms |
+| 5 | opaque per-payment digest |
+| 6 | `intentHash` |
+| 7 | `releaseAmount` |
+| 11 | `conversionRate`, 18 decimals |
+| 12 | intent timestamp, seconds |
+| 13 | a window, 1209600 s = 14 days |
+
+`releaseAmount` equalled `intent.amount` in both samples, so the
+`releaseAmount >= usd_amount_6dec` rule of 5.5 step 4 is satisfied with
+equality in the normal case rather than by a margin.
+
+### 12.2 Ironwood is a consensus branch, not an output type (corrects 4.2, 4.4, open item 3)
+
+The spec asks for "a v5 transaction with ... an Ironwood output". As written
+that is not constructible, and the phrase conflates two things:
+
+- **Ironwood is NU6.3**, a consensus branch, id `0x37a5165b`. It is the current
+  mainnet branch, as section 4.3 says.
+- Ironwood *also* names a **separate shielded value pool** (`orchard::ValuePool::Ironwood`),
+  and a transaction carries an Ironwood bundle only at **transaction version 6**.
+  `TxVersion::V5.has_ironwood()` is false.
+
+So: **the shielded refund output in a v5 transaction is an Orchard output.**
+`TxVersion::V5.has_orchard()` is true and V5 remains valid under the NU6.3
+branch, so the spec's v5 mandate stands unchanged; only the pool name in 4.4 and
+open item 3 needs to read Orchard.
+
+A trap this creates: under NU6.3 `Builder::new` defaults to **V6**, not V5. Both
+the user client and the LP must call `propose_version(TxVersion::V5)` explicitly.
+If one side takes the default the two ZIP 244 digests differ, and per 4.6 that
+is a silent funds-lock for the LP.
+
+A v5 transaction with the escrow P2SH outpoint as its input and a transparent
+output builds against the NU6.3 branch; the P2SH input is accepted by
+`add_transparent_p2sh_input`.
+
+### 12.3 The ZIP 317 fee is 15000 zat, not 10000 (corrects section 3 and criterion 6)
+
+Two findings, one blocking:
+
+`zip317::FeeRule` **cannot price a custom P2SH input.** Only the spender knows
+the scriptSig length, so the rule returns `FeeError::UnknownP2shInputs` and
+refuses to guess. The escrow computes its own conventional fee in
+`crates/zecp2p-escrow/src/fees.rs`; that arithmetic is cross-checked against the
+library's rule on inputs the library can size.
+
+With the fee computed, the numbers are not the ones section 3 assumes:
+
+| Transaction | Input size | Logical actions | Fee |
+|---|---|---|---|
+| Release, 1 transparent output | 310 bytes | 3 | **15000 zat** |
+| Refund, 1 shielded output | 233 bytes | 4 | **20000 zat** |
+
+The release input is 310 bytes because its scriptSig carries two 73-byte
+signatures and a 115-byte redeem script; ZIP 317 divides by the 150-byte nominal
+P2PKH input, so it is three logical actions rather than one. Section 3's "a 1-in
+1-out or 1-in 2-out transparent spend is 10000 zat" is true of a P2PKH spend and
+false of this escrow. Acceptance criterion 6 should read `amount_zat - 15000`.
+
+Underpaying is not recoverable: Zcash has no RBF, and section 7 already notes a
+stuck release cannot be bumped. The fee module therefore sizes signatures at
+their 73-byte maximum rather than their typical length.
+
+The redeem script is 115 bytes at present mainnet heights, where `T` encodes in
+three script bytes, and 116 once heights pass 8388608. Both fall in the same fee
+bracket, so no escrow written today changes price at that boundary.
+
+### 12.4 Confirmed unchanged
+
+- The redeem script of 4.1 spends on both branches under the consensus flags a
+  node applies, including `LowS`, `NullDummy`, `MinimalData`, `CleanStack` and
+  `CHECKLOCKTIMEVERIFY`; the refund is rejected at `T - 1` and accepted at `T`.
+- `secp256k1-zkp` 0.11 with `ecdsa_adaptor` is available as 5.3 assumes.
+- The ZIP 244 API differs in shape from the sketch in 4.6: `SignableInput` is an
+  enum whose transparent variant is built with
+  `zcash_transparent::sighash::SignableInput::from_parts(bundle, hash_type,
+  index, script_code, script_pubkey, value)`, which validates the input index
+  against the bundle. The committed fields are as 4.6 describes.
+
+### 12.5 Open after Phase 0
+
+- No `zebrad` or `zcashd` is installed on the build host, and no Zcash RPC
+  endpoint is configured. Phase 1's mempool-acceptance gate needs one; that is
+  the next blocker, not a protocol question.
+- The consensus branch id must still be read from the node at runtime per 4.3.
+  Mainnet was at height 3469623 when this was written, on the NU6.3 branch.
