@@ -341,6 +341,15 @@ where
         reject(status_for(&err), &err.to_string())
     })?;
 
+    // Spec section 6: log the event id and the decision. Never `k`, never the
+    // terms beyond their hash (criterion 14).
+    tracing::info!(
+        event_id = %hex::encode(event_id),
+        terms_hash = %hex::encode(terms.terms_hash()),
+        decision = "announced",
+        "announce"
+    );
+
     Ok(Json(AnnounceResponse {
         event_id: hex::encode(event_id),
         r: hex::encode(r.serialize()),
@@ -411,7 +420,27 @@ where
             "the attestor could not complete the decision",
         )
     })?
-    .map_err(|e| reject(status_for(&e), &e.to_string()))?;
+    .map_err(|e| {
+        tracing::warn!(
+            event_id = %hex::encode(derived),
+            decision = "refused",
+            reason = %e,
+            "attest"
+        );
+        reject(status_for(&e), &e.to_string())
+    })?;
+
+    // Spec section 6: the event id, the decision, and the enclave signature -
+    // and of the attestation payload only the intent hash, the release amount
+    // and the signer.
+    tracing::info!(
+        event_id = %hex::encode(derived),
+        decision = "signed",
+        intent_hash = %req.attestation.intent_hash,
+        release_amount = %req.attestation.release_amount,
+        enclave_signature = %req.attestation.signature,
+        "attest"
+    );
 
     Ok(Json(AttestResponse {
         s: hex::encode(s.secret_bytes()),

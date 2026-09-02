@@ -5,6 +5,14 @@ edition.workspace = true
 license.workspace = true
 description = "Outcome attestor for the ZEC-native escrow: verifies a zk-p2p enclave payment attestation and signs the DLC outcome"
 
+[[bin]]
+name = "zecp2p-attestor"
+path = "src/main.rs"
+
+[lib]
+name = "zecp2p_attestor"
+path = "src/lib.rs"
+
 [features]
 # Exposes decide_against_signer. Tests only; see the escrow crate.
 test-signer = ["zecp2p-escrow/test-signer"]

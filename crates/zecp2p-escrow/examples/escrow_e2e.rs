@@ -36,6 +36,13 @@ use zecp2p_escrow::tx::{build_refund, encode_signature, serialize_refund, Escrow
 
 /// Development keys. Deterministic so a run is reproducible, and refused on
 /// mainnet.
+///
+/// R5-7 is right that these are public: an escrow funded at the address `plan`
+/// prints with them is spendable by anyone through the 2-of-2 branch, at any
+/// height. That is acceptable for watching a refund confirm on testnet and is
+/// **not** acceptable for criterion 12, where the point is that a fabricated
+/// `s` fails - with both keys public there is nothing to fabricate. The tool
+/// warns on every run that uses them.
 const DEV_U: [u8; 32] = [0x11; 32];
 const DEV_L: [u8; 32] = [0x22; 32];
 
@@ -104,6 +111,21 @@ fn p2pkh_from_t_addr(addr: &str) -> Vec<u8> {
     let mut full = vec![0u8; zeros];
     full.extend(num.iter().rev());
     assert!(full.len() >= 26, "address too short: {addr}");
+
+    // R5-7: check the trailing four bytes against the double-SHA256 of the
+    // payload. Without this a single mistyped character sends the refund to a
+    // hash nobody holds - TAZ on the testnet run, the escrow on the mainnet one.
+    let (payload, checksum) = full.split_at(full.len() - 4);
+    let expected = {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(Sha256::digest(payload))
+    };
+    assert_eq!(
+        checksum,
+        &expected[..4],
+        "address checksum does not match; {addr} is mistyped"
+    );
+
     let hash = &full[2..22];
 
     // t1/tm are P2PKH; t3/t2 are P2SH.
@@ -143,6 +165,14 @@ fn main() {
         Network::Main => AddressNetwork::Main,
         Network::Test => AddressNetwork::Test,
     };
+
+    if u_dev || l_dev {
+        eprintln!(
+            "WARNING: using public development keys. Anyone can spend an escrow funded at \
+             this address through the 2-of-2 branch. Fine for watching a refund confirm; \
+             not valid for criterion 12, which needs a secret to fabricate against."
+        );
+    }
 
     let height = retry("height", || chain.height());
     let branch = retry("branch", || chain.consensus_branch_id());

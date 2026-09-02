@@ -47,6 +47,13 @@ fn an_escrow_below_the_dust_and_fee_floor_is_refused() {
             minimum: MINIMUM_ESCROW_ZAT
         }
     );
+
+    // The floor is 0.001 ZEC *above fees* (R5-8), so 100000 flat is refused.
+    assert!(matches!(
+        AcceptedQuote::at_identity_rate(1_000_000, PAYEE, 3_500_000, l_pub(), 100_000),
+        Err(QuoteError::BelowMinimum { .. })
+    ));
+    assert_eq!(MINIMUM_ESCROW_ZAT, 120_000);
     // And exactly at the floor it is accepted, so the boundary is not off by one.
     AcceptedQuote::at_identity_rate(1_000_000, PAYEE, 3_500_000, l_pub(), MINIMUM_ESCROW_ZAT)
         .unwrap();

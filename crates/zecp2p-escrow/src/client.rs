@@ -210,11 +210,14 @@ pub enum QuoteError {
     BadLpKey,
 }
 
-/// The minimum escrow, spec section 3: 0.001 ZEC above fees.
+/// The minimum escrow, spec section 3: "0.001 ZEC above fees".
 ///
-/// 100000 zat is 0.001 ZEC, and the release fee is 15000 (spec 12.3), so this
-/// floor leaves the escrow spendable rather than dust.
-pub const MINIMUM_ESCROW_ZAT: u64 = 100_000;
+/// R5-8: this was 100000 flat, which is 0.001 ZEC and not 0.001 ZEC *above
+/// fees*. The larger of the two fees is the shielded refund at 20000 zat (spec
+/// 12.3), so the floor is 0.001 ZEC plus that. Nothing broke at the old value -
+/// an escrow there still released 85000 - but the constant now says what the
+/// spec says.
+pub const MINIMUM_ESCROW_ZAT: u64 = 100_000 + 20_000;
 
 impl AcceptedQuote {
     /// Builds a quote, refusing anything the protocol cannot honour.
