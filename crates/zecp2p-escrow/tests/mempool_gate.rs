@@ -57,6 +57,10 @@ fn client() -> Option<RpcChainClient> {
     let url = std::env::var("ZECP2P_RPC_URL").ok()?;
     let mut config = RpcConfig::public(url, Network::Test);
     config.timeout = Duration::from_secs(45);
+    // R7-6: zebra sits on a sendrawtransaction whose input it cannot find for
+    // 60 s before answering. A shorter budget turns the node's verdict - which
+    // is the whole point of these tests - into a client timeout.
+    config.broadcast_timeout = Duration::from_secs(120);
     RpcChainClient::new(config).ok()
 }
 

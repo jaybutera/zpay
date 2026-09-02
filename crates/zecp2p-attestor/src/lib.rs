@@ -674,6 +674,17 @@ fn decide_and_sign_with_signer(
         .ok_or(AttestorError::UnknownEvent)?;
     let already_signed = event.signed_s;
 
+    // R7-7: `attest_decide_and_sign` is public and takes a `ChainObservation`,
+    // so a caller could hand back a recency bound of its own choosing - the
+    // round 2 finding 2 shape. Narrow it here, where the row is already in
+    // hand, so no caller can widen it whatever it passes.
+    let observation = &ChainObservation {
+        earliest_acceptable_payment_ms: observation
+            .earliest_acceptable_payment_ms
+            .max(event.announced_at_ms),
+        ..observation.clone()
+    };
+
     let details = PaymentDetails::decode(encoded_payment_details)?;
     let nullifier = payment_nullifier(&details);
     let already_consumed = db

@@ -98,3 +98,19 @@ pub fn release_fee_to_transparent_zat(redeem_script_len: usize) -> u64 {
 pub fn refund_fee_to_shielded_zat(redeem_script_len: usize) -> u64 {
     conventional_fee_zat(refund_input_size(redeem_script_len), 0, 2)
 }
+
+/// The fee for a refund paying a single transparent output.
+///
+/// R7-2: the runner used the shielded number on a transparent refund and
+/// overpaid by 10000 zat. A regtest node's floor for that shape is two logical
+/// actions. The shielded number becomes the right one when the refund of spec
+/// 4.4 actually pays a shielded output, which needs the wallet tooling
+/// `funding.rs` describes; until then paying it is paying for actions the
+/// transaction does not have.
+pub fn refund_fee_to_transparent_zat(redeem_script_len: usize) -> u64 {
+    conventional_fee_zat(
+        refund_input_size(redeem_script_len),
+        P2PKH_STANDARD_OUTPUT_SIZE,
+        0,
+    )
+}

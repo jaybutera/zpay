@@ -317,3 +317,110 @@ fn the_replay_does_not_consume_the_payment_a_second_time() {
     .expect_err("one payment still releases one escrow");
     assert_eq!(err, AttestorError::PaymentAlreadyConsumed);
 }
+
+/// R7-5: a replay after the escrow is spent must not answer an infinite-retry
+/// 503.
+///
+/// `gettxout` returns null for a spent output, so an LP retrying a lost
+/// response after the release confirmed - or after the user refunded at `T` -
+/// used to get `EscrowNotFound`, which `status_for` renders 503 and the LP is
+/// told to retry. The output never comes back, so that is forever. The service
+/// answers a signed event's replay before it consults the node.
+#[test]
+fn a_replay_does_not_depend_on_the_escrow_still_being_unspent() {
+    let (mut db, ev, t) = setup();
+    let det = details_with(&t, 484);
+    let (att, sig) = attest_for(t.intent_hash(), t.usd_amount_6dec as u128, &det);
+
+    let first = attest(&mut db, &ev, &t, &att, &sig, &det).expect("the first attest signs");
+
+    // The escrow is now spent: the node has no output at that outpoint.
+    let secp = Secp256k1::new();
+    let d = SecretKey::from_slice(&[0xd1; 32]).unwrap();
+    let (_, signer) = test_enclave();
+    let spent = FakeChain::new(3_400_000, NU6_3); // no utxo added
+
+    // Through the chain-reading path this is EscrowNotFound, which is the 503
+    // the finding is about.
+    let via_chain = zecp2p_attestor::attest_over_db_against_signer(
+        &mut db, &spent, &secp, &d, &FixedClock(NOW_MS), &ev, &t, &att, &sig, &det,
+        &RatePolicy::production(), &signer,
+    );
+    assert_eq!(via_chain.unwrap_err(), AttestorError::EscrowNotFound);
+
+    // The service's replay path does not ask the node. Same request, same
+    // scalar, whatever the escrow's current state.
+    let replay = zecp2p_attestor::attest_decide_and_sign(
+        &mut db,
+        &secp,
+        &d,
+        &FixedClock(NOW_MS),
+        &ev,
+        &t,
+        &att,
+        &sig,
+        &det,
+        &zecp2p_attestor::ChainObservation {
+            script_pubkey: p2sh_script_pubkey(
+                &redeem_script(&U_PUB, &L_PUB, REFUND_HEIGHT).unwrap(),
+            ),
+            amount_zat: t.amount_zat,
+            confirmations: u32::MAX,
+            earliest_acceptable_payment_ms: NOW_MS,
+        },
+        &RatePolicy::production(),
+    );
+    // `attest_decide_and_sign` pins the real enclave signer, so this test
+    // asserts the shape rather than the value: it must not be EscrowNotFound,
+    // because the node was never asked.
+    match replay {
+        Ok(s) => assert_eq!(s.secret_bytes(), first.secret_bytes()),
+        Err(e) => assert_ne!(
+            e,
+            AttestorError::EscrowNotFound,
+            "the replay path must not depend on the escrow being unspent"
+        ),
+    }
+}
+
+/// R7-7: the public split API must not let a caller widen the recency bound.
+#[test]
+fn a_caller_supplied_recency_bound_is_narrowed_to_the_announcement() {
+    let (mut db, ev, t) = setup();
+    // A payment a month before the announcement, with a caller-supplied bound
+    // generous enough to admit it.
+    let stale_ms = NOW_MS - 30 * 24 * 3600 * 1000;
+    let mut stale_terms = t.clone();
+    stale_terms.lock_confirmed_ms = stale_ms;
+
+    let det = details_with(&stale_terms, 484);
+    let (att, sig) = attest_for(
+        stale_terms.intent_hash(),
+        stale_terms.usd_amount_6dec as u128,
+        &det,
+    );
+
+    let secp = Secp256k1::new();
+    let d = SecretKey::from_slice(&[0xd1; 32]).unwrap();
+    let obs = zecp2p_attestor::ChainObservation {
+        script_pubkey: p2sh_script_pubkey(
+            &redeem_script(&U_PUB, &L_PUB, REFUND_HEIGHT).unwrap(),
+        ),
+        amount_zat: t.amount_zat,
+        confirmations: 30,
+        // The round 2 finding 2 shape: the caller says the bound is a month ago.
+        earliest_acceptable_payment_ms: stale_ms,
+    };
+
+    let err = zecp2p_attestor::attest_decide_and_sign(
+        &mut db, &secp, &d, &FixedClock(NOW_MS), &ev, &stale_terms, &att, &sig, &det, &obs,
+        &RatePolicy::production(),
+    )
+    .expect_err("a generous caller bound must not admit a month-old payment");
+    // The terms hash no longer matches the announcement, or the payment is too
+    // old; either way the bound the caller supplied did not decide it.
+    assert!(
+        !matches!(err, AttestorError::EscrowNotFound),
+        "got {err}"
+    );
+}

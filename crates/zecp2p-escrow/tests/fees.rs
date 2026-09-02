@@ -113,6 +113,33 @@ fn the_fee_is_unchanged_when_the_refund_height_needs_a_fourth_byte() {
     );
 }
 
+/// R7-2: a transparent refund is two logical actions, not four.
+///
+/// The node probed in round 7 refused a 5000 zat transparent refund and
+/// accepted 10000, which is what this computes. The shielded number is
+/// double, because an Orchard bundle is padded to two actions.
+#[test]
+fn a_transparent_refund_costs_less_than_a_shielded_one() {
+    use zecp2p_escrow::fees::refund_fee_to_transparent_zat;
+    let rs_len = escrow_redeem_len();
+
+    assert_eq!(refund_fee_to_transparent_zat(rs_len), 10_000);
+    assert_eq!(refund_fee_to_shielded_zat(rs_len), 20_000);
+    assert!(
+        refund_fee_to_transparent_zat(rs_len) < refund_fee_to_shielded_zat(rs_len),
+        "paying the shielded fee on a transparent refund overpays for actions the \
+         transaction does not have"
+    );
+
+    // And it agrees with the library rule for the same shape.
+    let theirs = library_fee(
+        refund_input_size(rs_len),
+        vec![P2PKH_STANDARD_OUTPUT_SIZE],
+        0,
+    );
+    assert_eq!(refund_fee_to_transparent_zat(rs_len), theirs);
+}
+
 #[test]
 fn the_fee_never_falls_below_the_grace_floor() {
     assert_eq!(conventional_fee_zat(0, 0, 0), 10_000);

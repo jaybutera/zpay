@@ -300,9 +300,9 @@ impl SqliteEventStore {
         // Truncate the WAL so the pre-update page holding `k` is not left
         // readable in it. With `secure_delete` on, the main-file cell is
         // overwritten; this deals with the copy in the log (R5-2).
-        let _ = self
-            .conn
-            .pragma_update(None, "wal_checkpoint", "TRUNCATE");
+        // R7-3: this used to run its own pragma and discard the result, so the
+        // R6-5 warning never fired on the one path the finding was about.
+        self.checkpoint_wal();
         Ok(s)
     }
 

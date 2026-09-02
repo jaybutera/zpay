@@ -48,6 +48,16 @@ impl Network {
     }
 }
 
+/// How long to wait on a `sendrawtransaction` whose input the node cannot find.
+///
+/// R7-6: zebra holds such a submission for 60 s before answering `could not
+/// find transparent input UTXO`, and the adapter's 30 s default timed out
+/// first. That is not a corner case: an LP broadcasting a release against a
+/// node one block behind the funding transaction hits exactly this, and reads
+/// a timeout instead of the node's answer. Broadcast therefore gets its own,
+/// longer budget.
+pub const DEFAULT_BROADCAST_TIMEOUT: Duration = Duration::from_secs(90);
+
 #[derive(Debug, Clone)]
 pub struct RpcConfig {
     pub url: String,
@@ -58,7 +68,11 @@ pub struct RpcConfig {
     /// `x-api-key`.
     pub api_key_header: Option<(String, String)>,
     pub network: Network,
+    /// Budget for reads.
     pub timeout: Duration,
+    /// Budget for `sendrawtransaction`, which a node may sit on far longer
+    /// than a read. See [`DEFAULT_BROADCAST_TIMEOUT`].
+    pub broadcast_timeout: Duration,
 }
 
 impl RpcConfig {
@@ -71,6 +85,7 @@ impl RpcConfig {
             api_key_header: None,
             network,
             timeout: Duration::from_secs(30),
+            broadcast_timeout: DEFAULT_BROADCAST_TIMEOUT,
         }
     }
 
@@ -84,6 +99,7 @@ impl RpcConfig {
             api_key_header: None,
             network,
             timeout: Duration::from_secs(30),
+            broadcast_timeout: DEFAULT_BROADCAST_TIMEOUT,
         }
     }
 }
@@ -91,6 +107,9 @@ impl RpcConfig {
 pub struct RpcChainClient {
     config: RpcConfig,
     http: reqwest::blocking::Client,
+    /// A second client with the longer broadcast budget, so a read cannot
+    /// inherit it and a broadcast cannot be cut short by the read budget.
+    broadcast_http: reqwest::blocking::Client,
     /// Set once the endpoint has confirmed it serves the configured network, so
     /// the check happens automatically rather than relying on a caller to
     /// remember it (round 2 finding 6).
@@ -161,9 +180,14 @@ impl RpcChainClient {
             .timeout(config.timeout)
             .build()
             .map_err(|e| ChainError::Unreachable(e.to_string()))?;
+        let broadcast_http = reqwest::blocking::Client::builder()
+            .timeout(config.broadcast_timeout)
+            .build()
+            .map_err(|e| ChainError::Unreachable(e.to_string()))?;
         Ok(Self {
             config,
             http,
+            broadcast_http,
             network_checked: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -204,6 +228,15 @@ impl RpcChainClient {
         method: &str,
         params: serde_json::Value,
     ) -> Result<T, ChainError> {
+        self.call_with(&self.http, method, params)
+    }
+
+    fn call_with<T: serde::de::DeserializeOwned>(
+        &self,
+        http: &reqwest::blocking::Client,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<T, ChainError> {
         let body = serde_json::json!({
             "jsonrpc": "1.0",
             "id": "zecp2p",
@@ -211,7 +244,7 @@ impl RpcChainClient {
             "params": params,
         });
 
-        let mut req = self.http.post(&self.config.url).json(&body);
+        let mut req = http.post(&self.config.url).json(&body);
         if let (Some(u), Some(p)) = (&self.config.user, &self.config.password) {
             req = req.basic_auth(u, Some(p));
         }
@@ -390,8 +423,11 @@ impl ChainClient for RpcChainClient {
 
     fn broadcast(&self, raw_tx: &[u8]) -> Result<[u8; 32], ChainError> {
         self.ensure_network()?;
-        let txid: String =
-            self.call("sendrawtransaction", serde_json::json!([hex::encode(raw_tx)]))?;
+        let txid: String = self.call_with(
+            &self.broadcast_http,
+            "sendrawtransaction",
+            serde_json::json!([hex::encode(raw_tx)]),
+        )?;
         rpc_hex_to_txid(&txid)
     }
 }

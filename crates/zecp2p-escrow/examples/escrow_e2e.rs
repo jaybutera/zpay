@@ -28,7 +28,7 @@ use secp256k1::{Message, PublicKey, Secp256k1, SecretKey};
 use zecp2p_escrow::chain::{ChainClient, ChainError};
 use zecp2p_escrow::deadlines::EscrowPolicy;
 use zecp2p_escrow::depth::required_depth;
-use zecp2p_escrow::fees::refund_fee_to_shielded_zat;
+use zecp2p_escrow::fees::refund_fee_to_transparent_zat;
 use zecp2p_escrow::funding::{escrow_address, AddressNetwork};
 use zecp2p_escrow::rpc::{Network, RpcChainClient, RpcConfig};
 use zecp2p_escrow::script::refund_script_sig;
@@ -284,8 +284,10 @@ fn main() {
             );
 
             // A transparent destination, because the shielded output of spec
-            // 4.4 needs the wallet tooling described in funding.rs.
-            let fee = refund_fee_to_shielded_zat(redeem.len());
+            // 4.4 needs the wallet tooling described in funding.rs - so the
+            // fee is the transparent one. Paying the shielded number here
+            // overpays for actions the transaction does not have (R7-2).
+            let fee = refund_fee_to_transparent_zat(redeem.len());
             let out_script = p2pkh_from_t_addr(dest);
             let unsigned = build_refund(&terms, &out_script, fee).expect("build refund");
             let digest = unsigned.sighash().expect("sighash");

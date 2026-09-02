@@ -28,7 +28,7 @@ use zecp2p_escrow::payment_details::RatePolicy;
 use zecp2p_escrow::terms::CanonicalTerms;
 
 use crate::db::SqliteEventStore;
-use crate::{AttestorError, Clock};
+use crate::{AttestorError, ChainObservation, Clock};
 
 /// Everything the service holds. `d` never leaves it.
 pub struct AttestorService<C, K> {
@@ -367,7 +367,13 @@ where
                     outcome: zecp2p_escrow::dlc::OUTCOME_PAID,
                 }));
             }
-            _ => return Err(reject(status_for(&err), &err.to_string())),
+            _ => {
+                tracing::warn!(
+                    event_id = %hex::encode(event_id),
+                    decision = "refused", reason = %err, "announce"
+                );
+                return Err(reject(status_for(&err), &err.to_string()));
+            }
         }
     }
 
@@ -443,6 +449,76 @@ where
     })?
     .map_err(|e| reject(status_for(&e), &e.to_string()))?;
 
+    // 1b. R7-5: an exact replay of an already-signed event is answered before
+    //     the node is consulted. `gettxout` returns null for a spent output, so
+    //     an LP retrying a lost response after the escrow was released or
+    //     refunded used to get a 503 it is told to retry - forever, since the
+    //     output never comes back. The scalar already exists and the request
+    //     still has to prove it is the same one, which phase 3 checks.
+    if event.signed_s.is_some() {
+        let svc_r = svc.clone();
+        let terms_r = terms.clone();
+        let att_r = attestation.clone();
+        let sig_r = signature.clone();
+        let det_r = details.clone();
+        let announced = event.announced_at_ms;
+        let replay = tokio::task::spawn_blocking(move || {
+            let mut db = svc_r.db.blocking_lock();
+            // A signed event's observation cannot change the outcome of a
+            // replay: every check a replay must pass is about the request and
+            // the row. Feed the recorded escrow facts back in.
+            let obs = ChainObservation {
+                script_pubkey: zecp2p_escrow::script::p2sh_script_pubkey(
+                    &zecp2p_escrow::script::redeem_script(
+                        &terms_r.u_pub,
+                        &terms_r.l_pub,
+                        terms_r.refund_height,
+                    )
+                    .ok()?,
+                ),
+                amount_zat: terms_r.amount_zat,
+                confirmations: u32::MAX,
+                earliest_acceptable_payment_ms: announced,
+            };
+            Some(crate::attest_decide_and_sign(
+                &mut db,
+                &svc_r.secp,
+                &svc_r.d,
+                &svc_r.clock,
+                &derived,
+                &terms_r,
+                &att_r,
+                &sig_r,
+                &det_r,
+                &obs,
+                &RatePolicy::production(),
+            ))
+        })
+        .await
+        .ok()
+        .flatten();
+
+        if let Some(result) = replay {
+            return match result {
+                Ok(s) => {
+                    tracing::info!(
+                        event_id = %hex::encode(derived), decision = "replayed", "attest"
+                    );
+                    Ok(Json(AttestResponse {
+                        s: hex::encode(s.secret_bytes()),
+                    }))
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        event_id = %hex::encode(derived), decision = "refused",
+                        phase = "replay", reason = %e, "attest"
+                    );
+                    Err(reject(status_for(&e), &e.to_string()))
+                }
+            };
+        }
+    }
+
     // 2. Without the lock, ask the node about the escrow.
     let svc2 = svc.clone();
     let terms2 = terms.clone();
@@ -452,12 +528,22 @@ where
     })
     .await
     .map_err(|_| {
+        tracing::warn!(
+            event_id = %hex::encode(derived), decision = "refused",
+            phase = "chain", "attest"
+        );
         reject(
             StatusCode::SERVICE_UNAVAILABLE,
             "the attestor could not reach its node",
         )
     })?
-    .map_err(|e| reject(status_for(&e), &e.to_string()))?;
+    .map_err(|e| {
+        tracing::warn!(
+            event_id = %hex::encode(derived), decision = "refused",
+            phase = "chain", reason = %e, "attest"
+        );
+        reject(status_for(&e), &e.to_string())
+    })?;
 
     // 3. Under the lock again, decide and sign. A request that raced us between
     //    phases loses at the commit, not here: the signing transaction's

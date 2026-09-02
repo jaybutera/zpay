@@ -440,8 +440,9 @@ Paid path:
    at least 1000000.
 5. The attestor returns `s` with `s*G == Y` for the announced `R`.
 6. The release tx confirms with scriptSig `OP_0 <sig_u> <sig_l> OP_1
-   <redeemScript>`, both signatures low-S, and pays `amount_zat - 10000` to
-   the LP output. `recover(sig_u, pre_sig, Y)` reproduces `s`.
+   <redeemScript>`, both signatures low-S, and pays `amount_zat - 15000` to
+   the LP output. (12.3 corrected the fee from 10000; a regtest zebra has since
+   refused the same release at 10000 and accepted it at 15000.) `recover(sig_u, pre_sig, Y)` reproduces `s`.
 7. The release confirms before `BROADCAST_DEADLINE`.
 8. A second `/attest` for the same `event_id` is refused.
 
@@ -690,9 +691,8 @@ two signatures under one nonce expose `d`.
 
 ### 13.3 Still not built
 
-- Any RPC adapter. Phase 1's mempool gate and criterion 12's mempool rejection
-  remain unmet, and the script-level evidence is not a substitute for a node
-  accepting or refusing a transaction.
+- The shielded refund output of 4.4, which is why the runner pays a transparent
+  one and uses the transparent fee.
 - The funding transaction of 4.2: a shielded spend needs a wallet, note
   management and the Orchard proving path. `tx.rs` builds only the two
   transactions that spend the escrow.
