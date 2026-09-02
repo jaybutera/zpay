@@ -190,6 +190,105 @@ pub struct AcceptedQuote {
     pub amount_zat: u64,
 }
 
+/// Why a quote was refused.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum QuoteError {
+    #[error("the escrow amount is zero")]
+    ZeroAmount,
+    #[error("the escrow holds {amount_zat} zat, below the {minimum} zat floor")]
+    BelowMinimum { amount_zat: u64, minimum: u64 },
+    #[error("the quote pays nothing")]
+    ZeroPayout,
+    #[error(
+        "rate {got} is not the identity rate {expected}; for a ZEC escrow the enclave's \
+         releaseAmount only means dollars at the identity rate (spec 16.3)"
+    )]
+    NonIdentityRate { got: u128, expected: u128 },
+    #[error("refund height {got} is outside the usable range 1..={max}")]
+    RefundHeightOutOfRange { got: u64, max: u64 },
+    #[error("the LP public key is not a valid compressed secp256k1 point")]
+    BadLpKey,
+}
+
+/// The minimum escrow, spec section 3: 0.001 ZEC above fees.
+///
+/// 100000 zat is 0.001 ZEC, and the release fee is 15000 (spec 12.3), so this
+/// floor leaves the escrow spendable rather than dust.
+pub const MINIMUM_ESCROW_ZAT: u64 = 100_000;
+
+impl AcceptedQuote {
+    /// Builds a quote, refusing anything the protocol cannot honour.
+    ///
+    /// Round 4 finding 4: a client builds these, and every field is one the
+    /// user is committing to. A zero amount, a rate that is not the identity
+    /// rate, or a timeout the client can never reach are all refusable here
+    /// rather than several layers down, where the error would name a
+    /// consequence instead of the cause.
+    pub fn new(
+        usd_amount_6dec: u64,
+        payee_hash: [u8; 32],
+        rate_18dec: u128,
+        refund_height: u64,
+        l_pub: [u8; 33],
+        amount_zat: u64,
+    ) -> Result<Self, QuoteError> {
+        if amount_zat == 0 {
+            return Err(QuoteError::ZeroAmount);
+        }
+        if amount_zat < MINIMUM_ESCROW_ZAT {
+            return Err(QuoteError::BelowMinimum {
+                amount_zat,
+                minimum: MINIMUM_ESCROW_ZAT,
+            });
+        }
+        if usd_amount_6dec == 0 {
+            return Err(QuoteError::ZeroPayout);
+        }
+        if rate_18dec != crate::payment_details::IDENTITY_RATE_18DEC {
+            return Err(QuoteError::NonIdentityRate {
+                got: rate_18dec,
+                expected: crate::payment_details::IDENTITY_RATE_18DEC,
+            });
+        }
+        if refund_height == 0 || refund_height > MAX_REFUND_HEIGHT {
+            return Err(QuoteError::RefundHeightOutOfRange {
+                got: refund_height,
+                max: MAX_REFUND_HEIGHT,
+            });
+        }
+        // A key that is not a point makes an unspendable escrow, and the user
+        // would discover it at `T` and not before.
+        PublicKey::from_slice(&l_pub).map_err(|_| QuoteError::BadLpKey)?;
+
+        Ok(Self {
+            usd_amount_6dec,
+            payee_hash,
+            rate_18dec,
+            refund_height,
+            l_pub,
+            amount_zat,
+        })
+    }
+
+    /// A quote at the identity rate, which is the only rate a ZEC escrow uses.
+    pub fn at_identity_rate(
+        usd_amount_6dec: u64,
+        payee_hash: [u8; 32],
+        refund_height: u64,
+        l_pub: [u8; 33],
+        amount_zat: u64,
+    ) -> Result<Self, QuoteError> {
+        Self::new(
+            usd_amount_6dec,
+            payee_hash,
+            crate::payment_details::IDENTITY_RATE_18DEC,
+            refund_height,
+            l_pub,
+            amount_zat,
+        )
+    }
+}
+
 /// The attestor announcement the user receives (spec 5.1).
 #[derive(Debug, Clone)]
 pub struct Announcement {

@@ -452,9 +452,9 @@ fn map_store_error(e: store::StoreError) -> AttestorError {
         store::StoreError::UnknownEvent => AttestorError::UnknownEvent,
         store::StoreError::AlreadySigned => AttestorError::AlreadySigned,
         store::StoreError::PaymentAlreadyConsumed => AttestorError::PaymentAlreadyConsumed,
-        store::StoreError::DuplicateEvent | store::StoreError::DuplicateFundingTx => {
-            AttestorError::DuplicateAnnouncement
-        }
+        store::StoreError::DuplicateEvent
+        | store::StoreError::DuplicateFundingTx
+        | store::StoreError::DuplicateNoncePoint => AttestorError::DuplicateAnnouncement,
     }
 }
 
@@ -495,11 +495,42 @@ impl Clock for FixedClock {
 
 /// The `/announce` handler, spec 5.1.
 ///
-/// Stamps `announced_at_ms` from the handler's own clock, refuses a zero stamp,
-/// and checks that the requested `event_id` is the one this outpoint actually
+/// Draws the nonce itself from the OS RNG (round 4 finding 1), stamps
+/// `announced_at_ms` from the handler's own clock, refuses a zero stamp, and
+/// checks that the requested `event_id` is the one this outpoint actually
 /// produces - so a caller cannot announce under an id belonging to a different
 /// escrow and have the store's later checks compare against the wrong row.
+///
+/// `k` is never a parameter. Spec section 6 requires it be generated per event
+/// from the OS RNG and never derived from `d`; a caller-supplied nonce is a
+/// caller-supplied opportunity to repeat one, and two signatures under one
+/// nonce publish `d`.
 pub fn handle_announce(
+    store: &mut store::EventStore,
+    secp: &Secp256k1<secp256k1_zkp::All>,
+    clock: &impl Clock,
+    event_id: &[u8; 32],
+    terms: &CanonicalTerms,
+) -> Result<PublicKey, AttestorError> {
+    let k = SecretKey::new(&mut secp256k1_zkp::rand::thread_rng());
+    announce_with_nonce(store, secp, clock, event_id, terms, &k)
+}
+
+/// As [`handle_announce`], with the nonce supplied. Test-only: a production
+/// announcement draws its own.
+#[cfg(feature = "test-signer")]
+pub fn handle_announce_with_nonce(
+    store: &mut store::EventStore,
+    secp: &Secp256k1<secp256k1_zkp::All>,
+    clock: &impl Clock,
+    event_id: &[u8; 32],
+    terms: &CanonicalTerms,
+    k: &SecretKey,
+) -> Result<PublicKey, AttestorError> {
+    announce_with_nonce(store, secp, clock, event_id, terms, k)
+}
+
+fn announce_with_nonce(
     store: &mut store::EventStore,
     secp: &Secp256k1<secp256k1_zkp::All>,
     clock: &impl Clock,

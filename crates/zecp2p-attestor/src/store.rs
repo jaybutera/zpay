@@ -44,6 +44,11 @@ pub enum StoreError {
     AlreadySigned,
     #[error("this payment has already released another escrow")]
     PaymentAlreadyConsumed,
+    #[error(
+        "this nonce point has already been announced for another event; two signatures under \
+         one nonce publish the attestor's long-lived key"
+    )]
+    DuplicateNoncePoint,
 }
 
 /// A nonce bound to the event it was drawn for.
@@ -98,6 +103,14 @@ pub struct EventStore {
     /// releases one escrow, so this set is what stops an LP presenting a single
     /// attestation against several escrows for the same user.
     consumed_payments: HashMap<[u8; 32], [u8; 32]>,
+    /// Every nonce point ever announced.
+    ///
+    /// Round 4 finding 1: a repeated `R` means a repeated `k`, and two outcome
+    /// signatures under one nonce let anyone solve for `d` from the two
+    /// published scalars - which the escrow crate's `dlc` tests demonstrate.
+    /// The RNG makes a collision negligible; this makes it impossible, which is
+    /// the right posture for the one failure that is unrecoverable.
+    announced_nonce_points: HashMap<[u8; 33], [u8; 32]>,
 }
 
 impl core::fmt::Debug for EventStore {
@@ -107,6 +120,7 @@ impl core::fmt::Debug for EventStore {
             // The count only. A nonce must not reach a log even as bytes.
             .field("nonces_held", &self.nonces.len())
             .field("consumed_payments", &self.consumed_payments.len())
+            .field("announced_nonce_points", &self.announced_nonce_points.len())
             .finish()
     }
 }
@@ -134,6 +148,9 @@ impl EventStore {
         if self.funding.contains_key(&funding_txid) {
             return Err(StoreError::DuplicateFundingTx);
         }
+        if self.announced_nonce_points.contains_key(&r) {
+            return Err(StoreError::DuplicateNoncePoint);
+        }
         self.events.insert(
             event_id,
             Event {
@@ -148,6 +165,7 @@ impl EventStore {
         );
         self.nonces.insert(event_id, k);
         self.funding.insert(funding_txid, event_id);
+        self.announced_nonce_points.insert(r, event_id);
         Ok(())
     }
 
