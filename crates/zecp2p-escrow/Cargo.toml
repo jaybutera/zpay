@@ -12,8 +12,8 @@ zcash_transparent = { version = "0.10", features = ["transparent-inputs"] }
 zcash_address = "0.13"
 zcash_encoding = "0.5"
 orchard = "0.15"
-secp256k1 = { version = "0.30", features = ["rand", "recovery", "global-context"] }
-secp256k1-zkp = { version = "0.11", features = ["rand", "std"] }
+secp256k1 = { version = "0.30", features = ["rand", "recovery", "global-context", "hashes"] }
+secp256k1-zkp = { version = "0.11", features = ["rand", "rand-std", "std", "hashes", "global-context"] }
 ripemd = "0.1"
 sha3 = "0.10"
 sha2 = "0.10"
