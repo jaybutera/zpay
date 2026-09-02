@@ -87,13 +87,21 @@ session owner's key.
 ./scripts/deploy-site.sh
 ```
 
-Live at <https://d2acgjt7j1yqe8.cloudfront.net/>.
+Live at <https://zpay.cash/>, with `www.zpay.cash` serving the same
+distribution. The CloudFront domain <https://d2acgjt7j1yqe8.cloudfront.net/>
+still answers and is what the deploy script prints.
 
 The site is a private S3 bucket (`zpay-site-<account-id>`) behind CloudFront
 distribution `<distribution-id>`, which reads it through an origin access
 control; the bucket denies everything else, so the S3 URLs are not reachable.
-Viewers get HTTPS on the default `*.cloudfront.net` certificate, and CloudFront
-compresses text on the way out.
+Both hostnames are alternate domain names on the distribution, so CloudFront
+terminates TLS for them with an ACM certificate in `us-east-1` (certificates
+for CloudFront must live in that region regardless of where anything else
+runs). DNS is Cloudflare, and the two records are CNAMEs to the distribution
+set to DNS-only: proxying them would put Cloudflare's certificate in front
+and hide CloudFront's. The default `*.cloudfront.net` certificate still
+covers the distribution's own domain. CloudFront compresses text on the way
+out.
 
 The script syncs in four passes, because the `Cache-Control` differs by file
 and `aws s3 sync` sets one value per invocation:
