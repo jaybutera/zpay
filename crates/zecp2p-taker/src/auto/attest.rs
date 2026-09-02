@@ -81,6 +81,14 @@ pub struct Attestation {
     pub domain_separator: String,
     #[serde(rename = "typedDataValue")]
     pub typed_data_value: TypedDataValue,
+    /// The `data` field of the on-chain `PaymentAttestation`. `dataHash` is its
+    /// keccak256, which is what the enclave actually signed over.
+    #[serde(rename = "encodedPaymentDetails", default)]
+    pub encoded_payment_details: String,
+    /// Carried through unsigned; the verifier reads it but the witnesses do not
+    /// sign it.
+    #[serde(default)]
+    pub metadata: String,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]

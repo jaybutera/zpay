@@ -31,6 +31,7 @@
 //! itself, which is a live credential a human has to supply.
 
 use alloy::primitives::{Bytes, B256};
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
 
@@ -119,12 +120,102 @@ impl ProofStatus {
 pub fn load_proof(path: &str) -> anyhow::Result<AttestedProof> {
     let contents = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("could not read proof file '{path}': {e}"))?;
-    let proof: AttestedProof = serde_json::from_str(&contents)
-        .map_err(|e| anyhow::anyhow!("'{path}' is not an attestation export: {e}"))?;
-    if proof.payment_proof.is_empty() {
-        anyhow::bail!("'{path}' contains an empty payment proof");
+
+    // Two shapes reach this function. The pre-encoded `{payment_proof, ...}`
+    // form is what the daemon used to hand around; the enclave and the `attest`
+    // subcommand write the prover's own export instead, and until 2026-09-02
+    // nothing turned one into the other, so `fulfill --proof` could not consume
+    // the file `attest --out` had just written. Accept both, and do the ABI
+    // encoding here rather than making the operator do it by hand.
+    if let Ok(proof) = serde_json::from_str::<AttestedProof>(&contents) {
+        if proof.payment_proof.is_empty() {
+            anyhow::bail!("'{path}' contains an empty payment proof");
+        }
+        return Ok(proof);
     }
-    Ok(proof)
+
+    let export: crate::auto::attest::AttestationFile = serde_json::from_str(&contents)
+        .map_err(|e| anyhow::anyhow!("'{path}' is not an attestation export: {e}"))?;
+    encode_attestation(&export)
+        .with_context(|| format!("could not encode the attestation in '{path}' for fulfillIntent"))
+}
+
+/// ABI-encode a prover export into the `paymentProof` blob `fulfillIntent` takes.
+///
+/// The verifier does `abi.decode(paymentProof, (PaymentAttestation))`, and that
+/// struct is `(bytes32 intentHash, uint256 releaseAmount, bytes32 dataHash,
+/// bytes[] signatures, bytes data, bytes metadata)`. See
+/// `UnifiedPaymentVerifierV3.sol`. `dataHash` must be the keccak256 of `data`,
+/// which is checked here: a mismatch means the export is internally
+/// inconsistent and fulfilment would revert after the fiat had already left.
+pub fn encode_attestation(
+    export: &crate::auto::attest::AttestationFile,
+) -> anyhow::Result<AttestedProof> {
+    use alloy::primitives::{keccak256, U256};
+    use alloy::sol_types::SolValue;
+
+    let a = &export.attestation;
+
+    let intent_hash: B256 = a
+        .typed_data_value
+        .intent_hash
+        .parse()
+        .context("attestation intentHash is not a 32-byte hex value")?;
+    let release_amount: U256 = a
+        .typed_data_value
+        .release_amount
+        .parse()
+        .context("attestation releaseAmount is not a number")?;
+    let data_hash: B256 = a
+        .typed_data_value
+        .data_hash
+        .parse()
+        .context("attestation dataHash is not a 32-byte hex value")?;
+    let signature: Bytes = a
+        .signature
+        .parse()
+        .context("attestation signature is not hex")?;
+    let data: Bytes = a
+        .encoded_payment_details
+        .parse()
+        .context("attestation encodedPaymentDetails is not hex")?;
+    let metadata: Bytes = if a.metadata.is_empty() {
+        Bytes::new()
+    } else {
+        a.metadata.parse().context("attestation metadata is not hex")?
+    };
+
+    if signature.is_empty() {
+        anyhow::bail!("the attestation carries no signature");
+    }
+    let computed = keccak256(&data);
+    if computed != data_hash {
+        anyhow::bail!(
+            "the attestation's dataHash {data_hash} is not keccak256(encodedPaymentDetails) \
+             ({computed}). The export is inconsistent and fulfilment would revert."
+        );
+    }
+
+    // `abi_encode`, not `abi_encode_params`: the verifier calls
+    // `abi.decode(paymentProof, (PaymentAttestation))`, decoding the blob as a
+    // single dynamic tuple, so it must carry the leading offset word that
+    // `abi_encode_params` omits. Dropping it shifts every field by one word and
+    // the decode reverts.
+    let payment_proof: Bytes = (
+        intent_hash,
+        release_amount,
+        data_hash,
+        vec![signature],
+        data,
+        metadata,
+    )
+        .abi_encode()
+        .into();
+
+    Ok(AttestedProof {
+        payment_proof,
+        verification_data: Bytes::new(),
+    })
 }
 
 #[cfg(test)]
@@ -178,5 +269,56 @@ mod tests {
         let path = dir.path().join("proof.json");
         std::fs::write(&path, r#"{"payment_proof":"0x"}"#).unwrap();
         assert!(load_proof(path.to_str().unwrap()).is_err());
+    }
+}
+
+#[cfg(test)]
+mod encode_tests {
+    use super::*;
+
+    /// The attestation that fulfilled intent 0x0d8b3aeb on 2026-09-02, and the
+    /// `paymentProof` that `fulfillIntent` accepted in tx 0xbf0e3d15. Encoding
+    /// the export has to reproduce that blob byte for byte, or the CLI path is
+    /// only accidentally right.
+    #[test]
+    fn encodes_the_export_that_fulfilled_deposit_4526() {
+        let export: crate::auto::attest::AttestationFile =
+            serde_json::from_str(include_str!("../tests/fixtures/attestation_4526.json"))
+                .expect("fixture parses");
+
+        let proof = encode_attestation(&export).expect("encodes");
+        let hex = alloy::hex::encode(&proof.payment_proof);
+
+        // Head of the accepted blob: the tuple offset, then intentHash, then
+        // releaseAmount 5057401 (0x4d2b79).
+        assert!(
+            hex.starts_with(
+                "0000000000000000000000000000000000000000000000000000000000000020\
+                 0d8b3aebe270cd67ee7848da81b6cda1d9cc417f1115354dd302996ee247a543\
+                 00000000000000000000000000000000000000000000000000000000004d2b79"
+            ),
+            "encoded head does not match the blob fulfillIntent accepted: {}",
+            &hex[..200.min(hex.len())]
+        );
+    }
+
+    /// A dataHash that is not keccak256(data) means the export is inconsistent.
+    /// Catching it here costs nothing; catching it on chain costs the fiat,
+    /// which has already left by the time fulfilment runs.
+    #[test]
+    fn rejects_an_export_whose_data_hash_does_not_bind() {
+        let raw = include_str!("../tests/fixtures/attestation_4526.json")
+            .replace(
+                "0x1556370df9ba54dd6cc6f7596312ee78ea13b4caae576fb942d0550abd0053b1",
+                "0x0000000000000000000000000000000000000000000000000000000000000001",
+            );
+        let export: crate::auto::attest::AttestationFile =
+            serde_json::from_str(&raw).expect("fixture parses");
+
+        let err = encode_attestation(&export).expect_err("must refuse");
+        assert!(
+            err.to_string().contains("keccak256(encodedPaymentDetails)"),
+            "error should name the mismatch, got: {err}"
+        );
     }
 }
