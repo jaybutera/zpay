@@ -213,7 +213,7 @@ async function getQuote() {
   note.className = 'quote-note';
   if (v === '') {
     $('q-out').hidden = true;
-    note.textContent = 'type an amount to see the Venmo payout';
+    note.textContent = 'type an amount to see what lands in their Venmo';
     return;
   }
   if (!validZec(v)) {
