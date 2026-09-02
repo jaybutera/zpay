@@ -423,20 +423,60 @@ where
     // writes SQLite. Running it on a tokio worker is what R5-4 was - reqwest's
     // blocking client cannot drop its runtime inside an async context, and the
     // panic poisoned the store lock for every later request.
+    // R6-6: three phases, so the store lock is not held across the chain round
+    // trip. One stalled `gettxout` used to block every other announce and attest
+    // for as long as the RPC timeout.
+    //
+    // 1. Under the lock, read the announcement.
+    let svc1 = svc.clone();
+    let ev1 = derived;
+    let event = tokio::task::spawn_blocking(move || {
+        let db = svc1.db.blocking_lock();
+        crate::attest_prepare(&db, &ev1)
+    })
+    .await
+    .map_err(|_| {
+        reject(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the attestor could not read its store",
+        )
+    })?
+    .map_err(|e| reject(status_for(&e), &e.to_string()))?;
+
+    // 2. Without the lock, ask the node about the escrow.
     let svc2 = svc.clone();
+    let terms2 = terms.clone();
+    let announced_at = event.announced_at_ms;
+    let observation = tokio::task::spawn_blocking(move || {
+        crate::observe_escrow(&svc2.chain, &terms2, announced_at)
+    })
+    .await
+    .map_err(|_| {
+        reject(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the attestor could not reach its node",
+        )
+    })?
+    .map_err(|e| reject(status_for(&e), &e.to_string()))?;
+
+    // 3. Under the lock again, decide and sign. A request that raced us between
+    //    phases loses at the commit, not here: the signing transaction's
+    //    `UPDATE ... WHERE s IS NULL` and the UNIQUE payment nullifier are what
+    //    make check-then-sign atomic.
+    let svc3 = svc.clone();
     let s = tokio::task::spawn_blocking(move || {
-        let mut db = svc2.db.blocking_lock();
-        crate::attest_over_db(
+        let mut db = svc3.db.blocking_lock();
+        crate::attest_decide_and_sign(
             &mut db,
-            &svc2.chain,
-            &svc2.secp,
-            &svc2.d,
-            &svc2.clock,
+            &svc3.secp,
+            &svc3.d,
+            &svc3.clock,
             &derived,
             &terms,
             &attestation,
             &signature,
             &details,
+            &observation,
             &RatePolicy::production(),
         )
     })

@@ -593,6 +593,138 @@ pub fn observe_escrow(
     })
 }
 
+/// Phase one of `/attest`: everything that needs the store *before* the chain
+/// is consulted.
+///
+/// R6-6: the service held the store lock across the `gettxout` round trip, so
+/// one stalled node call blocked every other announce and attest for as long as
+/// the RPC timeout - 45 s in the daemon. Splitting the sequence lets the lock be
+/// released around the network call.
+///
+/// Correctness does not depend on the lock spanning the gap. The signing
+/// transaction's `UPDATE ... WHERE s IS NULL` and the UNIQUE
+/// `payment_nullifier` are what make check-then-sign atomic; a racing request
+/// that slips in between loses at the commit, with its nonce intact.
+pub fn attest_prepare(
+    db: &db::SqliteEventStore,
+    event_id: &[u8; 32],
+) -> Result<store::Event, AttestorError> {
+    db.get(event_id)
+        .map_err(|e| AttestorError::Unavailable(e.to_string()))?
+        .ok_or(AttestorError::UnknownEvent)
+}
+
+/// Phase three of `/attest`: decide and sign, with the chain already read.
+///
+/// Takes the observation rather than a `ChainClient`, so the caller can hold the
+/// store lock for exactly this call and not for the network round trip (R6-6).
+#[allow(clippy::too_many_arguments)]
+pub fn attest_decide_and_sign(
+    db: &mut db::SqliteEventStore,
+    secp: &Secp256k1<secp256k1_zkp::All>,
+    d: &SecretKey,
+    clock: &impl Clock,
+    event_id: &[u8; 32],
+    terms: &CanonicalTerms,
+    attestation: &PaymentAttestation,
+    signature: &[u8],
+    encoded_payment_details: &[u8],
+    observation: &ChainObservation,
+    rate: &RatePolicy,
+) -> Result<SecretKey, AttestorError> {
+    decide_and_sign_with_signer(
+        db,
+        secp,
+        d,
+        clock,
+        event_id,
+        terms,
+        attestation,
+        signature,
+        encoded_payment_details,
+        observation,
+        rate,
+        &ENCLAVE_SIGNER,
+    )
+}
+
+/// The shared body of the signing phase. `attest_over_db_with_signer` reads the
+/// chain itself and then calls this; the service reads the chain between two
+/// lock acquisitions and calls it directly.
+#[allow(clippy::too_many_arguments)]
+fn decide_and_sign_with_signer(
+    db: &mut db::SqliteEventStore,
+    secp: &Secp256k1<secp256k1_zkp::All>,
+    d: &SecretKey,
+    clock: &impl Clock,
+    event_id: &[u8; 32],
+    terms: &CanonicalTerms,
+    attestation: &PaymentAttestation,
+    signature: &[u8],
+    encoded_payment_details: &[u8],
+    observation: &ChainObservation,
+    rate: &RatePolicy,
+    trusted_signer: &[u8; 20],
+) -> Result<SecretKey, AttestorError> {
+    // Re-read under the lock: between the chain call and here, another request
+    // may have signed this event.
+    let event = db
+        .get(event_id)
+        .map_err(|e| AttestorError::Unavailable(e.to_string()))?
+        .ok_or(AttestorError::UnknownEvent)?;
+    let already_signed = event.signed_s;
+
+    let details = PaymentDetails::decode(encoded_payment_details)?;
+    let nullifier = payment_nullifier(&details);
+    let already_consumed = db
+        .payment_is_consumed(&nullifier)
+        .map_err(|e| AttestorError::Unavailable(e.to_string()))?;
+
+    let is_replay_of_this_event = already_signed.is_some()
+        && event.payment_nullifier == Some(nullifier)
+        && event.terms_hash == terms.terms_hash();
+
+    decide_inner(
+        &event.terms_hash,
+        event.signed_s.is_some() && !is_replay_of_this_event,
+        terms,
+        attestation,
+        signature,
+        encoded_payment_details,
+        observation,
+        trusted_signer,
+        rate,
+        already_consumed && !is_replay_of_this_event,
+    )?;
+
+    if let Some(existing) = already_signed {
+        if is_replay_of_this_event {
+            return SecretKey::from_slice(&existing)
+                .map_err(|e| AttestorError::Dlc(DlcError::Secp(e.to_string())));
+        }
+        return Err(AttestorError::AlreadySigned);
+    }
+
+    let signed_at_ms = clock.now_ms();
+    let terms_hash = event.terms_hash;
+    let s_bytes = db
+        .sign_and_record(event_id, nullifier, signed_at_ms, |k| {
+            // R6-8: these were mapped to `AlreadySigned`, so a signing failure
+            // would have been reported as 409 "already signed" - wrong on its
+            // face, and misleading to an operator. Neither can happen with a
+            // valid `k`, and if one does it is the store being unusable.
+            let k = SecretKey::from_slice(k)
+                .map_err(|e| store::StoreError::Unavailable(format!("stored nonce: {e}")))?;
+            let s = sign_outcome(secp, &k, d, event_id, &terms_hash)
+                .map_err(|e| store::StoreError::Unavailable(format!("outcome signing: {e}")))?;
+            Ok(s.secret_bytes())
+        })
+        .map_err(map_store_error)?;
+
+    SecretKey::from_slice(&s_bytes)
+        .map_err(|e| AttestorError::Dlc(DlcError::Secp(e.to_string())))
+}
+
 /// The `/attest` handler that reads the chain itself.
 ///
 /// This is the shape a service should call: the only chain facts it uses come
@@ -735,10 +867,6 @@ fn attest_over_db_with_signer(
     // So the repeat is idempotent only on an exact match: the same terms as the
     // announcement, and the same payment. That is checked below, after the
     // request has been validated, not before. See spec 19.1.
-    let already_signed = db
-        .signed_outcome(event_id)
-        .map_err(|e| AttestorError::Unavailable(e.to_string()))?;
-
     let event = db
         .get(event_id)
         .map_err(|e| AttestorError::Unavailable(e.to_string()))?
@@ -746,55 +874,18 @@ fn attest_over_db_with_signer(
 
     let observation = observe_escrow(chain, terms, event.announced_at_ms)?;
 
-    let details = PaymentDetails::decode(encoded_payment_details)?;
-    let nullifier = payment_nullifier(&details);
-    let already_consumed = db
-        .payment_is_consumed(&nullifier)
-        .map_err(|e| AttestorError::Unavailable(e.to_string()))?;
-
-    // A replay of the signed request is not a second consumption of the payment.
-    let is_replay_of_this_event = already_signed.is_some()
-        && event.payment_nullifier == Some(nullifier)
-        && event.terms_hash == terms.terms_hash();
-
-    decide_inner(
-        &event.terms_hash,
-        // Never treat the event as signed when this is a faithful replay: the
-        // request still has to pass every other check before it earns the
-        // stored scalar.
-        event.signed_s.is_some() && !is_replay_of_this_event,
+    decide_and_sign_with_signer(
+        db,
+        secp,
+        d,
+        clock,
+        event_id,
         terms,
         attestation,
         signature,
         encoded_payment_details,
         &observation,
-        trusted_signer,
         rate,
-        already_consumed && !is_replay_of_this_event,
-    )?;
-
-    // The request was valid *and* identical to the one already signed, so hand
-    // back the same scalar rather than signing again. Nothing new is published:
-    // this is the value this same request already produced (R6-2).
-    if let Some(existing) = already_signed {
-        if is_replay_of_this_event {
-            return SecretKey::from_slice(&existing)
-                .map_err(|e| AttestorError::Dlc(DlcError::Secp(e.to_string())));
-        }
-        return Err(AttestorError::AlreadySigned);
-    }
-
-    let signed_at_ms = clock.now_ms();
-    let terms_hash = event.terms_hash;
-    let s_bytes = db
-        .sign_and_record(event_id, nullifier, signed_at_ms, |k| {
-            let k = SecretKey::from_slice(k).map_err(|_| store::StoreError::AlreadySigned)?;
-            let s = sign_outcome(secp, &k, d, event_id, &terms_hash)
-                .map_err(|_| store::StoreError::AlreadySigned)?;
-            Ok(s.secret_bytes())
-        })
-        .map_err(map_store_error)?;
-
-    SecretKey::from_slice(&s_bytes)
-        .map_err(|e| AttestorError::Dlc(DlcError::Secp(e.to_string())))
+        trusted_signer,
+    )
 }

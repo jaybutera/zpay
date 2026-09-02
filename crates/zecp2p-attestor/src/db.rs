@@ -137,7 +137,11 @@ impl SqliteEventStore {
             );
             "#,
         )?;
-        Ok(Self { conn })
+        let store = Self { conn };
+        // A checkpoint blocked at the last shutdown is retried here, so a
+        // restart clears a WAL that still holds spent nonces (R6-5).
+        store.checkpoint_wal();
+        Ok(store)
     }
 
     /// Records an announcement. The UNIQUE constraints are what refuse a
@@ -300,6 +304,28 @@ impl SqliteEventStore {
             .conn
             .pragma_update(None, "wal_checkpoint", "TRUNCATE");
         Ok(s)
+    }
+
+    /// Truncates the WAL, reporting whether it was blocked.
+    ///
+    /// Called after every signing and again at startup, so a checkpoint blocked
+    /// by a reader is retried rather than forgotten (R6-5).
+    pub fn checkpoint_wal(&self) -> bool {
+        // `wal_checkpoint(TRUNCATE)` returns (busy, log, checkpointed). A busy
+        // of 1 means a reader held a snapshot and the log still holds frames.
+        let busy: i64 = self
+            .conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
+            .unwrap_or(1);
+        if busy != 0 {
+            tracing::warn!(
+                "the write-ahead log could not be truncated because another connection holds a \
+                 read snapshot; a spent nonce may remain readable in the -wal file until the \
+                 next successful checkpoint"
+            );
+            return false;
+        }
+        true
     }
 
     pub fn holds_nonce(&self, event_id: &[u8; 32]) -> Result<bool, DbError> {
