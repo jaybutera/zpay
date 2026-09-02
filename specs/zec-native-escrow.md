@@ -605,7 +605,7 @@ Updated 2026-09-02. Phase numbering follows section 9.
 | 1 Transactions | Code done, testnet gate not met | `crates/zecp2p-escrow/src/{script,tx,fees}.rs` |
 | 2 Attestor core | Decision path done, HTTP surface not built | `crates/zecp2p-attestor/src/{lib,store}.rs` |
 | 3 Adaptor | Done | `crates/zecp2p-escrow/src/dlc.rs` |
-| 4 Client handshake | Not started | |
+| 4 Client handshake | Logic done against a node trait; no RPC adapter | `crates/zecp2p-escrow/src/{client,lp,chain,deadlines}.rs` |
 | 5 Testnet end to end | Blocked, see below | |
 | 6 Mainnet $1 | Blocked on 5 | |
 | 7 Nitro attestor | Not started | |
@@ -649,3 +649,42 @@ The remaining code work before a testnet run is Phase 4: the client handshake,
 durable key storage, refund automation at `T`, and the LP daemon that watches
 depth, honours `PAY_DEADLINE` and `BROADCAST_DEADLINE`, calls the existing
 prover, and broadcasts. None of it is written.
+
+### 13.2 Phase 4 as built
+
+The chain sits behind a `ChainClient` trait with an in-memory implementation,
+so a reorg, a confirmation depth and an unreachable node are conditions a test
+causes rather than waits for. **No adapter over zebrad RPC exists.** Nothing in
+either crate has spoken to a node.
+
+The LP is a state machine rather than a sequence of calls, because the ordering
+is the safety argument: `ReadyToPay` is unreachable without a confirmed escrow
+at the depth for its size, a verified pre-signature, and room before
+`PAY_DEADLINE`. A reorg that unwinds the funding transaction moves the state
+backwards. `PaidPastMargin` is distinct from `AwaitingAttestation` because the
+operational response differs.
+
+The client stores `u_priv` and the redeem script before producing a
+pre-signature, and a storage failure aborts the handshake. The refund rebuilds
+from the stored record alone and is byte-identical to the one the full terms
+produce, which is what "the user needs nobody at `T`" has to mean in practice.
+
+Criterion 14 is enforced by test, and writing that test found two real
+violations: the derived `Debug` on `EscrowRecord` printed `u_priv`, and
+`EventStore` printed `k`. Both now redact. `k` is the worse of the two, since
+two signatures under one nonce expose `d`.
+
+### 13.3 Still not built
+
+- Any RPC adapter. Phase 1's mempool gate and criterion 12's mempool rejection
+  remain unmet, and the script-level evidence is not a substitute for a node
+  accepting or refusing a transaction.
+- The funding transaction of 4.2: a shielded spend needs a wallet, note
+  management and the Orchard proving path. `tx.rs` builds only the two
+  transactions that spend the escrow.
+- The attestor's HTTP surface: `/identity`, `/announce`, `/attest`, the bearer
+  token, the SQLite table behind `EventStore`, and rate limiting. The decision
+  logic those endpoints would call is written and tested.
+- The BIP340 `announce_sig` of 5.1. The user verifies the attestor's key
+  against a pin; it does not yet verify a signature over the announcement.
+- Phase 7 in full.
