@@ -11,7 +11,9 @@
 //! RNG. What a caller sends is the terms and the attestation, and both are
 //! checked against things the attestor already holds.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use tokio::sync::Mutex;
 
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -30,6 +32,13 @@ use crate::{AttestorError, Clock};
 
 /// Everything the service holds. `d` never leaves it.
 pub struct AttestorService<C, K> {
+    /// A `tokio::sync::Mutex`, not a `std::sync::Mutex`.
+    ///
+    /// Round 5 finding R5-4: the std mutex poisons if a handler panics while
+    /// holding it, and both handlers took it with `.expect`, so one panic made
+    /// every later request panic too. A tokio mutex has no poisoning, and the
+    /// blocking work now happens inside `spawn_blocking` where a panic is
+    /// returned as a `JoinError` rather than unwinding through the guard.
     db: Mutex<SqliteEventStore>,
     secp: Secp256k1<secp256k1_zkp::All>,
     d: SecretKey,
@@ -216,7 +225,16 @@ fn status_for(err: &AttestorError) -> StatusCode {
         AttestorError::AlreadySigned
         | AttestorError::DuplicateAnnouncement
         | AttestorError::PaymentAlreadyConsumed => StatusCode::CONFLICT,
-        AttestorError::Chain(_) | AttestorError::ZeroClock => StatusCode::SERVICE_UNAVAILABLE,
+        // "The attestor could not look", not "the attestor decided". The LP
+        // retries these; it does not retry a 4xx. `EscrowNotFound` and
+        // `InsufficientDepth` are here because both mean the attestor's node
+        // has not caught up yet, which the LP reaches whenever its own node is
+        // ahead (R5-1).
+        AttestorError::Chain(_)
+        | AttestorError::ZeroClock
+        | AttestorError::Unavailable(_)
+        | AttestorError::EscrowNotFound
+        | AttestorError::InsufficientDepth { .. } => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::BAD_REQUEST,
     }
 }
@@ -292,16 +310,33 @@ where
         ));
     }
 
-    let mut db = svc.db.lock().expect("attestor db lock");
-    db.announce(
-        event_id,
-        terms.terms_hash(),
-        r.serialize(),
-        terms.funding_txid,
-        k.secret_bytes(),
-        announced_at_ms,
-    )
-    .map_err(|e| {
+    // SQLite is blocking. Holding the guard across `spawn_blocking` keeps the
+    // announce atomic while keeping the executor free (R5-4).
+    let svc2 = svc.clone();
+    let terms_hash = terms.terms_hash();
+    let funding_txid = terms.funding_txid;
+    let k_bytes = k.secret_bytes();
+    let r_bytes = r.serialize();
+    let result = tokio::task::spawn_blocking(move || {
+        let mut db = svc2.db.blocking_lock();
+        db.announce(
+            event_id,
+            terms_hash,
+            r_bytes,
+            funding_txid,
+            k_bytes,
+            announced_at_ms,
+        )
+    })
+    .await
+    .map_err(|_| {
+        reject(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the attestor could not complete the announcement",
+        )
+    })?;
+
+    result.map_err(|e| {
         let err = crate::map_store_error(e);
         reject(status_for(&err), &err.to_string())
     })?;
@@ -345,19 +380,37 @@ where
         ));
     }
 
-    let s = crate::attest_over_db(
-        &mut svc.db.lock().expect("attestor db lock"),
-        &svc.chain,
-        &svc.secp,
-        &svc.d,
-        &svc.clock,
-        &derived,
-        &terms,
-        &attestation,
-        &signature,
-        &details,
-        &RatePolicy::production(),
-    )
+    // The whole decision is blocking: it reads the escrow over HTTP and then
+    // writes SQLite. Running it on a tokio worker is what R5-4 was - reqwest's
+    // blocking client cannot drop its runtime inside an async context, and the
+    // panic poisoned the store lock for every later request.
+    let svc2 = svc.clone();
+    let s = tokio::task::spawn_blocking(move || {
+        let mut db = svc2.db.blocking_lock();
+        crate::attest_over_db(
+            &mut db,
+            &svc2.chain,
+            &svc2.secp,
+            &svc2.d,
+            &svc2.clock,
+            &derived,
+            &terms,
+            &attestation,
+            &signature,
+            &details,
+            &RatePolicy::production(),
+        )
+    })
+    .await
+    .map_err(|_| {
+        // A panic in the decision path is an outage, not a verdict. The LP has
+        // already paid Venmo by the time it calls this, so it must retry rather
+        // than read a crash as "refused".
+        reject(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the attestor could not complete the decision",
+        )
+    })?
     .map_err(|e| reject(status_for(&e), &e.to_string()))?;
 
     Ok(Json(AttestResponse {

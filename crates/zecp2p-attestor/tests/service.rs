@@ -329,7 +329,10 @@ async fn attest_reads_the_escrow_from_the_attestors_own_node() {
         })),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    // 503, not 400: "the attestor's node has not caught up" is a retry
+    // condition, and the LP reaches it whenever its own node is ahead of the
+    // attestor's (R5-1).
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert!(
         body["error"].as_str().unwrap().contains("does not exist"),
         "got {}",

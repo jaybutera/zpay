@@ -84,6 +84,8 @@ pub enum AttestorError {
     EscrowNotFound,
     #[error("chain error: {0}")]
     Chain(String),
+    #[error("the attestor could not answer: {0}")]
+    Unavailable(String),
 }
 
 /// The confirmation depth table of spec section 7, applied by the attestor
@@ -392,12 +394,9 @@ pub(crate) fn handle_attest_with_signer(
     rate: &RatePolicy,
     trusted_signer: &[u8; 20],
 ) -> Result<SecretKey, AttestorError> {
-    // An event already signed returns what it published rather than signing
-    // again. The scalar is public the moment the release is broadcast, so this
-    // is idempotent, not a leak.
-    if let Some(existing) = store.signed_outcome(event_id) {
-        return SecretKey::from_slice(&existing)
-            .map_err(|e| AttestorError::Dlc(DlcError::Secp(e.to_string())));
+    // Criterion 8 again; see `attest_over_db_with_signer`.
+    if store.signed_outcome(event_id).is_some() {
+        return Err(AttestorError::AlreadySigned);
     }
 
     let event = store.get(event_id).ok_or(AttestorError::UnknownEvent)?.clone();
@@ -457,6 +456,9 @@ pub(crate) fn map_store_error(e: store::StoreError) -> AttestorError {
         store::StoreError::DuplicateEvent
         | store::StoreError::DuplicateFundingTx
         | store::StoreError::DuplicateNoncePoint => AttestorError::DuplicateAnnouncement,
+        // Not a decision: the store could not answer. The LP must retry rather
+        // than read this as a refusal (R5-1).
+        store::StoreError::Unavailable(m) => AttestorError::Unavailable(m),
     }
 }
 
@@ -650,18 +652,98 @@ pub fn attest_over_db(
     encoded_payment_details: &[u8],
     rate: &RatePolicy,
 ) -> Result<SecretKey, AttestorError> {
-    // A repeated /attest returns what was published rather than signing again.
-    if let Some(existing) = db
+    attest_over_db_with_signer(
+        db,
+        chain,
+        secp,
+        d,
+        clock,
+        event_id,
+        terms,
+        attestation,
+        signature,
+        encoded_payment_details,
+        rate,
+        &ENCLAVE_SIGNER,
+    )
+}
+
+/// As [`attest_over_db`], against a caller-supplied enclave signer.
+///
+/// Round 5 noted that `attest_over_db` had never returned `Ok` in any test:
+/// the pinned enclave key cannot sign for terms a test invents, so every
+/// `/attest` in the suite stopped at the signer check before it reached the
+/// chain call or the SQLite write. R5-4 lived in exactly that gap. This is the
+/// same gated affordance the in-memory path already had, so the success path
+/// can be driven end to end without adding a production path.
+#[cfg(feature = "test-signer")]
+#[allow(clippy::too_many_arguments)]
+pub fn attest_over_db_against_signer(
+    db: &mut db::SqliteEventStore,
+    chain: &impl ChainClient,
+    secp: &Secp256k1<secp256k1_zkp::All>,
+    d: &SecretKey,
+    clock: &impl Clock,
+    event_id: &[u8; 32],
+    terms: &CanonicalTerms,
+    attestation: &PaymentAttestation,
+    signature: &[u8],
+    encoded_payment_details: &[u8],
+    rate: &RatePolicy,
+    trusted_signer: &[u8; 20],
+) -> Result<SecretKey, AttestorError> {
+    attest_over_db_with_signer(
+        db,
+        chain,
+        secp,
+        d,
+        clock,
+        event_id,
+        terms,
+        attestation,
+        signature,
+        encoded_payment_details,
+        rate,
+        trusted_signer,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn attest_over_db_with_signer(
+    db: &mut db::SqliteEventStore,
+    chain: &impl ChainClient,
+    secp: &Secp256k1<secp256k1_zkp::All>,
+    d: &SecretKey,
+    clock: &impl Clock,
+    event_id: &[u8; 32],
+    terms: &CanonicalTerms,
+    attestation: &PaymentAttestation,
+    signature: &[u8],
+    encoded_payment_details: &[u8],
+    rate: &RatePolicy,
+    trusted_signer: &[u8; 20],
+) -> Result<SecretKey, AttestorError> {
+    // Acceptance criterion 8: "a second /attest for the same event_id is
+    // refused". R5-3 found this returning the stored scalar with 200, before
+    // any check on the request - so a bearer-token holder could read `s` for an
+    // event whose release had not been broadcast yet, by sending a zero
+    // signature and a zero blob.
+    //
+    // The criterion wins over the convenience. An LP that lost the response
+    // recovers by broadcasting the release it already has, or by reading `s`
+    // off the chain once any release is mined; it does not need the attestor to
+    // hand the scalar out a second time.
+    if db
         .signed_outcome(event_id)
-        .map_err(|e| AttestorError::Chain(e.to_string()))?
+        .map_err(|e| AttestorError::Unavailable(e.to_string()))?
+        .is_some()
     {
-        return SecretKey::from_slice(&existing)
-            .map_err(|e| AttestorError::Dlc(DlcError::Secp(e.to_string())));
+        return Err(AttestorError::AlreadySigned);
     }
 
     let event = db
         .get(event_id)
-        .map_err(|e| AttestorError::Chain(e.to_string()))?
+        .map_err(|e| AttestorError::Unavailable(e.to_string()))?
         .ok_or(AttestorError::UnknownEvent)?;
 
     let observation = observe_escrow(chain, terms, event.announced_at_ms)?;
@@ -670,7 +752,7 @@ pub fn attest_over_db(
     let nullifier = payment_nullifier(&details);
     let already_consumed = db
         .payment_is_consumed(&nullifier)
-        .map_err(|e| AttestorError::Chain(e.to_string()))?;
+        .map_err(|e| AttestorError::Unavailable(e.to_string()))?;
 
     decide_inner(
         &event.terms_hash,
@@ -680,7 +762,7 @@ pub fn attest_over_db(
         signature,
         encoded_payment_details,
         &observation,
-        &ENCLAVE_SIGNER,
+        trusted_signer,
         rate,
         already_consumed,
     )?;

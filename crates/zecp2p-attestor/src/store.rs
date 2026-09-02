@@ -49,6 +49,8 @@ pub enum StoreError {
          one nonce publish the attestor's long-lived key"
     )]
     DuplicateNoncePoint,
+    #[error("the attestor's store is unavailable: {0}")]
+    Unavailable(String),
 }
 
 /// A nonce bound to the event it was drawn for.

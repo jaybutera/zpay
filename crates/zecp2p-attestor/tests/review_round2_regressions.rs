@@ -313,10 +313,16 @@ fn poc3_the_second_escrow_never_produces_a_scalar_at_all() {
     assert!(store.signed_outcome(&events[1].1).is_none());
 }
 
-/// A repeated `/attest` for an event already signed returns what was published
-/// rather than signing again.
+/// A repeated `/attest` for an event already signed is refused.
+///
+/// Round 2 had this returning the stored scalar, and this test asserted that.
+/// Round 5 (R5-3) pointed out it fails acceptance criterion 8 as written -
+/// "a second /attest for the same event_id is refused" - and that returning the
+/// scalar before checking the request let any bearer-token holder read `s` for
+/// an event whose release had not been broadcast. The criterion wins; the test
+/// now asserts the refusal.
 #[test]
-fn a_repeated_attest_is_idempotent_and_does_not_sign_twice() {
+fn a_repeated_attest_is_refused_rather_than_signing_twice() {
     let secp = Secp256k1::new();
     let d = SecretKey::from_slice(&[0xd1; 32]).unwrap();
     let k = SecretKey::from_slice(&[0x4b; 32]).unwrap();
@@ -345,17 +351,18 @@ fn a_repeated_attest_is_idempotent_and_does_not_sign_twice() {
         earliest_acceptable_payment_ms: NOW_MS,
     };
 
-    let first = handle_attest_against_signer(
+    handle_attest_against_signer(
         &mut store, &secp, &d, &ev, &t, &att, &sig, &blob, &obs,
         &RatePolicy::production(), &signer,
     )
-    .unwrap();
-    let second = handle_attest_against_signer(
-        &mut store, &secp, &d, &ev, &t, &att, &sig, &blob, &obs,
-        &RatePolicy::production(), &signer,
-    )
-    .unwrap();
+    .expect("the first attest signs");
 
-    assert_eq!(first, second, "the same scalar, not a second signature");
+    let err = handle_attest_against_signer(
+        &mut store, &secp, &d, &ev, &t, &att, &sig, &blob, &obs,
+        &RatePolicy::production(), &signer,
+    )
+    .expect_err("a second attest for one event must be refused");
+    assert_eq!(err, AttestorError::AlreadySigned);
+
     assert!(!store.holds_nonce(&ev), "k is gone after the first signing");
 }

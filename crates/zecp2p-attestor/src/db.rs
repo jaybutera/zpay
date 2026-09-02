@@ -21,7 +21,7 @@
 //! and the nullifier. In Phase 7 it is sealed to the enclave; here it is stored
 //! as raw bytes, and the database file is as sensitive as the attestor key.
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
 
 use crate::store::{Event, StoreError};
 
@@ -53,6 +53,47 @@ impl std::fmt::Debug for SqliteEventStore {
     }
 }
 
+/// Separates "a rule refused this" from "the database could not answer".
+///
+/// R5-1: every insert error was mapped to a `Duplicate*` by substring match,
+/// with `DuplicateEvent` as the fallthrough - so a locked file became a 409 the
+/// LP does not retry, and the escrow died. Only an actual constraint violation
+/// is a decision; everything else is an outage.
+fn classify_insert(e: rusqlite::Error) -> StoreError {
+    let is_constraint = matches!(
+        &e,
+        rusqlite::Error::SqliteFailure(f, _)
+            if f.code == ErrorCode::ConstraintViolation
+    );
+    if !is_constraint {
+        return StoreError::Unavailable(e.to_string());
+    }
+    let text = e.to_string();
+    if text.contains("events.r") {
+        StoreError::DuplicateNoncePoint
+    } else if text.contains("events.funding_txid") {
+        StoreError::DuplicateFundingTx
+    } else {
+        StoreError::DuplicateEvent
+    }
+}
+
+/// The same split for the signing transaction.
+fn classify_write(e: rusqlite::Error) -> StoreError {
+    let is_constraint = matches!(
+        &e,
+        rusqlite::Error::SqliteFailure(f, _)
+            if f.code == ErrorCode::ConstraintViolation
+    );
+    if is_constraint && e.to_string().contains("payment_nullifier") {
+        StoreError::PaymentAlreadyConsumed
+    } else if is_constraint {
+        StoreError::AlreadySigned
+    } else {
+        StoreError::Unavailable(e.to_string())
+    }
+}
+
 fn bytes32(v: Vec<u8>, what: &'static str) -> Result<[u8; 32], DbError> {
     v.try_into().map_err(|_| DbError::Corrupt(what))
 }
@@ -73,6 +114,14 @@ impl SqliteEventStore {
         // user waits until `T`.
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
+        // Freed pages are overwritten rather than left readable. Spec section 6
+        // says `k` is overwritten on sign, and without this SQLite only unlinks
+        // it - the bytes stay in the file and the WAL (R5-2).
+        conn.pragma_update(None, "secure_delete", "ON")?;
+        // A short lock waits instead of failing. An operator's sqlite3 shell or
+        // a backup holding BEGIN IMMEDIATE was enough to turn an announcement
+        // into a spurious "already announced" (R5-1).
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS events (
@@ -120,18 +169,7 @@ impl SqliteEventStore {
         );
         match res {
             Ok(_) => Ok(()),
-            Err(e) => {
-                // Distinguish which uniqueness rule was hit, so an operator can
-                // tell a retry from a nonce collision.
-                let text = e.to_string();
-                Err(if text.contains("events.r") {
-                    StoreError::DuplicateNoncePoint
-                } else if text.contains("events.funding_txid") {
-                    StoreError::DuplicateFundingTx
-                } else {
-                    StoreError::DuplicateEvent
-                })
-            }
+            Err(e) => Err(classify_insert(e)),
         }
     }
 
@@ -213,10 +251,7 @@ impl SqliteEventStore {
     where
         F: FnOnce(&[u8; 32]) -> Result<[u8; 32], StoreError>,
     {
-        let tx = self
-            .conn
-            .transaction()
-            .map_err(|_| StoreError::UnknownEvent)?;
+        let tx = self.conn.transaction().map_err(classify_write)?;
 
         let (k, already): (Option<Vec<u8>>, Option<Vec<u8>>) = tx
             .query_row(
@@ -224,7 +259,10 @@ impl SqliteEventStore {
                 params![&event_id[..]],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .map_err(|_| StoreError::UnknownEvent)?;
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => StoreError::UnknownEvent,
+                other => classify_write(other),
+            })?;
 
         if already.is_some() {
             return Err(StoreError::AlreadySigned);
@@ -249,18 +287,18 @@ impl SqliteEventStore {
                     &event_id[..]
                 ],
             )
-            .map_err(|e| {
-                if e.to_string().contains("payment_nullifier") {
-                    StoreError::PaymentAlreadyConsumed
-                } else {
-                    StoreError::UnknownEvent
-                }
-            })?;
+            .map_err(classify_write)?;
 
         if updated != 1 {
             return Err(StoreError::AlreadySigned);
         }
-        tx.commit().map_err(|_| StoreError::UnknownEvent)?;
+        tx.commit().map_err(classify_write)?;
+        // Truncate the WAL so the pre-update page holding `k` is not left
+        // readable in it. With `secure_delete` on, the main-file cell is
+        // overwritten; this deals with the copy in the log (R5-2).
+        let _ = self
+            .conn
+            .pragma_update(None, "wal_checkpoint", "TRUNCATE");
         Ok(s)
     }
 
