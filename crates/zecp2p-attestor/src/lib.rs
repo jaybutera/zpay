@@ -58,17 +58,9 @@ pub enum AttestorError {
 /// independently of the LP.
 ///
 /// The LP applying it protects the LP. The attestor applying it protects the
-/// user, because the attestor is the party that will not sign.
-pub fn required_depth(usd_amount_6dec: u64) -> u32 {
-    match usd_amount_6dec {
-        // up to 50 USD
-        0..=50_000_000 => 10,
-        // 50 to 500 USD
-        50_000_001..=500_000_000 => 30,
-        // over 500 USD: protocol-final
-        _ => 100,
-    }
-}
+/// user, because the attestor is the party that will not sign. Both call the
+/// same function so the two cannot drift apart.
+pub use zecp2p_escrow::depth::required_depth;
 
 /// The verification of spec 5.5 steps 1 to 5, as a pure function.
 ///

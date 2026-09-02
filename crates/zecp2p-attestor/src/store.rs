@@ -38,13 +38,27 @@ pub enum StoreError {
 ///
 /// The persistent implementation must hold these too; the tests treat this as
 /// the specification of the behaviour rather than as a stub.
-#[derive(Debug, Default)]
+///
+/// `Debug` is written by hand. Criterion 14 bars `k` from any log, and of all
+/// the secrets here it is the one whose exposure is unrecoverable: two
+/// signatures under one nonce give up `d`.
+#[derive(Default)]
 pub struct EventStore {
     events: HashMap<[u8; 32], Event>,
     /// `k`, held apart from the event row so that "delete k on sign" is a
     /// single operation that cannot half-happen.
     nonces: HashMap<[u8; 32], [u8; 32]>,
     funding: HashMap<[u8; 32], [u8; 32]>,
+}
+
+impl core::fmt::Debug for EventStore {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("EventStore")
+            .field("events", &self.events.len())
+            // The count only. A nonce must not reach a log even as bytes.
+            .field("nonces_held", &self.nonces.len())
+            .finish()
+    }
 }
 
 impl EventStore {

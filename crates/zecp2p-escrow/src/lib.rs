@@ -7,9 +7,13 @@
 //! sides sign.
 
 pub mod attestation;
+pub mod chain;
+pub mod client;
 pub mod deadlines;
+pub mod depth;
 pub mod dlc;
 pub mod fees;
+pub mod lp;
 pub mod script;
 pub mod terms;
 pub mod tx;

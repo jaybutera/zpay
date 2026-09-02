@@ -114,6 +114,10 @@ impl Authorization for EscrowUnauthorized {
 
 /// A transaction the escrow has built but not yet signed, together with
 /// everything needed to compute its sighash.
+///
+/// Every field is public chain data - scripts, an outpoint, an amount - so
+/// `Debug` here cannot print a key.
+#[derive(Debug)]
 pub struct UnsignedEscrowTx {
     data: TransactionData<EscrowUnauthorized>,
     redeem_script: Vec<u8>,
