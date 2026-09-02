@@ -28,6 +28,8 @@ pub struct ClaimableDeposit {
     /// The intent size the escrow will accept.
     pub min_intent: U256,
     pub max_intent: U256,
+    /// USDC already locked by a live intent on this deposit, from any taker.
+    pub outstanding: U256,
     pub block_number: u64,
 }
 
@@ -38,6 +40,18 @@ impl ClaimableDeposit {
     /// more than `remainingDeposits`. The glue currently pins the range to the
     /// full deposit, so this is normally the whole amount.
     pub fn takeable_amount(&self, taker_max: U256) -> Option<U256> {
+        // A deposit with a live intent on it is mid-fill, and the remainder is
+        // not a fresh opportunity. On 2026-09-02 deposit 4526 was pinned to a
+        // single $5.00 intent; once that intent was signalled, `remaining` fell
+        // to the 120,606-unit dust the range could never serve, and the daemon
+        // read that dust as a new deposit to claim and tried to signal a second
+        // intent for $0.12 rather than paying the $5.00 intent it already held.
+        // Whoever owns the outstanding intent, the right move is to leave this
+        // deposit alone until it settles or expires.
+        if !self.outstanding.is_zero() {
+            return None;
+        }
+
         let amount = self.max_intent.min(self.remaining).min(taker_max);
         if amount < self.min_intent || amount.is_zero() {
             return None;
@@ -104,6 +118,7 @@ impl<P: Provider> Discovery<P> {
                 remaining: deposit.remainingDeposits,
                 min_intent: deposit.intentAmountRange.min,
                 max_intent: deposit.intentAmountRange.max,
+                outstanding: deposit.outstandingIntentAmount,
                 block_number: log.block_number.unwrap_or(0),
             });
         }
@@ -124,6 +139,7 @@ mod tests {
             remaining: U256::from(remaining),
             min_intent: U256::from(min),
             max_intent: U256::from(max),
+            outstanding: U256::ZERO,
             block_number: 1,
         }
     }
@@ -157,6 +173,27 @@ mod tests {
         assert_eq!(
             d.takeable_amount(U256::from(40_000_000u64)),
             Some(U256::from(40_000_000u64))
+        );
+    }
+
+    #[test]
+    fn leaves_a_deposit_alone_while_an_intent_is_live_on_it() {
+        // Deposit 4526 after its $5.00 intent was signalled: the range still
+        // reads [5057401, 5057401], but only 120,606 units are unspoken for.
+        // Taking that as a claimable deposit is what made the daemon try to
+        // signal a second intent for $0.12 instead of paying the one it held.
+        let mut d = deposit(120_606, 5_057_401, 5_057_401);
+        d.outstanding = U256::from(5_057_401u64);
+        assert_eq!(d.takeable_amount(U256::from(6_000_000u64)), None);
+    }
+
+    #[test]
+    fn takes_it_once_the_intent_has_settled() {
+        let mut d = deposit(5_057_401, 5_057_401, 5_057_401);
+        d.outstanding = U256::ZERO;
+        assert_eq!(
+            d.takeable_amount(U256::from(6_000_000u64)),
+            Some(U256::from(5_057_401u64))
         );
     }
 }
