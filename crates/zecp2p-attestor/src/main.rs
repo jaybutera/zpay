@@ -35,6 +35,20 @@ use zecp2p_attestor::service::{router, AttestorService};
 use zecp2p_attestor::SystemClock;
 use zecp2p_escrow::rpc::{Network, RpcChainClient, RpcConfig};
 
+/// The build identity `/identity` reports.
+///
+/// R8-7: both builds said `CARGO_PKG_VERSION`, and `cargo test` rewrites the
+/// debug binary with `test-signer` on - so nothing distinguished a test build
+/// from a production one at rest, or over the wire. Now `/identity` says which
+/// is answering.
+fn build_id() -> String {
+    if cfg!(feature = "test-signer") {
+        format!("{}+test-signer", env!("CARGO_PKG_VERSION"))
+    } else {
+        env!("CARGO_PKG_VERSION").to_string()
+    }
+}
+
 fn env(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("set {name}"))
 }
@@ -170,7 +184,7 @@ async fn main() {
             );
             AttestorService::with_trusted_signer(
                 db, d, chain, SystemClock, token,
-                env!("CARGO_PKG_VERSION").to_string(), bytes,
+                build_id(), bytes,
             )
         }
         Err(_) => AttestorService::new(
@@ -184,7 +198,7 @@ async fn main() {
         chain,
         SystemClock,
         token,
-        env!("CARGO_PKG_VERSION").to_string(),
+        build_id(),
     ));
 
     tracing::info!(
@@ -192,6 +206,7 @@ async fn main() {
         network = ?network,
         rpc = %rpc_url,
         db = %db_path,
+        build = %build_id(),
         "attestor starting"
     );
 

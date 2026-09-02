@@ -52,6 +52,15 @@ pub enum LpError {
     NotPayable(LpState),
     #[error("the terms carry a refund height of {0}, which is not a valid block height")]
     RefundHeightOutOfRange(u64),
+    #[error(
+        "height {height} is past the broadcast deadline {deadline} and the node still says: \
+         {last}"
+    )]
+    BroadcastDeadlinePassed {
+        height: u32,
+        deadline: u32,
+        last: String,
+    },
 }
 
 /// Whether the LP has paid, and whether it holds the attestor's scalar.
@@ -216,4 +225,45 @@ pub fn attestation_matches_terms(
 ) -> bool {
     attestation.intent_hash == terms.intent_hash()
         && attestation.release_amount >= terms.usd_amount_6dec as u128
+}
+
+/// Broadcasts a release, retrying the answers that mean "not yet".
+///
+/// R8-3: zebra answers an unknown-input spend either after 60 s or instantly
+/// from its rejection cache, and both clear when the missing input is mined.
+/// An LP that has paid the fiat and reads one of those as final has stopped for
+/// no reason. This retries them, and only them, until `BROADCAST_DEADLINE`.
+///
+/// A `Rejected` is a verdict and returns immediately: the transaction is wrong
+/// and retrying it will not change that. An `Unreachable` is retried too, since
+/// it says nothing about the transaction.
+pub fn broadcast_release_until_deadline(
+    chain: &impl ChainClient,
+    policy: &EscrowPolicy,
+    refund_height: u32,
+    raw_tx: &[u8],
+    mut sleep: impl FnMut(),
+) -> Result<[u8; 32], LpError> {
+    let deadline = policy.broadcast_deadline_for_refund_height(refund_height);
+
+    loop {
+        match chain.broadcast(raw_tx) {
+            Ok(txid) => return Ok(txid),
+            Err(e) if !e.is_retryable() => return Err(LpError::Chain(e)),
+            Err(e) => {
+                let height = chain.height().map_err(LpError::Chain)?;
+                if height > deadline {
+                    // Past the margin the release still spends, but it now
+                    // races the refund, and that race is the LP's loss (4.5).
+                    // Report the node's last word rather than looping forever.
+                    return Err(LpError::BroadcastDeadlinePassed {
+                        height,
+                        deadline,
+                        last: e.to_string(),
+                    });
+                }
+                sleep();
+            }
+        }
+    }
 }

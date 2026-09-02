@@ -315,9 +315,18 @@ fn main() {
         }
 
         "release" => {
+            // R8-1: do not add direct signing here, however convenient it looks
+            // as a recovery path. A release signed with `u_priv` is
+            // indistinguishable on chain from one signed by decrypting the
+            // pre-signature, so a mainnet criterion 6 run that fell back to it
+            // would look successful and prove nothing. Recovery belongs in
+            // `paid_path resume`, which replays from the run record and can
+            // only produce the decrypted signature.
             eprintln!(
-                "the release needs the attestor's scalar; run the attestor service and the LP \
-                 daemon. This tool covers the parts that need no Venmo payment."
+                "the release needs the attestor's scalar. Run `paid_path`, and `paid_path \
+                 resume` if it failed partway. This tool deliberately cannot sign a release \
+                 with u_priv: that would produce a transaction the chain cannot tell from a \
+                 decrypted one, and criterion 6 would be unfalsifiable."
             );
             std::process::exit(2);
         }

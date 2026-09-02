@@ -21,6 +21,13 @@ use serde::{Deserialize, Serialize};
 use crate::attestation::PaymentAttestation;
 use crate::terms::CanonicalTerms;
 
+/// The largest answer this client will read.
+///
+/// R8-6: every response the attestor sends is a few hundred bytes of hex. 64 KiB
+/// is generous by two orders of magnitude and bounds what a misbehaving peer can
+/// make the LP allocate.
+pub const MAX_RESPONSE_BYTES: u64 = 64 * 1024;
+
 #[derive(Debug, thiserror::Error)]
 pub enum LpClientError {
     #[error("the attestor is unreachable: {0}")]
@@ -242,10 +249,22 @@ impl AttestorClient {
     fn parse<T: serde::de::DeserializeOwned>(
         resp: reqwest::blocking::Response,
     ) -> Result<T, LpClientError> {
+        use std::io::Read;
+
         let status = resp.status();
-        let text = resp
-            .text()
+        // R8-6: `text()` reads whatever the peer sends. An attestor cannot steal
+        // by being large, but it can make the LP allocate, and every answer this
+        // client expects is a few hundred bytes.
+        let mut buf = Vec::new();
+        resp.take(MAX_RESPONSE_BYTES)
+            .read_to_end(&mut buf)
             .map_err(|e| LpClientError::Unreachable(e.to_string()))?;
+        if buf.len() as u64 == MAX_RESPONSE_BYTES {
+            return Err(LpClientError::BadAnswer(format!(
+                "the attestor's answer exceeded {MAX_RESPONSE_BYTES} bytes"
+            )));
+        }
+        let text = String::from_utf8_lossy(&buf).into_owned();
         if !status.is_success() {
             let message = serde_json::from_str::<ErrorBody>(&text)
                 .map(|b| b.error)

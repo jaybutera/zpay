@@ -288,7 +288,11 @@ impl RpcChainClient {
             // finding 6).
             let text = format!("{} (code {})", err.message, err.code);
             return Err(if method == "sendrawtransaction" {
-                ChainError::Rejected(text)
+                if is_not_yet(&err.message) {
+                    ChainError::NotYet(text)
+                } else {
+                    ChainError::Rejected(text)
+                }
             } else {
                 ChainError::Unreachable(format!("{method}: {text}"))
             });
@@ -323,6 +327,19 @@ impl RpcChainClient {
             Err(e) => Err(e),
         }
     }
+}
+
+/// Whether a `sendrawtransaction` refusal means "not yet" rather than "no".
+///
+/// R8-3: both of zebra's answers for an input it cannot find are temporary. The
+/// first costs 60 s (measured); the second comes from its rejection cache and
+/// is instant. Either clears when the missing input is mined, so a caller that
+/// has already paid the fiat must retry rather than give up.
+fn is_not_yet(message: &str) -> bool {
+    let m = message.to_lowercase();
+    m.contains("could not find transparent input utxo")
+        || m.contains("will be rejected from the mempool until the next chain tip block")
+        || m.contains("already queued for download")
 }
 
 /// Converts a ZEC amount reported as a JSON number into zatoshis.

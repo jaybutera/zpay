@@ -394,7 +394,9 @@ pub(crate) fn handle_attest_with_signer(
     rate: &RatePolicy,
     trusted_signer: &[u8; 20],
 ) -> Result<SecretKey, AttestorError> {
-    // Criterion 8 again; see `attest_over_db_with_signer`.
+    // Criterion 8. Note this is the in-memory path, which refuses a repeat
+    // outright; the SQLite path that the service actually runs replays an exact
+    // repeat per spec 19.1. `store.rs` records why they differ (R8-9).
     if store.signed_outcome(event_id).is_some() {
         return Err(AttestorError::AlreadySigned);
     }

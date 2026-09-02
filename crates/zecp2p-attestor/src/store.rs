@@ -86,10 +86,14 @@ impl core::fmt::Debug for BoundNonce {
     }
 }
 
-/// An in-memory store with the same invariants as the SQLite table.
+/// An in-memory store with the same *uniqueness* invariants as the SQLite table.
 ///
-/// The persistent implementation must hold these too; the tests treat this as
-/// the specification of the behaviour rather than as a stub.
+/// R7-8 and R8-9: this used to claim to be "the specification of the
+/// behaviour", and since spec 19.1 it is not - the SQLite path replays an exact
+/// repeat of a signed `/attest` and the in-memory path still refuses it
+/// outright. The claim is dropped rather than the divergence papered over: the
+/// service runs on SQLite, and `handle_attest` exists for tests of the decision
+/// logic that do not need a file. Where they differ, `db.rs` is authoritative.
 ///
 /// `Debug` is written by hand. Criterion 14 bars `k` from any log, and of all
 /// the secrets here it is the one whose exposure is unrecoverable: two
