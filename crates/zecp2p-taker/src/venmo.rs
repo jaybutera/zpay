@@ -54,8 +54,17 @@ const NOTE_SELECTOR: &str = "#payment-note, [data-testid='payment-note-input']";
 const SEND_SELECTOR: &str = "the \"Pay\" button, then \"Confirm\"";
 /// The button that opens the confirmation.
 const PAY_BUTTON: &str = "Pay";
-/// The button on the confirmation that actually sends.
-const CONFIRM_BUTTON: &str = "Confirm";
+/// The prefix of the button on the confirmation that actually sends.
+///
+/// Venmo labels it with the payee and the amount, e.g. "Pay Jay Butera $1.00",
+/// so it cannot be matched by a fixed string. It is matched by this prefix and
+/// then checked against the amount, which is stronger than an exact label would
+/// have been: the button states what it is about to do and we read it back.
+///
+/// There is a decoy. The page also carries a button literally labelled
+/// "Confirm" which stays disabled and belongs to something else entirely;
+/// waiting for that one times out while the real confirmation sits open.
+const CONFIRM_PREFIX: &str = "Pay ";
 
 /// Whether this run is allowed to move money.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -217,11 +226,11 @@ impl VenmoBrowser {
             PaymentStep::ConfirmSend {
                 selector: PAY_BUTTON.to_string(),
             },
-            PaymentStep::WaitForButton {
-                label: CONFIRM_BUTTON.to_string(),
+            PaymentStep::WaitForConfirm {
+                amount: req.amount.clone(),
             },
-            PaymentStep::ConfirmSend {
-                selector: CONFIRM_BUTTON.to_string(),
+            PaymentStep::ConfirmNamedAmount {
+                amount: req.amount.clone(),
             },
         ]
     }
@@ -317,6 +326,15 @@ impl VenmoBrowser {
                 Ok(())
             }
 
+            PaymentStep::WaitForConfirm { amount } => {
+                self.wait_for_expression(
+                    tab,
+                    &step.to_expression(),
+                    &format!("a confirmation button naming ${amount}"),
+                )
+                .await
+            }
+
             PaymentStep::WaitForButton { label } => self.wait_for_button(tab, label).await,
 
             other => {
@@ -341,6 +359,30 @@ impl VenmoBrowser {
             if std::time::Instant::now() >= deadline {
                 anyhow::bail!(
                     "waited {}s for {selector} on the Venmo page and it never appeared",
+                    self.timeout.as_secs()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    /// Poll an expression that answers true when the page is ready.
+    async fn wait_for_expression(
+        &self,
+        tab: &CdpTab,
+        expression: &str,
+        what: &str,
+    ) -> Result<()> {
+        let deadline = std::time::Instant::now() + self.timeout;
+        loop {
+            let value = self.evaluate(tab, expression).await?;
+            if value.get("result").and_then(|r| r.get("value")) == Some(&json!(true)) {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!(
+                    "waited {}s for {what} and it never appeared. The payment may be \
+                     mid-flow; check the tab before retrying.",
                     self.timeout.as_secs()
                 );
             }
@@ -454,6 +496,24 @@ pub enum PaymentStep {
         selector: String,
         expected: String,
     },
+    /// Wait for the confirmation button that names this amount.
+    ///
+    /// Venmo renders it as "Pay Jay Butera $1.00" once the confirmation opens.
+    /// The page also holds a permanently disabled button labelled "Confirm"
+    /// that belongs to something else; waiting on that one times out while the
+    /// real confirmation is sitting open, which is exactly what happened on the
+    /// first live attempt.
+    WaitForConfirm {
+        amount: String,
+    },
+    /// Click the confirmation button, having checked it names this amount.
+    ///
+    /// The label is the last statement the page makes about what it is about to
+    /// do, so it is read rather than trusted: a button that says a different
+    /// number is not clicked.
+    ConfirmNamedAmount {
+        amount: String,
+    },
     /// Wait for a button with this exact text to appear and become enabled.
     ///
     /// Venmo's confirmation step renders after the Pay click, so the Confirm
@@ -471,7 +531,10 @@ pub enum PaymentStep {
 
 impl PaymentStep {
     pub fn is_irreversible(&self) -> bool {
-        matches!(self, PaymentStep::ConfirmSend { .. })
+        matches!(
+            self,
+            PaymentStep::ConfirmSend { .. } | PaymentStep::ConfirmNamedAmount { .. }
+        )
     }
 
     fn to_expression(&self) -> String {
@@ -526,6 +589,39 @@ impl PaymentStep {
                  }})()",
                 sel = json!(selector)
             ),
+            // Matches on the prefix, then requires the label to carry the
+            // amount. Both halves matter: the prefix finds it, and the amount
+            // is the page telling us what it will do.
+            PaymentStep::WaitForConfirm { amount } => format!(
+                "(() => {{ \
+                   const pre = {pre}; const amt = {amt}; \
+                   const el = [...document.querySelectorAll('button')] \
+                     .find(b => {{ const t=(b.innerText||'').trim(); \
+                                  return t.startsWith(pre) && t.includes(amt); }}); \
+                   return !!el && !el.disabled; \
+                 }})()",
+                pre = json!(CONFIRM_PREFIX),
+                amt = json!(amount)
+            ),
+
+            PaymentStep::ConfirmNamedAmount { amount } => format!(
+                "(() => {{ \
+                   const pre = {pre}; const amt = {amt}; \
+                   const hits = [...document.querySelectorAll('button')] \
+                     .filter(b => {{ const t=(b.innerText||'').trim(); \
+                                     return t.startsWith(pre) && t.includes(amt); }}); \
+                   if (hits.length === 0) throw new Error('no confirmation button naming ' + amt); \
+                   if (hits.length > 1) throw new Error(hits.length + ' buttons name ' + amt); \
+                   const el = hits[0]; \
+                   if (el.disabled) throw new Error('the confirmation button is disabled'); \
+                   const label = (el.innerText||'').trim(); \
+                   el.click(); \
+                   return label; \
+                 }})()",
+                pre = json!(CONFIRM_PREFIX),
+                amt = json!(amount)
+            ),
+
             PaymentStep::WaitForButton { label } => format!(
                 "(() => {{ \
                    const want = {lab}; \
@@ -571,6 +667,12 @@ impl PaymentStep {
             }
             PaymentStep::RequireAmount { selector, expected } => {
                 format!("read {selector} back and require it to be {expected:?}")
+            }
+            PaymentStep::WaitForConfirm { amount } => {
+                format!("wait for the confirmation button naming ${amount}")
+            }
+            PaymentStep::ConfirmNamedAmount { amount } => {
+                format!("click the confirmation naming ${amount}  <-- sends the money")
             }
             PaymentStep::WaitForButton { label } => {
                 format!("wait for the {label:?} button to appear and be enabled")
@@ -859,11 +961,36 @@ mod tests {
             if js.contains("!!el") {
                 continue;
             }
+            // The confirmation step filters rather than finds, and guards on the
+            // match count before touching hits[0].
+            if js.contains("hits.length === 0") {
+                continue;
+            }
             assert!(
                 js.contains("if (!el)") || js.contains("!== null"),
                 "{js} dereferences whatever the lookup returned"
             );
         }
+    }
+
+    /// The live page on 2026-09-02: clicking "Pay" opens a confirmation whose
+    /// button is labelled "Pay Jay Butera $1.00", while a *disabled* button
+    /// literally labelled "Confirm" sits elsewhere on the same page. Waiting for
+    /// "Confirm" timed out for 120s with the real confirmation open and the
+    /// money unsent. The step must match the amount-bearing label instead.
+    #[test]
+    fn the_confirmation_is_matched_by_the_amount_it_names() {
+        let js = PaymentStep::ConfirmNamedAmount {
+            amount: "1.00".to_string(),
+        }
+        .to_expression();
+        assert!(js.contains("startsWith"), "{js}");
+        assert!(js.contains("1.00"), "{js}");
+        // Exactly one match, or it refuses rather than clicking the first.
+        assert!(js.contains("hits.length > 1"), "{js}");
+        assert!(js.contains("el.disabled"), "{js}");
+        // It must not be looking for the decoy.
+        assert!(!js.contains("=== 'Confirm'"), "{js}");
     }
 
     /// And a disabled send button is not a click worth making.

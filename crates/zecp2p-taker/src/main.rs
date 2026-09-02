@@ -184,6 +184,14 @@ enum Commands {
         /// The amount to type, as Venmo's field expects it ("1.00").
         #[arg(long)]
         amount: String,
+        /// Actually click send. Real money leaves, bound to no intent.
+        ///
+        /// Without this the run stops at the button, which tests every step
+        /// except the click. With it the payment is real and there is no escrow
+        /// behind it to release anything back: this is the browser driver being
+        /// exercised, not a fill.
+        #[arg(long)]
+        send_for_real: bool,
     },
 
     /// Ask the live feed which entry a payment is, without attesting anything.
@@ -242,8 +250,13 @@ async fn main() -> Result<()> {
 
     // Driving the payment page needs no key either: it stops before the click
     // and sends nothing on-chain.
-    if let Commands::TestPay { recipient, amount } = &cli.command {
-        return run_test_pay(&config, recipient, amount).await;
+    if let Commands::TestPay {
+        recipient,
+        amount,
+        send_for_real,
+    } = &cli.command
+    {
+        return run_test_pay(&config, recipient, amount, *send_for_real).await;
     }
     if let Commands::FindPayment {
         recipient,
@@ -451,7 +464,12 @@ fn print_terms(terms: &IntentTerms) {
 /// runs them against the page, and `PaymentStep::Fill` sets a React-controlled
 /// input, which is the failure that silently does nothing. This runs the live
 /// sequence with the irreversible step removed, so both failures surface here.
-async fn run_test_pay(config: &TakerConfig, recipient: &str, amount: &str) -> Result<()> {
+async fn run_test_pay(
+    config: &TakerConfig,
+    recipient: &str,
+    amount: &str,
+    send_for_real: bool,
+) -> Result<()> {
     // Refuse a malformed amount before opening a payment page for it.
     let cents = zecp2p_taker::venmo::amount_matches(amount, amount);
     if !cents {
@@ -480,8 +498,24 @@ async fn run_test_pay(config: &TakerConfig, recipient: &str, amount: &str) -> Re
         println!("  {}", step.describe());
     }
 
-    println!("\ndriving the page (DryRun: the send button is never clicked)\n");
-    match browser.pay(&tab, &request, SendMode::DryRun).await? {
+    let mode = if send_for_real {
+        // The cap still applies: it is the one guard that does not depend on the
+        // page behaving, and it refuses rather than clamps.
+        let cents = zecp2p_taker::auto::money::payment_cents(
+            alloy::primitives::U256::from(
+                amount.replace('.', "").parse::<u64>().unwrap_or(u64::MAX),
+            ) * alloy::primitives::U256::from(10_000u64),
+            alloy::primitives::U256::from(1_000_000_000_000_000_000u128),
+            config.taker.max_payment_cents,
+        )?;
+        println!("\nSENDING FOR REAL: ${cents} to @{claimed}\n");
+        SendMode::Live
+    } else {
+        println!("\ndriving the page (DryRun: the send button is never clicked)\n");
+        SendMode::DryRun
+    };
+
+    match browser.pay(&tab, &request, mode).await? {
         zecp2p_taker::venmo::PaymentOutcome::WouldHaveSent { recipient, amount } => {
             println!(
                 "PASS: the page accepted ${amount} to @{recipient}, the recipient \
@@ -489,8 +523,11 @@ async fn run_test_pay(config: &TakerConfig, recipient: &str, amount: &str) -> Re
             );
             println!("Nothing was sent.");
         }
-        zecp2p_taker::venmo::PaymentOutcome::Sent { .. } => {
-            bail!("a dry run reported a send; this is a bug and money may have moved")
+        zecp2p_taker::venmo::PaymentOutcome::Sent { recipient, amount } => {
+            if !send_for_real {
+                bail!("a dry run reported a send; this is a bug and money may have moved");
+            }
+            println!("SENT: ${amount} to @{recipient}");
         }
     }
     Ok(())
