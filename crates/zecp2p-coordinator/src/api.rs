@@ -35,6 +35,10 @@ const QUOTE_REFUND_PLACEHOLDER: &str = "t1KhV8ADhTGvVvBpTiEcJGnhTvBBFVFYHXx";
 pub struct QuoteQuery {
     /// Amount in ZEC (decimal, e.g., "0.5")
     pub zec_amount: String,
+    /// The rate the offramp will be created at, so the quoted Venmo figure is
+    /// computed rather than guessed. Defaults to the same 1.0 `/offramp` does.
+    #[serde(default)]
+    pub min_rate: Option<String>,
 }
 
 /// Get quote for ZEC → Venmo conversion
@@ -85,8 +89,15 @@ pub async fn get_quote(
         .map_err(|_| AppError::NearIntents("Invalid output amount".to_string()))?;
     let usdc_decimal = usdc_raw as f64 / 1_000_000.0;
 
-    // Estimate Venmo amount (assuming ~1% zk-p2p fee)
-    let venmo_amount = usdc_decimal * 0.99;
+    // What the taker will actually be asked to send, computed by the same
+    // function that will compute it for real at fill time rather than by a
+    // constant. This used to be `usdc_decimal * 0.99`, a flat 1% guess that was
+    // wrong in kind as well as in size: the 1% it modelled is the spread, and
+    // the real spread is whatever `min_rate` the caller goes on to pass.
+    let min_rate = parse_min_rate(query.min_rate.as_deref())?;
+    let venmo_cents = zecp2p_types::pricing::payment_cents_for(U256::from(usdc_raw), min_rate)
+        .map_err(|e| AppError::InvalidState(e.to_string()))?;
+    let venmo_amount = format!("{}.{:02}", venmo_cents / 100, venmo_cents % 100);
 
     // Calculate effective rate
     let zec_decimal = zatoshi as f64 / 100_000_000.0;
@@ -110,7 +121,7 @@ pub async fn get_quote(
     Ok(Json(QuoteResponse {
         zec_amount: query.zec_amount,
         usdc_amount: format!("{:.6}", usdc_decimal),
-        venmo_amount: format!("{:.2}", venmo_amount),
+        venmo_amount,
         rate: format!("{:.4}", rate),
         expires_at,
     }))
@@ -134,6 +145,11 @@ pub struct CreateOfframpBody {
     /// Minimum USD per USDC the taker must pay on zk-p2p (decimal, default "1.0")
     #[serde(default)]
     pub min_rate: Option<String>,
+    /// The exact dollars the taker must send on Venmo, as a decimal string
+    /// ("5.00"). Sizes the deposit's intent so the payment is this number
+    /// exactly, with the spread and the curator fee added on top of it.
+    #[serde(default)]
+    pub target_payment: Option<String>,
     /// Timeout in seconds
     #[serde(default)]
     pub timeout_seconds: Option<u64>,
@@ -189,6 +205,8 @@ pub async fn create_offramp(
     // Validate ZEC refund address format (basic check)
     validate_zec_address(&body.zec_refund_address)?;
 
+    let target_payment_cents = parse_target_payment(body.target_payment.as_deref())?;
+
     let request = OfframpRequest {
         zec_amount: zatoshi,
         venmo_username: body.venmo_username,
@@ -196,6 +214,7 @@ pub async fn create_offramp(
         taker_address,
         zec_refund_address: body.zec_refund_address,
         min_rate,
+        target_payment_cents,
         timeout_seconds: body.timeout_seconds.unwrap_or(600),
     };
 
@@ -515,6 +534,49 @@ mod zec_address_tests {
         assert!(validate_zec_address("bc1qxy2kgdygjrsqtzq2n0yrf249").is_err());
         assert!(validate_zec_address("t1short").is_err());
     }
+}
+
+/// Parse the requested Venmo payment ("5.00") into whole cents.
+///
+/// Reuses the 18-decimal parser so the accepted syntax is exactly the one
+/// `min_rate` accepts: digits and at most one point, no sign, no exponent, no
+/// "NaN". A payment is then required to be a whole number of cents, because
+/// Venmo's field takes two decimals and a request for $5.001 cannot be paid
+/// exactly, which is the whole point of this parameter.
+fn parse_target_payment(input: Option<&str>) -> Result<Option<u64>, AppError> {
+    let Some(s) = input else {
+        return Ok(None);
+    };
+    let s = s.trim();
+    if s.is_empty() {
+        return Ok(None);
+    }
+
+    let scaled = parse_decimal_18(s)
+        .map_err(|_| AppError::InvalidState(format!("Invalid target_payment {s:?}")))?;
+
+    // 1e18 per dollar / 100 cents per dollar = 1e16 per cent.
+    const PER_CENT: u128 = 10_000_000_000_000_000;
+    let scaled: u128 = scaled
+        .try_into()
+        .map_err(|_| AppError::InvalidState("target_payment is too large".to_string()))?;
+
+    if scaled == 0 {
+        return Err(AppError::InvalidState(
+            "target_payment must be more than zero".to_string(),
+        ));
+    }
+    if scaled % PER_CENT != 0 {
+        return Err(AppError::InvalidState(format!(
+            "target_payment {s:?} is not a whole number of cents; Venmo cannot be \
+             asked to send a fraction of a cent"
+        )));
+    }
+
+    let cents = scaled / PER_CENT;
+    u64::try_from(cents)
+        .map(Some)
+        .map_err(|_| AppError::InvalidState("target_payment is too large".to_string()))
 }
 
 /// Parse min_rate (USD per USDC the zk-p2p taker must pay) from a decimal

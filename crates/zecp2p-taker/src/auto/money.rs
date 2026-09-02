@@ -65,37 +65,10 @@ impl std::fmt::Display for PaymentAmount {
 /// or fails `UPV: Snapshot rate mismatch`, after the fiat has already left.
 /// The asymmetry is total, so this is not a style choice.
 pub fn payment_cents(amount_units: U256, rate: U256, cap_cents: u64) -> Result<PaymentAmount> {
-    if amount_units.is_zero() {
-        bail!("refusing to build a payment for a zero-amount intent");
-    }
-    if rate.is_zero() {
-        bail!("refusing to build a payment at a zero conversion rate");
-    }
-
-    // u128 is enough with room to spare: the product below is bounded by
-    // amount_units * rate, and a taker capped in the dollars will never see an
-    // amount_units anywhere near u128::MAX. Checked anyway, because an
-    // unchecked overflow here is a wrong payment rather than a panic.
-    let units: u128 = amount_units
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("intent amount {amount_units} does not fit in u128"))?;
-    let rate: u128 = rate
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("conversion rate {rate} does not fit in u128"))?;
-
-    // cents = ceil(units * rate / (1e18 * 10_000)), computed as one ceiling
-    // division so the two roundings cannot compound.
-    let scaled = units
-        .checked_mul(rate)
-        .ok_or_else(|| anyhow::anyhow!("{units} units at rate {rate} overflows"))?;
-    let divisor = RATE_SCALE
-        .checked_mul(UNITS_PER_CENT)
-        .expect("1e18 * 1e4 fits in u128");
-    // Ceiling division of a non-zero product is at least 1, so there is no
-    // zero-cent case to guard: sub-cent dust becomes a one-cent payment rather
-    // than an empty one. That is the right direction (see above), and it means
-    // the smallest payment this function can produce is $0.01.
-    let cents = scaled.div_ceil(divisor);
+    // The arithmetic itself is shared with the coordinator, which sizes the
+    // intent this function prices. Two implementations of it would be two
+    // chances to disagree about the number on the Venmo screen.
+    let cents = zecp2p_types::pricing::payment_cents_for(amount_units, rate)?;
 
     if cents > u128::from(cap_cents) {
         bail!(
@@ -110,6 +83,60 @@ pub fn payment_cents(amount_units: U256, rate: U256, cap_cents: u64) -> Result<P
     }
 
     Ok(PaymentAmount { cents })
+}
+
+/// The intent size whose payment lands on exactly `target_cents`.
+///
+/// This is [`payment_cents`] run backwards, and it exists because the two
+/// directions answer different questions. `payment_cents` asks "given an intent
+/// somebody already created, what do I owe?". This asks "the user requested
+/// $5.00 and must see $5.00 on Venmo; how big does the intent have to be?".
+///
+/// # Why the intent must be grossed up
+///
+/// The Venmo number is `units * rate`, and `rate` is below 1.0 by the spread
+/// that pays the taker. Sizing the intent at the requested amount therefore
+/// pays the spread *out of the requested amount*: the 2026-09-01 fill sized
+/// 4,875,437 units against a $5.00 request at rate 0.990881148896019200 and the
+/// payment came out $4.84. The fee has to be added on top of the request, not
+/// taken out of it, which means solving for the units rather than assuming them.
+///
+/// # Why floor, and why the readback
+///
+/// `payment_cents` ceils. Inverting a ceiling gives a *range* of admissible
+/// intent sizes, not a point: at the rate above, anything in
+/// `(5_035_921, 5_046_013]` prices to exactly 500 cents. Taking the floor of
+/// `target * scale / rate` picks the top of that range, which is the largest
+/// intent the requested payment can honestly buy, so the user receives the most
+/// USDC consistent with paying exactly what they asked to pay. One unit more
+/// prices to 501 cents.
+///
+/// The result is fed back through `payment_cents` before it is returned. That is
+/// not defensive decoration: it is the property the caller actually needs, and
+/// an off-by-one in this arithmetic is a payment that is a cent wrong on a live
+/// Venmo screen. If the readback disagrees, this refuses rather than returning a
+/// size that prices to something other than what was requested.
+pub fn intent_units_for_payment(
+    target_cents: u64,
+    rate: U256,
+    cap_cents: u64,
+) -> Result<(U256, PaymentAmount)> {
+    if target_cents > cap_cents {
+        bail!(
+            "requested payment of ${}.{:02} exceeds this daemon's cap of ${}.{:02}. \
+             Refusing to size an intent for it. Raise taker.max_payment_cents \
+             deliberately if this is intended.",
+            target_cents / 100,
+            target_cents % 100,
+            cap_cents / 100,
+            cap_cents % 100
+        );
+    }
+
+    let units = zecp2p_types::pricing::intent_units_for_cents(target_cents, rate)?;
+    let payment = payment_cents(units, rate, cap_cents)?;
+
+    Ok((units, payment))
 }
 
 #[cfg(test)]
@@ -204,6 +231,94 @@ mod tests {
         assert_eq!(cents(1, 1), 1);
         // Just under a cent.
         assert_eq!(cents(9_999, ONE), 1);
+    }
+
+    /// The bug this run exists to fix. A $5.00 request at deposit 4499's rate
+    /// produced a $4.84 Venmo payment because the intent was sized at the
+    /// requested amount and the spread came out of it. Sized the other way, the
+    /// payment is exactly $5.00 and the spread is added on top.
+    #[test]
+    fn a_five_dollar_request_pays_exactly_five_dollars() {
+        let rate = U256::from(990_881_148_896_019_200u128);
+        let (units, payment) = intent_units_for_payment(500, rate, NO_CAP).expect("should size");
+
+        assert_eq!(payment.cents(), 500);
+        assert_eq!(payment.to_venmo_string(), "5.00");
+
+        // The gross-up is real: the intent is larger than the request, not equal
+        // to it, and the difference is the spread paid on top.
+        assert_eq!(units, U256::from(5_046_013u64));
+        assert!(units > U256::from(5_000_000u64));
+
+        // The old sizing, for contrast: the requested amount as the intent.
+        let old = payment_cents(U256::from(4_875_437u64), rate, NO_CAP).unwrap();
+        assert_eq!(old.to_venmo_string(), "4.84");
+    }
+
+    /// The round trip is the guarantee, across the whole range of sizes and
+    /// spreads this daemon will see. Whatever is requested is what gets paid.
+    #[test]
+    fn every_sized_intent_prices_back_to_what_was_requested() {
+        let rates = [
+            RATE_SCALE,                    // 1.0, no spread
+            990_881_148_896_019_200,       // deposit 4499
+            988_652_000_000_000_000,       // the economics doc's $5 recommendation
+            998_000_000_000_000_000,       // deposit 4496
+            950_000_000_000_000_000,       // a wide spread
+        ];
+        for rate in rates {
+            for target in [1u64, 5, 99, 100, 484, 500, 501, 1_000, 2_500] {
+                let (units, payment) =
+                    intent_units_for_payment(target, U256::from(rate), NO_CAP)
+                        .unwrap_or_else(|e| panic!("rate {rate} target {target}: {e}"));
+                assert_eq!(
+                    payment.cents(),
+                    u128::from(target),
+                    "rate {rate} target {target} sized {units}"
+                );
+            }
+        }
+    }
+
+    /// Floor, not ceil: the sized intent is the largest one that still prices to
+    /// the request, and one unit more overshoots by a cent.
+    #[test]
+    fn the_sized_intent_is_the_top_of_the_admissible_range() {
+        let rate = U256::from(990_881_148_896_019_200u128);
+        let (units, _) = intent_units_for_payment(500, rate, NO_CAP).unwrap();
+
+        assert_eq!(payment_cents(units, rate, NO_CAP).unwrap().cents(), 500);
+        assert_eq!(
+            payment_cents(units + U256::from(1u64), rate, NO_CAP)
+                .unwrap()
+                .cents(),
+            501,
+            "one unit more must overshoot, or this is not the top of the range"
+        );
+    }
+
+    /// A rate of exactly 1.0 needs no gross-up, and must not invent one.
+    #[test]
+    fn a_rate_of_one_sizes_the_intent_at_the_request() {
+        let (units, payment) = intent_units_for_payment(500, U256::from(ONE), NO_CAP).unwrap();
+        assert_eq!(units, U256::from(5_000_000u64));
+        assert_eq!(payment.to_venmo_string(), "5.00");
+    }
+
+    /// The cap is checked against the request itself, before any arithmetic, so
+    /// an oversized order is refused rather than silently sized.
+    #[test]
+    fn sizing_refuses_a_request_over_the_cap() {
+        let err = intent_units_for_payment(5_000, U256::from(ONE), 1_000).expect_err("must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains("exceeds"), "{msg}");
+        assert!(msg.contains("$10.00"), "{msg}");
+    }
+
+    #[test]
+    fn sizing_refuses_degenerate_inputs() {
+        assert!(intent_units_for_payment(0, U256::from(ONE), NO_CAP).is_err());
+        assert!(intent_units_for_payment(500, U256::ZERO, NO_CAP).is_err());
     }
 
     #[test]

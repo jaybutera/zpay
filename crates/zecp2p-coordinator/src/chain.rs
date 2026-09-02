@@ -208,6 +208,57 @@ impl ChainClient {
         Ok((receipt.transaction_hash, deposit_id))
     }
 
+    /// Process a session, pinning the deposit's intent range to `[min, max]`.
+    ///
+    /// `process_offramp` leaves the range at the whole credited amount, which
+    /// makes the taker's Venmo payment a function of whatever the swap happened
+    /// to deliver. Pinning it lets the keeper fix the intent at the size that
+    /// prices to the payment the user requested, and leave the swap's overshoot
+    /// in the deposit rather than in the payment.
+    pub async fn process_offramp_with_range(
+        &self,
+        session_id: B256,
+        payment_methods: Vec<B256>,
+        payment_method_data: Vec<OfframpGlue::DepositPaymentMethodData>,
+        currencies: Vec<Vec<OfframpGlue::Currency>>,
+        intent_min: U256,
+        intent_max: U256,
+    ) -> Result<(B256, U256)> {
+        let glue_addr = self.glue_contract()?;
+        let provider = self.signing_provider()?;
+
+        let glue = OfframpGlue::new(glue_addr, provider);
+
+        let tx = glue
+            .processOfframpWithRange(
+                session_id,
+                payment_methods,
+                payment_method_data,
+                currencies,
+                intent_min,
+                intent_max,
+            )
+            .send()
+            .await
+            .context("Failed to send processOfframpWithRange transaction")?;
+
+        let receipt = tx.get_receipt().await?;
+
+        let deposit_id = receipt
+            .inner
+            .logs()
+            .iter()
+            .filter_map(|log| {
+                log.log_decode::<OfframpGlue::OfframpProcessed>()
+                    .ok()
+                    .map(|decoded| decoded.inner.depositId)
+            })
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("No OfframpProcessed event found"))?;
+
+        Ok((receipt.transaction_hash, deposit_id))
+    }
+
     /// Check if a zk-p2p deposit has any intents signaled
     pub async fn get_deposit(&self, deposit_id: U256) -> Result<IEscrow::Deposit> {
         let provider = self.provider();

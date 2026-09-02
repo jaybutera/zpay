@@ -250,6 +250,21 @@ sol! {
             Currency[][] calldata currencies
         ) external returns (uint256 depositId);
 
+        /// Same, but pins the deposit's intent amount range.
+        ///
+        /// The keeper uses this to fix a single intent at the size that prices to
+        /// the payment the user actually requested. `processOfframp` leaves the
+        /// range at the whole credited amount, which makes the Venmo number a
+        /// function of whatever the swap happened to deliver.
+        function processOfframpWithRange(
+            bytes32 sessionId,
+            bytes32[] calldata paymentMethods,
+            DepositPaymentMethodData[] calldata paymentMethodData,
+            Currency[][] calldata currencies,
+            uint256 intentMin,
+            uint256 intentMax
+        ) external returns (uint256 depositId);
+
         function rescue(bytes32 sessionId) external;
 
         function withdrawFromZkp2p(bytes32 sessionId) external;

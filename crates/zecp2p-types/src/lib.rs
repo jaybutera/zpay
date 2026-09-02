@@ -9,6 +9,7 @@
 pub mod abi;
 pub mod config;
 pub mod offramp;
+pub mod pricing;
 
 pub use config::Config;
 pub use offramp::{OfframpRequest, OfframpResponse, OfframpSession, OfframpStatus, QuoteResponse};

@@ -551,6 +551,7 @@ async fn test_keeper_auto_processes_on_usdc_arrival() {
         taker_address: Some(TEST_USER.parse().unwrap()),
         zec_refund_address: "t1VJnUz9FDy7WfFxqXwMZJWVxzMrRD7MvBA".to_string(),
         min_rate: U256::from(1_000_000_000_000_000_000u128),
+        target_payment_cents: None,
         timeout_seconds: 600,
     };
 
@@ -663,6 +664,7 @@ async fn test_full_event_driven_flow() {
         taker_address: Some(TEST_USER.parse().unwrap()),
         zec_refund_address: "t1VJnUz9FDy7WfFxqXwMZJWVxzMrRD7MvBA".to_string(),
         min_rate: U256::from(1_000_000_000_000_000_000u128),
+        target_payment_cents: None,
         timeout_seconds: 600,
     };
 
@@ -813,6 +815,7 @@ async fn test_keeper_detects_intent_signaled() {
         taker_address: Some(TEST_USER.parse().unwrap()),
         zec_refund_address: "t1VJnUz9FDy7WfFxqXwMZJWVxzMrRD7MvBA".to_string(),
         min_rate: U256::from(1_000_000_000_000_000_000u128),
+        target_payment_cents: None,
         timeout_seconds: 600,
     };
 
@@ -925,6 +928,7 @@ async fn test_keeper_detects_intent_fulfilled() {
         taker_address: Some(TEST_USER.parse().unwrap()),
         zec_refund_address: "t1VJnUz9FDy7WfFxqXwMZJWVxzMrRD7MvBA".to_string(),
         min_rate: U256::from(1_000_000_000_000_000_000u128),
+        target_payment_cents: None,
         timeout_seconds: 600,
     };
 
@@ -1077,6 +1081,7 @@ async fn test_complete_keeper_driven_flow() {
         taker_address: Some(TEST_USER.parse().unwrap()),
         zec_refund_address: "t1VJnUz9FDy7WfFxqXwMZJWVxzMrRD7MvBA".to_string(),
         min_rate: U256::from(1_000_000_000_000_000_000u128), // 1.0 (18 decimals)
+        target_payment_cents: None,
         timeout_seconds: 600,
     };
 
@@ -1284,6 +1289,7 @@ async fn test_a_short_settlement_credits_the_fill_and_leaves_the_rest_unassigned
         taker_address: None,
         zec_refund_address: "t1VJnUz9FDy7WfFxqXwMZJWVxzMrRD7MvBA".to_string(),
         min_rate: U256::from(1_000_000_000_000_000_000u128),
+        target_payment_cents: None,
         timeout_seconds: 600,
     };
 

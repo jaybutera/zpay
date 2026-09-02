@@ -204,6 +204,16 @@ enum Commands {
         #[arg(long)]
         min_rate: Option<String>,
 
+        /// The exact dollars the taker must send on Venmo ("1.00").
+        ///
+        /// Sizes the deposit's intent so the payment is this number exactly,
+        /// with the spread and the curator's fee added on top of it. Left out,
+        /// the intent is the whole swap output and the payment is whatever that
+        /// prices to: the 2026-09-01 fill went out that way and paid $4.84
+        /// against a $5.00 request.
+        #[arg(long)]
+        target_payment: Option<String>,
+
         /// Timeout for NEAR settlement in seconds
         #[arg(long, default_value = "600")]
         timeout: u64,
@@ -311,6 +321,7 @@ async fn main() -> Result<()> {
             taker,
             zec_address,
             min_rate,
+            target_payment,
             timeout,
         } => {
             let signer = user_signer(private_key.as_deref())?;
@@ -342,6 +353,7 @@ async fn main() -> Result<()> {
                 "taker_address": taker,
                 "zec_refund_address": zec_address,
                 "min_rate": min_rate,
+                "target_payment": target_payment,
                 "timeout_seconds": timeout,
             });
 

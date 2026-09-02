@@ -21,7 +21,7 @@ use zecp2p_taker::{
     auto::{
         attest::{AttestRequest, AttestationFile, Attester},
         cookie::CookieStore,
-        daemon::{require_usable_session, Confirm, FillPlan, Outcome, TerminalConfirm},
+        daemon::{require_usable_session, Confirm, FillPlan, FixedConfirm, Outcome, TerminalConfirm},
         intent::{IntentReader, IntentTerms},
         journal::{FillRecord, FillState, Journal},
         money::payment_cents,
@@ -32,7 +32,7 @@ use zecp2p_taker::{
     claim::Claimer,
     config::TakerConfig,
     proof::load_proof,
-    venmo::{SendMode, VenmoBrowser},
+    venmo::{PaymentRequest, SendMode, VenmoBrowser},
     TakerAgent,
 };
 
@@ -158,6 +158,32 @@ enum Commands {
         /// Scan once and exit rather than looping.
         #[arg(long)]
         once: bool,
+        /// Answer both money gates yes, with no terminal input.
+        ///
+        /// This is phase 2: the daemon signals, pays Venmo, attests and
+        /// fulfils without stopping. The cap, the payee check, the amount
+        /// readback in the browser and the journal are what stand between a
+        /// bad value and a real payment; there is no human left to catch it.
+        /// `--only-user` is strongly advised with this, or the daemon will
+        /// front fiat for strangers unattended.
+        #[arg(long)]
+        yes: bool,
+    },
+
+    /// Drive the real Venmo payment page for an amount, stopping before the send.
+    ///
+    /// This is the test the unit tests cannot be: it navigates the live DOM,
+    /// waits for the real selectors, fills the React-controlled amount field and
+    /// reads the value back out of the page, then stops. Every step of a live
+    /// payment runs except the click, so a stale selector or a silently
+    /// discarded React input fails here rather than during a real fill.
+    TestPay {
+        /// Venmo username to open a payment to, without the leading @.
+        #[arg(long)]
+        recipient: String,
+        /// The amount to type, as Venmo's field expects it ("1.00").
+        #[arg(long)]
+        amount: String,
     },
 
     /// Report an intent's terms as the daemon reads them, and stop.
@@ -197,6 +223,12 @@ async fn main() -> Result<()> {
             std::process::exit(1);
         }
         return Ok(());
+    }
+
+    // Driving the payment page needs no key either: it stops before the click
+    // and sends nothing on-chain.
+    if let Commands::TestPay { recipient, amount } = &cli.command {
+        return run_test_pay(&config, recipient, amount).await;
     }
 
     // Attest and Terms are read-only and need no key: they read the chain and,
@@ -259,7 +291,7 @@ async fn main() -> Result<()> {
     );
 
     match cli.command {
-        Commands::CheckVenmo => unreachable!("handled above"),
+        Commands::CheckVenmo | Commands::TestPay { .. } => unreachable!("handled above"),
 
         Commands::Run { dry_run, recipient } => {
             let mode = if dry_run {
@@ -313,6 +345,7 @@ async fn main() -> Result<()> {
             recipient,
             lookback,
             once,
+            yes,
         } => {
             let only_user = match only_user {
                 Some(a) => Some(a.parse::<alloy::primitives::Address>().context(
@@ -335,7 +368,7 @@ async fn main() -> Result<()> {
                     lookback_blocks: lookback.unwrap_or(config.taker.lookback_blocks),
                 },
             );
-            run_auto(&provider, &config, &watcher, taker, dry_run, recipient, once).await?;
+            run_auto(&provider, &config, &watcher, taker, dry_run, recipient, once, yes).await?;
         }
 
         Commands::Terms { .. } | Commands::Attest { .. } => unreachable!("handled above"),
@@ -376,6 +409,58 @@ fn print_terms(terms: &IntentTerms) {
     if terms.block_number > 0 {
         println!("signalled at: block {}", terms.block_number);
     }
+}
+
+/// Drive the real payment page and stop before the send button.
+///
+/// Exists because every other test of this path asserts over generated strings.
+/// The selectors in `venmo.rs` are guesses at Venmo's markup until something
+/// runs them against the page, and `PaymentStep::Fill` sets a React-controlled
+/// input, which is the failure that silently does nothing. This runs the live
+/// sequence with the irreversible step removed, so both failures surface here.
+async fn run_test_pay(config: &TakerConfig, recipient: &str, amount: &str) -> Result<()> {
+    // Refuse a malformed amount before opening a payment page for it.
+    let cents = zecp2p_taker::venmo::amount_matches(amount, amount);
+    if !cents {
+        bail!("{amount:?} is not an amount Venmo's field would accept");
+    }
+    let claimed = zecp2p_taker::payee::validate_username_shape(recipient)?.to_string();
+
+    let browser = VenmoBrowser::new(config.venmo.cdp_url.clone(), config.venmo.timeout_seconds);
+    let tab = browser
+        .find_venmo_tab()
+        .await
+        .context("no Venmo tab; start Chrome with --remote-debugging-port=9222 and sign in")?;
+    println!("tab        : {}", tab.url);
+    if !VenmoBrowser::session_looks_live(&tab) {
+        bail!("the Venmo tab at {} looks signed out", tab.url);
+    }
+
+    let request = PaymentRequest {
+        recipient: claimed.clone(),
+        amount: amount.to_string(),
+        note: config.venmo.note.clone(),
+    };
+
+    println!("\nsteps this would run for ${amount} to @{claimed}:");
+    for step in browser.payment_steps(&request) {
+        println!("  {}", step.describe());
+    }
+
+    println!("\ndriving the page (DryRun: the send button is never clicked)\n");
+    match browser.pay(&tab, &request, SendMode::DryRun).await? {
+        zecp2p_taker::venmo::PaymentOutcome::WouldHaveSent { recipient, amount } => {
+            println!(
+                "PASS: the page accepted ${amount} to @{recipient}, the recipient \
+                 matched, and the amount read back out of the field."
+            );
+            println!("Nothing was sent.");
+        }
+        zecp2p_taker::venmo::PaymentOutcome::Sent { .. } => {
+            bail!("a dry run reported a send; this is a bug and money may have moved")
+        }
+    }
+    Ok(())
 }
 
 /// Reproduce an attestation for an intent whose payment is already sent.
@@ -598,6 +683,7 @@ async fn run_auto<P: alloy::providers::Provider + Clone>(
     dry_run: bool,
     recipient_override: Option<String>,
     once: bool,
+    auto_yes: bool,
 ) -> Result<()> {
     let journal = Journal::open(&config.taker.journal_path)?;
 
@@ -632,6 +718,12 @@ async fn run_auto<P: alloy::providers::Provider + Clone>(
     println!("watching glue {} from block {from_block}", config.contracts.glue_contract);
     if dry_run {
         println!("dry run: nothing will be signalled, staked or paid.");
+    } else if auto_yes {
+        println!(
+            "--yes: both money gates are answered automatically. This run can \
+             signal, stake, send a real Venmo payment and fulfil with no further \
+             input."
+        );
     }
 
     loop {
@@ -651,6 +743,7 @@ async fn run_auto<P: alloy::providers::Provider + Clone>(
                     taker,
                     dry_run,
                     recipient_override.as_deref(),
+                    auto_yes,
                 )
                 .await
                 {
@@ -682,6 +775,7 @@ async fn handle_one<P: alloy::providers::Provider + Clone>(
     taker: alloy::primitives::Address,
     dry_run: bool,
     recipient_override: Option<&str>,
+    auto_yes: bool,
 ) -> Result<Outcome> {
     // Everything free comes first. The cookie check is here rather than before
     // the attestation because a dead cookie found after the payment means the
@@ -780,23 +874,248 @@ async fn handle_one<P: alloy::providers::Provider + Clone>(
         });
     }
 
+    // How the two money gates are answered. `--yes` is phase 2: no terminal
+    // input at all. The guards that remain are the payment cap, the payee
+    // check already done above, the browser's own amount readback, and the
+    // journal.
+    let confirm: Box<dyn Confirm> = if auto_yes {
+        Box::new(FixedConfirm(true))
+    } else {
+        Box::new(TerminalConfirm)
+    };
+
     // Gate one. Gas and a 14-day stake lock.
-    if !TerminalConfirm.confirm(Gate::Signal, &plan.signal_prompt())? {
+    if !confirm.confirm(Gate::Signal, &plan.signal_prompt())? {
         record.state = FillState::Cancelled;
         record.note = Some("operator declined at the signal gate".into());
         journal.record(&record)?;
         return Ok(Outcome::Declined { gate: Gate::Signal });
     }
 
-    println!(
-        "\nApproved. The rest of phase 1 (signal, pay, attest, fulfil) is wired \n\
-         through the same modules but is not run in this pass: no key is staked \n\
-         and no payment is made without a second explicit gate."
+    run_fill(
+        provider,
+        config,
+        journal,
+        &mut record,
+        &plan,
+        taker,
+        confirm.as_ref(),
+    )
+    .await
+}
+
+/// Everything after the signal gate: stake, signal, pay, attest, fulfil.
+///
+/// Split out of `handle_one` because this is the part where money moves and the
+/// ordering matters. Each step writes the journal *before* it acts, never after,
+/// so a crash leaves a record that says what may have happened rather than one
+/// that says nothing did.
+#[allow(clippy::too_many_arguments)]
+async fn run_fill<P: alloy::providers::Provider + Clone>(
+    provider: &P,
+    config: &TakerConfig,
+    journal: &Journal,
+    record: &mut FillRecord,
+    plan: &FillPlan,
+    taker: alloy::primitives::Address,
+    confirm: &dyn Confirm,
+) -> Result<Outcome> {
+    let claimer = Claimer::new(
+        provider.clone(),
+        config.contracts.zkp2p_orchestrator,
+        config.contracts.zkp2p_escrow,
+        config.contracts.stake_vault,
+        config.contracts.usdc,
+        taker,
     );
-    record.state = FillState::NeedsOperator;
-    record.note = Some("approved at the signal gate; phase 1 stops here".into());
-    journal.record(&record)?;
-    Ok(Outcome::Blocked {
-        why: "phase 1 stops after the signal gate in this build".into(),
-    })
+
+    // The curator's signature, the referral fee it mandates, and the rate. Asked
+    // for before the stake because a refusal here costs nothing and a 14-day
+    // lock costs a fortnight of working capital. An ungated deposit needs none,
+    // and 99 of 100 recently scanned deposits are gated.
+    let escrow = IEscrowTaker::new(config.contracts.zkp2p_escrow, provider);
+    let gating_service = escrow
+        .getDepositGatingService(plan.deposit.deposit_id, venmo_payment_method())
+        .call()
+        .await
+        .context("could not read the deposit's gating service")?;
+
+    let gating = if gating_service == alloy::primitives::Address::ZERO {
+        zecp2p_taker::auto::gating::GatingSignature::none()
+    } else {
+        let request = zecp2p_taker::auto::gating::GatingRequest {
+            deposit_id: plan.deposit.deposit_id.to_string(),
+            processor_name: "venmo".to_string(),
+            amount: plan.terms.amount.to_string(),
+            to_address: taker,
+            payment_method: venmo_payment_method(),
+            fiat_currency: usd_currency_code(),
+            conversion_rate: plan.terms.conversion_rate.to_string(),
+            chain_id: config.network.chain_id.to_string(),
+            payee_details: plan.terms.payee_hash.to_string(),
+            caller_address: taker,
+            escrow_address: config.contracts.zkp2p_escrow,
+            orchestrator_address: config.contracts.zkp2p_orchestrator,
+            extra: config.zkp2p.gating_extra.clone(),
+        };
+        zecp2p_taker::auto::gating::GatingClient::new(
+            reqwest::Client::new(),
+            config.zkp2p.api_url.clone(),
+        )
+        .sign(&request)
+        .await
+        .context("the curator refused to sign this intent")?
+    };
+
+    claimer
+        .ensure_stake(plan.stake_needed)
+        .await
+        .context("could not stake for this intent")?;
+
+    record.state = FillState::Signalling;
+    journal.record(record)?;
+
+    let intent = claimer
+        .signal_intent(
+            plan.deposit.deposit_id,
+            plan.terms.amount,
+            venmo_payment_method(),
+            usd_currency_code(),
+            plan.terms.conversion_rate,
+            &gating,
+        )
+        .await
+        .context("signalIntent failed")?;
+
+    record.state = FillState::Signalled;
+    record.intent_hash = Some(intent.intent_hash);
+    journal.record(record)?;
+    println!("signalled intent {}", intent.intent_hash);
+
+    // The attestation is bound to the intent's on-chain signal time, and a
+    // guess reverts with "UPV: Snapshot timestamp mismatch" after the fiat has
+    // left. Read it back from the chain rather than using the wall clock.
+    let terms = IntentReader::new(
+        provider,
+        config.contracts.zkp2p_orchestrator,
+        config.contracts.zkp2p_escrow,
+    )
+    .terms(intent.intent_hash, 50_000)
+    .await
+    .context("could not read back the intent we just signalled")?;
+    record.signalled_at_ms = Some(terms.timestamp_ms());
+    journal.record(record)?;
+
+    // Gate two. Real dollars, and nothing recalls them.
+    if !confirm.confirm(Gate::Pay, &plan.pay_prompt(intent.intent_hash))? {
+        record.state = FillState::Cancelled;
+        record.note = Some("operator declined at the payment gate".into());
+        journal.record(record)?;
+        // Give the claim back so the maker's USDC is not stranded and the stake
+        // unlocks, rather than leaving it to expire.
+        if let Err(e) = claimer.cancel_intent(intent.intent_hash).await {
+            tracing::error!(error = %e, "declined at the pay gate but cancelIntent also failed; the intent will expire");
+        }
+        return Ok(Outcome::Declined { gate: Gate::Pay });
+    }
+
+    // Written before the click, never after. A record in this state means the
+    // money may or may not have left, and only a human reading the Venmo feed
+    // can tell which.
+    record.state = FillState::Paying;
+    record.paid = Some(plan.payment.to_venmo_string());
+    journal.record(record)?;
+
+    let browser = VenmoBrowser::new(config.venmo.cdp_url.clone(), config.venmo.timeout_seconds);
+    let tab = browser
+        .find_venmo_tab()
+        .await
+        .context("no logged-in Venmo tab to pay from")?;
+    let request = PaymentRequest {
+        recipient: plan.recipient.clone(),
+        amount: plan.payment.to_venmo_string(),
+        note: config.venmo.note.clone(),
+    };
+
+    if let Err(e) = browser.pay(&tab, &request, SendMode::Live).await {
+        // The page refused somewhere. The recipient check and the amount
+        // readback are built to fail closed before the click, but a failure
+        // after it looks identical from here, so this does not guess.
+        record.state = FillState::NeedsOperator;
+        record.note = Some(format!(
+            "the browser step failed: {e:#}. The journal was written before the \
+             send button, so check the Venmo feed for a ${} payment to @{} \
+             before retrying. If it went out, resume at the attestation with \
+             intent {}; if not, cancel that intent.",
+            request.amount, request.recipient, intent.intent_hash
+        ));
+        journal.record(record)?;
+        return Err(e.context(
+            "the Venmo payment step failed; this fill now needs an operator to \
+             read the feed before anything else moves",
+        ));
+    }
+
+    record.state = FillState::Paid;
+    journal.record(record)?;
+    println!("paid ${} to @{}", request.amount, request.recipient);
+
+    // From here the fiat is gone and the only thing that recovers it is the
+    // attestation and the fulfil. Neither is gated: asking a human for
+    // permission to finish is asking permission to lose the payment.
+    let store = CookieStore::new(&config.session.path, config.session.max_age_hours)
+        .with_identity(
+            config.session.sender_id.clone(),
+            config.session.user_agent.clone(),
+        );
+    let material = store
+        .load()?
+        .ok_or_else(|| anyhow::anyhow!("no session material at {}", config.session.path))?;
+
+    let root = repo_root()?;
+    let attester = Attester::new(
+        &root,
+        config.attestation.service_url.clone(),
+        config.attestation.verifier.to_string(),
+        config.network.chain_id,
+    );
+    let out = std::path::PathBuf::from(format!("attestation.{}.json", plan.deposit.deposit_id));
+    let attest_request = AttestRequest {
+        intent_hash: intent.intent_hash,
+        amount: terms.amount,
+        conversion_rate: terms.conversion_rate,
+        timestamp_ms: terms.timestamp_ms(),
+        payee_hash: terms.payee_hash,
+        payment_index: 0,
+    };
+    let attested = attester
+        .attest(&attest_request, &material, &out)
+        .await
+        .context("the enclave would not attest the payment; the fiat has already left")?;
+
+    // The enclave re-signs whatever intent hash it is handed, so this is our own
+    // check that the attestation in hand belongs to the intent in hand.
+    attested
+        .check_binds(&attest_request)
+        .context("the attestation does not bind to the intent we signalled")?;
+
+    let proof = load_proof(
+        out.to_str()
+            .ok_or_else(|| anyhow::anyhow!("attestation path is not valid UTF-8"))?,
+    )?;
+
+    let tx = claimer
+        .fulfill_intent(
+            intent.intent_hash,
+            proof.payment_proof.clone(),
+            proof.verification_data.clone(),
+        )
+        .await
+        .context("fulfillIntent failed after the payment was made")?;
+
+    record.state = FillState::Fulfilled;
+    journal.record(record)?;
+    println!("fulfilled, tx {tx}");
+
+    Ok(Outcome::Fulfilled)
 }

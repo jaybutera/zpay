@@ -453,6 +453,7 @@ async fn test_session_timeout_detection() {
         taker_address: Some(TEST_USER.parse().unwrap()),
         zec_refund_address: "t1VJnUz9FDy7WfFxqXwMZJWVxzMrRD7MvBA".to_string(),
         min_rate: U256::from(1_000_000_000_000_000_000u128),
+        target_payment_cents: None,
         timeout_seconds: 600,
     };
 
@@ -566,6 +567,7 @@ async fn test_near_api_failure_during_quote() {
         taker_address: Some(TEST_USER.parse().unwrap()),
         zec_refund_address: "t1VJnUz9FDy7WfFxqXwMZJWVxzMrRD7MvBA".to_string(),
         min_rate: U256::from(1_000_000_000_000_000_000u128),
+        target_payment_cents: None,
         timeout_seconds: 600,
     };
 
@@ -621,6 +623,7 @@ async fn test_near_status_failure_during_keeper() {
         taker_address: Some(TEST_USER.parse().unwrap()),
         zec_refund_address: "t1VJnUz9FDy7WfFxqXwMZJWVxzMrRD7MvBA".to_string(),
         min_rate: U256::from(1_000_000_000_000_000_000u128),
+        target_payment_cents: None,
         timeout_seconds: 600,
     };
 
@@ -695,6 +698,7 @@ async fn test_terminal_state_no_processing() {
         taker_address: Some(TEST_USER.parse().unwrap()),
         zec_refund_address: "t1VJnUz9FDy7WfFxqXwMZJWVxzMrRD7MvBA".to_string(),
         min_rate: U256::from(1_000_000_000_000_000_000u128),
+        target_payment_cents: None,
         timeout_seconds: 600,
     };
 
@@ -775,6 +779,7 @@ async fn test_concurrent_reads_during_keeper() {
         taker_address: Some(TEST_USER.parse().unwrap()),
         zec_refund_address: "t1VJnUz9FDy7WfFxqXwMZJWVxzMrRD7MvBA".to_string(),
         min_rate: U256::from(1_000_000_000_000_000_000u128),
+        target_payment_cents: None,
         timeout_seconds: 600,
     };
 
@@ -869,6 +874,7 @@ async fn test_cache_db_consistency() {
         taker_address: Some(TEST_USER.parse().unwrap()),
         zec_refund_address: "t1VJnUz9FDy7WfFxqXwMZJWVxzMrRD7MvBA".to_string(),
         min_rate: U256::from(1_000_000_000_000_000_000u128),
+        target_payment_cents: None,
         timeout_seconds: 600,
     };
 
@@ -947,6 +953,7 @@ async fn test_session_at_timeout_boundary() {
         taker_address: Some(TEST_USER.parse().unwrap()),
         zec_refund_address: "t1VJnUz9FDy7WfFxqXwMZJWVxzMrRD7MvBA".to_string(),
         min_rate: U256::from(1_000_000_000_000_000_000u128),
+        target_payment_cents: None,
         timeout_seconds: 600,
     };
 

@@ -357,6 +357,7 @@ async fn test_coordinator_full_flow() {
         taker_address: Some(TEST_USER.parse().unwrap()), // Same for testing
         zec_refund_address: "t1VJnUz9FDy7WfFxqXwMZJWVxzMrRD7MvBA".to_string(),
         min_rate: U256::from(1_000_000_000_000_000_000u128), // 1 USDC/ZEC minimum
+        target_payment_cents: None,
         timeout_seconds: 600,
     };
 
@@ -463,6 +464,7 @@ async fn test_coordinator_rescue_state_validation() {
         taker_address: Some(TEST_USER.parse().unwrap()),
         zec_refund_address: "t1VJnUz9FDy7WfFxqXwMZJWVxzMrRD7MvBA".to_string(),
         min_rate: U256::from(1_000_000_000_000_000_000u128),
+        target_payment_cents: None,
         timeout_seconds: 600,
     };
 
@@ -539,6 +541,7 @@ async fn test_coordinator_withdraw_state_validation() {
         taker_address: Some(TEST_USER.parse().unwrap()),
         zec_refund_address: "t1VJnUz9FDy7WfFxqXwMZJWVxzMrRD7MvBA".to_string(),
         min_rate: U256::from(1_000_000_000_000_000_000u128),
+        target_payment_cents: None,
         timeout_seconds: 600,
     };
 
@@ -614,6 +617,7 @@ async fn test_coordinator_state_validation() {
         taker_address: Some(TEST_USER.parse().unwrap()),
         zec_refund_address: "t1VJnUz9FDy7WfFxqXwMZJWVxzMrRD7MvBA".to_string(),
         min_rate: U256::from(1_000_000_000_000_000_000u128),
+        target_payment_cents: None,
         timeout_seconds: 600,
     };
 

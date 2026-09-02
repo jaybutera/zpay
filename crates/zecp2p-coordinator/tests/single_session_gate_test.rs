@@ -69,6 +69,7 @@ fn a_request() -> OfframpRequest {
         taker_address: None,
         zec_refund_address: "t1Kx6cVPqiHZAd4qBmvhkYTpaYPMcQ8Sxpz".to_string(),
         min_rate: U256::from(1_000_000_000_000_000_000u128),
+        target_payment_cents: None,
         timeout_seconds: 600,
     }
 }

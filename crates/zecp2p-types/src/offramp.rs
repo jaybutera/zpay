@@ -75,6 +75,21 @@ pub struct OfframpRequest {
     /// (zk-p2p `Currency.minConversionRate`). 1e18 = 1 USD per USDC.
     /// The ZEC to USDC leg is priced by the NEAR Intents quote, not by this.
     pub min_rate: U256,
+    /// The exact dollars the taker must send on Venmo, in whole cents.
+    ///
+    /// When set, the deposit's intent range is pinned to the size that prices to
+    /// exactly this many cents at `min_rate`, and the taker's payment is that
+    /// number rather than a function of whatever the swap delivered. The spread
+    /// and the curator's fee are added on top of it by making the intent larger,
+    /// never by paying less than this.
+    ///
+    /// The 2026-09-01 fill left this unset. Its intent was the whole swap output
+    /// of 4,875,437 units, which at rate 0.990881148896019200 priced to $4.84
+    /// against a $5.00 request.
+    ///
+    /// Unset keeps the old behaviour: one intent for the entire credited amount.
+    #[serde(default)]
+    pub target_payment_cents: Option<u64>,
     /// Timeout for NEAR settlement in seconds (default: 600)
     #[serde(default = "default_timeout")]
     pub timeout_seconds: u64,

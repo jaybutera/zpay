@@ -26,6 +26,7 @@ fn create_test_request() -> OfframpRequest {
         taker_address: Some(Address::ZERO),
         zec_refund_address: "t1TestZcashAddress123".to_string(),
         min_rate: U256::from(30_000000_000000_000000u128), // 30 USDC/ZEC
+        target_payment_cents: None,
         timeout_seconds: 600,
     }
 }

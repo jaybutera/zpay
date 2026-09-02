@@ -26,12 +26,36 @@ use serde::Deserialize;
 use serde_json::json;
 use std::time::Duration;
 
-/// Venmo's amount field, by name and by test id.
-const AMOUNT_SELECTOR: &str = "input[name='amount'], [data-testid='amount-input']";
-/// The note field.
-const NOTE_SELECTOR: &str = "textarea[name='note'], [data-testid='note-input']";
-/// The button that moves the money.
-const SEND_SELECTOR: &str = "[data-testid='send-button'], button[type='submit']";
+/// Venmo's amount field.
+///
+/// Read off the live page on 2026-09-02 rather than guessed. The field has no
+/// `name` and no `data-testid`; `aria-label="Amount"` is the only stable handle
+/// on it. The two selectors this replaced, `input[name='amount']` and
+/// `[data-testid='amount-input']`, match nothing on the real page, so every
+/// payment timed out waiting for a field that does not exist.
+const AMOUNT_SELECTOR: &str = "input[aria-label='Amount']";
+/// The note field, by its own id and test id.
+///
+/// Also corrected against the live page: it is `#payment-note`, not
+/// `textarea[name='note']`.
+const NOTE_SELECTOR: &str = "#payment-note, [data-testid='payment-note-input']";
+/// The button that moves the money, named for the log and the dry run.
+///
+/// **This one was the dangerous one.** The previous selector ended in
+/// `button[type='submit']`, and on the real payment page the first such button
+/// is the *Confirm* button of the confirmation step; the page also carries two
+/// avatar buttons and a cookie banner that are `type='submit'`. A selector that
+/// broad can click a live money button the run never meant to reach.
+///
+/// The real flow is a "Pay" button that opens a confirmation, then "Confirm".
+/// Both are plain MUI buttons with no id, no test id and no aria-label, so they
+/// are matched on their exact text inside [`PaymentStep::ConfirmSend`]'s own
+/// JavaScript; `:has-text()` is not CSS and `querySelector` cannot express it.
+const SEND_SELECTOR: &str = "the \"Pay\" button, then \"Confirm\"";
+/// The button that opens the confirmation.
+const PAY_BUTTON: &str = "Pay";
+/// The button on the confirmation that actually sends.
+const CONFIRM_BUTTON: &str = "Confirm";
 
 /// Whether this run is allowed to move money.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,9 +207,21 @@ impl VenmoBrowser {
                 selector: AMOUNT_SELECTOR.to_string(),
                 expected: req.amount.clone(),
             },
-            // Everything above is reversible. This is not.
+            // Everything above is reversible. These are not.
+            //
+            // Two clicks, because that is what the live page does: "Pay" opens a
+            // confirmation and "Confirm" completes it. They are separate steps
+            // so each is individually irreversible, individually logged, and
+            // individually dropped by a dry run, rather than one step that
+            // guesses how many buttons the flow has.
             PaymentStep::ConfirmSend {
-                selector: SEND_SELECTOR.to_string(),
+                selector: PAY_BUTTON.to_string(),
+            },
+            PaymentStep::WaitForButton {
+                label: CONFIRM_BUTTON.to_string(),
+            },
+            PaymentStep::ConfirmSend {
+                selector: CONFIRM_BUTTON.to_string(),
             },
         ]
     }
@@ -281,6 +317,8 @@ impl VenmoBrowser {
                 Ok(())
             }
 
+            PaymentStep::WaitForButton { label } => self.wait_for_button(tab, label).await,
+
             other => {
                 self.evaluate(tab, &other.to_expression()).await?;
                 Ok(())
@@ -303,6 +341,30 @@ impl VenmoBrowser {
             if std::time::Instant::now() >= deadline {
                 anyhow::bail!(
                     "waited {}s for {selector} on the Venmo page and it never appeared",
+                    self.timeout.as_secs()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    /// Poll for a button with this exact text until it is present and enabled.
+    async fn wait_for_button(&self, tab: &CdpTab, label: &str) -> Result<()> {
+        let deadline = std::time::Instant::now() + self.timeout;
+        let expression = PaymentStep::WaitForButton {
+            label: label.to_string(),
+        }
+        .to_expression();
+        loop {
+            let value = self.evaluate(tab, &expression).await?;
+            if value.get("result").and_then(|r| r.get("value")) == Some(&json!(true)) {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!(
+                    "waited {}s for an enabled {label:?} button on the Venmo page and it \
+                     never appeared. The payment may be mid-flow; check the tab before \
+                     retrying.",
                     self.timeout.as_secs()
                 );
             }
@@ -392,6 +454,15 @@ pub enum PaymentStep {
         selector: String,
         expected: String,
     },
+    /// Wait for a button with this exact text to appear and become enabled.
+    ///
+    /// Venmo's confirmation step renders after the Pay click, so the Confirm
+    /// button does not exist when the sequence is built. Waiting for it by text
+    /// keeps the second click from firing into a page that has not rendered it,
+    /// which would otherwise look identical to a disabled button.
+    WaitForButton {
+        label: String,
+    },
     /// The click that moves money.
     ConfirmSend {
         selector: String,
@@ -455,12 +526,34 @@ impl PaymentStep {
                  }})()",
                 sel = json!(selector)
             ),
+            PaymentStep::WaitForButton { label } => format!(
+                "(() => {{ \
+                   const want = {lab}; \
+                   const el = [...document.querySelectorAll('button')] \
+                     .find(b => (b.innerText || '').trim() === want); \
+                   return !!el && !el.disabled; \
+                 }})()",
+                lab = json!(label)
+            ),
+
+            // Found by exact button text, not by `querySelector`. The live page
+            // has no id, test id or aria-label on either button, and the
+            // `button[type='submit']` this used to fall back to resolves to the
+            // confirmation step's own Confirm button, plus two avatars and a
+            // cookie banner. Matching text is narrower than that, not looser.
+            //
+            // Only "Pay" is clicked here. Venmo then renders a confirmation and
+            // the caller runs a second ConfirmSend for it, so each click is its
+            // own step with its own guard rather than one blind double-click.
             PaymentStep::ConfirmSend { selector } => format!(
                 "(() => {{ \
-                   const el = document.querySelector({sel}); \
-                   if (!el) throw new Error('no send button: ' + {sel}); \
-                   if (el.disabled) throw new Error('the send button is disabled'); \
+                   const want = {sel}; \
+                   const buttons = [...document.querySelectorAll('button')]; \
+                   const el = buttons.find(b => (b.innerText || '').trim() === want); \
+                   if (!el) throw new Error('no button labelled ' + want + ' on this page'); \
+                   if (el.disabled) throw new Error('the ' + want + ' button is disabled'); \
                    el.click(); \
+                   return want; \
                  }})()",
                 sel = json!(selector)
             ),
@@ -479,8 +572,11 @@ impl PaymentStep {
             PaymentStep::RequireAmount { selector, expected } => {
                 format!("read {selector} back and require it to be {expected:?}")
             }
+            PaymentStep::WaitForButton { label } => {
+                format!("wait for the {label:?} button to appear and be enabled")
+            }
             PaymentStep::ConfirmSend { selector } => {
-                format!("click {selector}  <-- sends the money")
+                format!("click the {selector:?} button  <-- sends the money")
             }
         }
     }
@@ -627,12 +723,35 @@ mod tests {
         assert!(!is_whole_cents(U256::from(1u64)));
     }
 
+    /// Two clicks move money, because the live page has two: "Pay" opens a
+    /// confirmation and "Confirm" completes it. Both are marked irreversible, so
+    /// a dry run stops at the first and neither can be reached by accident.
     #[test]
-    fn exactly_one_step_moves_money() {
+    fn every_money_moving_step_is_marked_irreversible() {
         let steps = a_payment();
-        assert_eq!(steps.iter().filter(|s| s.is_irreversible()).count(), 1);
-        // and it is the last thing we do
+        let money: Vec<_> = steps.iter().filter(|s| s.is_irreversible()).collect();
+        assert_eq!(money.len(), 2, "the live flow is Pay then Confirm");
+        // The last thing done is a money step; nothing follows the send.
         assert!(steps.last().unwrap().is_irreversible());
+        // And every reversible step comes before the first irreversible one, so
+        // there is no check left stranded after the money has started moving.
+        let first_money = steps.iter().position(|s| s.is_irreversible()).unwrap();
+        assert!(
+            steps[..first_money].iter().all(|s| !s.is_irreversible()),
+            "a check must not sit after the first click"
+        );
+    }
+
+    /// The amount readback is the last thing before the first click. This is the
+    /// ordering NEW-3 was about, and the two-button flow must not have moved it.
+    #[test]
+    fn the_readback_is_the_last_step_before_any_money_moves() {
+        let steps = a_payment();
+        let first_money = steps.iter().position(|s| s.is_irreversible()).unwrap();
+        assert!(
+            matches!(steps[first_money - 1], PaymentStep::RequireAmount { .. }),
+            "expected the amount readback immediately before the first click"
+        );
     }
 
     fn a_payment() -> Vec<PaymentStep> {
@@ -734,9 +853,15 @@ mod tests {
             if !js.contains("querySelector") {
                 continue;
             }
+            // A step that only tests for presence (`!!el && !el.disabled`)
+            // never dereferences, so it needs no guard. Everything that reaches
+            // through the handle does.
+            if js.contains("!!el") {
+                continue;
+            }
             assert!(
                 js.contains("if (!el)") || js.contains("!== null"),
-                "{js} dereferences whatever querySelector returned"
+                "{js} dereferences whatever the lookup returned"
             );
         }
     }
@@ -745,10 +870,16 @@ mod tests {
     #[test]
     fn a_disabled_send_button_is_refused() {
         let js = PaymentStep::ConfirmSend {
-            selector: SEND_SELECTOR.to_string(),
+            selector: PAY_BUTTON.to_string(),
         }
         .to_expression();
         assert!(js.contains("el.disabled"), "{js}");
+        // The selector is matched on exact button text rather than on
+        // `button[type='submit']`, which on the live page also matches two
+        // avatars and a cookie banner, and whose first match is the
+        // confirmation's own Confirm button.
+        assert!(js.contains("innerText"), "{js}");
+        assert!(!js.contains("type='submit'"), "{js}");
     }
 
     /// Venmo formats the field its own way, so the comparison is on cents

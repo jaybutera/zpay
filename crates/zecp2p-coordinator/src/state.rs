@@ -340,17 +340,91 @@ impl AppState {
             session.request.min_rate,
         )]];
 
+        // Size the intent, if the user asked for an exact payment.
+        //
+        // Left unset, the deposit's intent range is the whole credited amount and
+        // the taker's Venmo payment is `credited * min_rate`: a number nobody
+        // chose, because `credited` is whatever the swap happened to deliver. The
+        // 2026-09-01 fill went out that way and paid $4.84 against a $5.00
+        // request. Pinning the range to the size that prices to the requested
+        // payment puts the spread and the curator's fee on top of the request
+        // instead of inside it, and leaves the swap's overshoot in the deposit.
+        let intent_range = match session.request.target_payment_cents {
+            None => None,
+            Some(target_cents) => {
+                // The money that will actually back the deposit, read from the
+                // contract rather than from our own record of it. This is the
+                // number `_processOfframp` will spend, so it is the number the
+                // sized intent has to fit inside.
+                let credited = self
+                    .chain
+                    .get_session(session.session_id)
+                    .await
+                    .map_err(|e| AppError::Chain(e.to_string()))?
+                    .credited;
+
+                let units = zecp2p_types::pricing::intent_units_for_cents(
+                    target_cents,
+                    session.request.min_rate,
+                )
+                .map_err(|e| AppError::InvalidState(e.to_string()))?;
+
+                // The deposit is funded from this session's credit and nothing
+                // else, so an intent larger than the credit cannot be created.
+                // Refusing here names the shortfall; the contract would only say
+                // InvalidIntentRange.
+                if units > credited {
+                    return Err(AppError::InvalidState(format!(
+                        "a Venmo payment of ${}.{:02} at rate {} needs an intent of {} USDC \
+                         units, but this session only credited {}. The swap delivered less \
+                         than the requested payment needs. Send more ZEC, or lower the \
+                         requested payment.",
+                        target_cents / 100,
+                        target_cents % 100,
+                        session.request.min_rate,
+                        units,
+                        credited
+                    )));
+                }
+
+                tracing::info!(
+                    target_cents,
+                    intent_units = %units,
+                    credited = %credited,
+                    rate = %session.request.min_rate,
+                    "sizing the intent so the Venmo payment is exactly what was requested"
+                );
+                Some(units)
+            }
+        };
+
         // Execute on-chain
-        let (tx_hash, deposit_id) = self
-            .chain
-            .process_offramp(
-                session.session_id,
-                payment_methods,
-                payment_method_data,
-                currencies,
-            )
-            .await
-            .map_err(|e| AppError::Chain(e.to_string()))?;
+        let (tx_hash, deposit_id) = match intent_range {
+            // A single intent pinned to the sized amount: min == max, so a taker
+            // can claim that size and nothing else.
+            Some(units) => self
+                .chain
+                .process_offramp_with_range(
+                    session.session_id,
+                    payment_methods,
+                    payment_method_data,
+                    currencies,
+                    units,
+                    units,
+                )
+                .await
+                .map_err(|e| AppError::Chain(e.to_string()))?,
+            None => self
+                .chain
+                .process_offramp(
+                    session.session_id,
+                    payment_methods,
+                    payment_method_data,
+                    currencies,
+                )
+                .await
+                .map_err(|e| AppError::Chain(e.to_string()))?,
+        };
 
         session.process_offramp_tx = Some(tx_hash);
         session.zkp2p_deposit_id = Some(deposit_id);
