@@ -12,9 +12,28 @@ at 92% disk with 80 GB free, a testnet sync is tens of gigabytes, coinbase needs
 100 confirmations, and other agents share the machine.
 
 Regtest solves it in a minute. Blocks are mined on demand through the `generate`
-RPC - no proof-of-work grinding, no sync, no peers, no faucet - and the
-consensus rules that matter to this protocol are the same ones: P2SH, CLTV,
-ZIP 244 sighashes, the mempool's standardness checks, and `sendrawtransaction`.
+RPC - no proof-of-work grinding, no sync, no peers, no faucet.
+
+**The activation heights are the whole configuration.** A default Regtest node
+runs Canopy, where ZIP 225 v5 transactions do not exist: zebrad rejects every
+transaction this repo builds at parse, with `v5 transaction must have NU5 or
+later consensus branch ID`. An earlier version of this file claimed regtest
+shares ZIP 244 sighashes with mainnet; under Canopy it does not, and that claim
+was wrong (round 6 finding R6-1).
+
+With `[network.testnet_parameters.activation_heights]` setting NU5 through NU6.3
+to height 1, the node reports `chaintip: 37a5165b` - the same consensus branch
+id as mainnet - and the same v5 transaction parses, failing only on its missing
+input. That is the configuration in `zebrad.toml.example`.
+
+Two quirks worth recording, because both cost time:
+
+- `extend_funding_stream_addresses_as_required = true` is needed. Without it any
+  custom activation height panics zebrad at startup: the funding-stream check
+  wants 52 addresses for the height range and the defaults supply 51.
+- The parameters live under `testnet_parameters` even when `network = "Regtest"`.
+  Setting `network = "Testnet"` instead gets the activation heights but no
+  genesis block, and `generate` then answers "Zebra's state is empty".
 
 ## Running it
 

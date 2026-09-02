@@ -3,6 +3,16 @@ network = "Regtest"
 listen_addr = "127.0.0.1:18244"
 cache_dir = false
 
+[network.testnet_parameters]
+extend_funding_stream_addresses_as_required = true
+
+[network.testnet_parameters.activation_heights]
+NU5 = 1
+NU6 = 1
+"NU6.1" = 1
+"NU6.2" = 1
+"NU6.3" = 1
+
 [state]
 cache_dir = "./regtest-state"
 ephemeral = false
@@ -14,7 +24,7 @@ enable_cookie_auth = false
 parallel_cpu_threads = 1
 
 [mining]
-internal_miner = true
+internal_miner = false
 miner_address = "tmVHejhMFq979Z7oRwseWMW7snYoQsj22yn"
 
 [tracing]
