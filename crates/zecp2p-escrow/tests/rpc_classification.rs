@@ -109,3 +109,70 @@ fn the_network_check_passes_for_a_matching_endpoint() {
     assert_eq!(c.height().unwrap(), 4_319_776);
     assert_eq!(c.consensus_branch_id().unwrap(), 0x37a5_165b);
 }
+
+/// The round-1 behaviours the round-2 PoCs also exercised, re-checked here with
+/// a stub that answers the automatic network check too.
+///
+/// The reviewer's own `rpc_poc.rs` now fails on two of these, because
+/// `ensure_network` runs first against a stub that serves one canned body. The
+/// behaviours themselves are unchanged, and this is where that is asserted.
+mod behaviours_behind_the_network_check {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Serves the chain-info body first, then the body under test.
+    fn serve_then(second: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let n = AtomicUsize::new(0);
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { break };
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf);
+                let body = if n.fetch_add(1, Ordering::SeqCst) == 0 {
+                    TESTNET_INFO
+                } else {
+                    second
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[test]
+    fn a_null_result_is_still_not_mined_rather_than_an_error() {
+        let c = client(serve_then(r#"{"result":null,"error":null,"id":"x"}"#));
+        assert_eq!(
+            c.utxo(&[0x7a; 32], 0),
+            Ok(None),
+            "null means no such output, which the LP reads as wait"
+        );
+    }
+
+    #[test]
+    fn negative_confirmations_are_still_treated_as_zero() {
+        // A block off the best chain can never satisfy a depth requirement.
+        let c = client(serve_then(
+            r#"{"result":{"confirmations":-3,"scriptPubKey":{"hex":"a914aa87"},"value":0.05},"error":null}"#,
+        ));
+        assert_eq!(c.utxo(&[0x7a; 32], 0).unwrap().unwrap().confirmations, 0);
+    }
+
+    #[test]
+    fn a_reported_depth_is_believed_which_is_the_hosted_mode_caveat() {
+        // Spec 16.7: in hosted mode the attestor's chain view is the
+        // provider's. Depth is exactly the number the provider is trusted for,
+        // and nothing here can detect a lie about it. Pinned so the caveat is
+        // not mistaken for a gap nobody noticed.
+        let c = client(serve_then(
+            r#"{"result":{"confirmations":100,"scriptPubKey":{"hex":"a914aa87"},"value":0.05},"error":null}"#,
+        ));
+        assert_eq!(c.utxo(&[0x7a; 32], 0).unwrap().unwrap().confirmations, 100);
+    }
+}
