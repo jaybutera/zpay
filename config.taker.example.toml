@@ -45,11 +45,20 @@ journal_path = "taker-fills.jsonl"
 # header and the numeric sender id. Written 0600; treat it as a password file.
 # One capture serves many fills, so this is a refresh problem rather than a
 # per-fill one. `zecp2p-taker refresh-cookie` re-captures it.
+# Either JSON with the cookie, sender id and capture time, or a bare Cookie
+# header as copied out of devtools. The bare form needs sender_id below and
+# takes its capture time from the file's mtime.
 path = "venmo-session.json"
 # Refuse to signal on material older than this. The attestation service imposes
 # no such limit; this is caution. Checked before signalIntent, because a dead
 # cookie found after the payment means the fiat is gone.
 max_age_hours = 12
+# The NUMERIC Venmo account id whose feed the enclave reads. Not the @handle.
+# Required when path holds a bare Cookie header.
+# sender_id = "1234567890"
+# The User-Agent the cookie was captured under. Venmo ties a session to it
+# closely enough that a mismatched agent can fail the enclave's replay.
+# user_agent = "Mozilla/5.0 ...
 
 [venmo]
 # Chrome started with --remote-debugging-port=9222, already logged into Venmo.

@@ -110,6 +110,10 @@ impl CookieHealth {
 pub struct CookieStore {
     path: PathBuf,
     max_age_hours: i64,
+    /// Numeric Venmo sender id, for a store holding a bare Cookie header.
+    sender_id: Option<String>,
+    /// The User-Agent the cookie was captured under.
+    user_agent: Option<String>,
 }
 
 impl CookieStore {
@@ -117,20 +121,72 @@ impl CookieStore {
         Self {
             path: path.as_ref().to_path_buf(),
             max_age_hours,
+            sender_id: None,
+            user_agent: None,
         }
     }
 
+    /// Supply the sender id and User-Agent for a plain-text cookie file.
+    pub fn with_identity(
+        mut self,
+        sender_id: Option<String>,
+        user_agent: Option<String>,
+    ) -> Self {
+        self.sender_id = sender_id;
+        self.user_agent = user_agent;
+        self
+    }
+
+    /// Load session material, from either shape the store accepts.
+    ///
+    /// A JSON file carries the sender id and the capture time with the cookie,
+    /// which is what the health check wants. A plain-text file carries only the
+    /// Cookie header, which is what a human actually has after copying it out of
+    /// devtools, and it is the shape `/tmp/venmo_cookie.txt` is in.
+    ///
+    /// Both are supported because refusing the plain one would mean the first
+    /// thing an operator does with this daemon is reformat a credential by hand,
+    /// and hand-editing a file containing a live session cookie is how it ends
+    /// up pasted somewhere it should not be. For the plain shape the sender id
+    /// comes from [`SessionConfig::sender_id`] and the capture time from the
+    /// file's own mtime, which is a real answer rather than a guess: the file was
+    /// written when the cookie was captured.
     pub fn load(&self) -> Result<Option<SessionMaterial>> {
-        match std::fs::read_to_string(&self.path) {
-            Ok(contents) => {
-                let material: SessionMaterial = serde_json::from_str(&contents).with_context(
-                    || format!("{} is not a session-material file", self.path.display()),
-                )?;
-                Ok(Some(material))
+        let contents = match std::fs::read_to_string(&self.path) {
+            Ok(contents) => contents,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(e).with_context(|| format!("could not read {}", self.path.display()))
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e).with_context(|| format!("could not read {}", self.path.display())),
+        };
+
+        let trimmed = contents.trim();
+        if trimmed.starts_with('{') {
+            let material: SessionMaterial = serde_json::from_str(trimmed).with_context(|| {
+                format!("{} looks like JSON but is not session material", self.path.display())
+            })?;
+            return Ok(Some(material));
         }
+
+        // Plain Cookie header. The mtime is when it was captured.
+        let captured_at = std::fs::metadata(&self.path)
+            .and_then(|m| m.modified())
+            .map(chrono::DateTime::<chrono::Utc>::from)
+            .unwrap_or_else(|_| chrono::Utc::now());
+
+        let sender_id = self.sender_id.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} holds a bare Cookie header, so the numeric Venmo sender id has                  to come from [session] sender_id in the taker config. The enclave                  reads that account's feed; the @handle is not it.",
+                self.path.display()
+            )
+        })?;
+
+        Ok(Some(SessionMaterial {
+            cookie: trimmed.to_string(),
+            sender_id,
+            user_agent: self.user_agent.clone(),
+            captured_at,
+        }))
     }
 
     /// Write session material, owner-readable only.
@@ -249,6 +305,51 @@ mod tests {
             CookieHealth::Malformed(why) => assert!(why.contains("numeric"), "{why}"),
             other => panic!("expected malformed, got {other:?}"),
         }
+    }
+
+    /// The shape a human actually has: the Cookie header, copied out of
+    /// devtools, in a file. Reformatting a live credential by hand is how it
+    /// ends up somewhere it should not be, so the store reads it as-is.
+    #[test]
+    fn a_bare_cookie_header_file_loads_with_the_configured_sender_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("venmo_cookie.txt");
+        std::fs::write(&path, "api_access_token=abc; _csrf=def\n").unwrap();
+
+        let store = CookieStore::new(&path, 24)
+            .with_identity(Some("1234567890123456789".into()), Some("Mozilla/5.0".into()));
+        let material = store.load().unwrap().expect("loads");
+        assert_eq!(material.sender_id, "1234567890123456789");
+        assert!(material.cookie.starts_with("api_access_token="));
+        // The trailing newline must not travel into the Cookie header.
+        assert!(!material.cookie.ends_with('\n'));
+        assert!(store.health().unwrap().is_usable());
+    }
+
+    /// A bare cookie file with no configured sender id cannot be used, and the
+    /// message says which id is wanted: the enclave reads a numeric account.
+    #[test]
+    fn a_bare_cookie_without_a_sender_id_says_what_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("venmo_cookie.txt");
+        std::fs::write(&path, "api_access_token=abc").unwrap();
+
+        let err = CookieStore::new(&path, 24).load().expect_err("must refuse");
+        assert!(err.to_string().contains("sender_id"), "{err}");
+    }
+
+    /// The capture time of a bare cookie file is its mtime, not the wall clock,
+    /// so a file written days ago reads as stale rather than as fresh.
+    #[test]
+    fn a_bare_cookie_files_age_comes_from_its_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("venmo_cookie.txt");
+        std::fs::write(&path, "api_access_token=abc").unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(48 * 3600);
+        filetime::set_file_mtime(&path, filetime::FileTime::from_system_time(old)).unwrap();
+
+        let store = CookieStore::new(&path, 24).with_identity(Some("1".into()), None);
+        assert!(matches!(store.health().unwrap(), CookieHealth::Stale { .. }));
     }
 
     #[test]

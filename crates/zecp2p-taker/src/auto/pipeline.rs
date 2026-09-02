@@ -50,6 +50,18 @@ pub enum Gate {
 }
 
 impl Gate {
+    /// The word a human types to pass this gate.
+    ///
+    /// Deliberately different per gate and never a single character: the two
+    /// gates spend different things, and a bare `y` is a reflex away from
+    /// approving a payment when you meant to approve a signal.
+    pub fn confirm_word(self) -> &'static str {
+        match self {
+            Gate::Signal => "signal",
+            Gate::Pay => "pay",
+        }
+    }
+
     pub fn describe(self) -> &'static str {
         match self {
             Gate::Signal => "signal an intent (spends gas, locks stake for 14 days)",

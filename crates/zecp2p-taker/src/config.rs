@@ -168,6 +168,19 @@ pub struct SessionConfig {
     /// the stake.
     #[serde(default = "default_session_max_age_hours")]
     pub max_age_hours: i64,
+    /// The numeric Venmo sender id whose feed the enclave reads.
+    ///
+    /// Needed when `path` holds a bare Cookie header rather than JSON, which is
+    /// the shape a human has after copying it out of devtools. The @handle is
+    /// not this: the enclave wants the numeric account id.
+    #[serde(default)]
+    pub sender_id: Option<String>,
+    /// The User-Agent the cookie was captured under.
+    ///
+    /// Venmo ties a session to it closely enough that a mismatched agent can
+    /// fail the enclave's replay.
+    #[serde(default)]
+    pub user_agent: Option<String>,
 }
 
 fn default_session_path() -> String {
@@ -183,6 +196,8 @@ impl Default for SessionConfig {
         Self {
             path: default_session_path(),
             max_age_hours: default_session_max_age_hours(),
+            sender_id: None,
+            user_agent: None,
         }
     }
 }
