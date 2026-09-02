@@ -38,8 +38,16 @@ pub enum ClientError {
     IncompleteRecord(&'static str),
     #[error("the announced attestor key is not the pinned one")]
     UnpinnedAttestor,
+    #[error(
+        "the announcement is for event {announced}, but this escrow's outpoint is event \
+         {expected}; a pre-signature encrypted under another event's outcome point can be \
+         decrypted by whoever obtains that event's scalar"
+    )]
+    ForeignAnnouncement { announced: String, expected: String },
     #[error("the escrow record was not persisted before funding")]
     NotPersisted,
+    #[error("the canonical terms and the transaction terms describe different escrows")]
+    TermsDisagree,
     #[error("it is height {current}, the refund is not spendable until {refund_height}")]
     TooEarlyToRefund { current: u32, refund_height: u32 },
     #[error("dlc error: {0}")]
@@ -108,17 +116,35 @@ pub struct Announcement {
     pub event_id: [u8; 32],
 }
 
-/// Checks the announcement against the attestor identity the user has pinned.
+/// Checks the announcement against the attestor identity the user has pinned,
+/// and against the escrow's own outpoint.
 ///
-/// In Phase 1 that pin is a configured key. In Phase 7 it is whatever key the
-/// Nitro attestation document carries, which is the step that turns "trust the
-/// operator" into "trust the measured code".
+/// The event id check is not a formality. The LP relays the announcement, so it
+/// can relay a *genuine* one issued for an escrow the LP itself controls. If
+/// the user encrypts its pre-signature under that event's outcome point, then
+/// the moment the LP pays itself for its own escrow the attestor hands over a
+/// scalar that decrypts the victim's signature too. The user must therefore
+/// recompute `event_id` from the outpoint it is about to fund, and refuse
+/// anything else.
+///
+/// In Phase 1 the attestor pin is a configured key. In Phase 7 it is whatever
+/// key the Nitro attestation document carries, which is the step that turns
+/// "trust the operator" into "trust the measured code".
 pub fn verify_announcement(
     announcement: &Announcement,
     pinned_attestor_key: &PublicKey,
+    funding_txid: &[u8; 32],
+    vout: u32,
 ) -> Result<(), ClientError> {
     if &announcement.p != pinned_attestor_key {
         return Err(ClientError::UnpinnedAttestor);
+    }
+    let expected = crate::dlc::event_id(funding_txid, vout);
+    if announcement.event_id != expected {
+        return Err(ClientError::ForeignAnnouncement {
+            announced: hex::encode(announcement.event_id),
+            expected: hex::encode(expected),
+        });
     }
     Ok(())
 }
@@ -138,13 +164,30 @@ pub fn prepare_escrow(
     secp: &Secp256k1<secp256k1_zkp::All>,
     store: &mut impl RecordStore,
     terms: &EscrowTerms,
+    canonical: &crate::terms::CanonicalTerms,
     u_priv: &SecretKey,
     announcement: &Announcement,
     pinned_attestor_key: &PublicKey,
     lp_output_script: &[u8],
     fee_zat: u64,
 ) -> Result<(secp256k1_zkp::EcdsaAdaptorSignature, PublicKey), ClientError> {
-    verify_announcement(announcement, pinned_attestor_key)?;
+    // The canonical terms and the transaction terms must describe the same
+    // escrow, or the user would be signing for one and quoting the other.
+    if canonical.funding_txid != terms.funding_txid
+        || canonical.vout != terms.vout
+        || canonical.amount_zat != terms.amount_zat
+        || canonical.u_pub != terms.u_pub
+        || canonical.l_pub != terms.l_pub
+        || canonical.refund_height != terms.refund_height
+    {
+        return Err(ClientError::TermsDisagree);
+    }
+    verify_announcement(
+        announcement,
+        pinned_attestor_key,
+        &terms.funding_txid,
+        terms.vout,
+    )?;
 
     let record = EscrowRecord {
         u_priv: u_priv.secret_bytes(),
@@ -159,7 +202,13 @@ pub fn prepare_escrow(
     store.save(&record)?;
 
     // Only now is anything cryptographic produced.
-    let y = outcome_point(secp, &announcement.r, &announcement.p, &announcement.event_id)?;
+    let y = outcome_point(
+        secp,
+        &announcement.r,
+        &announcement.p,
+        &announcement.event_id,
+        &canonical.terms_hash(),
+    )?;
     let digest = build_release(terms, lp_output_script, fee_zat)?.sighash()?;
     let pre_sig = pre_sign(secp, &digest, u_priv, &y);
 
@@ -194,15 +243,18 @@ pub fn refund_when_due(
     chain: &impl ChainClient,
     record: &EscrowRecord,
     policy: &EscrowPolicy,
-    lock_height: u32,
     user_output_script: &[u8],
     fee_zat: u64,
 ) -> Result<crate::tx::UnsignedEscrowTx, ClientError> {
     record.validate()?;
     let current = chain.height()?;
-    let refund_height = policy.refund_height(lock_height);
+    // The script's own `T`, not a policy-derived one. CLTV honours the number
+    // in the redeem script and nothing else, so deriving the gate from a policy
+    // and a lock height can only disagree with the chain.
+    let refund_height = u32::try_from(record.refund_height)
+        .map_err(|_| ClientError::IncompleteRecord("refund_height is not a block height"))?;
 
-    if !policy.may_refund(lock_height, current) {
+    if !policy.may_refund_at(refund_height, current) {
         return Err(ClientError::TooEarlyToRefund {
             current,
             refund_height,

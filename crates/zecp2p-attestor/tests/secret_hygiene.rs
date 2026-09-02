@@ -52,7 +52,7 @@ fn the_nonce_is_not_recoverable_from_the_store_after_signing() {
     store
         .announce([1; 32], [2; 32], [3; 33], [4; 32], NONCE)
         .unwrap();
-    store.mark_signed(&[1; 32], [7; 32]).unwrap();
+    store.mark_signed(&[1; 32], [7; 32], [0x9a; 32]).unwrap();
 
     assert!(!store.holds_nonce(&[1; 32]));
     let text = format!("{store:?}");

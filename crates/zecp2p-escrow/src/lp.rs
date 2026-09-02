@@ -50,6 +50,8 @@ pub enum LpError {
     BadPreSignature,
     #[error("refusing to pay from state {0:?}")]
     NotPayable(LpState),
+    #[error("the terms carry a refund height of {0}, which is not a valid block height")]
+    RefundHeightOutOfRange(u64),
 }
 
 /// Whether the LP has paid, and whether it holds the attestor's scalar.
@@ -69,10 +71,16 @@ pub fn evaluate(
     terms: &EscrowTerms,
     canonical: &CanonicalTerms,
     policy: &EscrowPolicy,
-    lock_height: u32,
     progress: LpProgress,
 ) -> Result<LpState, LpError> {
     let current = chain.height()?;
+    // Every deadline comes from the `T` burned into the redeem script, not from
+    // an observed lock height. The script's CLTV is the only clock the chain
+    // honours, so a lock height recorded a block late would put the LP's
+    // margins somewhere the chain does not agree with - and at worst leave
+    // `ReadyToPay` reachable at the very height the user can refund.
+    let refund_height = u32::try_from(terms.refund_height)
+        .map_err(|_| LpError::RefundHeightOutOfRange(terms.refund_height))?;
 
     if progress.outcome_secret_held {
         return Ok(LpState::ReadyToRelease);
@@ -80,7 +88,7 @@ pub fn evaluate(
 
     if progress.venmo_paid {
         return Ok(
-            if policy.within_broadcast_margin(lock_height, current) {
+            if policy.within_broadcast_margin_of(refund_height, current) {
                 LpState::AwaitingAttestation
             } else {
                 LpState::PaidPastMargin
@@ -91,7 +99,7 @@ pub fn evaluate(
     // Not paid. Past the pay deadline the LP stops, whatever the escrow looks
     // like: paying inside the margin is how a release loses the race to the
     // refund after money has already gone out.
-    if !policy.may_pay(lock_height, current) {
+    if !policy.may_pay_before(refund_height, current) {
         return Ok(LpState::AbandonedUnpaid);
     }
 

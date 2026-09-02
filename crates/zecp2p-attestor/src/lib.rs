@@ -16,7 +16,10 @@ pub mod store;
 
 use secp256k1_zkp::{PublicKey, Secp256k1, SecretKey};
 use zecp2p_escrow::attestation::{
-    verify_against_signer, AttestationError, PaymentAttestation, ENCLAVE_SIGNER,
+    verify_with_signer, AttestationError, PaymentAttestation, ENCLAVE_SIGNER,
+};
+use zecp2p_escrow::payment_details::{
+    payment_nullifier, PaymentDetails, PaymentDetailsError, RatePolicy,
 };
 use zecp2p_escrow::dlc::{outcome_point, sign_outcome, DlcError};
 use zecp2p_escrow::terms::CanonicalTerms;
@@ -52,6 +55,12 @@ pub enum AttestorError {
     InsufficientDepth { found: u32, required: u32 },
     #[error("dlc error: {0}")]
     Dlc(#[from] DlcError),
+    #[error("payment details rejected: {0}")]
+    PaymentDetails(#[from] PaymentDetailsError),
+    #[error(
+        "this Venmo payment has already released another escrow; one payment releases one escrow"
+    )]
+    PaymentAlreadyConsumed,
 }
 
 /// The confirmation depth table of spec section 7, applied by the attestor
@@ -78,8 +87,10 @@ pub fn decide(
     encoded_payment_details: &[u8],
     observation: &ChainObservation,
     expected_script_pubkey: &[u8],
-) -> Result<(), AttestorError> {
-    decide_against_signer(
+    rate: &RatePolicy,
+    payment_already_consumed: bool,
+) -> Result<[u8; 32], AttestorError> {
+    decide_inner(
         announced_terms_hash,
         already_signed,
         terms,
@@ -89,12 +100,16 @@ pub fn decide(
         observation,
         expected_script_pubkey,
         &ENCLAVE_SIGNER,
+        rate,
+        payment_already_consumed,
     )
 }
 
-/// As [`decide`], but against a caller-supplied trusted enclave signer. Spec
-/// section 8 treats signer rotation as configuration, and tests need to build
-/// attestations bound to terms they control.
+/// As [`decide`], but against a caller-supplied trusted enclave signer.
+///
+/// Gated behind `test-signer` so a production build has no path that trusts
+/// anything but the pinned enclave key.
+#[cfg(feature = "test-signer")]
 #[allow(clippy::too_many_arguments)]
 pub fn decide_against_signer(
     announced_terms_hash: &[u8; 32],
@@ -106,7 +121,38 @@ pub fn decide_against_signer(
     observation: &ChainObservation,
     expected_script_pubkey: &[u8],
     trusted_signer: &[u8; 20],
-) -> Result<(), AttestorError> {
+    rate: &RatePolicy,
+    payment_already_consumed: bool,
+) -> Result<[u8; 32], AttestorError> {
+    decide_inner(
+        announced_terms_hash,
+        already_signed,
+        terms,
+        attestation,
+        signature,
+        encoded_payment_details,
+        observation,
+        expected_script_pubkey,
+        trusted_signer,
+        rate,
+        payment_already_consumed,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decide_inner(
+    announced_terms_hash: &[u8; 32],
+    already_signed: bool,
+    terms: &CanonicalTerms,
+    attestation: &PaymentAttestation,
+    signature: &[u8],
+    encoded_payment_details: &[u8],
+    observation: &ChainObservation,
+    expected_script_pubkey: &[u8],
+    trusted_signer: &[u8; 20],
+    rate: &RatePolicy,
+    payment_already_consumed: bool,
+) -> Result<[u8; 32], AttestorError> {
     // 1. The terms must be the ones the announcement committed to. Without
     //    this the LP could announce against one escrow and attest against
     //    another.
@@ -126,7 +172,7 @@ pub fn decide_against_signer(
     // 3 and 4. The enclave signature, the pinned signer and domain, and the
     //    amount. `verify` also re-derives dataHash from the payment details, so
     //    a caller cannot present values that disagree with what was signed.
-    verify_against_signer(
+    verify_with_signer(
         attestation,
         signature,
         encoded_payment_details,
@@ -134,6 +180,28 @@ pub fn decide_against_signer(
         terms.usd_amount_6dec as u128,
         trusted_signer,
     )?;
+
+    // 3b. The signature above proves the enclave signed *these bytes*. It says
+    //     nothing about what the bytes claim. Until the payment itself is
+    //     checked against the terms, an LP could prove a payment to its own
+    //     Venmo, at a rate it chose, made long before this escrow existed, and
+    //     every earlier check would still pass. Decode the payment and compare
+    //     it field by field.
+    let details = PaymentDetails::decode(encoded_payment_details)?;
+    details.check_against_terms(
+        &intent,
+        &terms.payee_hash,
+        terms.usd_amount_6dec as u128,
+        terms.lock_confirmed_ms,
+        rate,
+    )?;
+
+    // 3c. One Venmo payment releases one escrow. Without this, an LP that made
+    //     a single payment could announce several escrows for the same user and
+    //     present the same attestation against each of them.
+    if payment_already_consumed {
+        return Err(AttestorError::PaymentAlreadyConsumed);
+    }
 
     // 5. The escrow itself, on the attestor's own node.
     if observation.script_pubkey != expected_script_pubkey {
@@ -153,7 +221,9 @@ pub fn decide_against_signer(
         });
     }
 
-    Ok(())
+    // The caller records this against the event so the payment cannot be
+    // presented again for a different escrow.
+    Ok(payment_nullifier(&details))
 }
 
 /// Produces the outcome scalar once `decide` has passed.
@@ -166,8 +236,9 @@ pub fn sign_decided_outcome(
     k: &SecretKey,
     d: &SecretKey,
     event_id: &[u8; 32],
+    terms_hash: &[u8; 32],
 ) -> Result<SecretKey, AttestorError> {
-    Ok(sign_outcome(secp, k, d, event_id)?)
+    Ok(sign_outcome(secp, k, d, event_id, terms_hash)?)
 }
 
 /// The outcome point the user checks its pre-signature against.
@@ -176,6 +247,7 @@ pub fn announced_outcome_point(
     r: &PublicKey,
     p: &PublicKey,
     event_id: &[u8; 32],
+    terms_hash: &[u8; 32],
 ) -> Result<PublicKey, AttestorError> {
-    Ok(outcome_point(secp, r, p, event_id)?)
+    Ok(outcome_point(secp, r, p, event_id, terms_hash)?)
 }

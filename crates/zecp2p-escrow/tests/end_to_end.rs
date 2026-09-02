@@ -22,6 +22,7 @@ use zecp2p_escrow::fees::{refund_fee_to_shielded_zat, release_fee_to_transparent
 use zecp2p_escrow::script::{
     p2sh_script_pubkey, refund_script_sig, release_script_sig,
 };
+use zecp2p_escrow::terms::CanonicalTerms;
 use zecp2p_escrow::tx::{build_refund, build_release, encode_signature, EscrowTerms};
 
 const NU6_3: u32 = 0x37a5_165b;
@@ -106,6 +107,23 @@ fn parties() -> Parties {
     }
 }
 
+/// The canonical terms for the same escrow, whose hash the outcome point now
+/// commits to (review finding 3).
+fn canonical(t: &EscrowTerms) -> CanonicalTerms {
+    CanonicalTerms {
+        funding_txid: t.funding_txid,
+        vout: t.vout,
+        amount_zat: t.amount_zat,
+        u_pub: t.u_pub,
+        l_pub: t.l_pub,
+        refund_height: t.refund_height,
+        usd_amount_6dec: 1_000_000,
+        rate_18dec: 1_000_000_000_000_000_000,
+        payee_hash: [0x85; 32],
+        lock_confirmed_ms: 1_788_315_013_000,
+    }
+}
+
 /// The attestor's keys, and the user's view of them.
 fn attestor() -> (SecretKey, SecretKey) {
     (
@@ -127,7 +145,7 @@ fn the_paid_path_releases_the_escrow() {
     let big_p = secp256k1_zkp::SecretKey::from_slice(&d.secret_bytes())
         .unwrap()
         .public_key(&p.zkp);
-    let y = outcome_point(&p.zkp, &r, &big_p, &event).unwrap();
+    let y = outcome_point(&p.zkp, &r, &big_p, &event, &canonical(&p.terms).terms_hash()).unwrap();
 
     // --- The user builds the release exactly as the LP will, and pre-signs.
     let redeem = p.terms.redeem_script().unwrap();
@@ -152,10 +170,14 @@ fn the_paid_path_releases_the_escrow() {
     let attested = attestor_would_sign();
     assert!(attested, "the attestor signs only when the enclave check passes");
 
-    let s = sign_outcome(&p.zkp, 
+    let s = sign_outcome(
+        &p.zkp,
         &secp256k1_zkp::SecretKey::from_slice(&k.secret_bytes()).unwrap(),
         &secp256k1_zkp::SecretKey::from_slice(&d.secret_bytes()).unwrap(),
-        &event).unwrap();
+        &event,
+        &canonical(&p.terms).terms_hash(),
+    )
+    .unwrap();
 
     // --- The LP checks s*G == Y, then decrypts (spec 5.6).
     verify_outcome_secret(&p.zkp, &s, &y).unwrap();
@@ -263,7 +285,7 @@ fn a_fabricated_outcome_secret_produces_a_release_the_script_rejects() {
     let big_p = secp256k1_zkp::SecretKey::from_slice(&d.secret_bytes())
         .unwrap()
         .public_key(&p.zkp);
-    let y = outcome_point(&p.zkp, &r, &big_p, &event).unwrap();
+    let y = outcome_point(&p.zkp, &r, &big_p, &event, &canonical(&p.terms).terms_hash()).unwrap();
 
     let redeem = p.terms.redeem_script().unwrap();
     let fee = release_fee_to_transparent_zat(redeem.len());
@@ -284,9 +306,11 @@ fn a_fabricated_outcome_secret_produces_a_release_the_script_rejects() {
             "a fabricated scalar must fail the s*G == Y check"
         );
 
-        let Ok(sig_u_zkp) = decrypt_pre_signature(&pre_sig, &fake) else {
-            continue;
-        };
+        // Unconditional: decryption succeeds structurally for any scalar, so a
+        // `let ... else { continue }` here would skip the only assertion the
+        // moment that changed, and the test would pass having checked nothing.
+        let sig_u_zkp = decrypt_pre_signature(&pre_sig, &fake)
+            .expect("decryption is structurally possible with any scalar");
         let sig_u =
             secp256k1::ecdsa::Signature::from_der(&sig_u_zkp.serialize_der()).unwrap();
         let script_sig = release_script_sig(
@@ -313,7 +337,7 @@ fn the_lp_cannot_move_the_payout_after_the_user_pre_signs() {
     let event = event_id(&p.terms.funding_txid, p.terms.vout);
     let r = secp256k1_zkp::SecretKey::from_slice(&k.secret_bytes()).unwrap().public_key(&p.zkp);
     let big_p = secp256k1_zkp::SecretKey::from_slice(&d.secret_bytes()).unwrap().public_key(&p.zkp);
-    let y = outcome_point(&p.zkp, &r, &big_p, &event).unwrap();
+    let y = outcome_point(&p.zkp, &r, &big_p, &event, &canonical(&p.terms).terms_hash()).unwrap();
 
     let redeem = p.terms.redeem_script().unwrap();
     let fee = release_fee_to_transparent_zat(redeem.len());
@@ -329,6 +353,7 @@ fn the_lp_cannot_move_the_payout_after_the_user_pre_signs() {
         &secp256k1_zkp::SecretKey::from_slice(&k.secret_bytes()).unwrap(),
         &secp256k1_zkp::SecretKey::from_slice(&d.secret_bytes()).unwrap(),
         &event,
+        &canonical(&p.terms).terms_hash(),
     )
     .unwrap();
     let sig_u_zkp = decrypt_pre_signature(&pre_sig, &s).unwrap();

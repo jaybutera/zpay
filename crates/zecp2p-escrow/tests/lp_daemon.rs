@@ -74,7 +74,6 @@ fn state(chain: &FakeChain, progress: LpProgress) -> Result<LpState, LpError> {
         &tx_terms(),
         &canonical(),
         &EscrowPolicy::mainnet_default(),
-        LOCK_HEIGHT,
         progress,
     )
 }
@@ -146,7 +145,7 @@ fn the_lp_abandons_rather_than_paying_past_the_deadline() {
     // Section 8, the "LP never pays" row: nobody loses, because the user
     // refunds at T. Paying inside the margin is how that becomes a loss.
     let policy = EscrowPolicy::mainnet_default();
-    let deadline = policy.pay_deadline(LOCK_HEIGHT);
+    let deadline = policy.pay_deadline_for_refund_height(REFUND_HEIGHT as u32);
 
     let chain = funded_chain(deadline - 1, 100);
     assert_eq!(state(&chain, verified()).unwrap(), LpState::ReadyToPay);
@@ -242,7 +241,7 @@ fn a_paid_escrow_past_the_broadcast_margin_is_flagged_rather_than_hidden() {
     // Section 8: the LP has paid and the release now races the refund. The
     // state says so, because the operational response is different.
     let policy = EscrowPolicy::mainnet_default();
-    let chain = funded_chain(policy.broadcast_deadline(LOCK_HEIGHT) + 1, 100);
+    let chain = funded_chain(policy.broadcast_deadline_for_refund_height(REFUND_HEIGHT as u32) + 1, 100);
     let progress = LpProgress {
         pre_signature_verified: true,
         venmo_paid: true,
@@ -333,7 +332,6 @@ fn a_larger_escrow_waits_for_a_deeper_confirmation() {
         &tx_terms(),
         &c,
         &EscrowPolicy::mainnet_default(),
-        LOCK_HEIGHT,
         verified(),
     )
     .unwrap();
@@ -344,4 +342,83 @@ fn a_larger_escrow_waits_for_a_deeper_confirmation() {
             required: 30
         }
     );
+}
+
+/// Review finding 4: deadlines must come from the `T` in the redeem script, not
+/// from an observed lock height.
+///
+/// The PoC: the user broadcasts the funding transaction late, so it confirms at
+/// `T - 100`. An LP that recorded that as its lock height and derived deadlines
+/// from it computed a pay deadline 1052 blocks in the *future* and cheerfully
+/// reported `ReadyToPay` at the exact height the user could refund. It would
+/// then send Venmo into a race it has already lost.
+#[test]
+fn the_lp_is_not_payable_at_the_scripts_refund_height() {
+    let policy = EscrowPolicy::mainnet_default();
+    let t = REFUND_HEIGHT as u32;
+
+    // At T itself the user can refund, so the LP must be long past paying.
+    let chain = funded_chain(t, 100);
+    let s = state(&chain, verified()).unwrap();
+    assert_eq!(
+        s,
+        LpState::AbandonedUnpaid,
+        "at the refund height the LP must have abandoned, not be ready to pay"
+    );
+    assert!(matches!(may_send_payment(&s), Err(LpError::NotPayable(_))));
+
+    // And the boundary is where the script's T puts it, 60 blocks earlier.
+    let deadline = policy.pay_deadline_for_refund_height(t);
+    assert_eq!(deadline, t - 60);
+    assert_eq!(
+        state(&funded_chain(deadline - 1, 100), verified()).unwrap(),
+        LpState::ReadyToPay
+    );
+    assert_eq!(
+        state(&funded_chain(deadline, 100), verified()).unwrap(),
+        LpState::AbandonedUnpaid
+    );
+}
+
+/// A corollary: the escrow's own `T` governs, so two escrows funded at the same
+/// height but written with different refund heights get different deadlines.
+#[test]
+fn two_escrows_at_one_height_get_deadlines_from_their_own_scripts() {
+    let policy = EscrowPolicy::mainnet_default();
+    let current = REFUND_HEIGHT as u32 - 30;
+
+    // The escrow whose T is REFUND_HEIGHT is past its pay deadline at T-30.
+    let chain = funded_chain(current, 100);
+    assert_eq!(state(&chain, verified()).unwrap(), LpState::AbandonedUnpaid);
+
+    // A second escrow with a later T is still payable at the same height.
+    let mut later_tx = tx_terms();
+    later_tx.refund_height = REFUND_HEIGHT + 500;
+    let mut later_chain = FakeChain::new(current, NU6_3);
+    later_chain.add_utxo(
+        TXID,
+        0,
+        Utxo {
+            script_pubkey: later_tx.script_pubkey().unwrap(),
+            amount_zat: 5_000_000,
+            confirmations: 100,
+        },
+    );
+    let s = evaluate(&later_chain, &later_tx, &canonical(), &policy, verified()).unwrap();
+    assert_eq!(s, LpState::ReadyToPay);
+}
+
+/// Review finding 9: a branch id read from a node is untrusted input, and an
+/// unknown one must be an error rather than a panic in a builder the daemons
+/// call on every poll.
+#[test]
+fn an_unknown_branch_id_is_an_error_not_a_panic() {
+    use zecp2p_escrow::tx::{build_release, TxError};
+    let mut t = tx_terms();
+    t.consensus_branch_id = 0xdead_beef;
+
+    match build_release(&t, &[0x51], 15_000) {
+        Err(TxError::UnknownBranchId(id)) => assert_eq!(id, 0xdead_beef),
+        other => panic!("expected an UnknownBranchId refusal, got {other:?}"),
+    }
 }

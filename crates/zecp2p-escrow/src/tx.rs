@@ -45,6 +45,11 @@ pub enum TxError {
     BadInputIndex,
     #[error("could not serialize the transaction: {0}")]
     Serialize(String),
+    #[error(
+        "consensus branch id {0:#x} is not one this build knows; it is read from the node, so \
+         an unknown value means a network upgrade this binary predates"
+    )]
+    UnknownBranchId(u32),
 }
 
 /// Everything both parties need to rebuild the same transaction.
@@ -202,13 +207,19 @@ fn build(
         },
     };
 
+    // The branch id is read from a node, so it is untrusted input: a hostile or
+    // merely upgraded node can hand back a value this build does not know.
+    // Refusing is right; panicking in a builder the daemons call on every poll
+    // is not.
+    let branch = BranchId::try_from(terms.consensus_branch_id)
+        .map_err(|_| TxError::UnknownBranchId(terms.consensus_branch_id))?;
+
     let data = TransactionData::<EscrowUnauthorized>::from_parts(
         // Spec 4.3 mandates version 5. Under the NU6.3 branch the builder would
         // default to V6 (Phase 0 finding 12.2); pinning it here means the two
         // parties cannot disagree by taking different defaults.
         TxVersion::V5,
-        BranchId::try_from(terms.consensus_branch_id)
-            .expect("the caller reads the branch id from its node"),
+        branch,
         lock_time,
         // nExpiryHeight = 0: a release delayed by congestion stays minable
         // (spec 4.5), and Zcash has no RBF to bump it with.
@@ -327,7 +338,7 @@ pub fn serialize_signed(
     let data = TransactionData::<TxAuthorized>::from_parts(
         TxVersion::V5,
         BranchId::try_from(terms.consensus_branch_id)
-            .map_err(|_| TxError::BadInputIndex)?,
+            .map_err(|_| TxError::UnknownBranchId(terms.consensus_branch_id))?,
         lock_time,
         0.into(),
         Some(bundle),

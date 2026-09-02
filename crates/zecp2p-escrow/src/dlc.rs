@@ -72,16 +72,25 @@ pub fn event_id(funding_txid: &[u8; 32], vout: u32) -> [u8; 32] {
     sha256::Hash::from_engine(eng).to_byte_array()
 }
 
-/// `e = tagged_hash("zecp2p-outcome-v1", R || P || event_id || "paid") mod n`.
+/// `e = tagged_hash("zecp2p-outcome-v1", R || P || event_id || terms_hash || "paid") mod n`.
+///
+/// `terms_hash` is in the preimage so that `Y` commits to the terms, not merely
+/// to the outpoint. Without it the outcome point is the same for any terms over
+/// one escrow, so a scalar released for a 1 USD claim would decrypt a
+/// pre-signature the user made expecting a 100 USD one. With it, changing any
+/// term changes `Y`, and a pre-signature made under the user's terms cannot be
+/// completed by a scalar signed for different ones.
 pub fn outcome_challenge(
     r: &PublicKey,
     p: &PublicKey,
     event_id: &[u8; 32],
+    terms_hash: &[u8; 32],
 ) -> Result<Scalar, DlcError> {
-    let mut data = Vec::with_capacity(33 + 33 + 32 + OUTCOME_PAID.len());
+    let mut data = Vec::with_capacity(33 + 33 + 32 + 32 + OUTCOME_PAID.len());
     data.extend_from_slice(&r.serialize());
     data.extend_from_slice(&p.serialize());
     data.extend_from_slice(event_id);
+    data.extend_from_slice(terms_hash);
     data.extend_from_slice(OUTCOME_PAID.as_bytes());
 
     let e = tagged_hash(OUTCOME_TAG, &data);
@@ -100,8 +109,9 @@ pub fn outcome_point<C: Signing + Verification>(
     r: &PublicKey,
     p: &PublicKey,
     event_id: &[u8; 32],
+    terms_hash: &[u8; 32],
 ) -> Result<PublicKey, DlcError> {
-    let e = outcome_challenge(r, p, event_id)?;
+    let e = outcome_challenge(r, p, event_id, terms_hash)?;
     let e_p = p.mul_tweak(secp, &e)?;
     Ok(r.combine(&e_p)?)
 }
@@ -116,10 +126,11 @@ pub fn sign_outcome<C: Signing + Verification>(
     k: &SecretKey,
     d: &SecretKey,
     event_id: &[u8; 32],
+    terms_hash: &[u8; 32],
 ) -> Result<SecretKey, DlcError> {
     let r = k.public_key(secp);
     let p = d.public_key(secp);
-    let e = outcome_challenge(&r, &p, event_id)?;
+    let e = outcome_challenge(&r, &p, event_id, terms_hash)?;
     // s = k + e*d
     let e_d = d.mul_tweak(&e)?;
     Ok(k.add_tweak(&Scalar::from_be_bytes(e_d.secret_bytes()).map_err(|_| {

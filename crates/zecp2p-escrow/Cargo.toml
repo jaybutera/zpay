@@ -5,6 +5,12 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+# Exposes verify_against_signer, which trusts a caller-supplied enclave key.
+# Tests need it to bind attestations to terms they control; production builds
+# must not have that path at all.
+test-signer = []
+
 [dependencies]
 zcash_primitives = { version = "0.30", features = ["transparent-inputs", "circuits"] }
 zcash_protocol = { version = "0.10", features = ["local-consensus"] }

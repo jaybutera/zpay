@@ -32,6 +32,41 @@ pub enum StoreError {
     UnknownEvent,
     #[error("this event has already been signed")]
     AlreadySigned,
+    #[error("this payment has already released another escrow")]
+    PaymentAlreadyConsumed,
+}
+
+/// A nonce bound to the event it was drawn for.
+///
+/// Handing back a bare `[u8; 32]` let a caller sign event B with event A's
+/// nonce, which is the one mistake that exposes `d`. Carrying the event id
+/// alongside the scalar means the signing call can refuse a mismatch, and the
+/// type cannot be constructed outside the store.
+#[derive(Clone, PartialEq, Eq)]
+pub struct BoundNonce {
+    event_id: [u8; 32],
+    k: [u8; 32],
+}
+
+impl BoundNonce {
+    /// The nonce, but only for the event it was issued against.
+    pub fn secret_for(&self, event_id: &[u8; 32]) -> Option<&[u8; 32]> {
+        (&self.event_id == event_id).then_some(&self.k)
+    }
+
+    pub fn event_id(&self) -> &[u8; 32] {
+        &self.event_id
+    }
+}
+
+impl core::fmt::Debug for BoundNonce {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // Criterion 14: `k` must not reach a log.
+        f.debug_struct("BoundNonce")
+            .field("event_id", &hex::encode(self.event_id))
+            .field("k", &"[redacted]")
+            .finish()
+    }
 }
 
 /// An in-memory store with the same invariants as the SQLite table.
@@ -49,6 +84,10 @@ pub struct EventStore {
     /// single operation that cannot half-happen.
     nonces: HashMap<[u8; 32], [u8; 32]>,
     funding: HashMap<[u8; 32], [u8; 32]>,
+    /// Payments that have already released an escrow. One Venmo payment
+    /// releases one escrow, so this set is what stops an LP presenting a single
+    /// attestation against several escrows for the same user.
+    consumed_payments: HashMap<[u8; 32], [u8; 32]>,
 }
 
 impl core::fmt::Debug for EventStore {
@@ -57,6 +96,7 @@ impl core::fmt::Debug for EventStore {
             .field("events", &self.events.len())
             // The count only. A nonce must not reach a log even as bytes.
             .field("nonces_held", &self.nonces.len())
+            .field("consumed_payments", &self.consumed_payments.len())
             .finish()
     }
 }
@@ -101,12 +141,12 @@ impl EventStore {
         self.events.get(event_id)
     }
 
-    /// Returns `k` for signing. Fails if the event is unknown or already
+    /// Returns `k` bound to its event. Fails if the event is unknown or already
     /// signed, which is what stops a second signature under the same nonce.
     pub fn take_nonce_for_signing(
         &mut self,
         event_id: &[u8; 32],
-    ) -> Result<[u8; 32], StoreError> {
+    ) -> Result<BoundNonce, StoreError> {
         let event = self.events.get(event_id).ok_or(StoreError::UnknownEvent)?;
         if event.signed_s.is_some() {
             return Err(StoreError::AlreadySigned);
@@ -114,11 +154,40 @@ impl EventStore {
         self.nonces
             .get(event_id)
             .copied()
+            .map(|k| BoundNonce {
+                event_id: *event_id,
+                k,
+            })
             .ok_or(StoreError::AlreadySigned)
     }
 
-    /// Records the signature and destroys `k`.
-    pub fn mark_signed(&mut self, event_id: &[u8; 32], s: [u8; 32]) -> Result<(), StoreError> {
+    /// Whether this payment has already released an escrow.
+    pub fn payment_is_consumed(&self, nullifier: &[u8; 32]) -> bool {
+        self.consumed_payments.contains_key(nullifier)
+    }
+
+    /// The event a payment was consumed by, for operators answering "why was
+    /// this refused".
+    pub fn payment_consumed_by(&self, nullifier: &[u8; 32]) -> Option<[u8; 32]> {
+        self.consumed_payments.get(nullifier).copied()
+    }
+
+    /// Records the signature, consumes the payment, and destroys `k`.
+    ///
+    /// The three happen together on purpose: a crash between signing and
+    /// recording the nullifier would let the same payment release a second
+    /// escrow.
+    pub fn mark_signed(
+        &mut self,
+        event_id: &[u8; 32],
+        s: [u8; 32],
+        payment_nullifier: [u8; 32],
+    ) -> Result<(), StoreError> {
+        if let Some(other) = self.consumed_payments.get(&payment_nullifier) {
+            if other != event_id {
+                return Err(StoreError::PaymentAlreadyConsumed);
+            }
+        }
         let event = self
             .events
             .get_mut(event_id)
@@ -127,6 +196,7 @@ impl EventStore {
             return Err(StoreError::AlreadySigned);
         }
         event.signed_s = Some(s);
+        self.consumed_payments.insert(payment_nullifier, *event_id);
         // The nonce is gone from here on. A later signing attempt finds no `k`
         // and cannot proceed even if some other check were bypassed.
         self.nonces.remove(event_id);

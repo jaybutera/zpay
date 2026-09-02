@@ -85,38 +85,50 @@ impl EscrowPolicy {
         Ok(())
     }
 
-    /// `T`, the height at and after which the user can refund.
-    pub fn refund_height(&self, lock_height: u32) -> u32 {
+    /// `T` as this policy would set it for a lock at `lock_height`.
+    ///
+    /// This is for *quoting* an escrow that has not been created yet. Once a
+    /// redeem script exists, `T` is the number burned into it, and every
+    /// deadline must be measured from that number rather than recomputed here:
+    /// a lock height recorded a block late, or a policy edited after the fact,
+    /// would otherwise move deadlines away from the CLTV the chain will
+    /// actually enforce. The `*_for_refund_height` methods below take the
+    /// script's `T` and are what the daemons use.
+    pub fn proposed_refund_height(&self, lock_height: u32) -> u32 {
         lock_height + self.refund_delay_blocks
     }
 
     /// The LP must not send Venmo at or after this height (spec 7).
-    pub fn pay_deadline(&self, lock_height: u32) -> u32 {
-        self.refund_height(lock_height) - self.pay_deadline_blocks
+    pub fn pay_deadline_for_refund_height(&self, refund_height: u32) -> u32 {
+        refund_height.saturating_sub(self.pay_deadline_blocks)
     }
 
     /// The release must be broadcast by this height.
-    pub fn broadcast_deadline(&self, lock_height: u32) -> u32 {
-        self.refund_height(lock_height) - self.broadcast_deadline_blocks
+    pub fn broadcast_deadline_for_refund_height(&self, refund_height: u32) -> u32 {
+        refund_height.saturating_sub(self.broadcast_deadline_blocks)
     }
 
     /// Whether the LP may still start a payment at `current_height`.
     ///
-    /// The comparison is `>=` because spec 7 says "does not send Venmo at or
+    /// The comparison is strict because spec 7 says "does not send Venmo at or
     /// after `PAY_DEADLINE`".
-    pub fn may_pay(&self, lock_height: u32, current_height: u32) -> bool {
-        current_height < self.pay_deadline(lock_height)
+    pub fn may_pay_before(&self, refund_height: u32, current_height: u32) -> bool {
+        current_height < self.pay_deadline_for_refund_height(refund_height)
     }
 
     /// Whether a release broadcast at `current_height` is still inside the
     /// margin. After this the release is still valid, but it races the refund
     /// and the loss is the LP's (spec 4.5).
-    pub fn within_broadcast_margin(&self, lock_height: u32, current_height: u32) -> bool {
-        current_height <= self.broadcast_deadline(lock_height)
+    pub fn within_broadcast_margin_of(&self, refund_height: u32, current_height: u32) -> bool {
+        current_height <= self.broadcast_deadline_for_refund_height(refund_height)
     }
 
     /// Whether the user may broadcast the refund.
-    pub fn may_refund(&self, lock_height: u32, current_height: u32) -> bool {
-        current_height >= self.refund_height(lock_height)
+    ///
+    /// Takes the script's `T` because that is the only number CLTV honours. A
+    /// policy-derived height that disagreed with the script would either refuse
+    /// a refund the chain would accept, or offer one it will not.
+    pub fn may_refund_at(&self, refund_height: u32, current_height: u32) -> bool {
+        current_height >= refund_height
     }
 }

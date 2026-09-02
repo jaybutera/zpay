@@ -23,14 +23,14 @@ fn the_deadlines_sit_where_section_7_puts_them() {
     let p = EscrowPolicy::mainnet_default();
     let lock = 3_400_000;
 
-    assert_eq!(p.refund_height(lock), 3_401_152);
-    assert_eq!(p.pay_deadline(lock), 3_401_152 - 60);
-    assert_eq!(p.broadcast_deadline(lock), 3_401_152 - 40);
+    assert_eq!(p.proposed_refund_height(lock), 3_401_152);
+    assert_eq!(p.pay_deadline_for_refund_height(p.proposed_refund_height(lock)), 3_401_152 - 60);
+    assert_eq!(p.broadcast_deadline_for_refund_height(p.proposed_refund_height(lock)), 3_401_152 - 40);
 
     // The pay deadline is strictly earlier than the broadcast deadline, which
     // is the whole point: the LP stops paying while it still has room to get a
     // release confirmed.
-    assert!(p.pay_deadline(lock) < p.broadcast_deadline(lock));
+    assert!(p.pay_deadline_for_refund_height(p.proposed_refund_height(lock)) < p.broadcast_deadline_for_refund_height(p.proposed_refund_height(lock)));
 }
 
 #[test]
@@ -38,35 +38,35 @@ fn the_lp_may_not_pay_at_or_after_the_pay_deadline() {
     // Spec 7 says "at or after", so the boundary block itself is barred.
     let p = EscrowPolicy::mainnet_default();
     let lock = 3_400_000;
-    let deadline = p.pay_deadline(lock);
+    let deadline = p.pay_deadline_for_refund_height(p.proposed_refund_height(lock));
 
-    assert!(p.may_pay(lock, deadline - 1));
-    assert!(!p.may_pay(lock, deadline), "the deadline block itself is too late");
-    assert!(!p.may_pay(lock, deadline + 1));
+    assert!(p.may_pay_before(p.proposed_refund_height(lock), deadline - 1));
+    assert!(!p.may_pay_before(p.proposed_refund_height(lock), deadline), "the deadline block itself is too late");
+    assert!(!p.may_pay_before(p.proposed_refund_height(lock), deadline + 1));
 }
 
 #[test]
 fn the_user_may_refund_at_t_and_not_before() {
     let p = EscrowPolicy::mainnet_default();
     let lock = 3_400_000;
-    let t = p.refund_height(lock);
+    let t = p.proposed_refund_height(lock);
 
-    assert!(!p.may_refund(lock, t - 1), "CLTV rejects a refund before T");
-    assert!(p.may_refund(lock, t), "the refund is valid at exactly T");
-    assert!(p.may_refund(lock, t + 1_000));
+    assert!(!p.may_refund_at(p.proposed_refund_height(lock), t - 1), "CLTV rejects a refund before T");
+    assert!(p.may_refund_at(p.proposed_refund_height(lock), t), "the refund is valid at exactly T");
+    assert!(p.may_refund_at(p.proposed_refund_height(lock), t + 1_000));
 }
 
 #[test]
 fn the_broadcast_margin_closes_before_t() {
     let p = EscrowPolicy::mainnet_default();
     let lock = 3_400_000;
-    let margin = p.broadcast_deadline(lock);
+    let margin = p.broadcast_deadline_for_refund_height(p.proposed_refund_height(lock));
 
-    assert!(p.within_broadcast_margin(lock, margin));
-    assert!(!p.within_broadcast_margin(lock, margin + 1));
+    assert!(p.within_broadcast_margin_of(p.proposed_refund_height(lock), margin));
+    assert!(!p.within_broadcast_margin_of(p.proposed_refund_height(lock), margin + 1));
     // Past the margin the release is still a valid transaction; it simply
     // races the refund, which is the LP's loss (spec 4.5).
-    assert!(margin < p.refund_height(lock));
+    assert!(margin < p.proposed_refund_height(lock));
 }
 
 #[test]
@@ -78,14 +78,14 @@ fn a_different_refund_delay_moves_every_height_with_it() {
     short.validate().unwrap();
 
     let lock = 100_000;
-    assert_eq!(short.refund_height(lock), 100_200);
-    assert_eq!(short.pay_deadline(lock), 100_140);
-    assert_eq!(short.broadcast_deadline(lock), 100_160);
+    assert_eq!(short.proposed_refund_height(lock), 100_200);
+    assert_eq!(short.pay_deadline_for_refund_height(short.proposed_refund_height(lock)), 100_140);
+    assert_eq!(short.broadcast_deadline_for_refund_height(short.proposed_refund_height(lock)), 100_160);
 
-    assert!(short.may_pay(lock, 100_139));
-    assert!(!short.may_pay(lock, 100_140));
-    assert!(short.may_refund(lock, 100_200));
-    assert!(!short.may_refund(lock, 100_199));
+    assert!(short.may_pay_before(short.proposed_refund_height(lock), 100_139));
+    assert!(!short.may_pay_before(short.proposed_refund_height(lock), 100_140));
+    assert!(short.may_refund_at(short.proposed_refund_height(lock), 100_200));
+    assert!(!short.may_refund_at(short.proposed_refund_height(lock), 100_199));
 }
 
 #[test]

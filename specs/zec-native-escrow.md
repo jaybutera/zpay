@@ -688,3 +688,157 @@ two signatures under one nonce expose `d`.
 - The BIP340 `announce_sig` of 5.1. The user verifies the attestor's key
   against a pin; it does not yet verify a signature over the announcement.
 - Phase 7 in full.
+
+## 14. Hosted-API mode, and what it does not establish
+
+The development setup points the RPC adapter at a hosted Zcash endpoint. That
+is a build-and-test posture, **not the production trust model**, and the
+difference is worth stating precisely rather than leaving to inference.
+
+A hosted provider can lie about height, confirmation depth, or whether an
+output exists, and the adapter cannot detect it. What the protocol still
+verifies for itself, against every answer the provider gives:
+
+- the escrow's `scriptPubKey` bytes, compared to the script derived from the
+  terms, so a provider naming a different output is caught;
+- the amount, against the terms;
+- the consensus branch id, against what the transaction was built for;
+- every signature, hash and script, none of which the provider is asked about.
+
+So a provider that reports the wrong *escrow* is refused. A provider that
+reports the wrong *chain* is believed. Under that stance the confirmation-depth
+policy of section 7 is advisory, because depth is exactly the number a provider
+is trusted for. Production runs against our own node, where it is not.
+
+### 14.1 The endpoint in use
+
+`https://api.tatum.io/v3/blockchain/node/zcash-{mainnet,testnet}`, keyless, no
+signup. Testnet and mainnet both answer `getblockchaininfo`, `getblockcount`,
+`getblock`, `gettxout` and `getrawtransaction`. Both report
+`consensus.chaintip = 37a5165b`, confirming section 12.2's branch id against the
+live chain.
+
+Two limits, both real:
+
+- **5 requests per minute.** Enough for a gate, not for a polling daemon.
+- **`sendrawtransaction` is blocked at the provider's WAF**, returning
+  Cloudflare `403 error code: 1010` for a two-character payload as readily as a
+  real one. It is the method that is blocked, not the size.
+
+The second means **Phase 1's mempool gate and criterion 12's mempool rejection
+remain unmet.** `crates/zecp2p-escrow/tests/mempool_gate.rs` is written and runs
+unchanged against a real node; the `dump_release` example prints the same bytes
+for submitting by other means.
+
+## 15. Review round 1: what was found and what changed
+
+An adversarial review found eleven issues, two of them critical, with runnable
+proofs of concept. All are fixed. Each fix has a test that fails without it;
+the reviewer's PoCs are kept as
+`crates/zecp2p-escrow/tests/review_round1_regressions.rs`.
+
+### 15.1 The attestor never read the payment (critical)
+
+`decide` checked that `keccak256(encodedPaymentDetails)` equalled the signed
+`dataHash`. That proves the enclave signed *those bytes* and says nothing about
+what they claim. The enclave signs whatever payment the caller proved, so an LP
+could pay **its own Venmo account**, one cent, at a rate it chose, a month
+before the escrow existed, and every check passed.
+
+The blob is now decoded (`payment_details.rs`) and compared field by field:
+payee against `terms.payee_hash`, platform against Venmo, currency against USD,
+intent against the recomputed intent, amount against the terms, and the payment
+timestamp against the observed lock time. The duplicated words (method,
+currency, payee appear twice) must agree with each other.
+
+The timestamp check carries a **10-minute backdating tolerance**, and that is
+not slack for its own sake: on the captured 1.00 USD attestation the payment is
+timestamped 155 seconds *before* its own intent timestamp, because Venmo's clock
+and the prover's snapshot are different clocks. A strict comparison would reject
+genuine attestations.
+
+### 15.2 The client accepted an announcement for another escrow (critical)
+
+The LP relays the announcement, so it can relay a *genuine* one issued for an
+escrow the LP itself controls. The client encrypted its pre-signature under that
+event's outcome point; when the LP then paid itself for its own escrow, the
+scalar the attestor legitimately published completed the victim's release too.
+
+The client now recomputes `event_id(funding_txid, vout)` from the outpoint it is
+about to fund and refuses anything else. One comparison.
+
+### 15.3 The outcome point now commits to the terms
+
+`e` is `tagged_hash("zecp2p-outcome-v1", R || P || event_id || terms_hash ||
+"paid")`. Previously `Y` was identical for any terms over one escrow, so a
+scalar signed for a 1 USD claim would decrypt a pre-signature made expecting
+100 USD. The attestor's terms-hash check made that hard to reach; one check
+between an LP and someone's ZEC is thinner than the cryptography allows.
+
+**Section 5.1 changes accordingly:** the announcement request must carry the
+terms, and `Y = R + e*P` is computed with `terms_hash` in the preimage.
+
+### 15.4 Deadlines come from the script, not from an observed lock height
+
+Section 7's margins were computed from a lock height the caller supplied. A
+funding transaction that confirmed late put the LP's pay deadline in the future
+and made `ReadyToPay` reachable at the exact height the user could refund. Every
+deadline is now measured from the `T` burned into the redeem script, which is
+the only clock CLTV honours. The client's refund gate reads the stored `T` for
+the same reason.
+
+`EscrowPolicy::proposed_refund_height` remains, for *quoting* an escrow that
+does not exist yet. Once a script exists, its `T` governs.
+
+### 15.5 One payment releases one escrow
+
+There was no nullifier: a single Venmo payment could be presented against
+several escrows for the same user. The attestor now derives a payment nullifier
+from the payment's own digest, payee, index and timestamp, and the store records
+it atomically with the signature. `mark_signed` refuses a nullifier already
+consumed by a different event.
+
+### 15.6 `INTENT_RATE` semantics, unresolved and now explicit
+
+Word 11 is `conversionRate`. The LP passes `INTENT_RATE` as USD per ZEC; the
+captured $4.87 attestation carries `990881148896019200`, which is 0.99 in 18
+decimals, because that fill was a **USDC** fill where the rate is dollars per
+USDC-like unit. Nothing captured establishes what the value must be for a ZEC
+escrow.
+
+Rather than guess, the check is a policy: `RatePolicy::Exact` (production, once
+the semantics are settled), `AtLeast`, or `Unenforced` (development). The
+attestor requires the caller to state which. **This remains an open item**, and
+it must be settled to `Exact` before mainnet.
+
+### 15.7 Smaller items
+
+- An unknown consensus branch id is `TxError::UnknownBranchId` rather than a
+  panic. It is read from a node, so it is untrusted input, and the daemons call
+  the builder on every poll.
+- `verify_against_signer` and `decide_against_signer` are behind the
+  `test-signer` feature. A production build has no path that trusts anything but
+  the pinned enclave key.
+- The store returns a `BoundNonce` carrying its event id, so a handler cannot
+  sign event B with event A's nonce.
+- Weak tests fixed: assertions that sat inside `if let Ok(...)` or
+  `let ... else { continue }` passed vacuously the moment the wrapped call
+  changed shape. They are now unconditional.
+
+### 15.8 A correction to the mental model
+
+`verify_outcome_secret(-s)` fails, but `decrypt(-s)` yields a signature that
+*does* verify under `u_pub` after low-S normalisation. This is not a break: `-s`
+is derivable only from `s`, so anyone who can compute it already holds the real
+scalar. But it means `s*G == Y` is not the property standing between an LP and
+the escrow. What gates the spend is the script's CHECKMULTISIG, and what gates
+that is whether the decrypted signature verifies under `u_pub`. A test pins this
+so the wrong model is not re-derived from a passing suite.
+
+### 15.9 Stale funding txid
+
+If the wallet rebuilds the funding transaction after `prepare_escrow` has saved
+the record, the stored txid names an escrow that will never exist.
+`may_broadcast_funding` takes the txid actually about to be broadcast and
+refuses when no record matches it, so the mismatch is caught before the money
+moves rather than discovered at `T`.

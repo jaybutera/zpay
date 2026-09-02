@@ -145,7 +145,7 @@ pub fn verify(
     expected_intent_hash: &[u8; 32],
     minimum_release_amount: u128,
 ) -> Result<(), AttestationError> {
-    verify_against_signer(
+    verify_with_signer(
         a,
         signature,
         encoded_payment_details,
@@ -158,11 +158,36 @@ pub fn verify(
 /// As [`verify`], but against a caller-supplied trusted signer.
 ///
 /// Spec section 8 lists enclave signer rotation as a config change rather than
-/// a protocol change, so the signer is a parameter here and pinned by the
-/// caller. Production callers use [`verify`]; tests use this to construct
-/// attestations bound to terms they control, which the real enclave key
-/// obviously cannot be made to sign.
+/// a protocol change, so the signer stays a parameter. It is gated behind the
+/// `test-signer` feature so a production build has no reachable path that
+/// trusts anything but [`ENCLAVE_SIGNER`]: review round 1 flagged an
+/// ungated override as the first thing an attacker would look for, and the
+/// gate is cheaper than the argument that nobody would call it.
+#[cfg(feature = "test-signer")]
 pub fn verify_against_signer(
+    a: &PaymentAttestation,
+    signature: &[u8],
+    encoded_payment_details: &[u8],
+    expected_intent_hash: &[u8; 32],
+    minimum_release_amount: u128,
+    trusted_signer: &[u8; 20],
+) -> Result<(), AttestationError> {
+    verify_with_signer(
+        a,
+        signature,
+        encoded_payment_details,
+        expected_intent_hash,
+        minimum_release_amount,
+        trusted_signer,
+    )
+}
+
+/// Verification against an explicitly supplied signer.
+///
+/// This is the shared implementation. The public, caller-chooses-the-signer
+/// entry point is [`verify_against_signer`] and is feature-gated; the attestor
+/// calls this with the pinned key on its production path.
+pub fn verify_with_signer(
     a: &PaymentAttestation,
     signature: &[u8],
     encoded_payment_details: &[u8],

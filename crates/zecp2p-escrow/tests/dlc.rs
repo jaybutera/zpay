@@ -24,6 +24,7 @@ struct Setup {
     k: SecretKey,
     r: PublicKey,
     event: [u8; 32],
+    terms_hash: [u8; 32],
     digest: [u8; 32],
 }
 
@@ -44,6 +45,8 @@ fn setup() -> Setup {
         k,
         r,
         event: event_id(&[0x7a; 32], 0),
+        // The terms the outcome point commits to (review finding 3).
+        terms_hash: [0x7c; 32],
         digest: [0x42; 32],
     }
 }
@@ -53,15 +56,15 @@ fn the_attestor_scalar_is_the_discrete_log_of_the_outcome_point() {
     // The whole construction reduces to this: s*G == Y = R + e*P. If it did not
     // hold, the attestor's signature would not decrypt anything.
     let s = setup();
-    let y = outcome_point(&s.secp, &s.r, &s.p, &s.event).unwrap();
-    let secret = sign_outcome(&s.secp, &s.k, &s.d, &s.event).unwrap();
+    let y = outcome_point(&s.secp, &s.r, &s.p, &s.event, &s.terms_hash).unwrap();
+    let secret = sign_outcome(&s.secp, &s.k, &s.d, &s.event, &s.terms_hash).unwrap();
     verify_outcome_secret(&s.secp, &secret, &y).expect("s*G must equal Y");
 }
 
 #[test]
 fn the_full_paid_path_produces_a_valid_user_signature() {
     let s = setup();
-    let y = outcome_point(&s.secp, &s.r, &s.p, &s.event).unwrap();
+    let y = outcome_point(&s.secp, &s.r, &s.p, &s.event, &s.terms_hash).unwrap();
 
     // User pre-signs before funding, LP verifies before paying.
     let pre_sig = pre_sign(&s.secp, &s.digest, &s.u_priv, &y);
@@ -69,7 +72,7 @@ fn the_full_paid_path_produces_a_valid_user_signature() {
         .expect("the LP must be able to verify the pre-signature before it pays");
 
     // Attestor signs the outcome; LP decrypts.
-    let secret = sign_outcome(&s.secp, &s.k, &s.d, &s.event).unwrap();
+    let secret = sign_outcome(&s.secp, &s.k, &s.d, &s.event, &s.terms_hash).unwrap();
     let sig = decrypt_pre_signature(&pre_sig, &secret).unwrap();
 
     // The result is an ordinary ECDSA signature by the user's key. On chain it
@@ -84,7 +87,7 @@ fn the_lp_cannot_decrypt_without_the_attestors_scalar() {
     // Property 3 in its operational form: an attestor that refuses or is down
     // means the LP cannot claim. Every wrong scalar here stands for a guess.
     let s = setup();
-    let y = outcome_point(&s.secp, &s.r, &s.p, &s.event).unwrap();
+    let y = outcome_point(&s.secp, &s.r, &s.p, &s.event, &s.terms_hash).unwrap();
     let pre_sig = pre_sign(&s.secp, &s.digest, &s.u_priv, &y);
 
     for (label, wrong) in [
@@ -98,16 +101,18 @@ fn the_lp_cannot_decrypt_without_the_attestors_scalar() {
             "{label} must not pass the s*G == Y check"
         );
 
-        // decrypt() will still return *a* signature for a wrong key, because it
-        // is just subtraction; what matters is that it does not verify.
-        if let Ok(sig) = decrypt_pre_signature(&pre_sig, &wrong) {
-            assert!(
-                s.secp
-                    .verify_ecdsa(&Message::from_digest(s.digest), &sig, &s.u_pub)
-                    .is_err(),
-                "decrypting with {label} must not yield a signature valid under u_pub"
-            );
-        }
+        // decrypt() returns *a* signature for a wrong key, because decryption is
+        // just subtraction. The assertion must therefore be unconditional: an
+        // `if let Ok` here would pass vacuously on the day decrypt started
+        // returning Err, which is the opposite of what this test claims.
+        let sig = decrypt_pre_signature(&pre_sig, &wrong)
+            .expect("decryption with a wrong scalar still produces a signature");
+        assert!(
+            s.secp
+                .verify_ecdsa(&Message::from_digest(s.digest), &sig, &s.u_pub)
+                .is_err(),
+            "decrypting with {label} must not yield a signature valid under u_pub"
+        );
     }
 }
 
@@ -117,7 +122,7 @@ fn a_fabricated_scalar_yields_a_signature_that_does_not_verify() {
     // inert without the attestor. The script-level counterpart is in
     // script_execution.rs, and the mempool-level one is the testnet gate.
     let s = setup();
-    let y = outcome_point(&s.secp, &s.r, &s.p, &s.event).unwrap();
+    let y = outcome_point(&s.secp, &s.r, &s.p, &s.event, &s.terms_hash).unwrap();
     let pre_sig = pre_sign(&s.secp, &s.digest, &s.u_priv, &y);
 
     let mut fabricated = [0u8; 32];
@@ -130,12 +135,55 @@ fn a_fabricated_scalar_yields_a_signature_that_does_not_verify() {
         verify_outcome_secret(&s.secp, &fabricated, &y),
         Err(DlcError::WrongOutcomeSecret)
     );
-    if let Ok(sig) = decrypt_pre_signature(&pre_sig, &fabricated) {
-        assert!(s
-            .secp
+    let sig = decrypt_pre_signature(&pre_sig, &fabricated)
+        .expect("decryption succeeds structurally even for a fabricated scalar");
+    assert!(
+        s.secp
             .verify_ecdsa(&Message::from_digest(s.digest), &sig, &s.u_pub)
-            .is_err());
-    }
+            .is_err(),
+        "a fabricated scalar must not produce a signature valid under u_pub"
+    );
+}
+
+/// The security property is the ECDSA verification, not `s*G == Y`.
+///
+/// Review round 1 found that `verify_outcome_secret(-s)` fails while
+/// `decrypt(-s)` yields a signature that *does* verify under `u_pub` once
+/// normalised to low-S. That is not a break - the LP already holds a valid
+/// release either way, and `-s` is only obtainable from `s` - but it means a
+/// caller must not treat `s*G == Y` as the thing standing between an LP and the
+/// escrow. What actually gates the spend is the script's CHECKMULTISIG, and
+/// what gates that is whether the decrypted signature verifies under `u_pub`.
+///
+/// This test pins the surprising behaviour so nobody re-derives the wrong
+/// mental model from a passing suite.
+#[test]
+fn the_negated_scalar_fails_the_point_check_but_still_decrypts_to_a_valid_signature() {
+    let s = setup();
+    let y = outcome_point(&s.secp, &s.r, &s.p, &s.event, &s.terms_hash).unwrap();
+    let pre_sig = pre_sign(&s.secp, &s.digest, &s.u_priv, &y);
+    let secret = sign_outcome(&s.secp, &s.k, &s.d, &s.event, &s.terms_hash).unwrap();
+
+    let negated = secret.negate();
+    assert_eq!(
+        verify_outcome_secret(&s.secp, &negated, &y),
+        Err(DlcError::WrongOutcomeSecret),
+        "-s is not the discrete log of Y, so the point check rejects it"
+    );
+
+    let mut sig = decrypt_pre_signature(&pre_sig, &negated)
+        .expect("decrypting under -s still yields a signature");
+    sig.normalize_s();
+    s.secp
+        .verify_ecdsa(&Message::from_digest(s.digest), &sig, &s.u_pub)
+        .expect(
+            "and after low-S normalisation it verifies under u_pub: the ECDSA check, \
+             not s*G == Y, is what actually gates the release",
+        );
+
+    // The reason this is not an escalation: -s is derived from s, so anyone who
+    // can compute it already holds the real scalar.
+    assert_eq!(negated.negate(), secret);
 }
 
 #[test]
@@ -144,11 +192,11 @@ fn the_pre_signature_does_not_verify_under_the_wrong_outcome_point() {
     // pre-signature verified under some other Y, an LP could get an attestation
     // for a different event and still release.
     let s = setup();
-    let y = outcome_point(&s.secp, &s.r, &s.p, &s.event).unwrap();
+    let y = outcome_point(&s.secp, &s.r, &s.p, &s.event, &s.terms_hash).unwrap();
     let pre_sig = pre_sign(&s.secp, &s.digest, &s.u_priv, &y);
 
     let other_event = event_id(&[0x7b; 32], 0);
-    let other_y = outcome_point(&s.secp, &s.r, &s.p, &other_event).unwrap();
+    let other_y = outcome_point(&s.secp, &s.r, &s.p, &other_event, &s.terms_hash).unwrap();
     assert_ne!(y, other_y);
 
     assert_eq!(
@@ -163,7 +211,7 @@ fn the_pre_signature_does_not_verify_for_a_different_digest() {
     // any digest would let the LP pay itself from a transaction the user never
     // agreed to.
     let s = setup();
-    let y = outcome_point(&s.secp, &s.r, &s.p, &s.event).unwrap();
+    let y = outcome_point(&s.secp, &s.r, &s.p, &s.event, &s.terms_hash).unwrap();
     let pre_sig = pre_sign(&s.secp, &s.digest, &s.u_priv, &y);
 
     assert_eq!(
@@ -175,7 +223,7 @@ fn the_pre_signature_does_not_verify_for_a_different_digest() {
 #[test]
 fn the_pre_signature_does_not_verify_under_another_users_key() {
     let s = setup();
-    let y = outcome_point(&s.secp, &s.r, &s.p, &s.event).unwrap();
+    let y = outcome_point(&s.secp, &s.r, &s.p, &s.event, &s.terms_hash).unwrap();
     let pre_sig = pre_sign(&s.secp, &s.digest, &s.u_priv, &y);
 
     let other = SecretKey::from_slice(&[0x12; 32]).unwrap().public_key(&s.secp);
@@ -192,9 +240,9 @@ fn the_outcome_secret_is_recoverable_from_the_on_chain_signature() {
     // adaptor scheme and worth being explicit about: s is not a secret after
     // release, it is a receipt.
     let s = setup();
-    let y = outcome_point(&s.secp, &s.r, &s.p, &s.event).unwrap();
+    let y = outcome_point(&s.secp, &s.r, &s.p, &s.event, &s.terms_hash).unwrap();
     let pre_sig = pre_sign(&s.secp, &s.digest, &s.u_priv, &y);
-    let secret = sign_outcome(&s.secp, &s.k, &s.d, &s.event).unwrap();
+    let secret = sign_outcome(&s.secp, &s.k, &s.d, &s.event, &s.terms_hash).unwrap();
     let sig = decrypt_pre_signature(&pre_sig, &secret).unwrap();
 
     let recovered = recover_outcome_secret(&s.secp, &pre_sig, &sig, &y).unwrap();
@@ -212,8 +260,8 @@ fn each_escrow_gets_a_distinct_event_id_and_outcome_point() {
     assert_ne!(a, b, "a different vout is a different event");
     assert_ne!(a, c, "a different funding tx is a different event");
 
-    let ya = outcome_point(&s.secp, &s.r, &s.p, &a).unwrap();
-    let yb = outcome_point(&s.secp, &s.r, &s.p, &b).unwrap();
+    let ya = outcome_point(&s.secp, &s.r, &s.p, &a, &s.terms_hash).unwrap();
+    let yb = outcome_point(&s.secp, &s.r, &s.p, &b, &s.terms_hash).unwrap();
     assert_ne!(ya, yb);
 }
 
@@ -222,16 +270,16 @@ fn the_outcome_challenge_binds_the_nonce_the_attestor_key_and_the_event() {
     // If e ignored any of these, an attestor could reuse one scalar across
     // escrows.
     let s = setup();
-    let base = outcome_challenge(&s.r, &s.p, &s.event).unwrap();
+    let base = outcome_challenge(&s.r, &s.p, &s.event, &s.terms_hash).unwrap();
 
     let other_r = SecretKey::from_slice(&[0x4c; 32]).unwrap().public_key(&s.secp);
     let other_p = SecretKey::from_slice(&[0xd2; 32]).unwrap().public_key(&s.secp);
 
-    assert_ne!(base.to_be_bytes(), outcome_challenge(&other_r, &s.p, &s.event).unwrap().to_be_bytes());
-    assert_ne!(base.to_be_bytes(), outcome_challenge(&s.r, &other_p, &s.event).unwrap().to_be_bytes());
+    assert_ne!(base.to_be_bytes(), outcome_challenge(&other_r, &s.p, &s.event, &s.terms_hash).unwrap().to_be_bytes());
+    assert_ne!(base.to_be_bytes(), outcome_challenge(&s.r, &other_p, &s.event, &s.terms_hash).unwrap().to_be_bytes());
     assert_ne!(
         base.to_be_bytes(),
-        outcome_challenge(&s.r, &s.p, &event_id(&[0x7b; 32], 0)).unwrap().to_be_bytes()
+        outcome_challenge(&s.r, &s.p, &event_id(&[0x7b; 32], 0), &s.terms_hash).unwrap().to_be_bytes()
     );
 }
 
@@ -259,11 +307,11 @@ fn a_reused_nonce_across_two_events_leaks_the_attestor_key() {
     let event_a = event_id(&[0x7a; 32], 0);
     let event_b = event_id(&[0x7b; 32], 0);
 
-    let s_a = sign_outcome(&s.secp, &s.k, &s.d, &event_a).unwrap();
-    let s_b = sign_outcome(&s.secp, &s.k, &s.d, &event_b).unwrap();
+    let s_a = sign_outcome(&s.secp, &s.k, &s.d, &event_a, &s.terms_hash).unwrap();
+    let s_b = sign_outcome(&s.secp, &s.k, &s.d, &event_b, &s.terms_hash).unwrap();
 
-    let e_a = sk(&outcome_challenge(&s.r, &s.p, &event_a).unwrap().to_be_bytes());
-    let e_b = sk(&outcome_challenge(&s.r, &s.p, &event_b).unwrap().to_be_bytes());
+    let e_a = sk(&outcome_challenge(&s.r, &s.p, &event_a, &s.terms_hash).unwrap().to_be_bytes());
+    let e_b = sk(&outcome_challenge(&s.r, &s.p, &event_b, &s.terms_hash).unwrap().to_be_bytes());
 
     // Negating a SecretKey negates it mod n, so `a - b` is `a + (-b)`.
     let num = add(&s_a, &s_b.negate());
@@ -320,4 +368,56 @@ fn invert(x: &SecretKey) -> SecretKey {
         }
     }
     acc.expect("n-2 is nonzero")
+}
+
+/// Review finding 3: the outcome point must commit to the terms, not just to
+/// the outpoint.
+///
+/// Before this fix `Y` was the same for any terms over one escrow, so a scalar
+/// the attestor signed for a 1 USD claim would decrypt a pre-signature the user
+/// made expecting 100 USD. The attestor's own terms-hash check made that hard
+/// to reach, but a single check standing between an LP and someone's ZEC is
+/// thinner than the cryptography allows.
+#[test]
+fn the_outcome_point_changes_when_the_terms_change() {
+    let s = setup();
+    let other_terms = [0x7d; 32];
+    assert_ne!(s.terms_hash, other_terms);
+
+    let y = outcome_point(&s.secp, &s.r, &s.p, &s.event, &s.terms_hash).unwrap();
+    let y_other = outcome_point(&s.secp, &s.r, &s.p, &s.event, &other_terms).unwrap();
+    assert_ne!(
+        y, y_other,
+        "the same outpoint under different terms must give a different Y"
+    );
+}
+
+#[test]
+fn a_scalar_signed_for_other_terms_does_not_release_this_escrow() {
+    // The property the binding buys: even if the attestor could be induced to
+    // sign for terms the user never agreed to, the scalar it publishes does not
+    // complete the user's pre-signature.
+    let s = setup();
+    let victim_terms = s.terms_hash;
+    let attacker_terms = [0x7d; 32];
+
+    let y_victim = outcome_point(&s.secp, &s.r, &s.p, &s.event, &victim_terms).unwrap();
+    let pre_sig = pre_sign(&s.secp, &s.digest, &s.u_priv, &y_victim);
+
+    // The attestor signs the outcome for the attacker's terms.
+    let s_attacker = sign_outcome(&s.secp, &s.k, &s.d, &s.event, &attacker_terms).unwrap();
+
+    assert_eq!(
+        verify_outcome_secret(&s.secp, &s_attacker, &y_victim),
+        Err(DlcError::WrongOutcomeSecret)
+    );
+
+    let sig = decrypt_pre_signature(&pre_sig, &s_attacker)
+        .expect("decryption is structurally possible with any scalar");
+    assert!(
+        s.secp
+            .verify_ecdsa(&Message::from_digest(s.digest), &sig, &s.u_pub)
+            .is_err(),
+        "a scalar signed for different terms must not complete this pre-signature"
+    );
 }
