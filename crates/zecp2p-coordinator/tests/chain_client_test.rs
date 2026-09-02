@@ -160,3 +160,30 @@ async fn test_glue_contract_configured() {
     assert!(result.is_ok());
     assert_eq!(result.unwrap(), glue_addr);
 }
+
+/// The glue deployed at 0xafc314Ea predates the intent-range entry point, and
+/// calling a selector a contract does not have reverts with empty return data.
+/// On 2026-09-02 that emptiness was read as EscrowV2 refusing the deposit and
+/// cost a funded session most of a day. The preflight has to tell the two apart
+/// from the deployed code, so assert it against the address that actually
+/// lacks the function.
+#[tokio::test]
+#[ignore = "requires network access"]
+async fn intent_range_preflight_sees_the_old_glue_lacks_it() {
+    let mut config = test_config();
+    config.contracts.glue_contract = Some(
+        "0xafc314Ea35Bb05AaDb254F5B4A8e05db8e7739A9"
+            .parse()
+            .unwrap(),
+    );
+
+    let client = ChainClient::new_readonly(&config)
+        .await
+        .expect("Failed to create chain client");
+
+    assert!(
+        !client.glue_supports_intent_range().await.unwrap(),
+        "the glue deployed before commit e6a0ecc must be reported as lacking \
+         processOfframpWithRange; reporting otherwise sends a call that reverts blank"
+    );
+}

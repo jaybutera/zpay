@@ -11,7 +11,7 @@ use alloy::{
     providers::{Provider, ProviderBuilder},
     rpc::types::Filter,
     signers::local::PrivateKeySigner,
-    sol_types::SolEvent,
+    sol_types::{SolCall, SolEvent},
 };
 use anyhow::{Context, Result};
 use zecp2p_types::{
@@ -81,6 +81,24 @@ impl ChainClient {
     pub fn glue_contract(&self) -> Result<Address> {
         self.glue_contract
             .ok_or_else(|| anyhow::anyhow!("GlueContract address not configured"))
+    }
+
+    /// Whether the deployed glue actually has `processOfframpWithRange`.
+    ///
+    /// A Solidity contract with no matching selector and no fallback reverts
+    /// with empty return data, which is indistinguishable at the RPC layer from
+    /// EscrowV2 rejecting the deposit. That cost a live session most of a day on
+    /// 2026-09-02: the glue at 0xafc314Ea was deployed before commit e6a0ecc
+    /// added the range entry point, so every attempt died in the dispatcher
+    /// while the logs blamed the escrow. Reading the code once, before sending,
+    /// turns that silence into a sentence.
+    pub async fn glue_supports_intent_range(&self) -> Result<bool> {
+        let glue_addr = self.glue_contract()?;
+        let code = self.provider().get_code_at(glue_addr).await?;
+        // Selector of processOfframpWithRange(bytes32,bytes32[],(address,bytes32,bytes)[],
+        // (bytes32,uint256,(address,bytes,int16,uint32))[][],uint256,uint256).
+        let selector = OfframpGlue::processOfframpWithRangeCall::SELECTOR;
+        Ok(code.windows(selector.len()).any(|w| w == selector))
     }
 
     /// Get current block number
@@ -225,6 +243,19 @@ impl ChainClient {
         intent_max: U256,
     ) -> Result<(B256, U256)> {
         let glue_addr = self.glue_contract()?;
+
+        // Fail with the real reason rather than a bare revert. See
+        // `glue_supports_intent_range`.
+        if !self.glue_supports_intent_range().await? {
+            anyhow::bail!(
+                "the glue deployed at {glue_addr} has no processOfframpWithRange; it \
+                 predates commit e6a0ecc. An exact-payment session needs the pinned \
+                 intent range, so redeploy the glue from the current contracts/src and \
+                 point glue_contract at it. Calling it as deployed reverts with empty \
+                 data, which looks like an EscrowV2 rejection and is not one."
+            );
+        }
+
         let provider = self.signing_provider()?;
 
         let glue = OfframpGlue::new(glue_addr, provider);
