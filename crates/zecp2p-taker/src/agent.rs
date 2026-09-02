@@ -7,12 +7,16 @@ use zecp2p_types::abi::{usd_currency_code, venmo_payment_method};
 
 use crate::{
     abi::IEscrowTaker,
+    auto::{
+        gating::{GatingClient, GatingRequest, GatingSignature},
+        money::payment_cents,
+    },
     claim::{Claimer, SignaledIntent},
     config::TakerConfig,
     discovery::{ClaimableDeposit, Discovery},
     payee,
     proof::{ProofRequest, ProofStatus},
-    venmo::{usdc_to_dollars, PaymentOutcome, PaymentRequest, SendMode, VenmoBrowser},
+    venmo::{PaymentOutcome, PaymentRequest, SendMode, VenmoBrowser},
 };
 
 /// How one deposit ended.
@@ -46,6 +50,9 @@ pub struct TakerAgent<P> {
     provider: P,
     /// Username to pay, when the operator supplied one directly.
     recipient_override: Option<String>,
+    /// This agent's own address. Inside the gating digest, so a signature
+    /// issued for it cannot be relayed by anyone else.
+    taker: Address,
 }
 
 /// One entry of the coordinator's `/deposits/open` listing.
@@ -91,6 +98,7 @@ impl<P: alloy::providers::Provider + Clone> TakerAgent<P> {
             http: reqwest::Client::new(),
             provider,
             recipient_override,
+            taker,
         }
     }
 
@@ -169,7 +177,20 @@ impl<P: alloy::providers::Provider + Clone> TakerAgent<P> {
         // Who gets paid. The deposit stores only the curator's opaque payee
         // hash, so the Venmo username has to come from the session behind it.
         let recipient = self.recipient_for(deposit).await?;
-        let dollars = usdc_to_dollars(amount);
+
+        // The rate the deposit actually prices at, read rather than assumed. A
+        // hardcoded 1e18 clears the on-chain floor and then fails the enclave's
+        // snapshot check with the fiat already sent. See
+        // `docs/status/auto-taker-daemon-design.md`.
+        let conversion_rate = self.deposit_rate(deposit.deposit_id).await?;
+
+        // Price the payment before anything is spent. A cap breach or a zero
+        // rate costs nothing to discover here and costs gas plus a 14-day stake
+        // lock to discover after signalling. The dry run reports this number
+        // too: an operator deciding on a rate-blind figure is deciding on the
+        // wrong one, by four cents on deposit 4499's $5.
+        let payment = payment_cents(amount, conversion_rate, self.config.taker.max_payment_cents)?;
+        let dollars = payment.to_venmo_string();
 
         if self.mode.is_dry_run() {
             let free = self.claimer.free_stake().await.unwrap_or(U256::ZERO);
@@ -193,7 +214,13 @@ impl<P: alloy::providers::Provider + Clone> TakerAgent<P> {
             });
         }
 
-        // Stake first: signalIntent reverts without free stake equal to the
+        // An empty gating signature reverts against the 99-in-100 of deposits
+        // that are gated, so ask the curator before spending anything.
+        let gating = self
+            .gating_for(deposit.deposit_id, amount, conversion_rate)
+            .await?;
+
+        // Stake second: signalIntent reverts without free stake equal to the
         // intent, and finding that out mid-claim wastes gas.
         self.claimer.ensure_stake(amount).await?;
 
@@ -204,7 +231,8 @@ impl<P: alloy::providers::Provider + Clone> TakerAgent<P> {
                 amount,
                 venmo_payment_method(),
                 usd_currency_code(),
-                U256::from(1_000_000_000_000_000_000u64),
+                conversion_rate,
+                &gating,
             )
             .await
         {
@@ -324,6 +352,84 @@ impl<P: alloy::providers::Provider + Clone> TakerAgent<P> {
         );
 
         Ok(claimed)
+    }
+
+    /// The rate this deposit prices at, in fiat per USDC scaled by 1e18.
+    ///
+    /// `agent.rs` used to pass `1e18` here unconditionally. That clears the
+    /// on-chain floor at `OrchestratorV3.sol:553` on any deposit, so nothing
+    /// reverts; the failure surfaces later, inside the enclave, which computes
+    /// `releaseAmount` from the rate in the intent. On the 2026-09-01 fill the
+    /// difference was 4,840,000 units against the intent's 4,875,437, and the
+    /// fulfilment would have reverted with `UPV: Snapshot rate mismatch` after
+    /// the Venmo payment had already gone out.
+    async fn deposit_rate(&self, deposit_id: U256) -> Result<U256> {
+        let escrow = IEscrowTaker::new(self.config.contracts.zkp2p_escrow, &self.provider);
+        let rate = escrow
+            .getDepositCurrencyMinRate(deposit_id, venmo_payment_method(), usd_currency_code())
+            .call()
+            .await
+            .with_context(|| format!("could not read the rate for deposit {deposit_id}"))?;
+
+        if rate.is_zero() {
+            anyhow::bail!(
+                "deposit {deposit_id} carries a zero minimum rate for Venmo/USD; \
+                 refusing to price a payment against it"
+            );
+        }
+        Ok(rate)
+    }
+
+    /// The gating signature this deposit needs, or none if it is open.
+    ///
+    /// The curator's `/v3/sign` returns the signature, its expiry and a
+    /// mandatory 95 bps referral fee together, and all three go into
+    /// `signalIntent` untouched. Rebuilding the fee locally reverts with
+    /// `InvalidSignature()` even when the signature itself is genuine.
+    async fn gating_for(
+        &self,
+        deposit_id: U256,
+        amount: U256,
+        conversion_rate: U256,
+    ) -> Result<GatingSignature> {
+        let escrow = IEscrowTaker::new(self.config.contracts.zkp2p_escrow, &self.provider);
+        let gating_service = escrow
+            .getDepositGatingService(deposit_id, venmo_payment_method())
+            .call()
+            .await
+            .with_context(|| {
+                format!("could not read the gating service for deposit {deposit_id}")
+            })?;
+
+        if gating_service == Address::ZERO {
+            tracing::debug!(deposit_id = %deposit_id, "deposit is open; no gating signature needed");
+            return Ok(GatingSignature::none());
+        }
+
+        let payee = self.deposit_payee(deposit_id).await?;
+        let client = GatingClient::new(self.http.clone(), self.config.zkp2p.api_url.clone());
+        let request = GatingRequest {
+            deposit_id: deposit_id.to_string(),
+            processor_name: "venmo".to_string(),
+            amount: amount.to_string(),
+            to_address: self.taker,
+            payment_method: venmo_payment_method(),
+            fiat_currency: usd_currency_code(),
+            conversion_rate: conversion_rate.to_string(),
+            chain_id: self.config.network.chain_id.to_string(),
+            payee_details: payee.to_string(),
+            caller_address: self.taker,
+            escrow_address: self.config.contracts.zkp2p_escrow,
+            orchestrator_address: self.config.contracts.zkp2p_orchestrator,
+            extra: self.config.zkp2p.gating_extra.clone(),
+        };
+
+        tracing::info!(
+            deposit_id = %deposit_id,
+            gating_service = %gating_service,
+            "deposit is gated; asking the curator to sign"
+        );
+        client.sign(&request).await
     }
 
     /// Read the deposit's own `payeeDetails` from the escrow.

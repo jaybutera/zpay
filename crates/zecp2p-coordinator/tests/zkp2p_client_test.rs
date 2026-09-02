@@ -12,6 +12,7 @@ fn client_for(server: &MockZkp2pServer) -> Zkp2pClient {
     Zkp2pClient::new(&Zkp2pConfig {
         // Trailing slash must be tolerated
         api_url: format!("{}/", server.api_url()),
+        ..Default::default()
     })
 }
 
@@ -96,6 +97,7 @@ async fn register_fails_on_server_error() {
 async fn register_fails_when_curator_is_unreachable() {
     let client = Zkp2pClient::new(&Zkp2pConfig {
         api_url: "http://127.0.0.1:1".to_string(),
+        ..Default::default()
     });
     assert!(client.register_venmo_payee("alice").await.is_err());
 }

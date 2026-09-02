@@ -100,6 +100,36 @@ fn the_shipped_example_config_passes_its_own_check() {
     });
 }
 
+/// The cap and the session settings are what stand between a bad rate and a
+/// wrong payment, so the shipped config has to actually carry them rather than
+/// silently falling back to a default nobody chose.
+#[test]
+fn the_shipped_config_sets_the_payment_cap_and_the_session_limits() {
+    with_env(&[], || {
+        let config = TakerConfig::load("../../config.taker.example.toml").expect("loads");
+        assert_eq!(
+            config.taker.max_payment_cents, 2_500,
+            "the shipped cap must be small enough that a $5 daemon cannot send $500"
+        );
+        assert!(config.taker.max_payment_cents > 0);
+        assert!(!config.taker.journal_path.is_empty());
+        assert!(config.session.max_age_hours > 0);
+        assert!(!config.session.path.is_empty());
+    });
+}
+
+/// The defaults have to hold on a config that predates these fields, because an
+/// operator upgrading the binary should not silently get an uncapped daemon.
+#[test]
+fn a_config_without_the_new_fields_still_gets_a_cap() {
+    let file = write_config(GOOD_CONFIG);
+    let config = with_env(&[], || {
+        TakerConfig::load(file.path().to_str().unwrap()).expect("loads")
+    });
+    assert_eq!(config.taker.max_payment_cents, 2_500);
+    assert_eq!(config.session.max_age_hours, 12);
+}
+
 #[test]
 fn a_clean_config_loads() {
     let file = write_config(GOOD_CONFIG);

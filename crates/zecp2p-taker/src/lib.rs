@@ -18,6 +18,7 @@
 
 pub mod abi;
 pub mod agent;
+pub mod auto;
 pub mod claim;
 pub mod config;
 pub mod discovery;

@@ -80,12 +80,22 @@ pub struct NearConfig {
 pub struct Zkp2pConfig {
     /// Curator API base URL
     pub api_url: String,
+    /// Extra fields to send with `POST /v3/sign`.
+    ///
+    /// That endpoint requires thirteen fields and names none of them in its
+    /// validation errors. Twelve are known and sent by
+    /// `zecp2p_taker::auto::gating`; the thirteenth is not identified yet, and
+    /// this map lets it be supplied from config the first time a live signed
+    /// call names it, rather than needing a release. Empty by default.
+    #[serde(default)]
+    pub gating_extra: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 impl Default for Zkp2pConfig {
     fn default() -> Self {
         Self {
             api_url: "https://api.zkp2p.xyz".to_string(),
+            gating_extra: Default::default(),
         }
     }
 }

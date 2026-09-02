@@ -338,6 +338,7 @@ fn create_test_config(
         },
         zkp2p: zecp2p_types::config::Zkp2pConfig {
             api_url: zkp2p_url.to_string(),
+            ..Default::default()
         },
         keeper: zecp2p_types::config::KeeperConfig::default(),
         attestation: zecp2p_types::config::AttestationConfig::default(),

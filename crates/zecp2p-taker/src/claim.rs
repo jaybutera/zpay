@@ -9,7 +9,10 @@ use alloy::{
 use anyhow::{Context, Result};
 use zecp2p_types::abi::{IOrchestrator, IERC20};
 
-use crate::abi::{IOrchestratorWrite, IStakeVault};
+use crate::{
+    abi::{IOrchestratorWrite, IStakeVault},
+    auto::gating::GatingSignature,
+};
 
 /// What a signalled intent left us holding.
 #[derive(Debug, Clone)]
@@ -98,11 +101,31 @@ impl<P: Provider> Claimer<P> {
 
     /// Claim a deposit by signalling an intent for `amount`.
     ///
-    /// `gatingSignature` is empty on purpose: OfframpGlue creates every deposit
-    /// with `intentGatingService = address(0)`, so the orchestrator asks for no
-    /// signature. Against a gated deposit this call reverts with
-    /// `InvalidSignature()`, which is the correct outcome; we do not take
-    /// other people's gated deposits.
+    /// The gating material comes from the caller, not from here. An earlier
+    /// version of this function hardcoded an empty `gatingSignature` and an
+    /// empty `referrers` array, on the reasoning that OfframpGlue creates every
+    /// deposit with `intentGatingService = address(0)`. Two things make that
+    /// wrong now.
+    ///
+    /// A scan of `DepositPaymentMethodAdded` over ~108,000 recent Base blocks
+    /// found 100 events with 99 of them gated, every one to
+    /// `0x396d31055db28c0c6f36e8b36f18fe7227248a97`. Ours are the outliers, and
+    /// `fast-fill-network-design.md` establishes that pointing our own deposits
+    /// at a gating key is a one-line coordinator change with no redeploy. A
+    /// taker that cannot claim a gated deposit is limited to the deposits
+    /// nobody else wants.
+    ///
+    /// The referral fee is the subtler half. The curator injects a **mandatory
+    /// 95 bps fee** to `0x0bc26ff515411396dd588abd6ef6846e04470227` and signs a
+    /// digest that includes it, so supplying the signature while rebuilding the
+    /// fee array locally reverts with `InvalidSignature()` even though the
+    /// signature itself is genuine. Both values arrive together from
+    /// [`crate::auto::gating`] and are passed through untouched.
+    ///
+    /// `conversion_rate` is the deposit's real rate. Passing `1e18` clears the
+    /// on-chain floor at `OrchestratorV3.sol:553` but makes the enclave compute
+    /// a `releaseAmount` against the wrong rate, which reverts later at
+    /// `UPV: Snapshot rate mismatch` with the fiat already sent.
     pub async fn signal_intent(
         &self,
         deposit_id: U256,
@@ -110,6 +133,7 @@ impl<P: Provider> Claimer<P> {
         payment_method: B256,
         fiat_currency: B256,
         conversion_rate: U256,
+        gating: &GatingSignature,
     ) -> Result<SignaledIntent> {
         let orchestrator = IOrchestratorWrite::new(self.orchestrator, &self.provider);
 
@@ -121,9 +145,16 @@ impl<P: Provider> Claimer<P> {
             paymentMethod: payment_method,
             fiatCurrency: fiat_currency,
             conversionRate: conversion_rate,
-            referrers: vec![],
-            gatingSignature: Bytes::new(),
-            signatureExpiration: U256::ZERO,
+            referrers: gating
+                .referrers
+                .iter()
+                .map(|r| IOrchestratorWrite::Referrer {
+                    referrer: r.referrer,
+                    fee: r.fee,
+                })
+                .collect(),
+            gatingSignature: gating.signature.clone(),
+            signatureExpiration: gating.expiration,
             postIntentHook: Address::ZERO,
             data: Bytes::new(),
             postIntentHookData: Bytes::new(),
@@ -159,6 +190,12 @@ impl<P: Provider> Claimer<P> {
     ///
     /// `payment_proof` has to come from the enclave; see `proof::ProofRequest`
     /// and `scripts/proof/prove_payment.mjs`.
+    ///
+    /// No gating signature is involved, even on a gated deposit. `fulfillIntent`
+    /// takes only `(paymentProof, intentHash, verificationData,
+    /// postIntentHookData)`; gating is a `signalIntent`-time check. Confirmed by
+    /// reading `OrchestratorV3.sol:237-277` rather than by assuming, and then by
+    /// the 2026-09-01 fill against gated deposit 4499.
     pub async fn fulfill_intent(
         &self,
         intent_hash: B256,

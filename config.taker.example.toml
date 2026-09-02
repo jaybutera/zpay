@@ -32,6 +32,24 @@ max_intent_amount = "100000000"
 min_intent_amount = "1000000"
 poll_interval_seconds = 15
 lookback_blocks = 5000
+# Hard ceiling on any one Venmo payment, in whole cents. Refuses rather than
+# clamps: this is what stops a units/dollars confusion or a bad conversion rate
+# from reaching the send button. Raise it deliberately.
+max_payment_cents = 2500
+# Written before each irreversible step, so a restart can tell which fills may
+# have moved money.
+journal_path = "taker-fills.jsonl"
+
+[session]
+# Venmo session material the enclave replays: the account.venmo.com Cookie
+# header and the numeric sender id. Written 0600; treat it as a password file.
+# One capture serves many fills, so this is a refresh problem rather than a
+# per-fill one. `zecp2p-taker refresh-cookie` re-captures it.
+path = "venmo-session.json"
+# Refuse to signal on material older than this. The attestation service imposes
+# no such limit; this is caution. Checked before signalIntent, because a dead
+# cookie found after the payment means the fiat is gone.
+max_age_hours = 12
 
 [venmo]
 # Chrome started with --remote-debugging-port=9222, already logged into Venmo.
@@ -44,3 +62,8 @@ timeout_seconds = 120
 # coordinator's username hashes to, and refuses to pay unless that matches the
 # hash the deposit itself carries.
 api_url = "https://api.zkp2p.xyz"
+# POST /v3/sign requires thirteen fields and names none of them in its errors.
+# Twelve are sent by the gating client; if a live call reports one still
+# missing, add it here rather than waiting for a release.
+# [zkp2p.gating_extra]
+# someField = "value"

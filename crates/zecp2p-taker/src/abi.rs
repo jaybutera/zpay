@@ -111,5 +111,24 @@ sol! {
             external
             view
             returns (DepositPaymentMethodData memory);
+
+        /// The floor the taker must meet, as fiat per USDC scaled by 1e18.
+        ///
+        /// `OrchestratorV3.sol:553` reverts with `RateBelowMinimum` under it.
+        /// A taker signalling at a hardcoded 1e18 clears this floor on every
+        /// deposit and then fails the enclave's snapshot check, so this is the
+        /// value the rate has to be derived from rather than assumed.
+        function getDepositCurrencyMinRate(
+            uint256 depositId,
+            bytes32 paymentMethod,
+            bytes32 fiatCurrency
+        ) external view returns (uint256);
+
+        /// The address that must sign `signalIntent`, or zero for an open
+        /// deposit. Decides whether a gating signature is needed at all.
+        function getDepositGatingService(uint256 depositId, bytes32 paymentMethod)
+            external
+            view
+            returns (address);
     }
 }

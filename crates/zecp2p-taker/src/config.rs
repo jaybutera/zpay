@@ -16,6 +16,9 @@ pub struct TakerConfig {
     pub taker: TakerSettings,
     #[serde(default)]
     pub venmo: VenmoConfig,
+    /// Stored Venmo session material for the enclave.
+    #[serde(default)]
+    pub session: SessionConfig,
     /// Peer TEE attestation service used to prove the Venmo payment.
     #[serde(default)]
     pub attestation: zecp2p_types::config::AttestationConfig,
@@ -80,6 +83,35 @@ pub struct TakerSettings {
     /// Zero means never stake automatically; the operator funds the vault.
     #[serde(default)]
     pub auto_stake_target: U256,
+    /// Hard ceiling on any single Venmo payment, in whole cents.
+    ///
+    /// Checked in `auto::money::payment_cents` against the amount derived from
+    /// the intent, and it refuses rather than clamps. This is the last line
+    /// against a units/dollars confusion, a bad conversion rate, or a
+    /// compromised coordinator: 4,875,437 read as dollars rather than 6-decimal
+    /// units is $4.8 million, and the cap is what stops that reaching the send
+    /// button.
+    ///
+    /// `u64` rather than `u128` because TOML has no u128: the shipped example
+    /// config would not parse, which `config_urls_test` catches.
+    #[serde(default = "default_max_payment_cents")]
+    pub max_payment_cents: u64,
+    /// Where the fill journal lives.
+    ///
+    /// Written before each irreversible step, so a restart can tell an operator
+    /// which fills may have moved money. See `auto::journal`.
+    #[serde(default = "default_journal_path")]
+    pub journal_path: String,
+}
+
+/// $25.00. Deliberately small: a daemon serving $5 orders should have to be
+/// told, in writing, before it can send more.
+fn default_max_payment_cents() -> u64 {
+    2_500
+}
+
+fn default_journal_path() -> String {
+    "taker-fills.jsonl".to_string()
 }
 
 fn default_poll_interval() -> u64 {
@@ -112,6 +144,47 @@ fn default_note() -> String {
 
 fn default_venmo_timeout() -> u64 {
     120
+}
+
+/// The stored Venmo session the enclave replays, and how stale it may get.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionConfig {
+    /// Session-material file: the `account.venmo.com` Cookie header and the
+    /// numeric sender id. Written 0600 and never logged.
+    ///
+    /// A stored cookie is usable across many fills: zk-p2p's attestation client
+    /// documents that the service enforces no capture-age limit and no one-use
+    /// replay limit, and that verification depends only on the upstream session
+    /// still being active. The same document notes the flip side, which is why
+    /// this file is as sensitive as a password file: a leaked encrypted JWE is
+    /// valid for the upstream session's lifetime.
+    #[serde(default = "default_session_path")]
+    pub path: String,
+    /// Refuse to signal on session material older than this.
+    ///
+    /// The service imposes no such limit; this is the operator's caution. It is
+    /// checked before `signalIntent`, because a dead cookie found after the
+    /// Venmo payment means the fiat is gone and only `cancelIntent` recovers
+    /// the stake.
+    #[serde(default = "default_session_max_age_hours")]
+    pub max_age_hours: i64,
+}
+
+fn default_session_path() -> String {
+    "venmo-session.json".to_string()
+}
+
+fn default_session_max_age_hours() -> i64 {
+    12
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self {
+            path: default_session_path(),
+            max_age_hours: default_session_max_age_hours(),
+        }
+    }
 }
 
 impl Default for VenmoConfig {
