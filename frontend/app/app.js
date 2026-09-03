@@ -417,7 +417,16 @@ for (const [id, unit] of [['unit-usd', 'usd'], ['unit-zec', 'zec']]) {
     $('unit-zec').setAttribute('aria-pressed', String(unit === 'zec'));
     $('amount-sigil').textContent = unit === 'usd' ? '$' : 'ᙇ';
     $('amount').placeholder = unit === 'usd' ? '25' : '0.5';
-    doQuote();
+
+    // Clear rather than reinterpret. "25" means twenty-five dollars in one
+    // unit and about twenty thousand dollars of ZEC in the other, and silently
+    // requoting the same digits against the other meaning is how someone sends
+    // far more than they meant to.
+    $('amount').value = '';
+    $('quote').hidden = true;
+    state.quote = null;
+    if (expiryTimer) clearInterval(expiryTimer);
+    $('amount').focus();
   });
 }
 

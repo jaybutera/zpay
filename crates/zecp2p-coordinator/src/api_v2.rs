@@ -130,7 +130,7 @@ async fn zatoshi_for_cents(state: &Arc<AppState>, cents: u64) -> Result<u64, App
     );
     let quoted = state
         .near
-        .get_quote(probe)
+        .get_dry_quote(probe)
         .await
         .map_err(|e| AppError::NearIntents(e.to_string()))?;
 
@@ -183,7 +183,7 @@ async fn build_live_quote(
 
     let quoted = state
         .near
-        .get_quote(request)
+        .get_dry_quote(request)
         .await
         .map_err(|e| AppError::NearIntents(e.to_string()))?;
 
@@ -194,10 +194,15 @@ async fn build_live_quote(
 
     // The quote's own deadline, or the product's TTL, whichever is sooner. A
     // countdown that outlives the swap's deadline is a countdown that lies.
-    let oneclick_expiry = chrono::DateTime::from_timestamp(quoted.expires_at as i64, 0);
-    let expires_at = match oneclick_expiry {
-        Some(t) => t.min(oneclick::default_expiry()),
-        None => oneclick::default_expiry(),
+    //
+    // A dry quote carries no deadline and `expires_at` comes back as 0, which
+    // is the epoch. Taking the minimum against that put every price on screen
+    // under a "price expired" label the moment it rendered, so a zero is
+    // treated as "not stated" rather than as a timestamp.
+    let ttl = oneclick::default_expiry();
+    let expires_at = match chrono::DateTime::from_timestamp(quoted.expires_at as i64, 0) {
+        Some(t) if quoted.expires_at > 0 => t.min(ttl),
+        _ => ttl,
     };
 
     // The id carries the ZEC it was quoted for, so `POST /v2/orders` knows the

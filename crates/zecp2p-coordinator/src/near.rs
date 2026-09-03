@@ -52,6 +52,30 @@ impl NearIntentsClient {
     /// This uses the 1Click API v0 format with proper asset IDs.
     /// Returns a deposit address and expected output amount.
     pub async fn get_quote(&self, request: QuoteRequest) -> Result<QuoteResponse> {
+        self.quote_inner(request, false, 5000).await
+    }
+
+    /// Price a swap without reserving a deposit address.
+    ///
+    /// A quote shown on screen is a price, not a commitment, and `dry` quotes
+    /// skip the deposit-address allocation. It also drops the relay waiting
+    /// time, which is the whole cost of the call: with `quoteWaitingTimeMs` at
+    /// 5000 a priced screen took 5.3 seconds on the ZEC path and 10.6 on the
+    /// dollar path, which asks twice. Nobody types an amount and waits ten
+    /// seconds to see what it is worth.
+    ///
+    /// The real quote, with a deposit address and the full waiting time, is
+    /// taken when the order opens.
+    pub async fn get_dry_quote(&self, request: QuoteRequest) -> Result<QuoteResponse> {
+        self.quote_inner(request, true, 600).await
+    }
+
+    async fn quote_inner(
+        &self,
+        request: QuoteRequest,
+        dry: bool,
+        waiting_ms: i32,
+    ) -> Result<QuoteResponse> {
         request.validate()?;
 
         let url = format!("{}/v0/quote", self.base_url);
@@ -61,7 +85,7 @@ impl NearIntentsClient {
 
         // Build the actual API request
         let api_request = ApiQuoteRequest {
-            dry: false,
+            dry,
             swap_type: SwapType::ExactInput,
             slippage_tolerance: request.slippage_bps.unwrap_or(50) as i32,
             origin_asset: request.origin_asset.clone(),
@@ -74,7 +98,7 @@ impl NearIntentsClient {
             recipient_type: RecipientType::DestinationChain,
             deadline,
             deposit_mode: Some(DepositMode::Simple),
-            quote_waiting_time_ms: Some(5000),
+            quote_waiting_time_ms: Some(waiting_ms),
             referral: None,
         };
 
@@ -98,9 +122,13 @@ impl NearIntentsClient {
         let quote = api_response.quote;
 
         Ok(QuoteResponse {
-            deposit_address: quote.deposit_address.ok_or_else(|| {
-                anyhow::anyhow!("No deposit address in quote response (dry run?)")
-            })?,
+            // A dry quote returns no deposit address, which is the point of
+            // asking for one. Only a real quote is required to carry it.
+            deposit_address: match quote.deposit_address {
+                Some(a) => a,
+                None if dry => String::new(),
+                None => anyhow::bail!("1Click returned a quote with no deposit address"),
+            },
             expected_output: quote.amount_out,
             min_output: quote.min_amount_out,
             expires_at: quote.deadline.map(|d| d.timestamp() as u64).unwrap_or(0),
