@@ -439,6 +439,8 @@ pub enum ReturnState {
     /// USDC is at `session.user`. The page converts it before it asks anything.
     UsdcAt { address: String, units: String },
     /// A back-swap of returned USDC is in flight.
+    ///
+    /// Not built: nothing constructs this. See [`ClaimAuthorization`].
     SwappingBack {
         quote_id: String,
         expected_zat: u64,
@@ -462,6 +464,20 @@ impl ReturnState {
 
 /// What the sender's key signs to claim a return. Which variant applies is
 /// decided by [`ReturnState`], never by the caller.
+///
+/// Not built. Nothing in the coordinator constructs a value of this type and no
+/// endpoint accepts one, so the failure screen's claim path cannot half-fire:
+/// the page records the address the sender types and says the signing step is
+/// still being built. The round 1 audit asked for that to be confirmed rather
+/// than assumed, so it is stated here, next to the type, where the next person
+/// to wire it up will read it.
+///
+/// Wiring it up means, at minimum: a `POST /v2/orders/{id}/claim` that verifies
+/// the session key's signature over the claim scope, a `ReturnState` that
+/// actually reaches `ZecAt` on a real refund, and a funded test of each variant
+/// separately. `SwappingBack` and the `Eip3009` variant additionally depend on
+/// the shielded refund path, which is proven only at the 1Click API and has
+/// never been watched land on chain (U1-5).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ClaimAuthorization {

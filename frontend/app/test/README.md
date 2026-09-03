@@ -1,9 +1,12 @@
 # Checks for the page's hand-written crypto
 
-Three things in `frontend/app/` are implemented by hand because the browser
-does not provide them: QR encoding, secp256k1, and keccak256. All three fail
-silently when they are wrong. A QR code that encodes nothing still looks like a
-QR code; a signature over the wrong bytes is still a well-formed signature.
+Four things in `frontend/app/` are implemented by hand because the browser does
+not provide them: QR encoding, secp256k1, keccak256, and the address checksums
+in `zaddr.js` (SHA-256, base58check, bech32m). All of them fail silently when
+they are wrong. A QR code that encodes nothing still looks like a QR code; a
+signature over the wrong bytes is still a well-formed signature; and a checksum
+that accepts everything accepts every real address too, which is why the round
+1 audit found `t1AAAA...` passing the check this replaces.
 
 These are not run by `cargo test`. Run them when you touch `qr.js` or the
 crypto section of `app.js`.
@@ -12,6 +15,7 @@ crypto section of `app.js`.
 npm install jsqr qrcode
 
 node frontend/app/test/crypto-vectors.js       # keccak and secp256k1 vectors
+node frontend/app/test/zaddr-vectors.js        # SHA-256, base58check, bech32m
 node frontend/app/test/qr-verify.js            # encode, then decode with jsQR
 
 node frontend/app/test/session-key-vectors.js > /tmp/js-sigs.json

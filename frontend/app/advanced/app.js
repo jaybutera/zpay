@@ -162,21 +162,12 @@ function validEvm(a, label) {
   return null;
 }
 
-// Mirrors crates/zecp2p-coordinator/src/near.rs. 1Click accepts a unified
-// address as refundTo, including a shielded-only one, so this no longer
-// refuses u1. The coordinator decodes the address properly; this is only the
-// cheap shape check that saves a round trip.
+// Mirrors crates/zecp2p-coordinator/src/near.rs, and now decodes rather than
+// measures: base58check for t1/t3, bech32m for u1. The advanced route is where
+// a sender types their own refund address, so a wrong checksum here is a refund
+// sent somewhere unspendable (U1-4).
 function validZecAddr(a) {
-  a = a.trim();
-  if (/^u1/.test(a)) {
-    if (a.length < 40) return 'That unified address is too short to be complete.';
-    return null;
-  }
-  if (/^(t1|t3)/.test(a)) {
-    if (a.length < 34 || a.length > 35) return 'A ZEC t-address is 34 or 35 characters.';
-    return null;
-  }
-  return 'Use a unified address (u1…) or a transparent one (t1… / t3…).';
+  return ZAddr.validateZcashAddress(a);
 }
 
 function mark(el, bad) { el.setAttribute('aria-invalid', bad ? 'true' : 'false'); }

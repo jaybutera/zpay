@@ -56,7 +56,15 @@ async function api(path, opts = {}) {
   const raw = await res.text();
   let body = null;
   if (raw) { try { body = JSON.parse(raw); } catch (_) {} }
-  if (!res.ok) throw new Error((body && (body.error || body.message)) || raw || res.statusText);
+  if (!res.ok) {
+    const err = new Error((body && (body.error || body.message)) || raw || res.statusText);
+    err.status = res.status;
+    // The coordinator sends the bridge's real floor alongside the sentence, so
+    // the page can convert it and say what to type instead of repeating an
+    // upstream category (U1-3).
+    if (body && typeof body.min_zatoshi === 'number') err.minZatoshi = body.min_zatoshi;
+    throw err;
+  }
   return body;
 }
 
@@ -288,6 +296,9 @@ const state = {
   rails: [],
   feeLabel: 'zpay fee',
   poll: null,
+  // Cents per whole ZEC from the last quote that succeeded, so a floor
+  // rejection can be reported in dollars.
+  lastRate: null,
 };
 
 /** Put the secret and the order id in the fragment, which no server sees. */
@@ -355,13 +366,38 @@ async function doQuote() {
       `&rail=${encodeURIComponent($('rail').value)}`
     );
     state.quote = q;
+    // Cents per whole ZEC, kept so a later floor rejection can be quoted in
+    // dollars rather than in zatoshi.
+    if (q.zec_zatoshi > 0) state.lastRate = q.net_cents / (q.zec_zatoshi / 1e8);
     renderQuote(q);
     msg('compose-msg', '');
   } catch (e) {
     state.quote = null;
     $('quote').hidden = true;
-    msg('compose-msg', 'err', e.message);
+    msg('compose-msg', 'err', floorHint(e) || e.message);
   }
+}
+
+// The bridge has a smallest swap it will make, it moves with the ZEC network
+// fee, and it is the reason a small amount is refused. Saying the number in the
+// unit the sender is typing in is the whole point of carrying it back.
+function floorHint(e) {
+  if (!e || typeof e.minZatoshi !== 'number') return null;
+
+  const zec = zecString(e.minZatoshi);
+  if (state.unit === 'zec') {
+    return `That is below the smallest swap this route can make right now. Send at least ${zec} ZEC.`;
+  }
+
+  // In dollars, price the floor so the sender is told a dollar amount rather
+  // than being asked to convert zatoshi themselves. The rate comes from the
+  // last quote that worked; without one, name the ZEC amount.
+  const rate = state.lastRate;
+  if (!rate) {
+    return `That is below the smallest swap this route can make right now. Send at least ${zec} ZEC.`;
+  }
+  const cents = Math.ceil((e.minZatoshi / 1e8) * rate);
+  return `That is below the smallest amount this route can send right now, about ${money(cents)}. Try that or more.`;
 }
 
 function renderQuote(q) {
@@ -618,9 +654,24 @@ function renderReturns(view) {
   }
 }
 
+// The advanced route is only reachable once there is a session to show it.
+function setAdvancedLink(sessionId) {
+  const a = $('advanced-link');
+  if (!a) return;
+  if (sessionId) {
+    a.href = 'advanced/?session=' + encodeURIComponent(sessionId);
+    a.hidden = false;
+  } else {
+    a.removeAttribute('href');
+    a.hidden = true;
+  }
+}
+
 function renderDetails(view) {
   const dl = $('detail-kv');
   dl.innerHTML = '';
+  const session = (view.timeline.details || []).find(([k]) => k === 'session id');
+  setAdvancedLink(session ? session[1] : null);
   for (const [k, v] of view.timeline.details || []) {
     const dt = document.createElement('dt'); dt.textContent = k;
     const dd = document.createElement('dd'); dd.textContent = v;
@@ -628,13 +679,11 @@ function renderDetails(view) {
   }
 }
 
-// The one client-side check on the return address. The coordinator decodes it
-// properly; this only saves a round trip on an obvious typo.
+// The client-side check on the return address. It decodes: base58check for
+// t1/t3, bech32m for u1, the same decision `near.rs` makes. Length and prefix
+// were what this used to check, which accepted `t1AAAA…` (U1-4).
 function validZcashAddress(a) {
-  a = a.trim();
-  if (/^u1/.test(a)) return a.length >= 40 ? null : 'That unified address looks incomplete.';
-  if (/^(t1|t3)/.test(a)) return (a.length >= 34 && a.length <= 35) ? null : 'A t-address is 34 or 35 characters.';
-  return 'Use a Zcash address: u1… (shielded) or t1… / t3….';
+  return ZAddr.validateZcashAddress(a);
 }
 
 $('form-return').addEventListener('submit', async (ev) => {
@@ -643,9 +692,14 @@ $('form-return').addEventListener('submit', async (ev) => {
   const bad = validZcashAddress(addr);
   if (bad) { msg('return-msg', 'err', bad); return; }
 
+  // Deliberately a stub, and it says so. Nothing is sent and nothing is
+  // stored: claiming a return needs a signature from this page over a claim
+  // the coordinator does not yet accept. Saying "recorded" would be a lie
+  // about where the sender's address went.
   msg('return-msg', 'info',
-    'Recorded. Returning funds needs a signature from this page, which is the ' +
-    'next thing being built; your ZEC stays claimable from this link until then.');
+    'That address is not saved yet. Claiming a return needs a signature from ' +
+    'this page, which is still being built. Your ZEC stays claimable from this ' +
+    'link, so keep it and check back.');
 });
 
 async function fetchStatus() {
@@ -709,7 +763,12 @@ async function checkHealth() {
     state.key = resumed.key;
     $('view-compose').hidden = true;
     $('view-status').hidden = false;
-    $('advanced-link').href = 'advanced/?session=' + encodeURIComponent(resumed.orderId);
+    // U1-6. The advanced page reads `?session=` as a session UUID and fetches
+    // `/offramp/{id}`. An order id is not a session id, and a main-route order
+    // has no session until it is funded, so this link went to "Session not
+    // found" every time. It is filled in from the details list once a session
+    // exists, and hidden until then.
+    setAdvancedLink(null);
     startPolling();
   }
 })();
