@@ -40,6 +40,12 @@ pub enum KeystoreError {
          Fix it with: chmod 600 {path}"
     )]
     TooOpen { path: String, mode: u32 },
+    #[error(
+        "no key at {path}. This command will not create one: a fresh key cannot be right for \
+         an escrow that already exists, and on mainnet a mistyped label would produce a \
+         different address. Check ZECP2P_ESCROW_LABEL, or run `plan` to create the pair."
+    )]
+    WouldCreate { path: String },
 }
 
 /// A directory of per-escrow keys.
@@ -151,6 +157,71 @@ impl Keystore {
     fn check_mode(_path: &Path) -> Result<(), KeystoreError> {
         Ok(())
     }
+}
+
+/// How a runner resolved its key, so a tool can say which happened.
+///
+/// R9-7: a mistyped `ZECP2P_ESCROW_LABEL` silently created a second key pair
+/// and therefore a different escrow address. On mainnet that is a funding
+/// instruction pointing at coin nobody will ever claim, so the tools print
+/// which of these they did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyOrigin {
+    /// Taken from an explicit environment variable.
+    Environment,
+    /// Read from an existing keystore file.
+    Loaded,
+    /// Generated, because the label was new.
+    Created,
+    /// The public development key. Never valid on mainnet.
+    Development,
+}
+
+/// Resolves a key the way the runners do: an explicit variable, then the
+/// keystore, then the development fallback.
+///
+/// R9-2: `paid_path` read only `ZECP2P_U_PRIV` and panicked under the runbook's
+/// environment, which sets up a keystore instead. Both tools call this now.
+///
+/// `allow_create` is false for anything acting on an escrow that already
+/// exists - a fresh key can never be right for one - and for mainnet unless the
+/// caller opts in, which is R9-7.
+pub fn from_env(
+    var: &str,
+    label_suffix: &str,
+    development_fallback: [u8; 32],
+    allow_create: bool,
+) -> Result<(SecretKey, KeyOrigin), KeystoreError> {
+    if let Ok(h) = std::env::var(var) {
+        let bytes = hex::decode(h.trim())
+            .map_err(|_| KeystoreError::Malformed(var.to_string()))?;
+        let key = SecretKey::from_slice(&bytes)
+            .map_err(|_| KeystoreError::Malformed(var.to_string()))?;
+        return Ok((key, KeyOrigin::Environment));
+    }
+
+    if let (Ok(dir), Ok(label)) = (
+        std::env::var("ZECP2P_KEYSTORE"),
+        std::env::var("ZECP2P_ESCROW_LABEL"),
+    ) {
+        let ks = Keystore::new(dir);
+        let name = format!("{label}-{label_suffix}");
+        if ks.exists(&name) {
+            return Ok((ks.load(&name)?, KeyOrigin::Loaded));
+        }
+        if !allow_create {
+            return Err(KeystoreError::WouldCreate {
+                path: ks.path_of(&name).display().to_string(),
+            });
+        }
+        return Ok((ks.create(&name)?, KeyOrigin::Created));
+    }
+
+    Ok((
+        SecretKey::from_slice(&development_fallback)
+            .map_err(|_| KeystoreError::Malformed("development key".into()))?,
+        KeyOrigin::Development,
+    ))
 }
 
 /// The compressed public key for a secret key.

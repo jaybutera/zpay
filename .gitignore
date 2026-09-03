@@ -68,3 +68,4 @@ scripts/proof/attestation*.json
 
 # Local coordinator database
 zecp2p*.db
+taker-fills.jsonl

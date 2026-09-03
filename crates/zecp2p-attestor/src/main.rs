@@ -187,9 +187,10 @@ async fn main() {
                 build_id(), bytes,
             )
         }
-        Err(_) => AttestorService::new(
-            db, d, chain, SystemClock, token, env!("CARGO_PKG_VERSION").to_string(),
-        ),
+        // R9-6: this branch reported plain CARGO_PKG_VERSION, so a test-signer
+        // binary run without the variable looked like a production one over the
+        // wire - which is exactly the check a mainnet run relies on.
+        Err(_) => AttestorService::new(db, d, chain, SystemClock, token, build_id()),
     });
     #[cfg(not(feature = "test-signer"))]
     let service = Arc::new(AttestorService::new(

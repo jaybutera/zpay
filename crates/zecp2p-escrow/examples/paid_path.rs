@@ -35,11 +35,12 @@ use zecp2p_escrow::dlc::{
     verify_outcome_secret, verify_pre_signature,
 };
 use zecp2p_escrow::fees::release_fee_to_transparent_zat;
+use zecp2p_escrow::keystore;
 use zecp2p_escrow::lp_client::{AttestorClient, WireAttestation};
 use zecp2p_escrow::payment_details::{
     IDENTITY_RATE_18DEC, USD_FIAT_CURRENCY, VENMO_PAYMENT_METHOD,
 };
-use zecp2p_escrow::rpc::{rpc_hex_to_txid, txid_to_rpc_hex, Network, RpcChainClient, RpcConfig};
+use zecp2p_escrow::rpc::{txid_to_rpc_hex, Network, RpcChainClient, RpcConfig};
 use zecp2p_escrow::script::release_script_sig;
 use zecp2p_escrow::terms::CanonicalTerms;
 use zecp2p_escrow::tx::{
@@ -50,21 +51,15 @@ fn env(k: &str) -> String {
     std::env::var(k).unwrap_or_else(|_| panic!("set {k}"))
 }
 
-fn key(k: &str) -> SecretKey {
-    SecretKey::from_slice(&hex::decode(env(k).trim()).expect("64 hex characters"))
-        .expect("a valid secp256k1 scalar")
-}
-
 /// Everything a run needs to be resumed.
 ///
 /// R8-1: the runner kept the pre-signature, `s` and the signed release in
-/// memory and wrote none of them, so a failure after `/attest` - including the
-/// R7-6 case where the node is a block behind at broadcast - lost the only
-/// signed release and it could not be rebuilt. The recovery that existed was to
-/// sign with `u_priv`, which produces a transaction the chain cannot tell from
-/// a decrypted one; on a mainnet criterion 6 run that would look like success
-/// and prove nothing.
-#[derive(Debug, Serialize, Deserialize)]
+/// memory and wrote none of them. R9-1: worse, the resume then re-derived the
+/// pre-signature instead of reading it back, and `encrypt` draws fresh
+/// randomness - so the record and the mined release disagreed and criterion 6
+/// became uncheckable. Everything a resume needs is written here, and a resume
+/// reads rather than recomputes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct RunRecord {
     lock_confirmed_ms: u64,
     terms_hash: String,
@@ -73,8 +68,14 @@ struct RunRecord {
     p: String,
     y: String,
     release_digest: String,
-    /// The adaptor pre-signature, so a resumed run decrypts rather than signs.
+    /// The adaptor pre-signature. Never regenerated (R9-1).
     pre_signature: String,
+    /// The LP payout script, so a resume rebuilds the same transaction rather
+    /// than whatever the environment says today.
+    lp_script: String,
+    /// The escrow amount and fee at the time of the first run.
+    amount_zat: u64,
+    fee_zat: u64,
     /// Set once the attestor has published it.
     s: Option<String>,
     /// Set once the release is assembled; this is what a resumed run broadcasts.
@@ -94,8 +95,7 @@ impl RunRecord {
     }
 }
 
-/// Base58Check decode of a `t` address, with the checksum enforced.
-fn decode_t_address(addr: &str) -> Vec<u8> {
+fn decode_t_address(addr: &str, network: Network) -> Vec<u8> {
     const A: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
     let mut num: Vec<u8> = Vec::new();
     for c in addr.bytes() {
@@ -118,14 +118,28 @@ fn decode_t_address(addr: &str) -> Vec<u8> {
     let expected = Sha256::digest(Sha256::digest(payload));
     assert_eq!(checksum, &expected[..4], "address checksum failed: {addr}");
 
-    let hash = &full[2..22];
-    if addr.starts_with("t3") || addr.starts_with("t2") {
+    let prefix = [full[0], full[1]];
+    let hash: [u8; 20] = full[2..22].try_into().unwrap();
+
+    // Mainnet: t1 = 1cb8 (P2PKH), t3 = 1cbd (P2SH).
+    // Testnet: tm = 1d25 (P2PKH), t2 = 1cba (P2SH).
+    let (p2pkh_prefix, p2sh_prefix) = match network {
+        Network::Main => ([0x1c, 0xb8], [0x1c, 0xbd]),
+        Network::Test => ([0x1d, 0x25], [0x1c, 0xba]),
+    };
+
+    if prefix == p2pkh_prefix {
+        p2pkh(hash)
+    } else if prefix == p2sh_prefix {
         let mut v = vec![0xa9, 20];
-        v.extend_from_slice(hash);
+        v.extend_from_slice(&hash);
         v.push(0x87);
         v
     } else {
-        p2pkh(hash.try_into().unwrap())
+        panic!(
+            "{addr} has prefix {prefix:02x?}, which is not a {network:?} address. Paying it \
+             would send the release somewhere unspendable."
+        );
     }
 }
 
@@ -194,40 +208,80 @@ fn test_enclave_address() -> [u8; 20] {
     addr
 }
 
-fn main() {
-    let a: Vec<String> = std::env::args().collect();
-    if a.len() > 1 && a[1] == "enclave-address" {
-        println!("{}", hex::encode(test_enclave_address()));
-        return;
+
+/// Loads the prover's export into the shape `/attest` wants.
+///
+/// R9-3: `paid_path` always built the attestation with the test key, so a
+/// production attestor answered 400 and the run stopped *after* the dollar was
+/// sent. `prove_payment_pinned.mjs` writes exactly these fields; the fixture at
+/// `tests/fixtures/attestation_1000000.json` has the same shape.
+fn attestation_from_prover(path: &str) -> WireAttestation {
+    let text = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("read the prover's export at {path}: {e}"));
+    let j: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse {path}: {e}"));
+    let att = &j["attestation"];
+    let tv = &att["typedDataValue"];
+
+    let field = |v: &serde_json::Value, name: &str| -> String {
+        v[name]
+            .as_str()
+            .unwrap_or_else(|| panic!("{path} has no attestation.{name}"))
+            .trim_start_matches("0x")
+            .to_string()
+    };
+
+    println!("  prover export  {path}");
+    println!("  signer         {}", field(att, "signer"));
+    println!("  intent hash    {}", field(tv, "intentHash"));
+    println!("  releaseAmount  {}", field(tv, "releaseAmount"));
+
+    WireAttestation {
+        intent_hash: field(tv, "intentHash"),
+        release_amount: tv["releaseAmount"]
+            .as_str()
+            .expect("releaseAmount is a decimal string")
+            .to_string(),
+        data_hash: field(tv, "dataHash"),
+        signature: field(att, "signature"),
+        encoded_payment_details: field(att, "encodedPaymentDetails"),
     }
-    let funding_txid = rpc_hex_to_txid(&txid_to_rpc_hex(
-        &hex::decode(a[1].trim())
-            .expect("txid hex")
-            .try_into()
-            .expect("32 bytes"),
-    ))
-    .unwrap();
-    let vout: u32 = a[2].parse().expect("vout");
-    let refund_height: u64 = a[3].parse().expect("T");
-    let payee_hash: [u8; 32] = hex::decode(a[4].trim())
+}
+
+struct Setup {
+    chain: RpcChainClient,
+    network: Network,
+    secp: Secp256k1<secp256k1_zkp::All>,
+    u_priv: SecretKey,
+    l_priv: SecretKey,
+    terms: EscrowTerms,
+    canonical: CanonicalTerms,
+    redeem: Vec<u8>,
+    fee: u64,
+    lp_script: Vec<u8>,
+    digest: [u8; 32],
+    event_id: [u8; 32],
+    record_path: String,
+    prior: Option<RunRecord>,
+}
+
+/// Everything both subcommands need, derived once so they cannot disagree.
+fn setup(args: &[String], allow_create: bool) -> Setup {
+    let funding_txid: [u8; 32] = hex::decode(args[2].trim())
+        .expect("txid hex")
+        .try_into()
+        .expect("32 bytes");
+    let vout: u32 = args[3].parse().expect("vout");
+    let refund_height: u64 = args[4].parse().expect("T");
+    let payee_hash: [u8; 32] = hex::decode(args[5].trim())
         .expect("payee hash hex")
         .try_into()
         .expect("32 bytes");
 
-    let secp = Secp256k1::new();
-    let u_priv = key("ZECP2P_U_PRIV");
-    let l_priv = key("ZECP2P_L_PRIV");
-    let u_pub = u_priv.public_key(&secp).serialize();
-    let l_pub = l_priv.public_key(&secp).serialize();
-
-    // R8-2: the network is read, not assumed, so `check_network` can refuse a
-    // mainnet endpoint given a testnet config and vice versa.
     let network = match std::env::var("ZECP2P_RPC_NETWORK").as_deref() {
         Ok("main") => Network::Main,
         _ => Network::Test,
     };
-    // A hosted endpoint needs a longer broadcast budget than a local node; see
-    // `RpcConfig::hosted`.
     let url = env("ZECP2P_RPC_URL");
     let mut cfg = if url.contains("127.0.0.1") || url.contains("localhost") {
         RpcConfig::public(url, network)
@@ -237,20 +291,67 @@ fn main() {
     cfg.timeout = cfg.timeout.max(Duration::from_secs(45));
     let chain = RpcChainClient::new(cfg).expect("rpc");
     let branch = chain.consensus_branch_id().expect("branch");
-    let height = chain.height().expect("height");
 
-    let utxo = chain
-        .utxo(&funding_txid, vout)
-        .expect("utxo")
-        .expect("the escrow must be funded");
+    // R9-2: from the keystore the runbook creates, not only ZECP2P_U_PRIV.
+    // R9-7: a mainnet run will not silently create a second pair.
+    let create = allow_create && network != Network::Main;
+    let (u_priv1, u_from) =
+        keystore::from_env("ZECP2P_U_PRIV", "u", [0x11; 32], create).expect("user key");
+    let (l_priv1, l_from) =
+        keystore::from_env("ZECP2P_L_PRIV", "l", [0x22; 32], create).expect("LP key");
+    let u_priv = SecretKey::from_slice(&u_priv1.secret_bytes()).unwrap();
+    let l_priv = SecretKey::from_slice(&l_priv1.secret_bytes()).unwrap();
+    if network == Network::Main
+        && (u_from == keystore::KeyOrigin::Development
+            || l_from == keystore::KeyOrigin::Development)
+    {
+        panic!("refusing to run on mainnet with the public development keys");
+    }
+    println!("  keys           u: {u_from:?}, l: {l_from:?}");
 
-    // --- The terms both sides agree, and the transaction they describe.
-    // R8-1: `now` here meant a second invocation produced different terms and a
-    // 409 from the attestor, so a run that failed after /attest could not be
-    // resumed. The record carries it; the environment can pin it.
+    let secp = Secp256k1::new();
+    let u_pub = u_priv.public_key(&secp).serialize();
+    let l_pub = l_priv.public_key(&secp).serialize();
+
     let record_path = std::env::var("ZECP2P_RUN_RECORD")
         .unwrap_or_else(|_| "paid-path-run.json".to_string());
     let prior = RunRecord::load(&record_path);
+
+    // R9-4: a resume that already holds a signed release must not need the
+    // escrow to still be unspent. `gettxout` answers null once the release is
+    // mined, and requiring it here made the one path that exists to re-broadcast
+    // a held release unreachable - which is the R7-6 case the retry loop was
+    // built for. The record carries the amount, so fall back to it.
+    let utxo_amount = match chain.utxo(&funding_txid, vout).expect("utxo") {
+        Some(u) => {
+            assert_eq!(
+                u.script_pubkey,
+                {
+                    let (u_pub2, l_pub2) = (u_pub, l_pub);
+                    let t = EscrowTerms {
+                        funding_txid,
+                        vout,
+                        amount_zat: u.amount_zat,
+                        u_pub: u_pub2,
+                        l_pub: l_pub2,
+                        refund_height,
+                        consensus_branch_id: branch,
+                    };
+                    t.script_pubkey().unwrap()
+                },
+                "the outpoint does not pay this escrow"
+            );
+            u.amount_zat
+        }
+        None => match prior.as_ref().map(|r| r.amount_zat) {
+            Some(a) => {
+                println!("  escrow         already spent; using the recorded amount");
+                a
+            }
+            None => panic!("the escrow must be funded"),
+        },
+    };
+
     let now_ms = prior
         .as_ref()
         .map(|r| r.lock_confirmed_ms)
@@ -265,13 +366,11 @@ fn main() {
                 .unwrap()
                 .as_millis() as u64
         });
-    if prior.is_some() {
-        println!("resuming from {record_path}");
-    }
+
     let canonical = CanonicalTerms {
         funding_txid,
         vout,
-        amount_zat: utxo.amount_zat,
+        amount_zat: utxo_amount,
         u_pub,
         l_pub,
         refund_height,
@@ -286,208 +385,397 @@ fn main() {
     let terms = EscrowTerms {
         funding_txid,
         vout,
-        amount_zat: utxo.amount_zat,
+        amount_zat: utxo_amount,
         u_pub,
         l_pub,
         refund_height,
         consensus_branch_id: branch,
     };
     let redeem = terms.redeem_script().expect("redeem");
-    assert_eq!(
-        utxo.script_pubkey,
-        terms.script_pubkey().unwrap(),
-        "the outpoint does not pay this escrow"
-    );
-    let fee = release_fee_to_transparent_zat(redeem.len());
 
-    // R8-2: the payout script was `p2pkh([0x09; 20])`, a hash nobody holds a
-    // key for. On mainnet that pays the release to nowhere.
-    let lp_script = match std::env::var("ZECP2P_LP_ADDRESS") {
-        Ok(addr) => decode_t_address(addr.trim()),
-        Err(_) => {
-            if network == Network::Main {
-                panic!("set ZECP2P_LP_ADDRESS: a mainnet release must pay a real address");
+    // A resume rebuilds the transaction the record describes, not whatever the
+    // environment says now (R9-1).
+    let fee = prior
+        .as_ref()
+        .map(|r| r.fee_zat)
+        .unwrap_or_else(|| release_fee_to_transparent_zat(redeem.len()));
+    let lp_script = match prior.as_ref() {
+        Some(r) => hex::decode(&r.lp_script).expect("recorded payout script"),
+        None => match std::env::var("ZECP2P_LP_ADDRESS") {
+            Ok(addr) => decode_t_address(addr.trim(), network),
+            Err(_) => {
+                if network == Network::Main {
+                    panic!("set ZECP2P_LP_ADDRESS: a mainnet release must pay a real address");
+                }
+                eprintln!("WARNING: no ZECP2P_LP_ADDRESS; paying a burn script. Testnet only.");
+                p2pkh([0x09; 20])
             }
-            eprintln!(
-                "WARNING: no ZECP2P_LP_ADDRESS; paying a burn script. Testnet only."
-            );
-            p2pkh([0x09; 20])
-        }
+        },
     };
 
-    println!("== escrow ==");
-    println!("  outpoint     {}:{vout}", txid_to_rpc_hex(&funding_txid));
-    println!("  value        {} zat, {} confirmations", utxo.amount_zat, utxo.confirmations);
-    println!("  T            {refund_height}   (tip {height})");
-    println!("  terms hash   {}", hex::encode(canonical.terms_hash()));
-    println!("  intent hash  {}", hex::encode(canonical.intent_hash()));
-
-    // --- 5.1: the LP asks the attestor to announce.
-    let attestor = AttestorClient::new(env("ZECP2P_ATTESTOR_URL"), env("ZECP2P_ATTESTOR_TOKEN"))
-        .expect("attestor client");
-    let (p_hex, build) = attestor.identity().expect("identity");
-    println!("== attestor ==");
-    println!("  P            {p_hex}");
-    println!("  build        {build}");
-
-    let ann = attestor.announce(&canonical).expect("announce");
-
-    // R8-4: the runner computed `Y` from whatever `P` the announcement carried.
-    // The client refuses an unpinned key; the runner should exercise that, since
-    // it is what stops an LP relaying an announcement from an attestor of its
-    // own. `ZECP2P_ATTESTOR_P` is required on mainnet.
-    match std::env::var("ZECP2P_ATTESTOR_P") {
-        Ok(pinned) => {
-            assert_eq!(
-                ann.p,
-                pinned.trim(),
-                "the announcement is from an attestor this run does not trust"
-            );
-            println!("  P pinned     yes");
-        }
-        Err(_) => {
-            if network == Network::Main {
-                panic!("set ZECP2P_ATTESTOR_P: a mainnet run must pin the attestor key");
-            }
-            println!("  P pinned     NO (testnet only)");
-        }
-    }
-    println!("  event id     {}", ann.event_id);
-    println!("  R            {}", ann.r);
-    assert_eq!(
-        ann.terms_hash,
-        hex::encode(canonical.terms_hash()),
-        "the attestor pinned different terms than we sent"
-    );
-
-    // --- 5.3: the user checks the announcement and pre-signs.
-    let r_point = secp256k1_zkp::PublicKey::from_slice(&hex::decode(&ann.r).unwrap()).unwrap();
-    let p_point = secp256k1_zkp::PublicKey::from_slice(&hex::decode(&ann.p).unwrap()).unwrap();
-    let event_id = zecp2p_escrow::dlc::event_id(&funding_txid, vout);
-    assert_eq!(
-        hex::encode(event_id),
-        ann.event_id,
-        "the announcement is for another escrow"
-    );
-
-    let y = outcome_point(&secp, &r_point, &p_point, &event_id, &canonical.terms_hash())
-        .expect("outcome point");
     let digest = build_release(&terms, &lp_script, fee)
         .unwrap()
         .sighash()
         .unwrap();
-    let pre_sig = pre_sign(&secp, &digest, &u_priv, &y);
-    verify_pre_signature(&secp, &pre_sig, &digest, &u_priv.public_key(&secp), &y)
-        .expect("the LP must be able to verify the pre-signature before it pays");
-    println!("== handshake ==");
-    println!("  release digest {}", hex::encode(digest));
-    println!("  Y              {}", hex::encode(y.serialize()));
-    println!("  pre-signature verified against u_pub and Y");
+    let event_id = zecp2p_escrow::dlc::event_id(&funding_txid, vout);
 
-    // Written before the LP pays anything. From here a failure is resumable.
-    let mut record = prior.unwrap_or(RunRecord {
-        lock_confirmed_ms: now_ms,
-        terms_hash: hex::encode(canonical.terms_hash()),
+    Setup {
+        chain,
+        network,
+        secp,
+        u_priv,
+        l_priv,
+        terms,
+        canonical,
+        redeem,
+        fee,
+        lp_script,
+        digest,
+        event_id,
+        record_path,
+        prior,
+    }
+}
+
+fn attestor_client() -> AttestorClient {
+    AttestorClient::new(env("ZECP2P_ATTESTOR_URL"), env("ZECP2P_ATTESTOR_TOKEN"))
+        .expect("attestor client")
+}
+
+/// Announces, pre-signs and stops. Nothing is paid.
+///
+/// R9-3: the operator needs the intent hash *before* sending the dollar, since
+/// the prover takes it and an attestation for the wrong intent is refused after
+/// the money is gone.
+fn cmd_announce(args: &[String]) {
+    let s = setup(args, true);
+    if let Some(prior) = &s.prior {
+        println!("a record already exists at {}", s.record_path);
+        println!("  intent hash    {}", prior_intent(prior, &s));
+        println!("  event id       {}", prior.event_id);
+        println!("nothing to do; run `attest` next");
+        return;
+    }
+
+    println!("== escrow ==");
+    println!("  outpoint       {}:{}", args[2].trim(), s.canonical.vout);
+    println!("  value          {} zat", s.canonical.amount_zat);
+    println!("  T              {}", s.canonical.refund_height);
+    println!("  terms hash     {}", hex::encode(s.canonical.terms_hash()));
+
+    let attestor = attestor_client();
+    let (p_hex, build) = attestor.identity().expect("identity");
+    println!("== attestor ==");
+    println!("  P              {p_hex}");
+    println!("  build          {build}");
+    if s.network == Network::Main && build.contains("test-signer") {
+        panic!("refusing to run on mainnet against a test-signer attestor");
+    }
+    match std::env::var("ZECP2P_ATTESTOR_P") {
+        Ok(pinned) => {
+            assert_eq!(p_hex, pinned.trim(), "the attestor is not the pinned one");
+            println!("  P pinned       yes");
+        }
+        Err(_) => {
+            if s.network == Network::Main {
+                panic!("set ZECP2P_ATTESTOR_P: a mainnet run must pin the attestor key");
+            }
+            println!("  P pinned       NO (testnet only)");
+        }
+    }
+
+    let ann = attestor.announce(&s.canonical).expect("announce");
+    assert_eq!(
+        ann.event_id,
+        hex::encode(s.event_id),
+        "the announcement is for another escrow"
+    );
+    assert_eq!(
+        ann.terms_hash,
+        hex::encode(s.canonical.terms_hash()),
+        "the attestor pinned different terms"
+    );
+
+    let r_point = secp256k1_zkp::PublicKey::from_slice(&hex::decode(&ann.r).unwrap()).unwrap();
+    let p_point = secp256k1_zkp::PublicKey::from_slice(&hex::decode(&ann.p).unwrap()).unwrap();
+    let y = outcome_point(
+        &s.secp,
+        &r_point,
+        &p_point,
+        &s.event_id,
+        &s.canonical.terms_hash(),
+    )
+    .expect("outcome point");
+
+    let pre_sig = pre_sign(&s.secp, &s.digest, &s.u_priv, &y);
+    verify_pre_signature(&s.secp, &pre_sig, &s.digest, &s.u_priv.public_key(&s.secp), &y)
+        .expect("the LP must be able to verify the pre-signature before it pays");
+
+    // Written before anything else, and never regenerated (R9-1).
+    let record = RunRecord {
+        lock_confirmed_ms: s.canonical.lock_confirmed_ms,
+        terms_hash: hex::encode(s.canonical.terms_hash()),
         event_id: ann.event_id.clone(),
         r: ann.r.clone(),
         p: ann.p.clone(),
         y: hex::encode(y.serialize()),
-        release_digest: hex::encode(digest),
+        release_digest: hex::encode(s.digest),
         pre_signature: hex::encode(pre_sig.as_ref()),
+        lp_script: hex::encode(&s.lp_script),
+        amount_zat: s.canonical.amount_zat,
+        fee_zat: s.fee,
         s: None,
         raw_release: None,
         txid: None,
-    });
-    record.save(&record_path);
-    println!("  run record   {record_path}");
+    };
+    record.save(&s.record_path);
 
-    // R8-5: confirm the announcement still stands immediately before paying. If
-    // the attestor lost its store in between, the user has pre-signed under an
-    // `R` it no longer holds, and an LP that pays first gets a 404 that is not
-    // retryable - out the fiat, with the user refunding at `T`. A repeat
-    // announce with the same terms costs nothing and returns the stored `R`.
-    let recheck = attestor
-        .announce(&canonical)
-        .expect("the attestor must still hold this announcement");
+    println!("== handshake ==");
+    println!("  R              {}", ann.r);
+    println!("  Y              {}", hex::encode(y.serialize()));
+    println!("  pre-signature verified and recorded");
+    println!("  run record     {}", s.record_path);
+    println!();
+    println!("== SEND THE DOLLAR, THEN RUN THE PROVER WITH ==");
+    println!("  INTENT_HASH          0x{}", hex::encode(s.canonical.intent_hash()));
+    println!("  INTENT_AMOUNT        {}", s.canonical.usd_amount_6dec);
+    println!("  PAYEE_HASH           0x{}", hex::encode(s.canonical.payee_hash));
+    println!("  INTENT_TIMESTAMP_MS  {}", s.canonical.lock_confirmed_ms);
+    println!("  INTENT_RATE          {}", s.canonical.rate_18dec);
+    println!();
+    println!("then: paid_path attest <txid> <vout> <T> <payee_hash> <attestation.json>");
+}
+
+fn prior_intent(_prior: &RunRecord, s: &Setup) -> String {
+    hex::encode(s.canonical.intent_hash())
+}
+
+/// Attests, decrypts and broadcasts. Replays whatever the record already holds.
+fn cmd_attest(args: &[String]) {
+    let s = setup(args, false);
+    let mut record = s
+        .prior
+        .clone()
+        .unwrap_or_else(|| panic!("no run record at {}; run `announce` first", s.record_path));
+
+    // R9-1 step 1 / R9-4: a release already built is broadcast as it stands.
+    // The attestor is not needed, which is the point: this is the path the
+    // retry loop was built for.
+    if let Some(raw_hex) = record.raw_release.clone() {
+        let raw = hex::decode(&raw_hex).expect("recorded release");
+        println!("== resuming with the release already built ==");
+        println!("  txid           {}", record.txid.clone().unwrap_or_default());
+        broadcast(&s, &raw, &record);
+        return;
+    }
+
+    let y = secp256k1_zkp::PublicKey::from_slice(&hex::decode(&record.y).unwrap())
+        .expect("recorded Y");
+    let pre_sig =
+        secp256k1_zkp::EcdsaAdaptorSignature::from_slice(&hex::decode(&record.pre_signature).unwrap())
+            .expect("recorded pre-signature");
+
+    // The recorded pre-signature must still be the one for this release, or the
+    // record and the transaction have diverged and criterion 6 is meaningless.
     assert_eq!(
-        recheck.r, record.r,
-        "the attestor no longer holds the R this pre-signature was made against; do not pay"
+        record.release_digest,
+        hex::encode(s.digest),
+        "the release digest changed since the record was written"
     );
-    println!("  R confirmed before paying");
+    verify_pre_signature(
+        &s.secp,
+        &pre_sig,
+        &s.digest,
+        &s.u_priv.public_key(&s.secp),
+        &y,
+    )
+    .expect("the recorded pre-signature must verify against the recorded Y");
+    println!("  pre-signature  replayed from the record and verified");
 
-    // --- 5.4: the LP pays and proves it. On mainnet this is a real Venmo
-    //     payment through the pinned prover.
-    let (att, att_sig, details) = attestation_for(&canonical, now_ms + 60_000);
+    // R9-1 step 2/3: use the recorded scalar if there is one.
+    let s_bytes: [u8; 32] = match record.s.clone() {
+        Some(hexs) => {
+            println!("  s              replayed from the record");
+            hex::decode(hexs).unwrap().try_into().unwrap()
+        }
+        None => {
+            let attestor = attestor_client();
+            let (p_hex, build) = attestor.identity().expect("identity");
+            if s.network == Network::Main && build.contains("test-signer") {
+                panic!("refusing to run on mainnet against a test-signer attestor");
+            }
+            assert_eq!(p_hex, record.p, "the attestor is not the one that announced");
 
-    // --- 5.5: the attestor checks and publishes s.
-    let s_bytes = attestor
-        .attest(
-            &ann.event_id,
-            &canonical,
-            WireAttestation::from_parts(&att, &att_sig, &details),
-        )
-        .expect("attest");
-    let s = SecretKey::from_slice(&s_bytes).expect("s");
-    record.s = Some(hex::encode(s_bytes));
-    record.save(&record_path);
+            // R8-5: the announcement must still stand before the scalar is asked for.
+            let recheck = attestor.announce(&s.canonical).expect("re-announce");
+            assert_eq!(recheck.r, record.r, "the attestor no longer holds this R");
+
+            // R9-3: a real attestation from the prover, or the test key off mainnet.
+            let wire = match args.get(6) {
+                Some(path) => attestation_from_prover(path),
+                None => {
+                    if s.network == Network::Main {
+                        panic!(
+                            "a mainnet run needs the prover's export: \
+                             paid_path attest <txid> <vout> <T> <payee_hash> <attestation.json>"
+                        );
+                    }
+                    eprintln!("WARNING: signing the attestation with the test key. Testnet only.");
+                    let (att, sig, det) =
+                        attestation_for(&s.canonical, s.canonical.lock_confirmed_ms + 60_000);
+                    WireAttestation::from_parts(&att, &sig, &det)
+                }
+            };
+
+            let got = attestor
+                .attest(&record.event_id, &s.canonical, wire)
+                .expect("attest");
+            record.s = Some(hex::encode(got));
+            record.save(&s.record_path);
+            got
+        }
+    };
+
+    let scalar = SecretKey::from_slice(&s_bytes).expect("s");
+    verify_outcome_secret(&s.secp, &scalar, &y).expect("s*G must equal Y");
+    let sig_u_zkp = decrypt_pre_signature(&pre_sig, &scalar).expect("decrypt");
+    let recovered = recover_outcome_secret(&s.secp, &pre_sig, &sig_u_zkp, &y).expect("recover");
+    assert_eq!(recovered.secret_bytes(), s_bytes, "recover must reproduce s");
     println!("== attestation ==");
     println!("  s              {}", hex::encode(s_bytes));
-
-    // --- 5.6: the LP checks s*G == Y, decrypts, and assembles the release.
-    verify_outcome_secret(&secp, &s, &y).expect("s*G must equal Y");
-    let sig_u_zkp = decrypt_pre_signature(&pre_sig, &s).expect("decrypt");
-
-    // Criterion 6: recover(sig_u, pre_sig, Y) reproduces s.
-    let recovered =
-        recover_outcome_secret(&secp, &pre_sig, &sig_u_zkp, &y).expect("recover");
-    assert_eq!(recovered.secret_bytes(), s_bytes, "recover must reproduce s");
     println!("  s*G == Y       yes");
     println!("  recover(sig_u, pre_sig, Y) reproduces s: yes");
 
     let sig_u = secp256k1::ecdsa::Signature::from_der(&sig_u_zkp.serialize_der()).unwrap();
     let secp1 = Secp1::new();
     let sig_l = secp1.sign_ecdsa(
-        &Message::from_digest(digest),
-        &Sk1::from_slice(&l_priv.secret_bytes()).unwrap(),
+        &Message::from_digest(s.digest),
+        &Sk1::from_slice(&s.l_priv.secret_bytes()).unwrap(),
     );
     let script_sig = release_script_sig(
         &encode_signature(&sig_u),
         &encode_signature(&sig_l),
-        &redeem,
+        &s.redeem,
     );
+    let expected = release_txid(&s.terms, &s.lp_script, s.fee, &script_sig).expect("txid");
+    let raw = serialize_release(&s.terms, &s.lp_script, s.fee, &script_sig).expect("serialize");
 
-    // The pre-broadcast txid, spec 4.2's property.
-    let expected = release_txid(&terms, &lp_script, fee, &script_sig).expect("txid");
-    let raw = serialize_release(&terms, &lp_script, fee, &script_sig).expect("serialize");
     record.raw_release = Some(hex::encode(&raw));
     record.txid = Some(txid_to_rpc_hex(&expected));
-    record.save(&record_path);
-    println!("== release ==");
-    println!("  fee            {fee} zat");
-    println!("  pays           {} zat", utxo.amount_zat - fee);
-    println!("  txid before broadcast {}", txid_to_rpc_hex(&expected));
+    record.save(&s.record_path);
 
-    // R8-3: retry the answers that mean "not yet". The raw transaction is in the
-    // record either way, so a give-up here is resumable.
+    println!("== release ==");
+    println!("  fee            {} zat", s.fee);
+    println!("  pays           {} zat", s.canonical.amount_zat - s.fee);
+    println!("  txid           {}", txid_to_rpc_hex(&expected));
+    broadcast(&s, &raw, &record);
+}
+
+fn broadcast(s: &Setup, raw: &[u8], record: &RunRecord) {
     let policy = zecp2p_escrow::deadlines::EscrowPolicy::mainnet_default();
     match zecp2p_escrow::lp::broadcast_release_until_deadline(
-        &chain,
+        &s.chain,
         &policy,
-        refund_height as u32,
-        &raw,
-        || std::thread::sleep(Duration::from_secs(5)),
+        s.terms.refund_height as u32,
+        raw,
+        || std::thread::sleep(Duration::from_secs(15)),
     ) {
         Ok(id) => {
             println!("  node accepted  {}", txid_to_rpc_hex(&id));
-            assert_eq!(
-                id, expected,
-                "the node's txid must match the one computed before broadcast"
+            println!();
+            println!("verify criterion 6 once it is mined:");
+            println!(
+                "  paid_path verify {} {}",
+                s.record_path,
+                txid_to_rpc_hex(&id)
             );
-            println!("  txid matched the pre-broadcast computation");
         }
         Err(e) => {
             println!("  node said      {e}");
-            println!("  the signed release is in {record_path}; rerun to resume");
+            println!("  the signed release is in {}; rerun `attest` to resend", s.record_path);
+            let _ = record;
+        }
+    }
+}
+
+/// Criterion 6 against the mined transaction, not the runner's own assertion.
+///
+/// R9-1 step 5: takes `sig_u` out of the scriptSig of the transaction the chain
+/// actually holds, recovers with the recorded pre-signature and `Y`, and
+/// compares to the recorded `s`. A release signed directly with `u_priv` fails
+/// this; that is the whole point.
+fn cmd_verify(args: &[String]) {
+    let record = RunRecord::load(&args[2])
+        .unwrap_or_else(|| panic!("no run record at {}", args[2]));
+    let txid_rpc = args[3].trim();
+
+    let network = match std::env::var("ZECP2P_RPC_NETWORK").as_deref() {
+        Ok("main") => Network::Main,
+        _ => Network::Test,
+    };
+    let url = env("ZECP2P_RPC_URL");
+    let cfg = if url.contains("127.0.0.1") || url.contains("localhost") {
+        RpcConfig::public(url, network)
+    } else {
+        RpcConfig::hosted(url, network)
+    };
+    let chain = RpcChainClient::new(cfg).expect("rpc");
+
+    let script_sig = chain
+        .release_script_sig(txid_rpc)
+        .expect("read the mined transaction");
+
+    // scriptSig is OP_0 <sig_u> <sig_l> OP_1 <redeem>; sig_u is the first push.
+    let len = script_sig[1] as usize;
+    let der = &script_sig[2..2 + len - 1]; // drop the sighash byte
+    let sig_u = secp256k1_zkp::ecdsa::Signature::from_der(der).expect("sig_u from the chain");
+
+    let secp = Secp256k1::new();
+    let y = secp256k1_zkp::PublicKey::from_slice(&hex::decode(&record.y).unwrap()).unwrap();
+    let pre_sig = secp256k1_zkp::EcdsaAdaptorSignature::from_slice(
+        &hex::decode(&record.pre_signature).unwrap(),
+    )
+    .expect("recorded pre-signature");
+
+    println!("mined txid     {txid_rpc}");
+    println!("record         {}", args[2]);
+    match recover_outcome_secret(&secp, &pre_sig, &sig_u, &y) {
+        Ok(rec) => {
+            let expected = record.s.clone().expect("the record has no s");
+            let got = hex::encode(rec.secret_bytes());
+            println!("recovered s    {got}");
+            println!("recorded  s    {expected}");
+            if got == expected {
+                println!();
+                println!("CRITERION 6 HOLDS: the mined signature is the decrypted pre-signature.");
+            } else {
+                println!();
+                println!("MISMATCH: recovery gave a different scalar.");
+                std::process::exit(1);
+            }
+        }
+        Err(e) => {
+            println!();
+            println!("CRITERION 6 FAILS: recovery from the mined signature did not work ({e}).");
+            println!("The release was not produced by decrypting the recorded pre-signature.");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn main() {
+    let a: Vec<String> = std::env::args().collect();
+    match a.get(1).map(String::as_str) {
+        Some("enclave-address") => println!("{}", hex::encode(test_enclave_address())),
+        Some("announce") => cmd_announce(&a),
+        Some("attest") => cmd_attest(&a),
+        Some("verify") => cmd_verify(&a),
+        _ => {
+            eprintln!("usage:");
+            eprintln!("  paid_path announce <txid> <vout> <T> <payee_hash>");
+            eprintln!("  paid_path attest   <txid> <vout> <T> <payee_hash> [attestation.json]");
+            eprintln!("  paid_path verify   <record.json> <mined_txid>");
+            std::process::exit(2);
         }
     }
 }

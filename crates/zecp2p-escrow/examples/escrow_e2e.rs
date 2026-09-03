@@ -146,10 +146,24 @@ fn p2pkh_from_t_addr(addr: &str) -> Vec<u8> {
         "address checksum does not match; {addr} is mistyped"
     );
 
-    let hash = &full[2..22];
+    // R9-8: check the version prefix rather than the leading characters, so a
+    // testnet address under a mainnet config is refused instead of decoding to
+    // an unspendable hash. Mainnet t1 = 1cb8, t3 = 1cbd; testnet tm = 1d25,
+    // t2 = 1cba.
+    let prefix = [full[0], full[1]];
+    const KNOWN: [([u8; 2], bool); 4] = [
+        ([0x1c, 0xb8], false),
+        ([0x1c, 0xbd], true),
+        ([0x1d, 0x25], false),
+        ([0x1c, 0xba], true),
+    ];
+    let is_p2sh = KNOWN
+        .iter()
+        .find(|(p, _)| *p == prefix)
+        .unwrap_or_else(|| panic!("{addr} has version prefix {prefix:02x?}, which is not a Zcash transparent address"))
+        .1;
 
-    // t1/tm are P2PKH; t3/t2 are P2SH.
-    let is_p2sh = addr.starts_with("t3") || addr.starts_with("t2");
+    let hash = &full[2..22];
     if is_p2sh {
         let mut s = vec![0xa9, 20];
         s.extend_from_slice(hash);

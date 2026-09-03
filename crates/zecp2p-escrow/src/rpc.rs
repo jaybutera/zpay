@@ -414,6 +414,42 @@ pub fn rpc_hex_to_txid(s: &str) -> Result<[u8; 32], ChainError> {
     Ok(out)
 }
 
+impl RpcChainClient {
+    /// The scriptSig of a mined transaction's first input.
+    ///
+    /// For criterion 6: `sig_u` has to come out of the transaction the chain
+    /// holds, not out of the runner's own memory, or the check proves only that
+    /// the runner is self-consistent.
+    pub fn release_script_sig(&self, txid_rpc_order: &str) -> Result<Vec<u8>, ChainError> {
+        #[derive(serde::Deserialize)]
+        struct Tx {
+            vin: Vec<Vin>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Vin {
+            #[serde(rename = "scriptSig")]
+            script_sig: ScriptSig,
+        }
+        #[derive(serde::Deserialize)]
+        struct ScriptSig {
+            hex: String,
+        }
+
+        let tx: Tx = self.call(
+            "getrawtransaction",
+            serde_json::json!([txid_rpc_order, 1]),
+        )?;
+        let hex_str = &tx
+            .vin
+            .first()
+            .ok_or_else(|| ChainError::Unreachable("the transaction has no inputs".into()))?
+            .script_sig
+            .hex;
+        hex::decode(hex_str)
+            .map_err(|e| ChainError::Unreachable(format!("bad scriptSig hex: {e}")))
+    }
+}
+
 impl ChainClient for RpcChainClient {
     fn height(&self) -> Result<u32, ChainError> {
         self.ensure_network()?;
