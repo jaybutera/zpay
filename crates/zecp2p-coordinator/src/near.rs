@@ -1083,3 +1083,65 @@ mod refund_address_tests {
 
 
 
+
+#[cfg(test)]
+mod floor_parsing_tests {
+    use super::*;
+
+    /// The exact sentence 1Click returned on 2026-09-02, and the number the
+    /// audit had to read out of it by hand because the coordinator threw it
+    /// away (U1-3).
+    #[test]
+    fn the_floor_is_read_out_of_the_rejection() {
+        let body = r#"{"message":"Amount is too low for bridge, try at least 132000"}"#;
+        assert_eq!(parse_floor_from_error(body), Some(132_000));
+    }
+
+    #[test]
+    fn a_bare_sentence_parses_too() {
+        assert_eq!(
+            parse_floor_from_error("Amount is too low for bridge, try at least 52000"),
+            Some(52_000)
+        );
+    }
+
+    /// Anything that is not that shape yields nothing, and the caller falls
+    /// back to the opaque category rather than inventing a floor.
+    #[test]
+    fn an_unrelated_error_yields_no_floor() {
+        for body in [
+            "",
+            "{}",
+            r#"{"message":"refundTo is not valid"}"#,
+            "try at least",
+            "try at least soon",
+        ] {
+            assert_eq!(parse_floor_from_error(body), None, "{body:?}");
+        }
+    }
+
+    /// Trailing punctuation is ordinary in a JSON body, so the digits must stop
+    /// at the first non-digit rather than swallowing it.
+    #[test]
+    fn digits_stop_where_the_number_stops() {
+        assert_eq!(
+            parse_floor_from_error(r#"{"message":"try at least 132000","code":400}"#),
+            Some(132_000)
+        );
+    }
+
+    /// The floor the coordinator checks against is the last one 1Click named,
+    /// not the constant in this file.
+    #[test]
+    fn the_observed_floor_replaces_the_constant() {
+        let original = observed_floor();
+        record_floor(132_000);
+        assert_eq!(observed_floor(), 132_000);
+
+        // It moves both ways: the bridge's floor tracks the network fee.
+        record_floor(48_000);
+        assert_eq!(observed_floor(), 48_000);
+
+        record_floor(original);
+    }
+}

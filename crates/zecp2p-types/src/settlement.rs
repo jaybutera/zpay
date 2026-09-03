@@ -676,3 +676,63 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod stage_order_tests {
+    use super::*;
+
+    /// U1-1, second part. A session spends one pass in `NearIntentPending`
+    /// after promotion, which maps back to `AwaitingZec`, while the order
+    /// already reads `ZecSeen`. Mirroring that raw told the sender their ZEC
+    /// had been un-received.
+    #[test]
+    fn a_rung_never_goes_back_down() {
+        assert_eq!(
+            Stage::AwaitingZec.no_lower_than(Stage::ZecSeen),
+            Stage::ZecSeen
+        );
+        assert_eq!(Stage::ZecSeen.no_lower_than(Stage::PaidOut), Stage::PaidOut);
+        assert_eq!(Stage::AwaitingZec.no_lower_than(Stage::Done), Stage::Done);
+    }
+
+    /// Forward movement is what the ladder is for.
+    #[test]
+    fn a_higher_rung_wins() {
+        assert_eq!(Stage::ZecSeen.no_lower_than(Stage::AwaitingZec), Stage::ZecSeen);
+        assert_eq!(Stage::Done.no_lower_than(Stage::PaidOut), Stage::Done);
+        assert_eq!(Stage::InEscrow.no_lower_than(Stage::InEscrow), Stage::InEscrow);
+    }
+
+    /// A return or a failure is news, not a rung, so it replaces whatever was
+    /// showing. Suppressing it would leave a sender watching a ladder while
+    /// their money came back.
+    #[test]
+    fn leaving_the_ladder_always_wins() {
+        for off in [Stage::Returning, Stage::Returned, Stage::Failed] {
+            for shown in Stage::ladder() {
+                assert_eq!(
+                    off.no_lower_than(*shown),
+                    off,
+                    "{off:?} must replace {shown:?}"
+                );
+            }
+        }
+    }
+
+    /// And once off the ladder, a rung does not put it back.
+    #[test]
+    fn a_rung_does_not_undo_a_failure() {
+        assert_eq!(Stage::AwaitingZec.no_lower_than(Stage::Failed), Stage::AwaitingZec);
+    }
+
+    /// The five rungs are ordered, and the three off-ladder states are not.
+    #[test]
+    fn exactly_the_ladder_has_a_rank() {
+        for s in Stage::ladder() {
+            assert!(s.rank().is_some(), "{s:?} is a rung and needs a rank");
+        }
+        for s in [Stage::Returning, Stage::Returned, Stage::Failed] {
+            assert!(s.rank().is_none(), "{s:?} is not a rung");
+        }
+    }
+}
