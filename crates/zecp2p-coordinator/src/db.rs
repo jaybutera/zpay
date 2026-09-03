@@ -87,7 +87,9 @@ impl Database {
                 error TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                last_polled_at TEXT
+                last_polled_at TEXT,
+                poll_seq INTEGER,
+                source_ip TEXT
             )
             "#,
         )
@@ -110,7 +112,27 @@ impl Database {
             // sorts ahead of one that did not. A row from before the column
             // existed has NULL here, which sorts first in SQLite, so those get
             // polled before anything else and then take their turn.
+            //
+            // Kept for the record it carries. The *ordering* moved to
+            // `poll_seq` in U3-4; this column is still written because "when
+            // was this last looked at" is the first thing anyone asks of a
+            // stuck order, and a sequence number does not answer it.
             "ALTER TABLE orders ADD COLUMN last_polled_at TEXT",
+            // U3-4. The rotation used to be ordered by the wall clock, which is
+            // a rotation only while the clock moves forward. A backward step of
+            // `D`, which is what a VM restore or a first NTP sync produces,
+            // gave every order polled after the step a timestamp earlier than
+            // every order polled before it, so the sweep re-polled the post-step
+            // set and reached nothing marked before the step until `D` had
+            // elapsed. A monotonic counter has no clock in it: a row polled
+            // later always sorts later, whatever the host thinks the time is.
+            "ALTER TABLE orders ADD COLUMN poll_seq INTEGER",
+            // U3-2. Which address opened the order, so the backlog can be
+            // counted per source and not only per session key and in total.
+            // Session keys are free, so the per-key cap bounds nobody; the
+            // global cap on its own turned two hundred free-key opens into a
+            // six-hour refusal of every new sender.
+            "ALTER TABLE orders ADD COLUMN source_ip TEXT",
         ] {
             if let Err(e) = sqlx::query(ddl).execute(&self.pool).await {
                 if !e.to_string().contains("duplicate column name") {
@@ -466,15 +488,34 @@ pub struct OrderRecord {
 }
 
 impl Database {
+    /// Insert an order with no record of where it came from.
+    ///
+    /// The one production caller is `open_order`, which knows the source and
+    /// uses `insert_order_from_source`. This is for the paths that write rows
+    /// directly and have no request behind them.
     pub async fn insert_order(&self, order: &OrderRecord) -> Result<()> {
+        self.insert_order_from_source(order, None).await
+    }
+
+    /// Insert an order, recording the address the open came from (U3-2).
+    ///
+    /// The source is stored rather than derived because the backlog cap needs
+    /// to know how much of the queue one caller is holding, and the session key
+    /// cannot answer that: keys are free and the page mints a new one per
+    /// submit, so every row in a flood looks like a different sender.
+    pub async fn insert_order_from_source(
+        &self,
+        order: &OrderRecord,
+        source: Option<&str>,
+    ) -> Result<()> {
         sqlx::query(
             r#"
             INSERT INTO orders (
                 id, backend, rail, handle, session_pubkey, evm_address, refund_address,
                 quote_json, deposit_json, swap_expected_usdc, swap_min_usdc,
                 overrides_json, session_uuid, stage,
-                return_json, error, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                return_json, error, created_at, updated_at, source_ip
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(order.id.to_string())
@@ -495,6 +536,7 @@ impl Database {
         .bind(&order.error)
         .bind(order.created_at.to_rfc3339())
         .bind(order.updated_at.to_rfc3339())
+        .bind(source)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -538,20 +580,29 @@ impl Database {
     /// nothing starved every real order opened for the next three days, and
     /// each was then retired with "nothing was sent".
     ///
-    /// Ordering by `last_polled_at` makes the sweep a rotation. An order the
-    /// budget did not reach keeps its stale timestamp and sorts ahead of every
-    /// order that was reached, so a set of `N` orders against a budget that
-    /// covers `B` of them gives every order a poll within `ceil(N / B)` ticks
-    /// rather than never. A row that has never been polled has NULL here, which
-    /// SQLite sorts first, so a newly opened order is seen on the next tick.
+    /// Ordering by the poll mark makes the sweep a rotation. An order the
+    /// budget did not reach keeps its stale mark and sorts ahead of every order
+    /// that was reached, so a set of `N` orders against a budget that covers
+    /// `B` of them gives every order a poll within `ceil(N / B)` ticks rather
+    /// than never. A row that has never been polled has NULL, which SQLite
+    /// sorts first, so a newly opened order is seen on the next tick.
     ///
-    /// `created_at` stays as the tiebreak, so orders polled in the same second
-    /// keep a stable, oldest-first order among themselves.
+    /// U3-4. The mark is `poll_seq`, a counter, and not `last_polled_at`, a
+    /// timestamp. The two agree while the host clock moves forward and disagree
+    /// the moment it steps backward: with a timestamp, a step of `D` makes
+    /// every order polled after the step sort ahead of every order polled
+    /// before it, and the sweep re-polls the post-step set and starves the rest
+    /// for `D`. Fifty orders, forty of them marked two hours ahead, ten a tick:
+    /// the same ten were polled six times running. The counter cannot do that,
+    /// because it only ever goes up.
+    ///
+    /// `created_at` stays as the tiebreak, so orders that have never been
+    /// polled keep a stable, oldest-first order among themselves.
     pub async fn get_open_orders(&self) -> Result<Vec<OrderRecord>> {
         let rows: Vec<OrderRow> = sqlx::query_as(
             r#"SELECT * FROM orders
                WHERE stage NOT IN ('"done"', '"returned"', '"failed"')
-               ORDER BY last_polled_at ASC, created_at ASC"#,
+               ORDER BY poll_seq ASC, created_at ASC"#,
         )
         .fetch_all(&self.pool)
         .await?;
@@ -564,12 +615,27 @@ impl Database {
     /// Written whether or not the poll changed anything: the point is the
     /// rotation, and an order that was polled and found unchanged has had its
     /// turn exactly as much as one that moved.
+    /// U3-4. The number the ordering reads is a counter, taken as one more than
+    /// the largest any row carries, so it is monotonic by construction and owes
+    /// nothing to the host clock. It is computed inside the statement rather
+    /// than read and written in two round trips, so two ticks cannot both read
+    /// the same maximum; the sweep is single-threaded anyway, and this keeps it
+    /// true if it ever is not.
+    ///
+    /// `last_polled_at` is written alongside for the operator: the ordering
+    /// does not read it, but "when was this last looked at" is the first
+    /// question anyone asks of an order that is not moving.
     pub async fn mark_order_polled(&self, id: uuid::Uuid) -> Result<()> {
-        sqlx::query("UPDATE orders SET last_polled_at = ? WHERE id = ?")
-            .bind(chrono::Utc::now().to_rfc3339())
-            .bind(id.to_string())
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            r#"UPDATE orders
+               SET poll_seq = (SELECT COALESCE(MAX(poll_seq), 0) + 1 FROM orders),
+                   last_polled_at = ?
+               WHERE id = ?"#,
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(id.to_string())
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -607,6 +673,59 @@ impl Database {
         .await?;
         Ok(n)
     }
+
+    /// How many unfunded orders one source address is holding open (U3-2).
+    ///
+    /// The count the global cap needs and the per-key count cannot give. A
+    /// flood is two hundred rows from fifty free session keys, which the per-key
+    /// cap of four never sees; from one address it is two hundred rows here.
+    /// Rows with no recorded source, which is every row written before the
+    /// column existed and every row a test inserts directly, are counted
+    /// against nobody.
+    pub async fn count_unfunded_orders_from_source(&self, source: &str) -> Result<i64> {
+        let (n,): (i64,) = sqlx::query_as(
+            r#"SELECT COUNT(*) FROM orders
+               WHERE source_ip = ?
+                 AND session_uuid IS NULL
+                 AND stage NOT IN ('"done"', '"returned"', '"failed"')"#,
+        )
+        .bind(source)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(n)
+    }
+
+    /// The oldest unfunded orders that have never had a deposit reported and
+    /// were opened before `cutoff`, newest-of-the-old last (U3-2).
+    ///
+    /// What the backlog cap evicts when it is full, rather than refusing the
+    /// next caller. `stage` is the filter that makes this safe: an order whose
+    /// deposit 1Click has acknowledged has left `AwaitingZec` by the time the
+    /// sweep sees it, and one that is still on `AwaitingZec` an hour after it
+    /// was opened is an address nobody has paid. It is still *asked about*
+    /// before it is retired: this returns the candidates and the caller runs
+    /// them through the same 1Click check every retirement uses (U3-1).
+    pub async fn oldest_unfunded_orders_before(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+        limit: i64,
+    ) -> Result<Vec<OrderRecord>> {
+        let rows: Vec<OrderRow> = sqlx::query_as(
+            r#"SELECT * FROM orders
+               WHERE session_uuid IS NULL
+                 AND stage = ?
+                 AND created_at < ?
+                 AND stage NOT IN ('"done"', '"returned"', '"failed"')
+               ORDER BY created_at ASC
+               LIMIT ?"#,
+        )
+        .bind(serde_json::to_string(&zecp2p_types::settlement::Stage::AwaitingZec)?)
+        .bind(cutoff.to_rfc3339())
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(OrderRecord::try_from).collect()
+    }
 }
 
 #[derive(sqlx::FromRow)]
@@ -629,10 +748,18 @@ struct OrderRow {
     error: Option<String>,
     created_at: String,
     updated_at: String,
-    /// When the sweep last reached this order. Read only by the ordering in
-    /// `get_open_orders`, so it is carried on the row and not on the record.
+    /// When the sweep last reached this order, for whoever is reading the
+    /// table by hand. Carried on the row and not on the record.
     #[allow(dead_code)]
     last_polled_at: Option<String>,
+    /// The sweep's rotation mark (U3-4). Read only by the ordering in
+    /// `get_open_orders`.
+    #[allow(dead_code)]
+    poll_seq: Option<i64>,
+    /// The address this order was opened from (U3-2). Read only by the backlog
+    /// counts, so it stays on the row.
+    #[allow(dead_code)]
+    source_ip: Option<String>,
 }
 
 impl TryFrom<OrderRow> for OrderRecord {

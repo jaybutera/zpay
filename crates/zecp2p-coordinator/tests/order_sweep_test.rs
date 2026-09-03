@@ -930,3 +930,85 @@ async fn an_in_flight_deposit_is_bounded_by_1clicks_own_deadline() {
     tick_capped_at(&state, 100).await;
     assert_eq!(near.times_asked_about(address), 1);
 }
+
+// ---------------------------------------------------------------------------
+// U3-4: the rotation is not a clock
+// ---------------------------------------------------------------------------
+
+/// A backward clock step does not starve the orders marked before it.
+///
+/// `last_polled_at` was the sweep's ordering, and that is a rotation only while
+/// the host clock moves forward. Step it backward by `D`, which is what a VM
+/// restore or a first NTP sync produces, and every order polled after the step
+/// carries a timestamp earlier than every order polled before it: the sweep
+/// re-polls the post-step set and reaches nothing marked before the step until
+/// `D` has elapsed. The audit's probe was fifty orders, forty of them marked two
+/// hours ahead of the clock, ten a tick, six ticks: the same ten every time and
+/// forty never reached.
+///
+/// This is that probe. The step is simulated by writing the ahead-of-the-clock
+/// timestamps directly, which is what the host clock stepping back an hour
+/// leaves behind, and the ordering now reads `poll_seq`, which only goes up.
+#[tokio::test]
+async fn a_backward_clock_step_does_not_starve_the_rotation() {
+    const N: usize = 50;
+    const STEPPED: usize = 40;
+    const PER_TICK: usize = 10;
+
+    let (near, near_url) = start_status_mock(0).await;
+    let temp = TempDir::new().expect("temp dir");
+    let db_path = temp.path().join("clockstep.db").to_string_lossy().to_string();
+    let state = coordinator_with(&near_url, &db_path).await;
+
+    let now = chrono::Utc::now();
+    let expires = now + chrono::Duration::hours(2);
+    let mut addresses = Vec::new();
+    let mut ids = Vec::new();
+    for i in 0..N {
+        let address = format!("t1ClockStep{i:08}");
+        let order = order_at(
+            &address,
+            now - chrono::Duration::seconds((N - i) as i64 + 10),
+            expires,
+        );
+        ids.push(order.id);
+        state.db.insert_order(&order).await.expect("insert");
+        addresses.push(address);
+    }
+
+    // The forty carry a mark two hours in the future, which is what a host
+    // clock stepping backward by two hours leaves on every row polled before
+    // the step. Under the old ordering those forty sort last for two hours and
+    // the remaining ten are re-polled every tick.
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite://{db_path}"))
+        .await
+        .expect("open the database directly");
+    let ahead = (now + chrono::Duration::hours(2)).to_rfc3339();
+    for id in ids.iter().take(STEPPED) {
+        sqlx::query("UPDATE orders SET last_polled_at = ? WHERE id = ?")
+            .bind(&ahead)
+            .bind(id.to_string())
+            .execute(&pool)
+            .await
+            .expect("write the stepped mark");
+    }
+    pool.close().await;
+
+    let budget = N.div_ceil(PER_TICK) + 1;
+    for _ in 0..budget {
+        tick_capped_at(&state, PER_TICK).await;
+    }
+
+    let unpolled: Vec<&String> = addresses
+        .iter()
+        .filter(|a| near.times_asked_about(a) == 0)
+        .collect();
+    assert!(
+        unpolled.is_empty(),
+        "U3-4: {} of {N} orders were never polled in {budget} ticks after a \
+         backward clock step, including {:?}. The rotation is ordered by a \
+         clock, and clocks step.",
+        unpolled.len(),
+        unpolled.iter().take(3).collect::<Vec<_>>()
+    );
+}
