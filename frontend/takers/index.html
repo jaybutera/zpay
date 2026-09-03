@@ -1,0 +1,320 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Run a taker: zpay</title>
+<meta name="description" content="Set up the zpay auto-taker daemon: stake USDC, claim open orders, pay from your own Venmo, prove it through zk-p2p's enclave, collect the USDC.">
+<link rel="canonical" href="https://zpay.cash/takers/">
+<meta name="theme-color" content="#0d0e10">
+<link rel="stylesheet" href="../site.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' fill='%230d0e10'/><text x='8' y='12' font-size='11' font-family='monospace' font-weight='700' fill='%23008cff' text-anchor='middle'>z</text></svg>">
+</head>
+<body>
+
+<header class="nav">
+  <div class="wrap">
+    <a class="wordmark" href="../">zpay<span class="tick">_</span></a>
+    <nav class="nav-links">
+      <a href="../#how">How it works</a>
+      <a href="../#fees">Fees</a>
+      <a href="./">Run a taker</a>
+      <a data-link="githubTaker" href="#" rel="noopener">Daemon source</a>
+    </nav>
+    <div class="spacer"></div>
+    <div class="nav-status" id="conn" data-state="unknown"><span class="dot"></span><span data-text>checking coordinator</span></div>
+    <a class="btn primary small" href="../app/">Open app</a>
+  </div>
+</header>
+
+<section class="doc">
+  <div class="wrap">
+    <nav class="doc-toc" aria-label="on this page">
+      <span class="label">on this page</span>
+      <a href="#what">What a taker does</a>
+      <a href="#economics">What it pays</a>
+      <a href="#need">What you need</a>
+      <a href="#install">Install</a>
+      <a href="#config">Configure</a>
+      <a href="#dry-run">Dry run</a>
+      <a href="#run">Run</a>
+      <a href="#proof">The proof step</a>
+      <a href="#cookie">The cookie</a>
+      <a href="#racing">Racing and failure</a>
+      <a href="#self">Filling your own orders</a>
+    </nav>
+
+    <article class="doc-body">
+      <span class="label blue">takers</span>
+      <h1>Run a taker</h1>
+      <p class="lede">
+        A taker is the other side of every zpay order: the account that pays the
+        Venmo and collects the USDC. The daemon does the watching, claiming,
+        paying and proving. You supply a Base key, a stake, and a browser that is
+        logged into Venmo.
+      </p>
+      <div class="cta">
+        <a class="btn primary" data-link="githubTaker" href="#" rel="noopener">auto-taker on GitHub</a>
+        <a class="btn" data-link="stakeVault" href="#" target="_blank" rel="noopener">Stake vault on BaseScan</a>
+      </div>
+
+      <h2 id="what">What a taker does</h2>
+      <p>
+        When a zpay user sends ZEC, the swapped USDC lands on the zpay contract,
+        which posts it to zk-p2p's EscrowV2 as a deposit with a rate floor and a
+        fixed payee hash. That deposit is open to anyone. A taker:
+      </p>
+      <ol>
+        <li><b>Discovers</b> it by scanning the contract's <code>OfframpProcessed</code> logs and asking the escrow which of those deposits still hold liquidity.</li>
+        <li><b>Prices</b> it against the min and max intent size in its config.</li>
+        <li><b>Stakes</b> USDC equal to the intent in zk-p2p's StakeVault, because <code>signalIntent</code> reverts without it.</li>
+        <li><b>Claims</b> it with <code>signalIntent</code> on OrchestratorV3.</li>
+        <li><b>Pays</b> the Venmo from a browser tab the operator already logged into, driven over the Chrome DevTools Protocol.</li>
+        <li><b>Proves</b> the payment by sending a Venmo session cookie to zk-p2p's Nitro enclave, which replays the payment feed and signs an EIP-712 attestation.</li>
+        <li><b>Releases</b> the USDC to itself with <code>fulfillIntent</code>, which the on-chain verifier accepts only with that signature.</li>
+      </ol>
+      <p>
+        Every step before the Venmo send is reversible. The send is not. The daemon's
+        payment sequence has exactly one step that moves money, it is the last one,
+        and a unit test holds that property.
+      </p>
+
+      <h2 id="economics">What it pays, and what it costs</h2>
+      <table>
+        <thead><tr><th>item</th><th>value</th><th>source</th></tr></thead>
+        <tbody>
+          <tr><td>Margin</td><td>The difference between the order's rate floor and one dollar per USDC. Default floor is 1.00, so the margin is whatever the user set below that.</td><td><code>Currency.minConversionRate</code> on the deposit</td></tr>
+          <tr><td>Gas per fill</td><td>$0.031 for the signal and release pair, 1.34M gas at 0.0096 gwei.</td><td>Measured on Base, 2026-09-01</td></tr>
+          <tr><td>Stake lock</td><td>Fourteen days after release. The vault's <code>unlockStake</code> is controller-only; nobody can pull it early.</td><td>StakeVault, observed after the 2026-09-01 fill</td></tr>
+          <tr><td>Venmo float</td><td>Dollars leave your Venmo before USDC arrives. Fiat first, proof second.</td><td>Order of operations</td></tr>
+          <tr><td>Chargeback exposure</td><td>Venmo is reversible. The fourteen-day lock is zk-p2p's dispute window, not a bug.</td><td>zk-p2p StakeVault design</td></tr>
+        </tbody>
+      </table>
+      <div class="callout warn">
+        <span class="label">size it honestly</span>
+        <p>Serving N orders at once needs N times the stake and N times the Venmo balance, and the stake does not recycle for two weeks. Ten $5 fills a day is $700 of committed stake before the first dollar comes back.</p>
+      </div>
+
+      <h2 id="need">What you need</h2>
+      <ul>
+        <li><b>A Base key</b> in <code>TAKER_PRIVATE_KEY</code>, holding ETH for gas and USDC for both the stake and any payment it fronts.</li>
+        <li><b>Chrome</b> started with <code>--remote-debugging-port=9222</code> and signed into Venmo. The daemon attaches to that tab. It never sees your password and never logs in.</li>
+        <li><b>A config file</b>, copied from the example below, with the zpay contract address filled in.</li>
+        <li><b>A coordinator token</b>, if you want the daemon to look up which handle a deposit pays. The chain only stores a hash. Ask the coordinator operator, or pass <code>--recipient</code> for an order you were told about directly.</li>
+      </ul>
+
+      <h2 id="install">Install</h2>
+      <p>Rust 1.75 or newer. The proof script needs Node 20 or newer.</p>
+<pre><span class="c"># build the daemon</span>
+git clone <span class="b" data-clone>https://github.com/zpay-cash/auto-taker</span>
+cd auto-taker
+cargo build --release
+
+<span class="c"># the prover lives beside it</span>
+(cd scripts/proof &amp;&amp; npm install)
+
+<span class="c"># a Chrome you are logged into Venmo with</span>
+chromium --remote-debugging-port=9222 --user-data-dir=$HOME/.zpay-chrome</pre>
+
+      <h2 id="config">Configure</h2>
+      <p>Copy the example and set <code>glue_contract</code> to the zpay contract. Everything else has a working default for Base mainnet.</p>
+<pre>cp config.taker.example.toml config.taker.toml</pre>
+<pre><span class="c"># config.taker.toml</span>
+[network]
+base_rpc_url = "https://mainnet.base.org"
+chain_id = 8453
+
+[contracts]
+usdc               = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+zkp2p_escrow       = "0x777777779d229cdF3110e9de47943791c26300Ef"  <span class="c"># EscrowV2</span>
+zkp2p_orchestrator = "0x014025fDE093f8701d86e9f38e2C3a9b779cb5c7"  <span class="c"># OrchestratorV3</span>
+stake_vault        = "0x47c26258222e2f96424bD2B21bf173f0DA5034C7"
+glue_contract      = "<span class="b" data-contract>0x617544CC688F7f742cA68B5d9106890500b6C689</span>"  <span class="c"># zpay</span>
+
+[taker]
+coordinator_url      = "https://coordinator.example"   <span class="c"># https, or loopback</span>
+<span class="c"># coordinator_token  = "..."                            # from the operator</span>
+max_intent_amount    = "100000000"   <span class="c"># 6-decimal USDC. 100 USDC</span>
+min_intent_amount    = "1000000"     <span class="c"># 1 USDC</span>
+poll_interval_seconds = 15
+lookback_blocks      = 5000
+max_payment_cents    = 2500          <span class="c"># hard ceiling per Venmo send; refuses, never clamps</span>
+journal_path         = "taker-fills.jsonl"
+
+[session]
+path          = "venmo-session.json"  <span class="c"># written 0600; treat as a password</span>
+max_age_hours = 12                    <span class="c"># refuse to signal on older material</span>
+
+[venmo]
+cdp_url         = "http://127.0.0.1:9222"
+note            = "thanks"
+timeout_seconds = 120
+
+[zkp2p]
+api_url = "https://api.zkp2p.xyz"</pre>
+      <p>
+        Three of those lines are guards, and each one exists because of a specific
+        way money could go wrong. <code>max_payment_cents</code> is what stops a
+        units-versus-dollars mistake from reaching the send button. <code>max_age_hours</code>
+        stops the daemon from signalling on a cookie that will fail at the enclave
+        after the fiat has already left. <code>coordinator_url</code> must be https
+        because the username you are about to pay travels over it; the daemon still
+        checks that name against the deposit's own on-chain payee hash before paying.
+      </p>
+
+      <h2 id="dry-run">Dry run first</h2>
+      <p>
+        The daemon's default way to try anything is <code>--dry-run</code>. It scans
+        the chain, prices each deposit, reads your free stake, resolves who would be
+        paid, and prints every browser step it would take, including the click that
+        sends money. It sends no transaction and moves nothing.
+      </p>
+<pre>zecp2p-taker check-venmo        <span class="c"># is there a usable, logged-in Venmo tab?</span>
+zecp2p-taker status             <span class="c"># taker address and free stake</span>
+zecp2p-taker auto --dry-run     <span class="c"># report what would happen; stop before every gate</span></pre>
+<pre>found claimable deposits count=1
+dry run: would signal, then pay $25.00 to @alice deposit_id=4392 amount=25000000 free_stake=0
+  would: open https://account.venmo.com/pay?recipients=alice
+  would: wait for input[name='amount'], [data-testid='amount-input']
+  would: type "25.00" into input[name='amount'], [data-testid='amount-input']
+  would: type "thanks" into textarea[name='note'], [data-testid='note-input']
+  would: click [data-testid='send-button'], button[type='submit']  <span class="w">&lt;-- sends the money</span></pre>
+
+      <h2 id="run">Run</h2>
+<pre>zecp2p-taker stake --amount 100     <span class="c"># put 100 USDC into the StakeVault</span>
+zecp2p-taker auto                   <span class="c"># watch the contract; asks before each of the two money steps</span>
+zecp2p-taker auto --once            <span class="c"># one scan, then exit</span>
+zecp2p-taker auto --yes             <span class="c"># unattended: signals, pays, attests, releases, no prompts</span></pre>
+      <p>
+        Without <code>--yes</code> the daemon stops at the two irreversible steps,
+        the claim and the Venmo send, and waits for a yes at the terminal. Everything
+        that can fail for free runs before the first prompt. With <code>--yes</code>
+        there is no human left to catch a bad value; the payment cap, the payee
+        check, the amount read back out of the browser, and the journal are what
+        stand between a wrong number and a real payment.
+      </p>
+      <p>
+        The daemon works one deposit at a time. Stake and Venmo balance are finite,
+        and a half-finished payment needs attention before the next claim. A restart
+        reads the journal first, so it can tell which fills may already have moved money.
+      </p>
+
+      <h2 id="proof">The proof step</h2>
+      <p>
+        Releasing the USDC needs a payment proof. This is not a zero-knowledge proof
+        and there is no browser extension. zk-p2p's V3 moved verification into an AWS
+        Nitro enclave: the client encrypts a logged-in Venmo cookie to a key whose
+        attestation document it checks against the AWS Nitro root, posts it, and the
+        enclave replays
+      </p>
+<pre>GET https://account.venmo.com/api/stories?feedType=me&amp;externalId=&lt;SENDER_ID&gt;</pre>
+      <p>
+        from inside the enclave and returns an ECDSA signature over
+        <code>PaymentAttestation(intentHash, releaseAmount, dataHash)</code>. The
+        verifier at <a data-link="verifier" href="#" target="_blank" rel="noopener">0xC6F4…502B</a>
+        checks that signature during <code>fulfillIntent</code>. A plain HTTPS call,
+        so the daemon makes it.
+      </p>
+      <div class="callout">
+        <span class="label">the timestamp bites</span>
+        <p>The verifier compares the attested snapshot against the intent stored on chain and reverts with <code>UPV: Snapshot timestamp mismatch</code> if they differ. The daemon reads the signal timestamp off the orchestrator for exactly this reason. An attestation built from the wall clock verifies locally and fails on chain.</p>
+      </div>
+      <p>
+        The signature is bound by EIP-712 to chain 8453 and that verifier address.
+        It cannot be produced for a testnet and cannot be replayed anywhere else.
+      </p>
+      <p>
+        If you paid and cannot produce a proof, <code>cancel</code> gives back the
+        claim so the maker's USDC is not stranded and your stake unlocks. Your
+        dollars have already left at that point; this is the way out, not a refund.
+      </p>
+<pre>zecp2p-taker fulfill --intent 0x… --proof attestation.json
+zecp2p-taker cancel  --intent 0x…</pre>
+
+      <h2 id="cookie">The cookie is the sharpest edge</h2>
+      <p>
+        The session material the enclave replays is a live Venmo credential. It is
+        encrypted to the enclave's attested key before it leaves your machine, so the
+        service operator cannot read it outside the enclave. It is still equal in
+        power to being logged in as you, and the enclave enforces no capture-age
+        limit and no one-use limit on it.
+      </p>
+      <ul>
+        <li>The daemon writes it to <code>session.path</code> with mode 0600 and never logs it.</li>
+        <li>One capture serves many fills. When it goes stale, capture it again from the same browser; the daemon refuses to signal on material older than <code>max_age_hours</code>.</li>
+        <li>Venmo ties a session to the browser's User-Agent closely enough that a mismatch can fail the replay. Capture and replay from the same browser.</li>
+        <li>Run the daemon on a machine you would be comfortable leaving logged into Venmo.</li>
+      </ul>
+
+      <h2 id="racing">Racing and failure</h2>
+      <p>
+        Two takers can signal on the same deposit and one will revert. That is an
+        open market working as designed. The daemon logs the loss and moves to the
+        next deposit. If the Venmo payment itself fails, the daemon cancels the
+        intent so the stake unlocks and the maker's order reopens.
+      </p>
+      <p>
+        An intent nobody proves expires after six hours and the escrow's
+        <code>pruneExpiredIntents</code> releases the deposit back to the order.
+        A taker who signals and walks away gets their stake back when the intent
+        expires; the deadline has no teeth beyond the wait.
+      </p>
+
+      <h2 id="self">Filling your own orders</h2>
+      <p>
+        The daemon does not care whose order it fills. Run it under the same Venmo
+        account you named as payee and it will claim your own deposit, pay yourself,
+        prove it and release the USDC back to your key. Your ZEC becomes dollars in
+        your Venmo with nobody else in the loop, and the stake it locks is your own
+        money against your own order.
+      </p>
+<pre>zecp2p-taker auto --yes --only-user 0xYourBaseAddress</pre>
+      <p>
+        <code>--only-user</code> restricts the daemon to sessions that address
+        opened. Leave it off and the daemon serves every zpay order it sees, which
+        means fronting fiat for strangers.
+      </p>
+      <p>
+        This is the shape of the first mainnet fill, on 2026-09-01: a $4.84 Venmo
+        payment released 4,875,437 units of escrowed USDC against an enclave
+        attestation. Every step of that one was driven by hand. The daemon is the
+        transcription.
+      </p>
+    </article>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <div class="col">
+      <a class="wordmark" href="../">zpay<span class="tick">_</span></a>
+      <p class="fine"><span data-fee>0.15%</span> fee &middot; non-custodial &middot; <span data-chain>Base 8453</span></p>
+      <p class="fine">contract <span class="addr" data-contract>0x617544CC688F7f742cA68B5d9106890500b6C689</span></p>
+    </div>
+    <div class="col">
+      <h4>product</h4>
+      <a href="../app/">Open app</a>
+      <a href="../#how">How it works</a>
+      <a href="../#fees">Fees</a>
+      <a href="../#limits">Limits</a>
+    </div>
+    <div class="col">
+      <h4>takers</h4>
+      <a href="./">Run a taker</a>
+      <a data-link="githubTaker" href="#" rel="noopener">auto-taker on GitHub</a>
+      <a data-link="stakeVault" href="#" target="_blank" rel="noopener">Stake vault</a>
+    </div>
+    <div class="col">
+      <h4>protocol</h4>
+      <a data-link="github" href="#" rel="noopener">zpay on GitHub</a>
+      <a data-contract-link href="#" target="_blank" rel="noopener">Contract on BaseScan</a>
+      <a data-link="escrow" href="#" target="_blank" rel="noopener">zk-p2p EscrowV2</a>
+      <a data-link="verifier" href="#" target="_blank" rel="noopener">Payment verifier</a>
+      <a data-link="nearIntents" href="#" target="_blank" rel="noopener">NEAR Intents</a>
+    </div>
+  </div>
+</footer>
+
+<script src="../site.js"></script>
+</body>
+</html>

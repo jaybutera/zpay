@@ -3,191 +3,150 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>zecp2p // ZEC → Venmo</title>
-<meta name="description" content="Trustless ZEC to Venmo offramp terminal.">
-<link rel="stylesheet" href="styles.css">
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' fill='%230d0e10'/><text x='8' y='12' font-size='11' font-family='monospace' fill='%239aa6b4' text-anchor='middle'>z</text></svg>">
+<title>zpay: pay a Venmo handle with ZEC</title>
+<meta name="description" content="Type an amount and a handle. Send ZEC from any wallet. Dollars land in their Venmo.">
+<meta name="theme-color" content="#0d0e10">
+<meta name="robots" content="noindex">
+<link rel="stylesheet" href="app.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' fill='%230d0e10'/><text x='8' y='12' font-size='11' font-family='monospace' font-weight='700' fill='%23008cff' text-anchor='middle'>z</text></svg>">
 </head>
 <body>
-<div class="wrap">
 
-  <header class="masthead">
-    <div>
-      <h1 class="brand">zecp2p<span class="tick">_</span></h1>
-      <div class="tagline">shielded zec &rarr; venmo &middot; non-custodial</div>
-    </div>
-    <div class="conn" id="conn" data-state="unknown">
-      <span class="dot"></span><span id="conn-text">checking coordinator</span>
-    </div>
-  </header>
+<header class="nav">
+  <div class="wrap">
+    <a class="wordmark" href="../">zpay<span class="tick">_</span></a>
+    <span class="conn" id="conn" data-state="unknown"><span class="dot"></span><span id="conn-text">checking</span></span>
+  </div>
+</header>
 
-  <nav class="tabs" role="tablist">
-    <button class="tab" role="tab" id="tab-new"    aria-controls="view-new"    aria-selected="true">01 / offramp</button>
-    <button class="tab" role="tab" id="tab-watch"  aria-controls="view-watch"  aria-selected="false">02 / watch</button>
-    <button class="tab" role="tab" id="tab-manage" aria-controls="view-manage" aria-selected="false">03 / manage</button>
-  </nav>
+<main class="wrap">
 
-  <!-- ============ 01 NEW OFFRAMP ============ -->
-  <section class="panel" id="view-new" role="tabpanel" aria-labelledby="tab-new">
-    <h2 class="panel-title">new offramp</h2>
-    <p class="panel-note">Enter a Venmo handle and a ZEC amount. You get a deposit address; send ZEC to it and the coordinator handles the rest.</p>
+  <!-- ========== 1. AMOUNT AND HANDLE ========== -->
+  <section class="card" id="view-compose">
+    <h1 class="h1">Pay a Venmo handle with ZEC</h1>
 
-    <form id="form-new" novalidate>
-      <div class="row2">
-        <div class="field">
-          <label for="venmo">venmo handle</label>
-          <div class="prefixed">
-            <span class="sigil">@</span>
-            <input id="venmo" name="venmo" placeholder="jane-doe" autocomplete="off" spellcheck="false" required>
-          </div>
-          <div class="hint">letters, numbers, underscore, hyphen</div>
-        </div>
-
-        <div class="field">
-          <label for="zec">zec amount</label>
-          <input id="zec" name="zec" inputmode="decimal" placeholder="0.5" autocomplete="off" spellcheck="false" required>
-          <div class="hint">up to 8 decimal places</div>
-        </div>
-      </div>
-
-      <div class="quote hidden" id="quote-box" aria-live="polite">
-        <div class="quote-grid">
-          <div class="stat"><span class="k">you send</span><span class="v" id="q-zec">&mdash;</span></div>
-          <div class="stat"><span class="k">usdc out</span><span class="v" id="q-usdc">&mdash;</span></div>
-          <div class="stat"><span class="k">venmo payout</span><span class="v big" id="q-venmo">&mdash;</span></div>
-          <div class="stat"><span class="k">rate usdc/zec</span><span class="v" id="q-rate">&mdash;</span></div>
-        </div>
-        <div class="expiry" id="q-expiry"></div>
-      </div>
-
-      <details class="adv" id="adv">
-        <summary>advanced &mdash; required addresses</summary>
-        <div class="adv-body">
-          <p class="hint" style="margin:8px 0 14px">
-            The coordinator needs these to settle and to refund you if anything fails.
-          </p>
-
-          <div class="field">
-            <label for="user_address">your base address</label>
-            <input id="user_address" placeholder="0x…" autocomplete="off" spellcheck="false" required>
-            <div class="hint">receives USDC on rescue or withdraw</div>
-          </div>
-
-          <div class="field">
-            <label for="taker_address">taker address</label>
-            <input id="taker_address" placeholder="0x…" autocomplete="off" spellcheck="false" required>
-            <div class="hint">pre-arranged counterparty who pays your Venmo</div>
-          </div>
-
-          <div class="field">
-            <label for="zec_refund_address">zec refund address</label>
-            <input id="zec_refund_address" placeholder="t1… / t3… / zs…" autocomplete="off" spellcheck="false" required>
-            <div class="hint">where ZEC returns if the swap fails</div>
-          </div>
-
-          <div class="row2">
-            <div class="field">
-              <label for="min_rate">min rate (usdc/zec)</label>
-              <input id="min_rate" inputmode="decimal" placeholder="auto from quote" autocomplete="off" spellcheck="false">
-              <div class="hint">blank &rarr; coordinator default (20)</div>
-            </div>
-            <div class="field">
-              <label for="timeout_seconds">timeout (seconds)</label>
-              <input id="timeout_seconds" inputmode="numeric" placeholder="600" autocomplete="off" spellcheck="false">
-              <div class="hint">NEAR settlement window</div>
-            </div>
-          </div>
-
-          <button type="button" class="act ghost" id="btn-remember">remember these on this device</button>
-          <button type="button" class="act ghost" id="btn-forget">forget</button>
-        </div>
-      </details>
-
-      <div class="actions">
-        <button type="button" class="act ghost" id="btn-quote">get quote</button>
-        <button type="submit" class="act" id="btn-create">create offramp</button>
-      </div>
-    </form>
-
-    <div id="new-msg"></div>
-  </section>
-
-  <!-- ============ 02 WATCH ============ -->
-  <section class="panel hidden" id="view-watch" role="tabpanel" aria-labelledby="tab-watch">
-    <h2 class="panel-title">session watch</h2>
-    <p class="panel-note">Track a session through the state machine. Polls the coordinator every 5 seconds while open.</p>
-
-    <form id="form-watch" novalidate>
+    <form id="form-pay" novalidate>
       <div class="field">
-        <label for="session_id">session id</label>
-        <input id="session_id" placeholder="uuid from your offramp" autocomplete="off" spellcheck="false" required>
+        <label for="amount">Amount</label>
+        <div class="amount-row">
+          <div class="amount-input">
+            <span class="sigil" id="amount-sigil">$</span>
+            <input id="amount" inputmode="decimal" placeholder="25" autocomplete="off" spellcheck="false" required>
+          </div>
+          <div class="unit-toggle" role="group" aria-label="Amount unit">
+            <button type="button" class="unit on" id="unit-usd" aria-pressed="true">USD</button>
+            <button type="button" class="unit" id="unit-zec" aria-pressed="false">ZEC</button>
+          </div>
+        </div>
       </div>
-      <div class="actions">
-        <button type="submit" class="act">watch</button>
-        <button type="button" class="act ghost" id="btn-refresh">refresh now</button>
-        <button type="button" class="act ghost" id="btn-stop">stop polling</button>
+
+      <div class="field">
+        <label for="handle">Who gets paid</label>
+        <div class="handle-row">
+          <select id="rail" aria-label="Payment app"></select>
+          <div class="handle-input">
+            <span class="sigil">@</span>
+            <input id="handle" placeholder="jane-doe" autocomplete="off" spellcheck="false" required>
+          </div>
+        </div>
+        <p class="hint" id="rail-hint"></p>
       </div>
+
+      <div class="quote" id="quote" hidden aria-live="polite">
+        <div class="quote-head">
+          <span class="quote-label">Lands in their Venmo</span>
+          <span class="quote-net" id="q-net">&mdash;</span>
+        </div>
+        <ul class="quote-lines" id="q-lines"></ul>
+        <div class="quote-foot">
+          <span id="q-route"></span>
+          <span id="q-expiry" class="countdown"></span>
+        </div>
+      </div>
+
+      <div id="compose-msg"></div>
+
+      <button type="submit" class="btn primary" id="btn-pay">Continue</button>
     </form>
 
-    <div id="watch-msg"></div>
-
-    <div id="watch-out" class="hidden" style="margin-top:18px">
-      <div class="deposit hidden" id="deposit-box">
-        <span class="k">send exactly this zec to</span>
-        <div class="addr" id="deposit-addr"></div>
-        <button type="button" class="act ghost" id="btn-copy">copy address</button>
-      </div>
-
-      <ol class="ladder" id="ladder"></ol>
-
-      <div class="kv" id="watch-kv"></div>
-
-      <div style="margin-top:16px">
-        <div class="stat"><span class="k">activity</span></div>
-        <div class="log" id="log"></div>
-      </div>
-    </div>
+    <p class="fineprint">
+      No account, no wallet connection. <a href="advanced/">Advanced route</a> if you want to
+      name your own addresses and spread.
+    </p>
   </section>
 
-  <!-- ============ 03 MANAGE ============ -->
-  <section class="panel hidden" id="view-manage" role="tabpanel" aria-labelledby="tab-manage">
-    <h2 class="panel-title">manage session</h2>
-    <p class="panel-note">Recovery paths when a session stalls. All three act on the session id currently loaded in watch.</p>
+  <!-- ========== 2. SEND THE ZEC ========== -->
+  <section class="card" id="view-pay" hidden>
+    <h2 class="h2">Send <span id="pay-amount"></span> from your Zcash wallet</h2>
 
-    <div class="field">
-      <label for="manage_id">session id</label>
-      <input id="manage_id" placeholder="uuid" autocomplete="off" spellcheck="false">
+    <div class="qr-block">
+      <a class="qr-link" id="pay-uri" href="#">
+        <canvas id="qr" width="220" height="220" aria-label="Payment QR code"></canvas>
+      </a>
+      <p class="qr-note">Scan it, or <a href="#" id="pay-open">open in your wallet</a>. The amount is already filled in.</p>
     </div>
 
-    <div class="kv" style="margin-bottom:16px">
-      <div class="rowline">
-        <span class="k">process</span>
-        <span class="v">Force the coordinator to advance a session that has USDC but has not been pushed into zk-p2p escrow.</span>
+    <details class="disclose">
+      <summary>Wallet can't open the link?</summary>
+      <div class="disclose-body">
+        <p class="hint">Send exactly <strong id="pay-amount-2"></strong> to this address:</p>
+        <div class="addr" id="pay-addr"></div>
+        <button type="button" class="btn ghost small" id="btn-copy-addr">Copy address</button>
       </div>
-      <div class="rowline">
-        <span class="k">rescue</span>
-        <span class="v">Pull USDC back out of the GlueContract to your Base address when processOfframp failed.</span>
-      </div>
-      <div class="rowline">
-        <span class="k">withdraw</span>
-        <span class="v">Withdraw USDC from the zk-p2p escrow when no taker signaled intent.</span>
-      </div>
-    </div>
+    </details>
 
-    <div class="actions">
-      <button type="button" class="act" id="btn-process">process</button>
-      <button type="button" class="act danger" id="btn-rescue">rescue</button>
-      <button type="button" class="act danger" id="btn-withdraw">withdraw</button>
-    </div>
-
-    <div id="manage-msg"></div>
+    <p class="next-note" id="pay-next"></p>
   </section>
 
-  <footer>
-    coordinator <span id="api-base-label"></span> &middot; keys never leave your device &middot; no accounts
-  </footer>
+  <!-- ========== 3. STATUS ========== -->
+  <section class="card" id="view-status" hidden>
+    <div class="keep-link" id="keep-link">
+      <strong>Keep this link.</strong> It is your receipt, and it is how you get your ZEC back if
+      anything goes wrong. Nobody else can open it.
+      <button type="button" class="btn ghost small" id="btn-copy-link">Copy link</button>
+    </div>
 
-</div>
+    <h2 class="h2" id="status-headline">Waiting for your ZEC</h2>
+    <p class="status-sub" id="status-sub"></p>
+
+    <ol class="ladder" id="ladder"></ol>
+
+    <!-- the failure screen: one field, one answer, always ZEC -->
+    <div class="returns" id="returns" hidden>
+      <h3 class="h3" id="returns-title"></h3>
+      <p class="returns-body" id="returns-body"></p>
+
+      <form id="form-return" hidden>
+        <div class="field">
+          <label for="return-addr">Your Zcash address</label>
+          <input id="return-addr" placeholder="u1… or t1…" autocomplete="off" spellcheck="false">
+          <p class="hint">Any Zcash address, shielded included. This is where your ZEC goes.</p>
+        </div>
+        <div id="return-msg"></div>
+        <button type="submit" class="btn primary" id="btn-return">Send my ZEC there</button>
+      </form>
+    </div>
+
+    <details class="disclose" id="details">
+      <summary>Details</summary>
+      <div class="disclose-body">
+        <dl class="kv" id="detail-kv"></dl>
+        <p class="hint"><a href="advanced/" id="advanced-link">Open this in the advanced route</a></p>
+      </div>
+    </details>
+  </section>
+
+</main>
+
+<footer class="foot">
+  <div class="wrap">
+    <a href="../">About zpay</a> &middot;
+    <a href="advanced/">Advanced</a> &middot;
+    <span>Your keys stay in this page. Nothing is sent to a server but the order.</span>
+  </div>
+</footer>
+
+<script src="qr.js"></script>
 <script src="app.js"></script>
 </body>
 </html>
