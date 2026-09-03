@@ -76,3 +76,38 @@ api_url = "https://api.zkp2p.xyz"
 # missing, add it here rather than waiting for a release.
 # [zkp2p.gating_extra]
 # someField = "value"
+
+# The native Zcash escrow rail, which runs alongside the Base one rather than
+# replacing it. Commented out, and absence means off: a daemon that switched on
+# a second settlement system because a section was missing would start watching
+# a chain nobody configured. `zecp2p-taker rails` says which rails are live.
+#
+# [zec]
+# Zcash RPC. Depth, consensus branch id and the escrow output are all read
+# through this, and the LP pays real fiat on the strength of what it says, so
+# https is required for anything that is not loopback.
+# rpc_url = "https://api.tatum.io/v3/blockchain/node/zcash-mainnet"
+# Basic auth, as a local zcashd wants. A hosted endpoint keying on a header
+# uses rpc_api_key_header and rpc_api_key instead.
+# rpc_user = "..."
+# rpc_password = "..."
+# rpc_api_key_header = "x-api-key"
+# rpc_api_key = "..."
+# "main" or "test". Not defaulted: a rail that defaulted to the chain with real
+# coin on it would be one typo from spending it.
+# network = "main"
+# The attestor that publishes the outcome scalar.
+# attestor_url = "http://127.0.0.1:8480"
+# The attestor's public key, pinned. A mainnet rail without this is refused at
+# load: a pre-signature encrypted under an unpinned attestor's outcome point can
+# be decrypted by whoever holds that key.
+# attestor_pubkey = "02..."
+# Refund delay in hours, and the block time used to turn it into heights. Both
+# are wall-clock quantities so a block-time change keeps the same real timeout;
+# NU7 proposes 25 s, at which the same 24 hours is three times the blocks.
+# refund_hours = 24
+# block_seconds = 75
+# Where the escrow crate's run records live. Each escrow's pre-signature is read
+# back from here rather than regenerated; regenerating draws a fresh nonce and
+# the record would then disagree with the mined release.
+# state_dir = "~/.zecp2p"

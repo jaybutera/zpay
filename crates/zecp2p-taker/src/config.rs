@@ -27,6 +27,131 @@ pub struct TakerConfig {
     /// before paying anyone.
     #[serde(default)]
     pub zkp2p: zecp2p_types::config::Zkp2pConfig,
+    /// The native Zcash escrow rail, which runs alongside the Base one rather
+    /// than replacing it.
+    ///
+    /// Absent by default, and absence means the rail is off. A daemon that
+    /// enabled the second settlement system because a config file was silent
+    /// would start watching a chain the operator never configured, so this is
+    /// opt-in and the CLI says so when it is missing.
+    #[serde(default)]
+    pub zec: Option<ZecConfig>,
+}
+
+/// Where the native escrow rail reads its chain and its policy.
+///
+/// None of this is shared with the Base rail: different chain, different node,
+/// different deadlines. What *is* shared is everything downstream of
+/// `max_payment_cents`, which stays on [`TakerSettings`] because it is the
+/// operator's ceiling on any single Venmo payment regardless of what settles it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ZecConfig {
+    /// Zcash RPC endpoint. The escrow crate reads depth, branch id and the
+    /// escrow output through this, and broadcasts the release to it.
+    pub rpc_url: String,
+    /// HTTP basic auth, as a local `zcashd` requires. A hosted endpoint that
+    /// keys on a header uses `api_key_header` instead.
+    #[serde(default)]
+    pub rpc_user: Option<String>,
+    #[serde(default)]
+    pub rpc_password: Option<String>,
+    /// A header a hosted provider keys on, for example `x-api-key`.
+    #[serde(default)]
+    pub rpc_api_key_header: Option<String>,
+    #[serde(default)]
+    pub rpc_api_key: Option<String>,
+    /// `main` or `test`. Mainnet is not the default: a rail that defaulted to
+    /// the chain with real coin on it would be one typo from spending it.
+    pub network: String,
+    /// The attestor that publishes the outcome scalar.
+    pub attestor_url: String,
+    /// The attestor's public key, pinned. A mainnet run without this is
+    /// refused: an unpinned attestor is one that can announce under a key the
+    /// LP has never seen, and a pre-signature encrypted under an attacker's
+    /// outcome point is one the attacker can decrypt.
+    #[serde(default)]
+    pub attestor_pubkey: Option<String>,
+    /// Hours of refund delay, from which every deadline is derived.
+    ///
+    /// A wall-clock quantity rather than a block count, because Zcash's block
+    /// time is a parameter: NU7 proposes 25 s, at which the same 24 hours is
+    /// three times the blocks.
+    #[serde(default = "default_refund_hours")]
+    pub refund_hours: u32,
+    /// Block time in seconds, for turning `refund_hours` into heights.
+    #[serde(default = "default_block_seconds")]
+    pub block_seconds: u32,
+    /// Where the escrow crate's run records live. Each escrow's pre-signature
+    /// is read back from here rather than regenerated; regenerating draws a
+    /// fresh nonce and the record would then disagree with the mined release.
+    #[serde(default = "default_zec_state_dir")]
+    pub state_dir: String,
+}
+
+fn default_refund_hours() -> u32 {
+    24
+}
+
+/// Zcash mainnet block time today.
+fn default_block_seconds() -> u32 {
+    75
+}
+
+fn default_zec_state_dir() -> String {
+    "~/.zecp2p".to_string()
+}
+
+impl ZecConfig {
+    /// The escrow policy this rail runs under, derived rather than hard-coded.
+    pub fn policy(&self) -> anyhow::Result<zecp2p_escrow::deadlines::EscrowPolicy> {
+        zecp2p_escrow::deadlines::EscrowPolicy::from_refund_hours(
+            self.block_seconds,
+            self.refund_hours,
+        )
+        .map_err(|e| anyhow::anyhow!("the zec rail's deadlines are not usable: {e}"))
+    }
+
+    pub fn network(&self) -> anyhow::Result<zecp2p_escrow::rpc::Network> {
+        match self.network.trim().to_ascii_lowercase().as_str() {
+            "main" | "mainnet" => Ok(zecp2p_escrow::rpc::Network::Main),
+            "test" | "testnet" => Ok(zecp2p_escrow::rpc::Network::Test),
+            other => anyhow::bail!(
+                "zec.network is {other:?}; it must be \"main\" or \"test\""
+            ),
+        }
+    }
+
+    /// Refuse a mainnet rail that has not pinned its attestor.
+    ///
+    /// The escrow's `paid_path` makes the same refusal, and it is repeated here
+    /// because this is the earlier of the two moments: a daemon that starts
+    /// watching mainnet unpinned has already accepted work it cannot safely
+    /// finish.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let network = self.network()?;
+        self.policy()?;
+        zecp2p_types::config::validate_service_url("zec.rpc_url", &self.rpc_url)?;
+        zecp2p_types::config::validate_service_url("zec.attestor_url", &self.attestor_url)?;
+        if network == zecp2p_escrow::rpc::Network::Main && self.attestor_pubkey.is_none() {
+            anyhow::bail!(
+                "zec.attestor_pubkey is unset on a mainnet rail. A pre-signature \
+                 encrypted under an unpinned attestor's outcome point can be decrypted \
+                 by whoever holds that key; pin it before watching mainnet."
+            );
+        }
+        Ok(())
+    }
+
+    pub fn rpc_config(&self) -> anyhow::Result<zecp2p_escrow::rpc::RpcConfig> {
+        let mut config =
+            zecp2p_escrow::rpc::RpcConfig::public(self.rpc_url.clone(), self.network()?);
+        config.user = self.rpc_user.clone();
+        config.password = self.rpc_password.clone();
+        if let (Some(header), Some(key)) = (&self.rpc_api_key_header, &self.rpc_api_key) {
+            config.api_key_header = Some((header.clone(), key.clone()));
+        }
+        Ok(config)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -286,6 +411,13 @@ impl TakerConfig {
         validate_service_url("attestation.service_url", &self.attestation.service_url)?;
         if let Some(url) = &self.taker.coordinator_url {
             validate_service_url("taker.coordinator_url", url)?;
+        }
+        // The second rail's endpoints get the same treatment as the first's.
+        // `zec.rpc_url` is the one that matters most here: it is what says
+        // whether the escrow reached depth and which branch is in force, and a
+        // plaintext answer to either is an answer an attacker can write.
+        if let Some(zec) = &self.zec {
+            zec.validate()?;
         }
         Ok(())
     }
