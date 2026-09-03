@@ -18,6 +18,9 @@ pub struct Config {
     /// Keeper loop timing
     #[serde(default)]
     pub keeper: KeeperConfig,
+    /// The fee the main route quotes and the settlement takes
+    #[serde(default)]
+    pub fee: FeeConfig,
     /// Peer/zk-p2p TEE attestation service
     #[serde(default)]
     pub attestation: AttestationConfig,
@@ -102,6 +105,98 @@ impl Default for Zkp2pConfig {
 
 /// Keeper loop timing
 ///
+/// The fee the abstraction charges for doing the work.
+///
+/// The protocol is open and the convenient front door charges, which is the
+/// same shape Uniswap's interface fee has. Both routes pay it and the advanced
+/// route gets no discount: on backend A the fee is taken inside
+/// `processOfframp` and cannot be waived per session anyway, so a per-route
+/// price would be a number the contract disagrees with.
+///
+/// It is quoted as one labelled line in a net quote, never as a rate the
+/// sender has to apply themselves.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeeConfig {
+    /// Basis points taken from the gross payout. 15 bps is 0.15%, which is
+    /// what the launch page advertises.
+    #[serde(default = "default_fee_bps")]
+    pub bps: u32,
+    /// Where the accrued fee is swept. Unset means the fee is quoted but no
+    /// recipient is configured yet, which is the state before the treasury
+    /// contract work lands.
+    #[serde(default)]
+    pub recipient: Option<Address>,
+}
+
+impl Default for FeeConfig {
+    fn default() -> Self {
+        Self { bps: default_fee_bps(), recipient: None }
+    }
+}
+
+fn default_fee_bps() -> u32 {
+    15
+}
+
+impl FeeConfig {
+    /// The label the sender reads on the quote line. Always the same words, so
+    /// the fee is recognisable across the quote, the receipt and the launch
+    /// page.
+    pub fn label(&self) -> String {
+        let whole = self.bps / 100;
+        let frac = self.bps % 100;
+        if frac == 0 {
+            format!("zpay fee ({whole}%)")
+        } else {
+            format!("zpay fee ({whole}.{:02}%)", frac)
+        }
+    }
+
+    /// The fee on a gross payout, in cents, rounded up.
+    ///
+    /// Rounding up rather than down means the quote never promises the sender
+    /// a net the contract's own rounding cannot deliver. At 15 bps a $5 order
+    /// pays a cent, which is the smallest the rail can move.
+    pub fn cents_on(&self, gross_cents: u64) -> u64 {
+        let bps = self.bps as u64;
+        gross_cents.saturating_mul(bps).div_ceil(10_000)
+    }
+}
+
+#[cfg(test)]
+mod fee_tests {
+    use super::*;
+
+    #[test]
+    fn the_label_is_the_launch_pages_number() {
+        assert_eq!(FeeConfig::default().label(), "zpay fee (0.15%)");
+        assert_eq!(FeeConfig { bps: 25, recipient: None }.label(), "zpay fee (0.25%)");
+        assert_eq!(FeeConfig { bps: 100, recipient: None }.label(), "zpay fee (1%)");
+    }
+
+    /// Rounding up, so the net quoted is a net that can actually be paid.
+    #[test]
+    fn the_fee_rounds_up_to_the_cent() {
+        let f = FeeConfig::default();
+        // $25.00 at 15 bps is 3.75 cents.
+        assert_eq!(f.cents_on(2500), 4);
+        // $5.00 at 15 bps is 0.75 cents.
+        assert_eq!(f.cents_on(500), 1);
+        // Exactly divisible stays exact.
+        assert_eq!(f.cents_on(10_000), 15);
+        assert_eq!(f.cents_on(0), 0);
+    }
+
+    /// A tiny order still pays something rather than riding free, and the
+    /// arithmetic does not overflow on an absurd one.
+    #[test]
+    fn small_and_huge_amounts_both_behave() {
+        let f = FeeConfig::default();
+        assert_eq!(f.cents_on(1), 1);
+        assert!(f.cents_on(u64::MAX) > 0);
+    }
+}
+
 /// The loop wakes on `poll_interval_seconds`, gives up on a session it drives
 /// on Base after `session_timeout_seconds`, and gives a session still waiting
 /// on the NEAR leg `near_intent_timeout_seconds` instead. The NEAR default is
@@ -258,6 +353,7 @@ impl Default for Config {
             },
             zkp2p: Zkp2pConfig::default(),
             keeper: KeeperConfig::default(),
+            fee: FeeConfig::default(),
             attestation: AttestationConfig::default(),
             server: ServerConfig {
                 host: "127.0.0.1".to_string(),

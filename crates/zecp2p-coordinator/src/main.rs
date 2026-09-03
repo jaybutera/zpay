@@ -8,6 +8,7 @@
 //! - Monitors zk-p2p for fulfillment
 
 mod api;
+mod backend;
 mod auth;
 mod chain;
 mod db;

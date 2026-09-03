@@ -25,6 +25,13 @@ hex = { workspace = true }
 dotenvy = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
+# The session key's derivations. k256 is already in the tree under alloy; naming
+# it here is what lets this crate derive an address from a public key the page
+# sends, without ever holding the secret.
+k256 = "0.13"
+ripemd = "0.1"
+sha2 = "0.10"
+async-trait = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
