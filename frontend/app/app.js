@@ -1,25 +1,22 @@
-/* zpay main route: two fields, a zcash: link, a status link.
-   Plain ES2020, no build step, no dependencies.
+/* zpay main route, native Zcash escrow.
 
-   The page holds a session key. That is the part worth reading carefully.
+   Two fields, one address, a status link. What is different from a page that
+   merely shows an address is that this page is a party to the escrow:
 
-   There is no wallet to connect here: the sender pays from a Zcash wallet that
-   knows nothing about Base, and the coordinator still needs an address to name
-   as session.user, because rescue and withdrawFromZkp2p pay that address and
-   nowhere else. So the page generates one 32-byte secret per order and derives
-   from it the EVM address, the Zcash transparent refund address, and the
-   signature that opens the order.
+   - It draws the user's key `u` and derives the t3 address itself, from `u`,
+     the payer's key and the refund height. The coordinator's answer is checked
+     against that derivation, never trusted, so the address on screen is one
+     whose timeout branch the page's own key can spend.
+   - Once the ZEC has confirmed and the attestor has announced, it rebuilds the
+     canonical terms from what it already knew, compares them to the payer's,
+     computes the ZIP 244 digest of the release, and hands over an adaptor
+     pre-signature. A term the payer changed is refused before anything is
+     signed. See escrow.js and the vectors under test/.
+   - If nobody pays, it signs the refund at height T with `u` alone and hands
+     the bytes to any node.
 
-   The secret lives in the URL fragment of the status link. Fragments are never
-   sent to a server, so the coordinator sees the order id and never the key.
-   The link the sender is told to keep is therefore the whole recovery story;
-   there is nothing else to back up.
-
-   The old page refused to sign in-page, on the grounds that a web page asking
-   for a private key is the shape of a wallet drainer. That objection is about
-   a key holding the sender's savings. This key is created by the page, holds
-   nothing but this order's claim on returned funds, and is never typed. The
-   advanced route still never asks for one. */
+   The key lives in the URL fragment, which no server sees, and in this
+   browser's localStorage. There is no other copy. */
 
 'use strict';
 
@@ -28,6 +25,8 @@
 const API = (() => {
   let saved = null;
   try { saved = localStorage.getItem('zecp2p.api'); } catch (_) {}
+  const q = new URLSearchParams(location.search).get('api');
+  if (q) { try { localStorage.setItem('zecp2p.api', q); } catch (_) {} return q.replace(/\/+$/, ''); }
   if (saved) return saved.replace(/\/+$/, '');
   if (location.protocol === 'file:' || location.port === '5173' || location.port === '8080') {
     return 'http://127.0.0.1:3000';
@@ -35,13 +34,16 @@ const API = (() => {
   return '';
 })();
 
-const $ = (id) => document.getElementById(id);
+/* The attestor key this page trusts, per network. On mainnet an empty pin
+   means the page refuses to pre-sign: the coordinator relays the attestor's
+   announcement, and a coordinator that could also name the attestor could
+   name one it controls. On a test network the announced key is accepted. */
+const PINS = {
+  main: { attestor_pubkey: '' },
+};
 
-function esc(v) {
-  return String(v === null || v === undefined ? '' : v)
-    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-}
+const $ = (id) => document.getElementById(id);
+const E = Escrow;
 
 async function api(path, opts = {}) {
   let res;
@@ -60,284 +62,94 @@ async function api(path, opts = {}) {
   return body;
 }
 
-function msg(host, kind, text) {
+function msg(host, kind, text, action) {
   const el = typeof host === 'string' ? $(host) : host;
   el.innerHTML = '';
   if (!text) return;
   const d = document.createElement('div');
   d.className = 'msg ' + kind;
   d.textContent = text;
+  if (action) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'btn small';
+    b.textContent = action.label;
+    b.addEventListener('click', action.run);
+    d.appendChild(document.createElement('br'));
+    d.appendChild(b);
+  }
   el.appendChild(d);
 }
 
 const money = (cents) =>
   '$' + (cents / 100).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const zec = (zat) => E.zecString(zat) + ' ZEC';
+const shortHex = (h) => h.length > 20 ? `${h.slice(0, 10)}…${h.slice(-8)}` : h;
 
-// ---------- session key ----------
-//
-// secp256k1 over WebCrypto is not available (WebCrypto has no secp256k1), so
-// the curve arithmetic is here. It is the minimum needed to derive a public
-// key and make one ECDSA signature: scalar multiplication, and RFC 6979 is
-// not used because a random k from crypto.getRandomValues is sound for a
-// one-shot key and avoids shipping HMAC-DRBG.
-
-const SECP = {
-  p: 0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2fn,
-  n: 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n,
-  a: 0n,
-  b: 7n,
-  Gx: 0x79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798n,
-  Gy: 0x483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8n,
-};
-
-const mod = (x, m) => ((x % m) + m) % m;
-
-function invMod(x, m) {
-  // Extended Euclid; x is never 0 where this is called.
-  let [old_r, r] = [mod(x, m), m];
-  let [old_s, s] = [1n, 0n];
-  while (r !== 0n) {
-    const q = old_r / r;
-    [old_r, r] = [r, old_r - q * r];
-    [old_s, s] = [s, old_s - q * s];
-  }
-  return mod(old_s, m);
-}
-
-// Points as {x, y} in affine, or null for infinity.
-function ptAdd(P, Q) {
-  if (!P) return Q;
-  if (!Q) return P;
-  if (P.x === Q.x && mod(P.y + Q.y, SECP.p) === 0n) return null;
-  let lam;
-  if (P.x === Q.x && P.y === Q.y) {
-    lam = mod(3n * P.x * P.x * invMod(2n * P.y, SECP.p), SECP.p);
-  } else {
-    lam = mod((Q.y - P.y) * invMod(mod(Q.x - P.x, SECP.p), SECP.p), SECP.p);
-  }
-  const x = mod(lam * lam - P.x - Q.x, SECP.p);
-  return { x, y: mod(lam * (P.x - x) - P.y, SECP.p) };
-}
-
-function ptMul(k, P) {
-  let R = null;
-  let A = P;
-  let n = mod(k, SECP.n);
-  while (n > 0n) {
-    if (n & 1n) R = ptAdd(R, A);
-    A = ptAdd(A, A);
-    n >>= 1n;
-  }
-  return R;
-}
-
-const G = { x: SECP.Gx, y: SECP.Gy };
-
-const toHex = (bytes) => Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
-const fromHex = (hex) => new Uint8Array(hex.match(/.{2}/g).map((h) => parseInt(h, 16)));
-const bigToBytes = (n, len) => fromHex(n.toString(16).padStart(len * 2, '0'));
-const bytesToBig = (b) => BigInt('0x' + toHex(b));
-
-/** A fresh session key. */
-function newSessionKey() {
-  let d;
-  do {
-    const raw = new Uint8Array(32);
-    crypto.getRandomValues(raw);
-    d = bytesToBig(raw);
-  } while (d === 0n || d >= SECP.n);
-  return d;
-}
-
-/** 33-byte compressed public key, as hex. */
-function compressedPubkey(d) {
-  const P = ptMul(d, G);
-  const prefix = (P.y & 1n) === 0n ? '02' : '03';
-  return prefix + P.x.toString(16).padStart(64, '0');
-}
-
-// ---------- keccak256, for the EIP-191 digest ----------
-//
-// Needed because the message the coordinator checks is an EIP-191 personal_sign
-// over a fixed string, and that is keccak, not SHA.
-
-const KECCAK_RC = [
-  0x0000000000000001n, 0x0000000000008082n, 0x800000000000808an, 0x8000000080008000n,
-  0x000000000000808bn, 0x0000000080000001n, 0x8000000080008081n, 0x8000000000008009n,
-  0x000000000000008an, 0x0000000000000088n, 0x0000000080008009n, 0x000000008000000an,
-  0x000000008000808bn, 0x800000000000008bn, 0x8000000000008089n, 0x8000000000008003n,
-  0x8000000000008002n, 0x8000000000000080n, 0x000000000000800an, 0x800000008000000an,
-  0x8000000080008081n, 0x8000000000008080n, 0x0000000080000001n, 0x8000000080008008n,
-];
-const KECCAK_ROT = [
-  0, 1, 62, 28, 27, 36, 44, 6, 55, 20, 3, 10, 43, 25, 39, 41, 45, 15, 21, 8, 18, 2, 61, 56, 14,
-];
-const M64 = (1n << 64n) - 1n;
-const rotl = (x, n) => n === 0 ? x : ((x << BigInt(n)) | (x >> BigInt(64 - n))) & M64;
-
-function keccakF(A) {
-  for (let round = 0; round < 24; round++) {
-    const C = new Array(5);
-    for (let x = 0; x < 5; x++) C[x] = A[x] ^ A[x + 5] ^ A[x + 10] ^ A[x + 15] ^ A[x + 20];
-    for (let x = 0; x < 5; x++) {
-      const D = C[(x + 4) % 5] ^ rotl(C[(x + 1) % 5], 1);
-      for (let y = 0; y < 5; y++) A[x + 5 * y] ^= D;
-    }
-    const B = new Array(25).fill(0n);
-    for (let x = 0; x < 5; x++) {
-      for (let y = 0; y < 5; y++) {
-        B[y + 5 * ((2 * x + 3 * y) % 5)] = rotl(A[x + 5 * y], KECCAK_ROT[x + 5 * y]);
-      }
-    }
-    for (let x = 0; x < 5; x++) {
-      for (let y = 0; y < 5; y++) {
-        A[x + 5 * y] = B[x + 5 * y] ^ (~B[((x + 1) % 5) + 5 * y] & B[((x + 2) % 5) + 5 * y] & M64);
-      }
-    }
-    A[0] ^= KECCAK_RC[round];
-  }
-  return A;
-}
-
-function keccak256(bytes) {
-  const rate = 136;
-  const padded = new Uint8Array(Math.ceil((bytes.length + 1) / rate) * rate);
-  padded.set(bytes);
-  padded[bytes.length] = 0x01;                 // keccak padding, not SHA-3's 0x06
-  padded[padded.length - 1] |= 0x80;
-
-  let A = new Array(25).fill(0n);
-  for (let off = 0; off < padded.length; off += rate) {
-    for (let i = 0; i < rate / 8; i++) {
-      let lane = 0n;
-      for (let j = 7; j >= 0; j--) lane = (lane << 8n) | BigInt(padded[off + i * 8 + j]);
-      A[i] ^= lane;
-    }
-    A = keccakF(A);
-  }
-
-  const out = new Uint8Array(32);
-  for (let i = 0; i < 4; i++) {
-    let lane = A[i];
-    for (let j = 0; j < 8; j++) { out[i * 8 + j] = Number(lane & 0xffn); lane >>= 8n; }
-  }
-  return out;
-}
-
-// ---------- ECDSA, EIP-191 ----------
-
-function ecdsaSign(d, digest) {
-  const z = bytesToBig(digest);
-  for (;;) {
-    const kb = new Uint8Array(32);
-    crypto.getRandomValues(kb);
-    const k = mod(bytesToBig(kb), SECP.n);
-    if (k === 0n) continue;
-
-    const R = ptMul(k, G);
-    const r = mod(R.x, SECP.n);
-    if (r === 0n) continue;
-
-    let s = mod(invMod(k, SECP.n) * (z + r * d), SECP.n);
-    if (s === 0n) continue;
-
-    // Low-s, which every EVM verifier requires.
-    let recovery = (R.y & 1n) === 0n ? 0 : 1;
-    if (s > SECP.n / 2n) { s = SECP.n - s; recovery ^= 1; }
-
-    return toHex(bigToBytes(r, 32)) + toHex(bigToBytes(s, 32)) + (27 + recovery).toString(16).padStart(2, '0');
-  }
-}
-
-/** The exact bytes crates/zecp2p-coordinator/src/auth.rs recovers from. */
-function ownershipMessage(action, address, scope) {
-  return `zecp2p:${action}:${address}:${scope}`;
-}
-
-function personalSign(d, message) {
-  const body = new TextEncoder().encode(message);
-  const prefix = new TextEncoder().encode(`\x19Ethereum Signed Message:\n${body.length}`);
-  const full = new Uint8Array(prefix.length + body.length);
-  full.set(prefix); full.set(body, prefix.length);
-  return '0x' + ecdsaSign(d, keccak256(full));
-}
-
-/** The EVM address for a session key, formatted exactly as the server writes it.
- *
- * Lowercase, with no EIP-55 checksum. `auth.rs` builds the message it recovers
- * from with alloy's `{:?}`, which prints lowercase hex, and the signature is
- * over those exact bytes. A checksummed address here derives the same key and
- * still fails every signature check, because the string signed would differ
- * from the string verified. That is what the vectors in
- * `frontend/app/test/session-key-vectors.js` exist to catch. */
-function evmAddress(d) {
-  const P = ptMul(d, G);
-  const uncompressed = new Uint8Array(64);
-  uncompressed.set(bigToBytes(P.x, 32), 0);
-  uncompressed.set(bigToBytes(P.y, 32), 32);
-  return '0x' + toHex(keccak256(uncompressed).slice(12));
-}
-
-// ---------- order state ----------
+// ---------- state ----------
 
 const state = {
-  key: null,          // BigInt session secret
-  orderId: null,
-  unit: 'usd',
+  caps: null,
+  unit: 'zec',
   quote: null,
-  rails: [],
-  feeLabel: 'zpay fee',
+  key: null,          // BigInt u_priv
+  orderId: null,
+  record: null,       // what localStorage holds for this order
+  order: null,        // last view from the coordinator
+  presign: 'idle',    // idle | signing | sent | failed
   poll: null,
 };
 
-/** Put the secret and the order id in the fragment, which no server sees. */
-function statusLink(orderId, key) {
-  const base = location.origin + location.pathname;
-  return `${base}#order=${orderId}&k=${key.toString(16).padStart(64, '0')}`;
+// ---------- the record: what the page must keep before the user sends ----------
+
+const RECORD_PREFIX = 'zpay.escrow.';
+
+function saveRecord(rec) {
+  try { localStorage.setItem(RECORD_PREFIX + rec.orderId, JSON.stringify(rec)); } catch (_) {}
+}
+function loadRecord(orderId) {
+  try {
+    const raw = localStorage.getItem(RECORD_PREFIX + orderId);
+    return raw ? JSON.parse(raw) : null;
+  } catch (_) { return null; }
 }
 
+function statusLink(orderId, key) {
+  return `${location.origin}${location.pathname}#order=${encodeURIComponent(orderId)}&k=${key.toString(16).padStart(64, '0')}`;
+}
 function readFragment() {
   const raw = location.hash.replace(/^#/, '');
   if (!raw) return null;
   const p = new URLSearchParams(raw);
   const order = p.get('order');
   const k = p.get('k');
-  if (!order || !k || !/^[0-9a-f]{64}$/i.test(k)) return null;
-  return { orderId: order, key: BigInt('0x' + k) };
+  if (!order) return null;
+  return { orderId: order, key: k && /^[0-9a-f]{64}$/i.test(k) ? BigInt('0x' + k) : null };
 }
 
-// ---------- capabilities and the rail picker ----------
+// ---------- capabilities ----------
 
 async function loadCapabilities() {
   try {
-    const caps = await api('/v2/capabilities');
-    state.rails = caps.rails || [];
-    if (caps.fee && caps.fee.label) state.feeLabel = caps.fee.label;
-  } catch (_) {
-    // The picker still renders with Venmo alone, so the page works if this
-    // call fails; it is a nicety, not a dependency.
-    state.rails = [{ id: 'venmo', label: 'Venmo', live: true }];
+    state.caps = await api('/escrow/capabilities');
+  } catch (e) {
+    state.caps = null;
+    $('q-note').textContent = 'zpay is not reachable from this page yet.';
+    $('q-note').className = 'quote-note err';
+    return;
   }
-
-  const sel = $('rail');
-  sel.innerHTML = '';
-  for (const r of state.rails) {
-    const opt = document.createElement('option');
-    opt.value = r.id;
-    opt.textContent = r.label;
-    opt.disabled = !r.live;
-    if (r.live && !sel.value) opt.selected = true;
-    sel.appendChild(opt);
+  const c = state.caps;
+  if (c.network && c.network !== 'main') {
+    $('net-tag').textContent = c.network === 'test' ? 'testnet' : c.network;
+    $('net-tag').hidden = false;
   }
-  updateRailHint();
-}
-
-function updateRailHint() {
-  const sel = $('rail');
-  const rail = state.rails.find((r) => r.id === sel.value);
-  $('rail-hint').textContent = rail && !rail.live
-    ? `${rail.label} is not live yet. Venmo is the one that works today.`
-    : '';
+  if (c.fee && typeof c.fee.bps === 'number') {
+    const pct = (c.fee.bps / 100).toFixed(2) + '%';
+    document.querySelectorAll('[data-fee]').forEach((el) => { el.textContent = pct; });
+  }
+  if (c.rate_usd_per_zec) $('rate-head').textContent = `1 ZEC = $${Number(c.rate_usd_per_zec).toFixed(2)}`;
+  const venmo = (c.rails || []).find((r) => r.id === 'venmo');
+  if (venmo && venmo.live === false) $('rail-hint').textContent = 'Venmo is paused right now.';
 }
 
 // ---------- quote ----------
@@ -347,39 +159,47 @@ let expiryTimer = null;
 
 async function doQuote() {
   const amount = $('amount').value.trim();
-  if (!amount) { $('quote').hidden = true; return; }
-
+  if (!amount) { $('q-out').hidden = true; state.quote = null; return; }
+  if (!/^\d*\.?\d*$/.test(amount) || Number(amount) <= 0) {
+    note('err', 'Enter a number.');
+    return;
+  }
   try {
-    const q = await api(
-      `/v2/quote?amount=${encodeURIComponent(amount)}&unit=${state.unit}` +
-      `&rail=${encodeURIComponent($('rail').value)}`
-    );
+    const q = await api(`/escrow/quote?amount=${encodeURIComponent(amount)}&unit=${state.unit}`);
     state.quote = q;
     renderQuote(q);
-    msg('compose-msg', '');
+    note('', '');
   } catch (e) {
     state.quote = null;
-    $('quote').hidden = true;
-    msg('compose-msg', 'err', e.message);
+    $('q-out').hidden = true;
+    note('err', e.message);
   }
+}
+
+function note(kind, text) {
+  const el = $('q-note');
+  el.className = 'quote-note ' + kind;
+  el.textContent = text || (kind || state.quote ? '' : 'type an amount to see what lands in their Venmo');
 }
 
 function renderQuote(q) {
   $('q-net').textContent = money(q.net_cents);
-
   const ul = $('q-lines');
   ul.innerHTML = '';
-  for (const line of q.lines) {
+  const add = (label, right, cls) => {
     const li = document.createElement('li');
-    li.className = line.is_zpay_fee ? 'fee' : '';
-    li.innerHTML = `<span>${esc(line.label)}</span><span>${esc(money(line.cents))}</span>`;
+    li.className = cls || '';
+    const a = document.createElement('span'); a.textContent = label;
+    const b = document.createElement('span'); b.textContent = right;
+    li.appendChild(a); li.appendChild(b);
     ul.appendChild(li);
-  }
-
-  const mins = Math.round(q.expected_seconds / 60);
-  $('q-route').textContent = `${q.route_label} · usually under ${mins} minutes`;
+  };
+  add('you send', zec(q.amount_zat));
+  for (const line of q.lines || []) add(line.label, money(line.cents), line.is_zpay_fee ? 'fee' : '');
+  if (q.rate_usd_per_zec) add('rate', `$${Number(q.rate_usd_per_zec).toFixed(2)} / ZEC`);
+  $('q-route').textContent = `${q.route_label || 'escrow on Zcash'} · usually under ${Math.max(1, Math.round((q.expected_seconds || 1200) / 60))} minutes`;
   startCountdown(q.expires_at);
-  $('quote').hidden = false;
+  $('q-out').hidden = false;
 }
 
 function startCountdown(iso) {
@@ -404,113 +224,443 @@ function startCountdown(iso) {
 
 $('amount').addEventListener('input', () => {
   clearTimeout(quoteTimer);
-  quoteTimer = setTimeout(doQuote, 500);
+  quoteTimer = setTimeout(doQuote, 400);
 });
-$('rail').addEventListener('change', () => { updateRailHint(); doQuote(); });
 
-for (const [id, unit] of [['unit-usd', 'usd'], ['unit-zec', 'zec']]) {
+for (const [id, unit] of [['unit-zec', 'zec'], ['unit-usd', 'usd']]) {
   $(id).addEventListener('click', () => {
+    if (state.unit === unit) return;
     state.unit = unit;
-    $('unit-usd').classList.toggle('on', unit === 'usd');
     $('unit-zec').classList.toggle('on', unit === 'zec');
-    $('unit-usd').setAttribute('aria-pressed', String(unit === 'usd'));
+    $('unit-usd').classList.toggle('on', unit === 'usd');
     $('unit-zec').setAttribute('aria-pressed', String(unit === 'zec'));
-    $('amount-sigil').textContent = unit === 'usd' ? '$' : 'ᙇ';
+    $('unit-usd').setAttribute('aria-pressed', String(unit === 'usd'));
     $('amount').placeholder = unit === 'usd' ? '25' : '0.5';
-
-    // Clear rather than reinterpret. "25" means twenty-five dollars in one
-    // unit and about twenty thousand dollars of ZEC in the other, and silently
-    // requoting the same digits against the other meaning is how someone sends
-    // far more than they meant to.
+    // Clear rather than reinterpret: "25" means twenty-five dollars in one
+    // unit and about a thousand dollars of ZEC in the other.
     $('amount').value = '';
-    $('quote').hidden = true;
+    $('q-out').hidden = true;
     state.quote = null;
     if (expiryTimer) clearInterval(expiryTimer);
+    note('', '');
     $('amount').focus();
   });
 }
 
 // ---------- open the order ----------
 
+const HANDLE_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{1,29}$/;
+
 $('form-pay').addEventListener('submit', async (ev) => {
   ev.preventDefault();
-
   const handle = $('handle').value.trim().replace(/^@/, '');
-  if (handle.length < 2) { msg('compose-msg', 'err', 'Enter the handle that gets paid.'); return; }
+  if (!HANDLE_RE.test(handle)) { note('err', 'Enter their Venmo username: letters, digits, - and _.'); return; }
+  if (!state.caps) { note('err', 'zpay is not reachable from this page yet.'); return; }
   if (!state.quote) { await doQuote(); if (!state.quote) return; }
 
   const btn = $('btn-pay');
   btn.disabled = true;
-  btn.textContent = 'Preparing…';
-  msg('compose-msg', '');
+  btn.textContent = 'Making your key…';
+  note('', '');
 
   try {
     // One key per order, made here and never sent anywhere.
-    state.key = newSessionKey();
-    const pubkey = compressedPubkey(state.key);
-    const address = evmAddress(state.key);
+    const key = E.randomScalar();
+    const uPub = E.pubkey(key);
 
-    const rail = $('rail').value;
-    const scope = `${state.quote.quote_id}:${rail}:${handle}`;
-    const signature = personalSign(state.key, ownershipMessage('open', address, scope));
-
-    const opened = await api('/v2/orders', {
+    const opened = await api('/escrow/orders', {
       method: 'POST',
-      headers: { 'x-zecp2p-signature': signature },
       body: JSON.stringify({
         quote_id: state.quote.quote_id,
-        destination: { rail, handle },
-        session_pubkey: pubkey,
-        overrides: {},
+        u_pub: E.toHex(uPub),
+        destination: { rail: 'venmo', handle },
       }),
     });
 
+    const esc = opened.escrow;
+    const network = opened.network || state.caps.network;
+    // The address is derived here, not read. The coordinator can only be
+    // agreed with, and an escrow whose refund branch this key cannot spend is
+    // refused before anyone sends to it.
+    const lPub = E.fromHex(esc.l_pub);
+    if (state.caps.l_pub && esc.l_pub !== state.caps.l_pub) {
+      throw new Error('The payer key in the order is not the one this page was given. Nothing was sent.');
+    }
+    const redeem = E.redeemScript(uPub, lPub, esc.refund_height);
+    const derived = E.escrowAddress(redeem, network);
+    if (derived !== esc.address) {
+      throw new Error('The address zpay returned is not the escrow this page derived. Nothing was sent.');
+    }
+    if (esc.amount_zat !== state.quote.amount_zat) {
+      throw new Error('The order amount is not the quoted amount. Nothing was sent.');
+    }
+
+    state.key = key;
     state.orderId = opened.order_id;
-    history.replaceState(null, '', statusLink(opened.order_id, state.key));
-    showPayment(opened);
+    state.record = {
+      orderId: opened.order_id,
+      network,
+      uPriv: key.toString(16).padStart(64, '0'),
+      uPub: E.toHex(uPub),
+      lPub: esc.l_pub,
+      refundHeight: esc.refund_height,
+      amountZat: esc.amount_zat,
+      address: esc.address,
+      redeemScript: E.toHex(redeem),
+      usdAmount6dec: esc.usd_amount_6dec,
+      payeeHash: esc.payee_hash,
+      platformFeeZat: esc.platform_fee_zat || 0,
+      treasuryScript: esc.treasury_script || '',
+      handle,
+      createdAt: new Date().toISOString(),
+    };
+    // Stored before the address is shown, so a crash between here and the
+    // user's wallet still leaves a refundable escrow (spec 5.3).
+    saveRecord(state.record);
+    state.presign = 'idle';
+    history.replaceState(null, '', statusLink(opened.order_id, key));
+    showOrder(opened);
     startPolling();
   } catch (e) {
-    msg('compose-msg', 'err', e.message);
+    note('err', e.message);
   } finally {
     btn.disabled = false;
-    btn.textContent = 'Continue';
+    btn.textContent = 'Get the address';
   }
 });
 
-// ---------- the pay screen ----------
+// ---------- the order view ----------
 
-function zecString(zat) {
-  const whole = Math.floor(zat / 1e8);
-  const frac = String(zat % 1e8).padStart(8, '0').replace(/0+$/, '');
-  return frac ? `${whole}.${frac}` : String(whole);
-}
-
-function showPayment(opened) {
-  const d = opened.deposit;
-  const amount = `${zecString(d.amount_zat)} ZEC`;
-
-  $('pay-amount').textContent = amount;
-  $('pay-amount-2').textContent = amount;
-  $('pay-addr').textContent = d.address;
-  $('pay-uri').href = d.zip321_uri;
-  $('pay-open').href = d.zip321_uri;
-
+function showOrder(view) {
+  const esc = view.escrow;
+  const uri = esc.zip321_uri || E.zip321(esc.address, esc.amount_zat);
+  $('pay-amount').textContent = zec(esc.amount_zat);
+  $('pay-addr').textContent = esc.address;
+  $('pay-uri').href = uri;
+  $('pay-open').href = uri;
+  $('pay-to').textContent = view.quote ? `@${view.destination.handle} gets ${money(view.quote.net_cents)}.` : '';
   try {
-    QR.draw($('qr'), d.zip321_uri);
+    QR.draw($('qr'), uri);
   } catch (_) {
-    // A QR that will not draw must not hide the address underneath it.
     $('qr').hidden = true;
-    $('details') && ($('details').open = true);
   }
-
-  $('pay-next').textContent =
-    'Once it arrives we swap it, a payer sends the dollars, and their payment is ' +
-    'proved before anything is released. Usually under 20 minutes.';
-
   $('view-compose').hidden = true;
-  $('view-pay').hidden = false;
-  $('view-status').hidden = false;
+  $('view-order').hidden = false;
+  render(view);
 }
+
+const LADDER = [
+  ['awaiting_zec', 'Send the ZEC'],
+  ['confirming', 'ZEC confirms'],
+  ['locked', 'Escrow locks'],
+  ['paid', 'Payer sends the dollars'],
+  ['released', 'Escrow releases'],
+];
+const STAGE_INDEX = {
+  awaiting_zec: 0, confirming: 1, needs_presignature: 2, locked: 3, paid: 4, released: 5,
+};
+const RETURN_STAGES = ['unpaid', 'refundable', 'refunded', 'failed'];
+
+function render(view) {
+  state.order = view;
+  const stage = view.stage;
+  const esc = view.escrow;
+  const f = view.funding;
+  const handle = view.destination ? view.destination.handle : (state.record && state.record.handle) || '';
+  const net = view.quote ? money(view.quote.net_cents) : '';
+
+  $('pay-block').hidden = stage !== 'awaiting_zec';
+  $('stage-block').hidden = stage === 'awaiting_zec';
+  $('keep-link').hidden = ['released', 'refunded'].includes(stage);
+  $('keep-open').hidden = !['awaiting_zec', 'confirming', 'needs_presignature'].includes(stage);
+
+  // ladder
+  const idx = STAGE_INDEX[stage];
+  const ol = $('ladder');
+  ol.innerHTML = '';
+  ol.hidden = RETURN_STAGES.includes(stage);
+  LADDER.forEach(([key, label], i) => {
+    const li = document.createElement('li');
+    li.dataset.state = idx === undefined ? 'todo' : i < idx ? 'done' : i === idx ? 'current' : 'todo';
+    if (stage === 'released') li.dataset.state = 'done';
+    const n = document.createElement('span'); n.className = 'n'; n.textContent = String(i + 1).padStart(2, '0');
+    const t = document.createElement('span'); t.textContent = label;
+    const side = document.createElement('span'); side.className = 'side';
+    if (key === 'confirming' && f && stage === 'confirming') side.textContent = `${f.confirmations} / ${f.required}`;
+    if (key === 'locked' && stage === 'needs_presignature') side.textContent = state.presign === 'signing' ? 'signing…' : state.presign === 'failed' ? 'not signed' : 'signing';
+    if (key === 'paid' && view.payment) side.textContent = money(view.payment.cents);
+    li.appendChild(n); li.appendChild(t); li.appendChild(side);
+    ol.appendChild(li);
+  });
+
+  // headline
+  const live = $('order-live');
+  live.dataset.state = '';
+  let head = 'status', liveText = '', headline = '', sub = '';
+  switch (stage) {
+    case 'awaiting_zec':
+      head = 'send'; liveText = 'waiting for your ZEC';
+      break;
+    case 'confirming':
+      liveText = 'confirming';
+      headline = 'ZEC received, confirming';
+      sub = f ? `${f.confirmations} of ${f.required} confirmations. About ${Math.ceil(((f.required - f.confirmations) * (state.caps && state.caps.block_seconds || 75)) / 60)} minutes.` : '';
+      break;
+    case 'needs_presignature':
+      liveText = 'locking';
+      headline = 'Locking the escrow';
+      sub = state.key
+        ? 'This page is signing the release. It takes a moment.'
+        : 'Open the link you kept, in this browser, so the page can sign. Nothing is lost.';
+      break;
+    case 'locked':
+      liveText = 'locked';
+      headline = 'Escrow locked';
+      sub = 'A payer can now send the dollars. Usually under 20 minutes. Nothing for you to do.';
+      break;
+    case 'paid':
+      liveText = 'proving';
+      headline = `Dollars sent to @${handle}`;
+      sub = 'Their payment is being proved. The escrow releases against that proof and nothing else.';
+      break;
+    case 'released':
+      live.dataset.state = 'done'; liveText = 'done';
+      headline = net ? `${net} landed in @${handle}'s Venmo` : `Paid @${handle}`;
+      sub = view.release ? `Released on Zcash in ${shortHex(view.release.txid)}.` : '';
+      break;
+    case 'unpaid':
+      live.dataset.state = 'bad'; liveText = 'nobody paid';
+      headline = 'Nobody paid';
+      break;
+    case 'refundable':
+      live.dataset.state = 'bad'; liveText = 'refundable';
+      headline = 'Your ZEC is refundable';
+      break;
+    case 'refunded':
+      live.dataset.state = 'done'; liveText = 'refunded';
+      headline = 'Your ZEC went back';
+      sub = view.refund ? `In ${shortHex(view.refund.txid)}.` : '';
+      break;
+    case 'failed':
+      live.dataset.state = 'bad'; liveText = 'stopped';
+      headline = 'This order stopped';
+      sub = view.reason || '';
+      break;
+    default:
+      liveText = stage;
+      headline = stage;
+  }
+  $('order-head').textContent = head;
+  $('order-live-text').textContent = liveText;
+  $('stage-headline').textContent = headline;
+  $('stage-sub').textContent = sub;
+
+  renderReturns(view);
+  renderDetails(view);
+
+  if (stage === 'needs_presignature' && state.key && state.presign === 'idle') presign(view);
+  if (['released', 'refunded', 'failed'].includes(stage)) stopPolling();
+}
+
+// ---------- the pre-signature ----------
+
+async function presign(view) {
+  state.presign = 'signing';
+  msg('order-msg', '');
+  try {
+    const rec = state.record;
+    const caps = state.caps || {};
+    const network = view.network || rec.network;
+    const a = view.announcement;
+    if (!a || !view.funding) throw new Error('The announcement has not arrived yet.');
+
+    let pinned = (PINS[network] || {}).attestor_pubkey;
+    if (network === 'main') {
+      if (!pinned) {
+        throw new Error('This page has no attestor key pinned for mainnet, so it will not sign. Your ZEC stays refundable from this link at block ' + rec.refundHeight + '.');
+      }
+    } else {
+      pinned = pinned || a.P;
+    }
+
+    const prepared = E.prepareEscrow(
+      {
+        uPriv: state.key,
+        amountZat: rec.amountZat,
+        lPub: E.fromHex(rec.lPub),
+        refundHeight: rec.refundHeight,
+        usdAmount6dec: rec.usdAmount6dec,
+        payeeHash: E.fromHex(rec.payeeHash),
+        platformFeeZat: rec.platformFeeZat,
+        treasuryScript: E.fromHex(rec.treasuryScript || ''),
+      },
+      {
+        // Explorers and RPCs print txids reversed; the terms carry internal order.
+        fundingTxid: E.reversed(E.fromHex(view.funding.txid)),
+        vout: view.funding.vout,
+        consensusBranchId: view.consensus_branch_id,
+      },
+      a.terms,
+      { P: E.fromHex(a.P), R: E.fromHex(a.R), eventId: E.fromHex(a.event_id) },
+      E.fromHex(pinned),
+      { lpOutputScript: E.fromHex(a.lp_output_script), minerFeeZat: a.miner_fee_zat },
+    );
+
+    // The chain facts go into the record now, so the refund can be rebuilt
+    // from this browser alone if the coordinator is never seen again.
+    state.record = {
+      ...rec,
+      fundingTxid: view.funding.txid,
+      vout: view.funding.vout,
+      consensusBranchId: view.consensus_branch_id,
+      termsHash: E.toHex(prepared.termsHash),
+      preSignedAt: new Date().toISOString(),
+    };
+    saveRecord(state.record);
+
+    await api(`/escrow/orders/${encodeURIComponent(state.orderId)}/presign`, {
+      method: 'POST',
+      body: JSON.stringify({
+        pre_signature: E.toHex(prepared.preSignature),
+        terms_hash: E.toHex(prepared.termsHash),
+        u_pub: rec.uPub,
+      }),
+    });
+    state.presign = 'sent';
+    void caps;
+    fetchStatus();
+  } catch (e) {
+    state.presign = 'failed';
+    msg('order-msg', 'err', e.message, { label: 'Try again', run: () => { state.presign = 'idle'; fetchStatus(); } });
+    render(view);
+  }
+}
+
+// ---------- returns: the refund at T ----------
+
+function renderReturns(view) {
+  const box = $('returns');
+  const form = $('form-return');
+  const out = $('return-out');
+  const stage = view.stage;
+  if (!RETURN_STAGES.includes(stage) && stage !== 'failed') { box.hidden = true; return; }
+  box.hidden = false;
+  out.hidden = !out.dataset.raw;
+
+  const T = view.escrow.refund_height;
+  const now = view.current_height || 0;
+  const blocks = Math.max(0, T - now);
+  const hours = (blocks * ((state.caps && state.caps.block_seconds) || 75)) / 3600;
+
+  switch (stage) {
+    case 'unpaid':
+      $('returns-title').textContent = 'Your ZEC comes back to you';
+      $('returns-body').textContent =
+        `Nobody sent the dollars in time. Your coins are refundable at block ${T.toLocaleString()}, ` +
+        `about ${hours < 1 ? Math.ceil(hours * 60) + ' minutes' : hours.toFixed(1) + ' hours'} from now. ` +
+        'Only your key can take them, and it is in this page. Nothing to do until then.';
+      form.hidden = true;
+      break;
+    case 'refundable':
+      $('returns-title').textContent = 'Where should your ZEC go?';
+      $('returns-body').textContent =
+        `${zec(view.escrow.amount_zat)} is in the escrow and block ${T.toLocaleString()} has passed. ` +
+        'This page signs the refund with your key; no one else is involved.';
+      form.hidden = !state.key;
+      if (!state.key) $('returns-body').textContent += ' Open the link you kept so this page can sign.';
+      break;
+    case 'refunded':
+      $('returns-title').textContent = 'Refund sent';
+      $('returns-body').textContent = view.refund ? `Transaction ${view.refund.txid}.` : '';
+      form.hidden = true;
+      break;
+    default:
+      $('returns-title').textContent = 'This order stopped';
+      $('returns-body').textContent = view.reason || '';
+      form.hidden = true;
+  }
+}
+
+$('form-return').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const addr = $('return-addr').value.trim();
+  const view = state.order;
+  const rec = state.record;
+  const btn = $('btn-return');
+  msg('order-msg', '');
+  let script;
+  try {
+    script = E.scriptForAddress(addr, view.network || rec.network);
+  } catch (e) {
+    msg('order-msg', 'err', e.message);
+    return;
+  }
+  btn.disabled = true;
+  try {
+    const f = view.funding || {};
+    const fundingTxid = rec.fundingTxid || f.txid;
+    const vout = rec.vout !== undefined ? rec.vout : f.vout;
+    const branch = rec.consensusBranchId || view.consensus_branch_id;
+    if (!fundingTxid || branch === undefined) throw new Error('The funding transaction is not known to this page yet.');
+
+    const terms = E.escrowTerms({
+      fundingTxid: E.reversed(E.fromHex(fundingTxid)), vout,
+      amountZat: rec.amountZat, uPub: E.fromHex(rec.uPub), lPub: E.fromHex(rec.lPub), refundHeight: rec.refundHeight,
+    }, branch);
+    const fee = E.refundFeeTransparent(terms.redeemScript.length);
+    const signed = E.signRefund(state.key, terms, script, fee);
+    const rawHex = E.toHex(signed.raw);
+    const txidHex = E.toHex(E.reversed(signed.txid));
+
+    const out = $('return-out');
+    out.dataset.raw = rawHex;
+    $('return-raw').textContent = rawHex;
+    out.hidden = false;
+
+    try {
+      await api(`/escrow/orders/${encodeURIComponent(state.orderId)}/refund`, {
+        method: 'POST',
+        body: JSON.stringify({ raw_tx: rawHex, txid: txidHex, address: addr }),
+      });
+      msg('order-msg', 'ok', `Refund broadcast. ${zec(rec.amountZat - fee)} to ${addr}, transaction ${txidHex}.`);
+      $('form-return').hidden = true;
+      fetchStatus();
+    } catch (e) {
+      msg('order-msg', 'err', `zpay could not broadcast it: ${e.message}\nThe signed transaction is below; any Zcash node accepts it after block ${rec.refundHeight.toLocaleString()}.`);
+    }
+  } catch (e) {
+    msg('order-msg', 'err', e.message);
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+// ---------- details ----------
+
+function renderDetails(view) {
+  const dl = $('detail-kv');
+  dl.innerHTML = '';
+  const rows = [];
+  const esc = view.escrow;
+  rows.push(['order', view.order_id]);
+  rows.push(['escrow', esc.address]);
+  rows.push(['amount', zec(esc.amount_zat)]);
+  rows.push(['refund height', String(esc.refund_height)]);
+  if (view.current_height) rows.push(['chain height', String(view.current_height)]);
+  if (view.funding) rows.push(['funding', `${view.funding.txid}:${view.funding.vout}`]);
+  if (view.announcement) rows.push(['terms hash', view.announcement.terms_hash || '']);
+  if (view.payment) rows.push(['venmo', `${money(view.payment.cents)} at ${view.payment.sent_at}`]);
+  if (view.release) rows.push(['release', view.release.txid]);
+  if (view.refund) rows.push(['refund', view.refund.txid]);
+  if (state.record) rows.push(['your key', 'held in this page and in the link']);
+  for (const [k, v] of rows) {
+    const dt = document.createElement('dt'); dt.textContent = k;
+    const dd = document.createElement('dd'); dd.textContent = v;
+    dl.appendChild(dt); dl.appendChild(dd);
+  }
+}
+
+// ---------- copy ----------
 
 $('btn-copy-addr').addEventListener('click', () => copyText($('pay-addr').textContent, $('btn-copy-addr'), 'Copy address'));
 $('btn-copy-link').addEventListener('click', () => copyText(location.href, $('btn-copy-link'), 'Copy link'));
@@ -525,136 +675,14 @@ async function copyText(text, btn, label) {
   setTimeout(() => { btn.textContent = label; }, 2000);
 }
 
-// ---------- status ----------
-
-const LADDER = [
-  ['awaiting_zec', 'Waiting for your ZEC'],
-  ['zec_seen',     'ZEC received'],
-  ['in_escrow',    'In escrow'],
-  ['paid_out',     'Payment sent'],
-  ['done',         'Done'],
-];
-
-const RETURN_STAGES = ['returning', 'returned', 'failed'];
-
-function renderStatus(view) {
-  const stage = view.timeline.stage;
-  const idx = LADDER.findIndex(([k]) => k === stage);
-
-  const ol = $('ladder');
-  ol.innerHTML = '';
-  LADDER.forEach(([key, label], i) => {
-    const li = document.createElement('li');
-    li.dataset.state = idx < 0 ? 'todo' : i < idx ? 'done' : i === idx ? 'current' : 'todo';
-    if (stage === 'done') li.dataset.state = 'done';
-    li.textContent = label;
-    ol.appendChild(li);
-  });
-  ol.hidden = RETURN_STAGES.includes(stage);
-
-  if (stage === 'done') {
-    $('status-headline').textContent = `${money(view.quote.net_cents)} landed in @${view.destination.handle}'s Venmo`;
-    const fee = view.quote.lines.find((l) => l.is_zpay_fee);
-    $('status-sub').textContent = fee ? `Includes the ${fee.label.replace(/^zpay fee /, '').replace(/[()]/g, '')} zpay fee of ${money(fee.cents)}.` : '';
-  } else if (idx >= 0) {
-    $('status-headline').textContent = LADDER[idx][1];
-    $('status-sub').textContent = idx === 0
-      ? 'Send the ZEC from your wallet. This page updates on its own.'
-      : 'Nothing for you to do. This page updates on its own.';
-  }
-
-  renderReturns(view);
-  renderDetails(view);
-}
-
-/** The failure screen. One field, one answer, and the answer is always ZEC. */
-function renderReturns(view) {
-  const r = view.returns;
-  const box = $('returns');
-  const form = $('form-return');
-
-  if (!r || r.state === 'none') { box.hidden = true; return; }
-  box.hidden = false;
-
-  switch (r.state) {
-    case 'usdc_at':
-      // Never shown as something to collect: the sender holds ZEC and has
-      // nowhere to put a dollar token. The page converts first and asks after.
-      $('returns-title').textContent = 'Sending your ZEC back';
-      $('returns-body').textContent =
-        'Nobody filled this order, so we are converting the funds back to ZEC. ' +
-        'Nothing for you to do yet; this page will ask where to send it.';
-      form.hidden = true;
-      break;
-
-    case 'swapping_back':
-      $('returns-title').textContent = 'Converting back to ZEC';
-      $('returns-body').textContent = `About ${zecString(r.expected_zat)} ZEC, on its way.`;
-      form.hidden = true;
-      break;
-
-    case 'zec_at':
-      $('returns-title').textContent = 'Your ZEC came back';
-      $('returns-body').textContent =
-        `${zecString(r.zatoshi)} ZEC is waiting. Where should it go?`;
-      form.hidden = false;
-      break;
-
-    case 'refundable_at_height':
-      $('returns-title').textContent = 'Your ZEC is refundable';
-      $('returns-body').textContent = `Claimable from block ${r.height}. Where should it go?`;
-      form.hidden = false;
-      break;
-
-    case 'settled':
-      $('returns-title').textContent = 'Your ZEC was returned';
-      $('returns-body').textContent =
-        `${zecString(r.zatoshi)} ZEC went to ${r.address}.`;
-      form.hidden = true;
-      break;
-
-    default:
-      box.hidden = true;
-  }
-}
-
-function renderDetails(view) {
-  const dl = $('detail-kv');
-  dl.innerHTML = '';
-  for (const [k, v] of view.timeline.details || []) {
-    const dt = document.createElement('dt'); dt.textContent = k;
-    const dd = document.createElement('dd'); dd.textContent = v;
-    dl.appendChild(dt); dl.appendChild(dd);
-  }
-}
-
-// The one client-side check on the return address. The coordinator decodes it
-// properly; this only saves a round trip on an obvious typo.
-function validZcashAddress(a) {
-  a = a.trim();
-  if (/^u1/.test(a)) return a.length >= 40 ? null : 'That unified address looks incomplete.';
-  if (/^(t1|t3)/.test(a)) return (a.length >= 34 && a.length <= 35) ? null : 'A t-address is 34 or 35 characters.';
-  return 'Use a Zcash address: u1… (shielded) or t1… / t3….';
-}
-
-$('form-return').addEventListener('submit', async (ev) => {
-  ev.preventDefault();
-  const addr = $('return-addr').value.trim();
-  const bad = validZcashAddress(addr);
-  if (bad) { msg('return-msg', 'err', bad); return; }
-
-  msg('return-msg', 'info',
-    'Recorded. Returning funds needs a signature from this page, which is the ' +
-    'next thing being built; your ZEC stays claimable from this link until then.');
-});
+// ---------- polling ----------
 
 async function fetchStatus() {
   if (!state.orderId) return;
   try {
-    const view = await api('/v2/orders/' + encodeURIComponent(state.orderId));
-    renderStatus(view);
-    if (['done', 'returned', 'failed'].includes(view.timeline.stage)) stopPolling();
-  } catch (_) {
+    const view = await api('/escrow/orders/' + encodeURIComponent(state.orderId));
+    if ($('view-order').hidden) showOrder(view); else render(view);
+  } catch (e) {
     // A failed poll is not worth a scary message; the next one may work.
   }
 }
@@ -662,7 +690,7 @@ async function fetchStatus() {
 function startPolling() {
   stopPolling();
   fetchStatus();
-  state.poll = setInterval(fetchStatus, 5000);
+  state.poll = setInterval(fetchStatus, 4000);
 }
 function stopPolling() {
   if (state.poll) { clearInterval(state.poll); state.poll = null; }
@@ -674,10 +702,10 @@ async function checkHealth() {
   try {
     await api('/health');
     $('conn').dataset.state = 'up';
-    $('conn-text').textContent = 'online';
+    $('conn-text').textContent = 'coordinator up';
   } catch (_) {
     $('conn').dataset.state = 'down';
-    $('conn-text').textContent = 'offline';
+    $('conn-text').textContent = 'coordinator down';
   }
 }
 
@@ -688,28 +716,28 @@ async function checkHealth() {
   checkHealth();
   setInterval(checkHealth, 30000);
 
-  // The launch page's quote widget hands the amount over in the query string,
-  // so somebody who priced an order on the front door does not retype it.
-  // Values are assigned to inputs, never rendered as markup.
+  // The front door hands the amount over in the query string.
   const params = new URLSearchParams(location.search);
   const deepZec = params.get('zec');
   const deepUsd = params.get('usd');
   const deepHandle = params.get('handle') || params.get('venmo');
-  if (deepZec || deepUsd) {
-    if (deepZec) $('unit-zec').click();
-    $('amount').value = (deepZec || deepUsd).trim();
-  }
+  if (deepUsd && !deepZec) $('unit-usd').click();
+  if (deepZec || deepUsd) $('amount').value = (deepZec || deepUsd).trim();
   if (deepHandle) $('handle').value = deepHandle.trim().replace(/^@/, '');
   if (deepZec || deepUsd) doQuote();
 
-  // Returning to a status link: the key comes back out of the fragment.
+  // Returning to a status link: the key comes back out of the fragment, and
+  // the record out of this browser.
   const resumed = readFragment();
   if (resumed) {
     state.orderId = resumed.orderId;
-    state.key = resumed.key;
-    $('view-compose').hidden = true;
-    $('view-status').hidden = false;
-    $('advanced-link').href = 'advanced/?session=' + encodeURIComponent(resumed.orderId);
+    state.record = loadRecord(resumed.orderId);
+    state.key = resumed.key || (state.record ? BigInt('0x' + state.record.uPriv) : null);
+    if (state.key && !state.record) {
+      // The link came from another browser. The refund still needs the chain
+      // facts, which the coordinator's view supplies; the key is enough.
+      state.record = null;
+    }
     startPolling();
   }
 })();

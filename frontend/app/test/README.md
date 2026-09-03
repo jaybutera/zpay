@@ -1,46 +1,55 @@
 # Checks for the page's hand-written crypto
 
-Three things in `frontend/app/` are implemented by hand because the browser
-does not provide them: QR encoding, secp256k1, and keccak256. All three fail
-silently when they are wrong. A QR code that encodes nothing still looks like a
-QR code; a signature over the wrong bytes is still a well-formed signature.
+`frontend/app/escrow.js` implements, in the browser, the user's half of the
+native Zcash escrow: SHA-256, RIPEMD-160, BLAKE2b, secp256k1, ECDSA, the
+libsecp256k1-zkp adaptor signature with its DLEQ proof, the redeem script, the
+t3 address, ZIP 317 fees, ZIP 225 serialization and the ZIP 244 digests. Every
+one of those fails silently when it is wrong: a digest one byte off is a
+pre-signature the LP verifies happily against the wrong transaction.
 
-These are not run by `cargo test`. Run them when you touch `qr.js` or the
-crypto section of `app.js`.
+None of this runs under `cargo test`. Run it when you touch `escrow.js`.
+
+## Vectors against the crate
 
 ```
-npm install jsqr qrcode
-
-node frontend/app/test/crypto-vectors.js       # keccak and secp256k1 vectors
-node frontend/app/test/qr-verify.js            # encode, then decode with jsQR
-
-node frontend/app/test/session-key-vectors.js > /tmp/js-sigs.json
-cargo run -p zecp2p-coordinator --example verify_js_sigs -- /tmp/js-sigs.json
+cargo run -p zecp2p-escrow --example frontend_vectors -- emit > /tmp/vectors.json
+node frontend/app/test/escrow-vectors.js /tmp/vectors.json /tmp/js-out.json
+cargo run -p zecp2p-escrow --example frontend_vectors -- check /tmp/vectors.json /tmp/js-out.json
 ```
 
-The last one is the one that matters most: it takes signatures the page
-produced and runs them through `auth::require_owner`, the same function the
-live endpoint calls, and checks that the address the coordinator derives from
-the page's public key is the address the page signed as.
+`emit` prints what the crate computes from fixed keys and a fixed outpoint.
+The node script recomputes each value and compares, then writes a
+pre-signature, a completed release and a signed refund. `check` runs those
+through `verify_pre_signature`, adaptor decryption with the real outcome
+scalar, `txid_of_signed`, and the consensus script interpreter, at `T` and at
+`T - 1`.
+
+## The mock coordinator
+
+```
+MOCK_OUT_DIR=/tmp/mock-out node frontend/app/test/mock-coordinator.mjs
+# open http://127.0.0.1:8787/app/
+cargo run -p zecp2p-escrow --example frontend_vectors -- check-release /tmp/mock-out/release-<id>.json
+```
+
+The mock serves `frontend/` and answers the six `/escrow/*` endpoints the page
+uses. Its payer key, attestor and terms are real and computed with the same
+`escrow.js`; its chain is a timer. A handle of `nobody-pays` runs the
+abandoned path to a refund instead. Every release it assembles is written out,
+and `check-release` recomputes the digest from the terms alone and executes
+the scriptSig against it, so a browser run is promoted from "JavaScript agrees
+with JavaScript" to "the crate agrees".
+
+## The older checks
+
+`qr-verify.js`, `crypto-vectors.js` and `session-key-vectors.js` cover the QR
+encoder and the Base-route session key used by `advanced/`. They need
+`npm install jsqr qrcode` and the coordinator's `verify_js_sigs` example; see
+their headers.
 
 ## What these caught
 
-- **Format bits written backwards.** QR format information is fifteen bits,
-  most significant first. Written least significant first, every module of the
-  data region is still correct and the symbol scans as nothing.
-- **The dark module overwritten.** The second copy of the format bits runs
-  through `[size-8][8]`, which is fixed dark and is not a format bit.
-- **EIP-55 where the server uses lowercase.** The page checksummed the address
-  inside the message it signed; `auth.rs` builds that message with alloy's
-  `{:?}`, which is lowercase. Same key, same algorithm, different bytes, and
-  every order would have failed to open with an unexplained 401.
-
-## Not independently checked
-
-The session key's transparent Zcash address is derived twice, in
-`backend/session_key.rs` with the `ripemd` crate and never in the page, which
-does not need it. Its base58check is checked against a vector computed outside
-that code, and the result is run through the coordinator's own refund
-validator, but the RIPEMD-160 step itself has only the one implementation
-behind it. Worth a second opinion from a wallet before a return is claimed
-against one of these addresses on mainnet.
+- **Format bits written backwards** in the QR encoder: the symbol scanned as
+  nothing while looking like a QR code.
+- **The dark module overwritten** by the second copy of the format bits.
+- **EIP-55 where the server uses lowercase** in the Base-route session key.

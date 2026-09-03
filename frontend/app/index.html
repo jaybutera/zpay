@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>zpay: pay a Venmo handle with ZEC</title>
-<meta name="description" content="Type an amount and a handle. Send ZEC from any wallet. Dollars land in their Venmo.">
+<meta name="description" content="Type their Venmo handle and send ZEC to one address. The coins sit in a Zcash escrow only you can refund until a payer sends the dollars and proves it.">
 <meta name="theme-color" content="#0d0e10">
 <meta name="robots" content="noindex">
 <link rel="stylesheet" href="app.css">
@@ -15,138 +15,229 @@
 <header class="nav">
   <div class="wrap">
     <a class="wordmark" href="../">zpay<span class="tick">_</span></a>
-    <span class="conn" id="conn" data-state="unknown"><span class="dot"></span><span id="conn-text">checking</span></span>
+    <nav class="nav-links">
+      <a href="../#how">How it works</a>
+      <a href="../#trust">Custody</a>
+      <a href="../#fees">Fees</a>
+      <a href="../takers/">Run a taker</a>
+    </nav>
+    <div class="spacer"></div>
+    <span class="net-tag" id="net-tag" hidden></span>
+    <div class="nav-status" id="conn" data-state="unknown"><span class="dot"></span><span id="conn-text">checking coordinator</span></div>
   </div>
 </header>
 
-<main class="wrap">
+<main>
+<section class="hero">
+  <div class="wrap">
 
-  <!-- ========== 1. AMOUNT AND HANDLE ========== -->
-  <section class="card" id="view-compose">
-    <h1 class="h1">Pay a Venmo handle with ZEC</h1>
+    <div class="hero-copy">
+      <span class="label blue">Zcash &rarr; escrow on Zcash &rarr; Venmo</span>
+      <h1>Send ZEC.<br>They get Venmo <span class="blue">dollars.</span></h1>
+      <p class="lede">
+        Type their Venmo handle and send ZEC to one address. Your coins sit in a
+        <b>Zcash escrow that only you can refund</b> until a payer sends the
+        dollars and proves it. They never touch crypto. Nothing leaves Zcash
+        until the proof is in.
+      </p>
 
-    <form id="form-pay" novalidate>
-      <div class="field">
-        <label for="amount">Amount</label>
-        <div class="amount-row">
-          <div class="amount-input">
-            <span class="sigil" id="amount-sigil">$</span>
-            <input id="amount" inputmode="decimal" placeholder="25" autocomplete="off" spellcheck="false" required>
-          </div>
-          <div class="unit-toggle" role="group" aria-label="Amount unit">
-            <button type="button" class="unit on" id="unit-usd" aria-pressed="true">USD</button>
-            <button type="button" class="unit" id="unit-zec" aria-pressed="false">ZEC</button>
-          </div>
-        </div>
+      <div class="facts">
+        <span>escrow on Zcash, not on Base</span>
+        <span><span data-fee>0.20%</span> fee</span>
+        <span>refund needs nobody</span>
+        <span>open source</span>
       </div>
 
-      <div class="field">
-        <label for="handle">Who gets paid</label>
-        <div class="handle-row">
-          <select id="rail" aria-label="Payment app"></select>
-          <div class="handle-input">
-            <span class="sigil">@</span>
-            <input id="handle" placeholder="jane-doe" autocomplete="off" spellcheck="false" required>
-          </div>
-        </div>
-        <p class="hint" id="rail-hint"></p>
+      <div class="flow" aria-label="How a payment settles">
+        <svg viewBox="0 0 660 214" role="img">
+          <!-- you -->
+          <rect class="box zec" x="8" y="60" width="132" height="58" rx="3"/>
+          <text x="74" y="84" text-anchor="middle" font-size="12" font-weight="700">you</text>
+          <text class="t-dim" x="74" y="102" text-anchor="middle" font-size="10">any Zcash wallet</text>
+
+          <!-- escrow -->
+          <rect class="box blue" x="210" y="48" width="170" height="82" rx="3"/>
+          <text class="t-blue" x="295" y="72" text-anchor="middle" font-size="12" font-weight="700">escrow on Zcash</text>
+          <text class="t-dim" x="295" y="90" text-anchor="middle" font-size="10">one t3 address</text>
+          <text class="t-dim" x="295" y="105" text-anchor="middle" font-size="10">your key + payer key, or</text>
+          <text class="t-dim" x="295" y="119" text-anchor="middle" font-size="10">your key alone after 24 h</text>
+
+          <!-- their venmo -->
+          <rect class="box blue" x="520" y="60" width="132" height="58" rx="3"/>
+          <text class="t-blue" x="586" y="84" text-anchor="middle" font-size="12" font-weight="700">their Venmo</text>
+          <text class="t-dim" x="586" y="102" text-anchor="middle" font-size="10">dollars arrive</text>
+
+          <!-- payer -->
+          <rect class="box" x="365" y="156" width="150" height="50" rx="3"/>
+          <text x="440" y="177" text-anchor="middle" font-size="12" font-weight="700">payer</text>
+          <text class="t-dim" x="440" y="193" text-anchor="middle" font-size="10">sends Venmo, proves it</text>
+
+          <!-- you -> escrow -->
+          <path class="line" d="M140 89 H210"/>
+          <path class="arrow" d="M204 85 L210 89 L204 93 Z"/>
+          <text class="t-dim" x="175" y="80" text-anchor="middle" font-size="10">ZEC</text>
+
+          <!-- payer -> venmo -->
+          <path class="line blue" d="M515 181 H586 V118"/>
+          <path class="arrow blue" d="M582 124 L586 118 L590 124 Z"/>
+          <text class="t-blue" x="600" y="150" font-size="10">$</text>
+
+          <!-- payer -> escrow: proof releases -->
+          <path class="line blue" d="M420 156 V130"/>
+          <path class="arrow blue" d="M416 136 L420 130 L424 136 Z"/>
+          <text class="t-dim" x="425" y="146" font-size="10">proof of payment</text>
+
+          <!-- escrow -> payer: release -->
+          <path class="line" d="M380 100 H440 V156"/>
+          <path class="arrow" d="M436 150 L440 156 L444 150 Z"/>
+          <text class="t-dim" x="392" y="94" font-size="10">release</text>
+
+          <!-- refund, dashed, escrow -> you -->
+          <path class="line dashed" d="M295 130 V176 H74 V118"/>
+          <path class="arrow" d="M70 124 L74 118 L78 124 Z"/>
+          <text class="t-dim" x="184" y="192" text-anchor="middle" font-size="10">nobody paid? refund after 24 h, your key alone</text>
+        </svg>
       </div>
 
-      <div class="quote" id="quote" hidden aria-live="polite">
-        <div class="quote-head">
-          <span class="quote-label">Lands in their Venmo</span>
-          <span class="quote-net" id="q-net">&mdash;</span>
-        </div>
-        <ul class="quote-lines" id="q-lines"></ul>
-        <div class="quote-foot">
-          <span id="q-route"></span>
-          <span id="q-expiry" class="countdown"></span>
-        </div>
-      </div>
-
-      <div id="compose-msg"></div>
-
-      <button type="submit" class="btn primary" id="btn-pay">Continue</button>
-    </form>
-
-    <p class="fineprint">
-      No account, no wallet connection. <a href="advanced/">Advanced route</a> if you want to
-      name your own addresses and spread.
-    </p>
-  </section>
-
-  <!-- ========== 2. SEND THE ZEC ========== -->
-  <section class="card" id="view-pay" hidden>
-    <h2 class="h2">Send <span id="pay-amount"></span> from your Zcash wallet</h2>
-
-    <div class="qr-block">
-      <a class="qr-link" id="pay-uri" href="#">
-        <canvas id="qr" width="220" height="220" aria-label="Payment QR code"></canvas>
-      </a>
-      <p class="qr-note">Scan it, or <a href="#" id="pay-open">open in your wallet</a>. The amount is already filled in.</p>
+      <p class="how-note">
+        A payer sees the locked ZEC, sends the Venmo, and proves it through the
+        same enclave zk-p2p uses. That proof is the only thing that can release
+        the escrow. If nobody pays within a day, your own key alone takes the
+        coins back.
+      </p>
     </div>
 
-    <details class="disclose">
-      <summary>Wallet can't open the link?</summary>
-      <div class="disclose-body">
-        <p class="hint">Send exactly <strong id="pay-amount-2"></strong> to this address:</p>
-        <div class="addr" id="pay-addr"></div>
-        <button type="button" class="btn ghost small" id="btn-copy-addr">Copy address</button>
-      </div>
-    </details>
+    <div class="card app-card" id="card">
 
-    <p class="next-note" id="pay-next"></p>
-  </section>
-
-  <!-- ========== 3. STATUS ========== -->
-  <section class="card" id="view-status" hidden>
-    <div class="keep-link" id="keep-link">
-      <strong>Keep this link.</strong> It is your receipt, and it is how you get your ZEC back if
-      anything goes wrong. Nobody else can open it.
-      <button type="button" class="btn ghost small" id="btn-copy-link">Copy link</button>
-    </div>
-
-    <h2 class="h2" id="status-headline">Waiting for your ZEC</h2>
-    <p class="status-sub" id="status-sub"></p>
-
-    <ol class="ladder" id="ladder"></ol>
-
-    <!-- the failure screen: one field, one answer, always ZEC -->
-    <div class="returns" id="returns" hidden>
-      <h3 class="h3" id="returns-title"></h3>
-      <p class="returns-body" id="returns-body"></p>
-
-      <form id="form-return" hidden>
-        <div class="field">
-          <label for="return-addr">Your Zcash address</label>
-          <input id="return-addr" placeholder="u1… or t1…" autocomplete="off" spellcheck="false">
-          <p class="hint">Any Zcash address, shielded included. This is where your ZEC goes.</p>
+      <!-- ========== 1. AMOUNT AND HANDLE ========== -->
+      <section class="view" id="view-compose">
+        <div class="head">
+          <span class="label">pay</span>
+          <span class="label mute" id="rate-head">&nbsp;</span>
         </div>
-        <div id="return-msg"></div>
-        <button type="submit" class="btn primary" id="btn-return">Send my ZEC there</button>
-      </form>
+
+        <form id="form-pay" novalidate>
+          <div class="field">
+            <label class="label" for="amount">you send</label>
+            <div class="input">
+              <input id="amount" inputmode="decimal" placeholder="0.5" autocomplete="off" spellcheck="false" required>
+              <div class="unit-toggle" role="group" aria-label="Amount unit">
+                <button type="button" class="unit on" id="unit-zec" aria-pressed="true">ZEC</button>
+                <button type="button" class="unit" id="unit-usd" aria-pressed="false">USD</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="field">
+            <label class="label" for="handle">their venmo</label>
+            <div class="input handle">
+              <span class="vmark">v</span>
+              <span class="at">@</span>
+              <input id="handle" placeholder="jane-doe" autocomplete="off" spellcheck="false" autocapitalize="off" required>
+            </div>
+            <p class="hint" id="rail-hint"></p>
+          </div>
+
+          <div class="quote-out" id="q-out" hidden aria-live="polite">
+            <div class="stat wide">
+              <span class="k label">lands in their venmo</span>
+              <span class="v big" id="q-net">&mdash;</span>
+            </div>
+            <ul class="quote-lines" id="q-lines"></ul>
+            <div class="quote-foot">
+              <span id="q-route"></span>
+              <span id="q-expiry" class="countdown"></span>
+            </div>
+          </div>
+          <div class="quote-note" id="q-note">type an amount to see what lands in their Venmo</div>
+
+          <button type="submit" class="btn primary" id="btn-pay">Get the address</button>
+          <p class="quote-fine">
+            No account, no wallet connection. Send from any Zcash wallet.
+            <a href="advanced/">Advanced route</a>
+          </p>
+        </form>
+      </section>
+
+      <!-- ========== 2. THE ADDRESS, THEN THE STATUS ========== -->
+      <section class="view" id="view-order" hidden>
+        <div class="head">
+          <span class="label" id="order-head">send</span>
+          <span class="label mute live" id="order-live"><span class="dot"></span><span id="order-live-text">waiting for your ZEC</span></span>
+        </div>
+
+        <div id="pay-block">
+          <h2 class="h2">Send <span class="mono" id="pay-amount"></span> to this address</h2>
+          <div class="qr-row">
+            <a class="qr-link" id="pay-uri" href="#" aria-label="Open in your wallet">
+              <canvas id="qr" width="176" height="176" aria-label="Payment QR code"></canvas>
+            </a>
+            <div class="qr-side">
+              <div class="addr" id="pay-addr"></div>
+              <div class="btns">
+                <button type="button" class="btn small" id="btn-copy-addr">Copy address</button>
+                <a class="btn small" id="pay-open" href="#">Open in wallet</a>
+              </div>
+              <p class="hint">Exactly this amount, in one transaction. <span id="pay-to"></span></p>
+            </div>
+          </div>
+        </div>
+
+        <div id="stage-block" hidden>
+          <h2 class="h2" id="stage-headline"></h2>
+          <p class="stage-sub" id="stage-sub"></p>
+        </div>
+
+        <ol class="ladder" id="ladder"></ol>
+
+        <div class="keep-link" id="keep-link">
+          <span class="label blue">keep this link</span>
+          <p>It holds the key that gets your ZEC back. Nobody else can open it, and there is no other copy.
+             <span id="keep-open">Leave the page open until it says <b>locked</b>; if you close it, open the link again.</span></p>
+          <div class="btns"><button type="button" class="btn small" id="btn-copy-link">Copy link</button></div>
+        </div>
+
+        <div class="returns" id="returns" hidden>
+          <h3 class="h3" id="returns-title"></h3>
+          <p class="returns-body" id="returns-body"></p>
+          <form id="form-return" hidden>
+            <div class="field">
+              <label class="label" for="return-addr">your zcash address</label>
+              <div class="input">
+                <input id="return-addr" placeholder="t1…" autocomplete="off" spellcheck="false">
+              </div>
+              <p class="hint">A transparent address for now. Shield it afterwards from your wallet.</p>
+            </div>
+            <button type="submit" class="btn primary" id="btn-return">Take my ZEC back</button>
+          </form>
+          <div id="return-out" hidden>
+            <p class="hint">Signed here, by your key alone. If zpay is unreachable, any Zcash node will broadcast these bytes.</p>
+            <div class="addr small" id="return-raw"></div>
+          </div>
+        </div>
+
+        <div id="order-msg"></div>
+
+        <details class="disclose" id="details">
+          <summary>Details</summary>
+          <div class="disclose-body"><dl class="kv" id="detail-kv"></dl></div>
+        </details>
+      </section>
+
     </div>
-
-    <details class="disclose" id="details">
-      <summary>Details</summary>
-      <div class="disclose-body">
-        <dl class="kv" id="detail-kv"></dl>
-        <p class="hint"><a href="advanced/" id="advanced-link">Open this in the advanced route</a></p>
-      </div>
-    </details>
-  </section>
-
+  </div>
+</section>
 </main>
 
 <footer class="foot">
   <div class="wrap">
-    <a href="../">About zpay</a> &middot;
-    <a href="advanced/">Advanced</a> &middot;
-    <span>Your keys stay in this page. Nothing is sent to a server but the order.</span>
+    <span>Your key is made in this page and never sent anywhere. Only the order leaves it.</span>
+    <span class="links"><a href="../">About zpay</a> &middot; <a href="advanced/">Advanced</a> &middot; <a href="../takers/">Run a taker</a></span>
   </div>
 </footer>
 
 <script src="qr.js"></script>
+<script src="escrow.js"></script>
 <script src="app.js"></script>
 </body>
 </html>
