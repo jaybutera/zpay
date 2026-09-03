@@ -109,6 +109,15 @@ pub struct AppState {
     pub zkp2p: Zkp2pClient,
     /// In-memory cache of active sessions
     sessions: RwLock<std::collections::HashMap<uuid::Uuid, OfframpSession>>,
+    /// The quote ids `/v2/quote` has issued and which have been spent, so a
+    /// price is a thing the coordinator handed out rather than a string the
+    /// caller made up, and one signature opens one order (U1-2).
+    pub quotes: crate::quotes::QuoteRegistry,
+    /// Per-source limits on the two endpoints a browser can reach. Each open
+    /// costs a 1Click round trip with a 5,000 ms relay wait, and nothing
+    /// bounded how many a caller could ask for (U1-2).
+    pub open_limiter: crate::ratelimit::RateLimiter,
+    pub quote_limiter: crate::ratelimit::RateLimiter,
 }
 
 /// A 1Click swap that already exists: an address the sender has been shown, and
@@ -140,6 +149,14 @@ impl AppState {
             near,
             zkp2p,
             sessions: RwLock::new(std::collections::HashMap::new()),
+            quotes: crate::quotes::QuoteRegistry::new(),
+            // An order takes a real 1Click quote and a curator round trip, so
+            // it is the more expensive of the two: a handful at once, then one
+            // every ten seconds. A person opening one order is far inside this.
+            open_limiter: crate::ratelimit::RateLimiter::new(5, 0.1),
+            // Quotes are dry and cheap, and the page asks for one per keystroke
+            // pause, so the allowance is much larger.
+            quote_limiter: crate::ratelimit::RateLimiter::new(30, 1.0),
         }
     }
 
@@ -542,20 +559,25 @@ impl AppState {
     }
 
     async fn keeper_tick(self: &Arc<Self>) -> Result<()> {
-        // Main-route orders first. An unfunded order has no session and no gas
-        // spent against it; this pass is what turns a funded one into a session,
-        // sending createSession and creditSession in the same tick.
-        if let Err(e) = self.tick_orders().await {
-            tracing::warn!("order tick error: {e}");
-        }
-
-        // Load active sessions
+        // Live sessions first. They hold real money: USDC owed on the glue, a
+        // deposit in zk-p2p escrow, an intent waiting to be fulfilled. Orders
+        // were swept first, so with 34 open orders every session's credit and
+        // fulfilment check waited 4.8 seconds behind a queue that grows without
+        // bound. Whatever the order sweep costs, it now costs it after the
+        // money has been looked at (U1-2).
         let sessions = self.db.get_active_sessions().await?;
 
         for session in sessions {
             if let Err(e) = self.process_session(&session).await {
                 tracing::warn!("Error processing session {}: {}", session.id, e);
             }
+        }
+
+        // Then main-route orders. An unfunded order has no session and no gas
+        // spent against it; this pass is what turns a funded one into a session,
+        // sending createSession and creditSession in the same tick.
+        if let Err(e) = self.tick_orders().await {
+            tracing::warn!("order tick error: {e}");
         }
 
         // Update last processed block

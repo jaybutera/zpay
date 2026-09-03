@@ -29,6 +29,14 @@ use crate::{db::OrderRecord, state::{AppState, FundedSwap}};
 /// confirmation takes and still bounds the polling set.
 const EXPIRY_GRACE: chrono::Duration = chrono::Duration::hours(1);
 
+/// How long one tick may spend polling orders before it gives up and lets the
+/// next tick continue.
+///
+/// The default poll interval is 15 seconds and live sessions are swept first,
+/// so five seconds leaves the loop responsive even if the open set is large or
+/// 1Click is slow.
+const ORDER_SWEEP_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Map an offramp session's status onto the canonical stage the sender reads.
 ///
 /// The five rungs are the same words on both backends, which is what lets one
@@ -49,13 +57,32 @@ pub fn stage_for(status: zecp2p_types::OfframpStatus) -> Stage {
 }
 
 impl AppState {
-    /// One pass over every order the keeper still has work to do on.
+    /// One pass over the orders the keeper still has work to do on.
+    ///
+    /// Bounded by a wall-clock budget. Expiry keeps the open set small, but the
+    /// set is fed by an endpoint anyone can call, so the sweep must not be able
+    /// to consume a whole tick however many rows it finds. Orders left over are
+    /// picked up next tick: `get_open_orders` returns oldest-first, and an
+    /// order that misses a pass loses nothing but a poll.
     pub async fn tick_orders(self: &Arc<Self>) -> Result<()> {
         let orders = self.db.get_open_orders().await?;
+        let total = orders.len();
+        let started = std::time::Instant::now();
+        let mut swept = 0usize;
+
         for order in orders {
+            if started.elapsed() > ORDER_SWEEP_BUDGET {
+                tracing::warn!(
+                    swept,
+                    total,
+                    "order sweep hit its time budget; the rest wait for the next tick"
+                );
+                break;
+            }
             if let Err(e) = self.advance_order(&order).await {
                 tracing::warn!(order_id = %order.id, "error advancing order: {e}");
             }
+            swept += 1;
         }
         Ok(())
     }

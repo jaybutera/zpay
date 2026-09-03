@@ -93,7 +93,17 @@ pub struct NearIntentsClient {
 impl NearIntentsClient {
     pub fn new(config: &NearConfig) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            // A3-3, still open at the time of the round 1 audit and made worse
+            // by the order sweep: none of these calls had a timeout, so one
+            // hung status request stalled the entire keeper loop, and with it
+            // every live session's credit and fulfilment check. The budget is
+            // generous because a real quote asks 1Click to wait 5,000 ms for
+            // the relay.
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .build()
+                .expect("the HTTP client's own configuration is valid"),
             base_url: config.api_url.clone(),
             default_timeout: config.default_timeout,
         }

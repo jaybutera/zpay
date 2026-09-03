@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{ConnectInfo, Extension, Path, Query, State},
     http::HeaderMap,
     Json,
 };
@@ -29,6 +29,26 @@ use crate::{
     error::AppError,
     state::AppState,
 };
+
+/// Take a token for this caller, or refuse before anything upstream is called.
+async fn limit(
+    state: &Arc<AppState>,
+    limiter: &crate::ratelimit::RateLimiter,
+    headers: &HeaderMap,
+    peer: Option<Extension<ConnectInfo<std::net::SocketAddr>>>,
+) -> Result<(), AppError> {
+    let source = crate::ratelimit::source_of(
+        headers,
+        peer.map(|Extension(ConnectInfo(addr))| addr),
+        state.config.server.behind_trusted_proxy,
+    );
+    limiter
+        .check(source)
+        .await
+        .map_err(|e| AppError::TooManyRequests {
+            retry_after_seconds: e.retry_after_seconds,
+        })
+}
 
 /// What the front end needs to render the form before anything is typed.
 pub async fn capabilities(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
@@ -79,8 +99,12 @@ fn default_rail() -> String {
 #[instrument(skip(state), fields(amount = %query.amount, unit = %query.unit))]
 pub async fn quote_v2(
     State(state): State<Arc<AppState>>,
+    peer: Option<Extension<ConnectInfo<std::net::SocketAddr>>>,
+    headers: HeaderMap,
     Query(query): Query<QuoteV2Query>,
 ) -> Result<Json<Quote>, AppError> {
+    limit(&state, &state.quote_limiter, &headers, peer).await?;
+
     let rail: Rail = query
         .rail
         .parse()
@@ -108,6 +132,14 @@ pub async fn quote_v2(
 
     let min_rate = crate::api::parse_min_rate_pub(query.min_rate.as_deref())?;
     let quote = build_live_quote(&state, backend, zatoshi, min_rate).await?;
+
+    // The id is now a thing the coordinator issued, not a string the caller can
+    // invent, and opening against it spends it. Because the signature's scope
+    // contains the id, that is also what makes the signature single-use (U1-2).
+    state
+        .quotes
+        .issue(&quote.quote_id, quote.zec_zatoshi, quote.expires_at)
+        .await;
 
     Ok(Json(quote))
 }
@@ -297,9 +329,12 @@ fn parse_usd_cents(raw: &str) -> Result<u64, AppError> {
 #[instrument(skip(state, headers, body), fields(rail = %body.destination.rail.as_str()))]
 pub async fn open_order(
     State(state): State<Arc<AppState>>,
+    peer: Option<Extension<ConnectInfo<std::net::SocketAddr>>>,
     headers: HeaderMap,
     Json(body): Json<OpenRequest>,
 ) -> Result<Json<Opened>, AppError> {
+    limit(&state, &state.open_limiter, &headers, peer).await?;
+
     let destination = zecp2p_types::settlement::PayoutDestination::new(
         body.destination.rail,
         body.destination.handle.clone(),
@@ -336,11 +371,23 @@ pub async fn open_order(
 
     let min_rate = crate::api::parse_min_rate_pub(body.overrides.min_rate.as_deref())?;
 
-    // Bounds first, so an amount 1Click would refuse costs no round trip and
-    // comes back as its own number rather than as an upstream category. The
-    // open path skipped this entirely, so an open at 1 zatoshi went all the way
-    // to 1Click and returned a 502 (U1-3).
-    let zatoshi = quote_zatoshi(&body)?;
+    // Spend the quote. This is the single-use gate: an id the coordinator never
+    // issued, one that has expired, and one already opened against are all
+    // refused here, before any 1Click round trip. The audit opened 31 orders
+    // from one signature and one from an invented id; both stop here (U1-2).
+    //
+    // It runs after `require_owner` so an unauthenticated caller cannot burn
+    // somebody else's price by guessing at ids.
+    let zatoshi = state
+        .quotes
+        .spend(body.quote_id.trim())
+        .await
+        .map_err(|e| AppError::InvalidRequest(e.message().to_string()))?;
+
+    // Bounds, so an amount 1Click would refuse costs no round trip and comes
+    // back as its own number rather than as an upstream category. The open path
+    // skipped this entirely, so an open at 1 zatoshi went all the way to 1Click
+    // and returned a 502 (U1-3).
     oneclick::check_amount(Amount::Zec { zatoshi })?;
 
     // Re-quote at open time rather than trusting a quote_id the caller sends
@@ -438,20 +485,6 @@ pub async fn open_order(
         // Backend A needs nothing from the sender after the ZEC is sent.
         client_steps: Vec::new(),
     }))
-}
-
-/// The ZEC an open request is for, taken from its own quote.
-fn quote_zatoshi(body: &OpenRequest) -> Result<u64, AppError> {
-    // The quote id carries no amount, so the caller sends the amount it was
-    // quoted for alongside it. `quote_id` stays as the correlation handle.
-    body.quote_id
-        .split_once('@')
-        .and_then(|(_, z)| z.parse().ok())
-        .ok_or_else(|| {
-            AppError::InvalidRequest(
-                "quote_id must be the value /v2/quote returned".to_string(),
-            )
-        })
 }
 
 /// A hash over the terms the order was opened on, so a sender can check the

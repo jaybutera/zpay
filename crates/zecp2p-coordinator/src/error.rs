@@ -49,6 +49,10 @@ pub enum AppError {
 
     #[error("Internal error: {0}")]
     Internal(String),
+
+    /// The caller is asking faster than this endpoint serves.
+    #[error("too many requests; try again in {retry_after_seconds}s")]
+    TooManyRequests { retry_after_seconds: u64 },
 }
 
 impl IntoResponse for AppError {
@@ -70,6 +74,7 @@ impl IntoResponse for AppError {
             AppError::Zkp2p(_) => (StatusCode::BAD_GATEWAY, "zk-p2p curator error".to_string()),
             AppError::Config(_) => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
             AppError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Internal error".to_string()),
+            AppError::TooManyRequests { .. } => (StatusCode::TOO_MANY_REQUESTS, self.to_string()),
         };
 
         // Log errors with appropriate level
@@ -78,6 +83,7 @@ impl IntoResponse for AppError {
             | AppError::InvalidState(_)
             | AppError::InvalidRequest(_)
             | AppError::BelowFloor { .. }
+            | AppError::TooManyRequests { .. }
             | AppError::Unauthorized(_) => {
                 warn!(error = %self, status = %status, "Client error")
             }
@@ -94,6 +100,21 @@ impl IntoResponse for AppError {
         // the code.
         if let AppError::BelowFloor { zatoshi } = &self {
             body["min_zatoshi"] = serde_json::json!(zatoshi);
+        }
+
+        if let AppError::TooManyRequests {
+            retry_after_seconds,
+        } = &self
+        {
+            return (
+                status,
+                [(
+                    axum::http::header::RETRY_AFTER,
+                    retry_after_seconds.to_string(),
+                )],
+                axum::Json(body),
+            )
+                .into_response();
         }
 
         (status, axum::Json(body)).into_response()

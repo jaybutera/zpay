@@ -16,6 +16,8 @@ mod db;
 mod error;
 mod near;
 mod orders;
+mod quotes;
+mod ratelimit;
 mod state;
 mod zkp2p;
 
@@ -131,9 +133,14 @@ async fn main() -> Result<()> {
     tracing::info!("Listening on {}", addr);
 
     let listener = TcpListener::bind(&addr).await?;
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(shutdown_tx))
-        .await?;
+    // `into_make_service_with_connect_info` is what puts the peer address in
+    // front of the rate limiter. Without it every caller shares one bucket.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal(shutdown_tx))
+    .await?;
 
     // Wait for keeper loop to finish
     tracing::info!("Waiting for keeper loop to finish...");

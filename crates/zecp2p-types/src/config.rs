@@ -298,6 +298,15 @@ pub struct ServerConfig {
     /// the CLI and the taker send no Origin header and are unaffected.
     #[serde(default)]
     pub allowed_origins: Vec<String>,
+    /// Whether to read the client's address out of `X-Forwarded-For`.
+    ///
+    /// Off by default, and it must stay off unless a proxy this operator
+    /// controls sets that header, because the header is client-supplied
+    /// otherwise: turning it on in front of a direct bind would let any caller
+    /// pick their own rate-limit bucket and defeat the limit entirely. On a
+    /// direct bind the peer address is the truth and this stays false.
+    #[serde(default)]
+    pub behind_trusted_proxy: bool,
 }
 
 fn default_deposit_listing_max_age() -> i64 {
@@ -312,6 +321,7 @@ impl Default for ServerConfig {
             taker_token: None,
             deposit_listing_max_age_seconds: default_deposit_listing_max_age(),
             allowed_origins: Vec::new(),
+            behind_trusted_proxy: false,
         }
     }
 }
@@ -361,6 +371,7 @@ impl Default for Config {
                 taker_token: None,
                 deposit_listing_max_age_seconds: default_deposit_listing_max_age(),
                 allowed_origins: Vec::new(),
+                behind_trusted_proxy: false,
             },
             database: DatabaseConfig {
                 path: "zecp2p.db".to_string(),

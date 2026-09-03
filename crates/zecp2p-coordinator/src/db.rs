@@ -523,10 +523,16 @@ impl Database {
         row.map(OrderRecord::try_from).transpose()
     }
 
-    /// Orders the keeper still has work to do on.
+    /// Orders the keeper still has work to do on, oldest first.
+    ///
+    /// The ordering is what makes the sweep's time budget fair: an order that
+    /// misses a pass is at the front of the next one, so a large open set slows
+    /// every order down rather than starving the oldest indefinitely.
     pub async fn get_open_orders(&self) -> Result<Vec<OrderRecord>> {
         let rows: Vec<OrderRow> = sqlx::query_as(
-            r#"SELECT * FROM orders WHERE stage NOT IN ('"done"', '"returned"', '"failed"')"#,
+            r#"SELECT * FROM orders
+               WHERE stage NOT IN ('"done"', '"returned"', '"failed"')
+               ORDER BY created_at ASC"#,
         )
         .fetch_all(&self.pool)
         .await?;
