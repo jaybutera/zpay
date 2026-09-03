@@ -688,6 +688,20 @@ async function checkHealth() {
   checkHealth();
   setInterval(checkHealth, 30000);
 
+  // The launch page's quote widget hands the amount over in the query string,
+  // so somebody who priced an order on the front door does not retype it.
+  // Values are assigned to inputs, never rendered as markup.
+  const params = new URLSearchParams(location.search);
+  const deepZec = params.get('zec');
+  const deepUsd = params.get('usd');
+  const deepHandle = params.get('handle') || params.get('venmo');
+  if (deepZec || deepUsd) {
+    if (deepZec) $('unit-zec').click();
+    $('amount').value = (deepZec || deepUsd).trim();
+  }
+  if (deepHandle) $('handle').value = deepHandle.trim().replace(/^@/, '');
+  if (deepZec || deepUsd) doQuote();
+
   // Returning to a status link: the key comes back out of the fragment.
   const resumed = readFragment();
   if (resumed) {
