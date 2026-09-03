@@ -882,6 +882,58 @@ fn the_digest_and_the_broadcast_bytes_come_from_the_same_split() {
     );
 }
 
+/// Round-2 review finding 1: what `paid_path verify` must compute.
+///
+/// The bug it fixes was arithmetic, not cryptography: verify subtracted only
+/// the miner fee from the escrow and compared that to the first output, so
+/// every fee-bearing release failed a check that was itself wrong. The testnet
+/// live-fire would have ended there.
+///
+/// The example binary holds the real check; this pins the arithmetic it has to
+/// use, against a transaction actually serialized by the escrow, so a future
+/// edit that reintroduces the subtraction has somewhere to fail.
+#[test]
+fn a_verify_must_subtract_both_fees_and_look_at_the_treasury_output() {
+    let secp = Secp256k1::new();
+    let terms = escrow_terms(&secp);
+    let quote = honest_quote(&secp);
+    let miner = release_fee_zat(terms.redeem_script().unwrap().len(), 2);
+    let split = quote.release_split(&lp_script(), miner);
+
+    let raw = zecp2p_escrow::tx::serialize_release_split(&terms, &split, &[0x51]).unwrap();
+    let outs = transparent_outputs(&raw);
+
+    // What the old arithmetic expected, and what the transaction actually pays.
+    let miner_only = AMOUNT - miner;
+    let both_fees = AMOUNT - miner - split.platform_fee_zat;
+    assert_ne!(
+        miner_only, both_fees,
+        "if these were equal the bug would be invisible and this test worthless"
+    );
+    assert_eq!(
+        outs[0].0, both_fees,
+        "the LP's leg is the escrow less the miner fee AND the platform fee"
+    );
+
+    // The treasury leg, which the old verify never looked at. It is the one
+    // output no other party checks: the LP watches its own, and the user has
+    // either been paid or refunded.
+    assert_eq!(outs.len(), 2);
+    assert_eq!(outs[1].1, split.treasury_script);
+    assert_eq!(outs[1].0, split.platform_fee_zat);
+
+    // And the fee-free shape, which must verify against a single output rather
+    // than be reported as missing a treasury leg it never had.
+    let no_fee = zecp2p_escrow::tx::serialize_release(
+        &terms,
+        &lp_script(),
+        release_fee_zat(terms.redeem_script().unwrap().len(), 1),
+        &[0x51],
+    )
+    .unwrap();
+    assert_eq!(transparent_outputs(&no_fee).len(), 1);
+}
+
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------

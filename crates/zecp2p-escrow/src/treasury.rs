@@ -110,12 +110,16 @@ pub const PLATFORM_FEE_BPS: u64 = 20;
 ///
 /// This is a constant rather than a node query because both parties must
 /// compute the same number offline, before either has talked to a node - the
-/// counterparty's copy of the release has to match byte for byte. The
-/// arithmetic is pinned by the tests below; that the *node* agrees is pinned by
-/// `tests/dust_boundary_regtest.rs`, which puts a 53 zat and a 54 zat output in
-/// front of a running node and records which one it relays. That test is
-/// ignored by default and needs `ZECP2P_RPC_URL`, like the rest of the live
-/// suite.
+/// counterparty's copy of the release has to match byte for byte.
+///
+/// `tests/dust_boundary.rs` derives it from the node's formula rather than
+/// restating it, and holds `platform_fee_zat` and `ReleaseSplit::outputs` to
+/// the same line. What no unit test can show is that a *running* node agrees:
+/// Zebra rejects a missing transparent input before it reaches its standardness
+/// rules, so a probe against a fictional outpoint answers "missing input"
+/// whatever the output is worth, and a real one would mean funding an escrow.
+/// The live-fire run in the ship order is what covers that, on a funded escrow
+/// where the node's answer means something.
 pub const DUST_THRESHOLD_ZAT: u64 = 54;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]

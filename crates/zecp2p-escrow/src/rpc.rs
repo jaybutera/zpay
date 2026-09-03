@@ -644,18 +644,25 @@ impl RpcChainClient {
             .ok_or_else(|| ChainError::Unreachable("the transaction has no inputs".into()))?;
         let script_sig = hex::decode(&vin.script_sig.hex)
             .map_err(|e| ChainError::Unreachable(format!("bad scriptSig hex: {e}")))?;
-        let vout0 = tx
-            .vout
-            .first()
-            .ok_or_else(|| ChainError::Unreachable("the transaction has no outputs".into()))?;
+        if tx.vout.is_empty() {
+            return Err(ChainError::Unreachable(
+                "the transaction has no outputs".into(),
+            ));
+        }
+        let mut outputs = Vec::with_capacity(tx.vout.len());
+        for o in &tx.vout {
+            outputs.push(ReleaseOutput {
+                script_pubkey: hex::decode(&o.script_pubkey.hex)
+                    .map_err(|e| ChainError::Unreachable(format!("bad scriptPubKey hex: {e}")))?,
+                value_zat: zec_to_zat(o.value)?,
+            });
+        }
 
         Ok(ReleaseDetails {
             script_sig,
             spends_txid: vin.txid.clone(),
             spends_vout: vin.vout,
-            pays_script_pubkey: hex::decode(&vout0.script_pubkey.hex)
-                .map_err(|e| ChainError::Unreachable(format!("bad scriptPubKey hex: {e}")))?,
-            pays_zat: zec_to_zat(vout0.value)?,
+            outputs,
         })
     }
 }
@@ -667,9 +674,32 @@ pub struct ReleaseDetails {
     /// The outpoint the first input spends, as the node prints it.
     pub spends_txid: Option<String>,
     pub spends_vout: Option<u32>,
-    /// The first output's script and amount.
-    pub pays_script_pubkey: Vec<u8>,
-    pub pays_zat: u64,
+    /// Every output, in the order the transaction carries them.
+    ///
+    /// All of them, not just the first. A fee-bearing release pays the LP and
+    /// then the treasury, and a verify that read only `vout[0]` would report a
+    /// release as sound without ever looking at where the platform cut went -
+    /// which is the one output nobody else is watching.
+    pub outputs: Vec<ReleaseOutput>,
+}
+
+/// One output of a mined release.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseOutput {
+    pub script_pubkey: Vec<u8>,
+    pub value_zat: u64,
+}
+
+impl ReleaseDetails {
+    /// The first output's script, which is the counterparty leg.
+    pub fn pays_script_pubkey(&self) -> &[u8] {
+        self.outputs.first().map(|o| o.script_pubkey.as_slice()).unwrap_or(&[])
+    }
+
+    /// The first output's value.
+    pub fn pays_zat(&self) -> u64 {
+        self.outputs.first().map(|o| o.value_zat).unwrap_or(0)
+    }
 }
 
 impl ChainClient for RpcChainClient {

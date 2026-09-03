@@ -142,6 +142,22 @@ impl RunRecord {
     }
 }
 
+/// Whether the operator asked for a release with no platform fee.
+///
+/// Reads the value rather than testing presence: `ZECP2P_NO_PLATFORM_FEE=0`
+/// must not turn the fee off. Anything falsy - `0`, `false`, `no`, empty -
+/// leaves the fee on, and anything else turns it off, so a typo errs toward
+/// charging rather than toward silently not charging.
+fn no_platform_fee_requested() -> bool {
+    match std::env::var("ZECP2P_NO_PLATFORM_FEE") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "no" | "off"
+        ),
+        Err(_) => false,
+    }
+}
+
 /// The escrow crate's own network enum, from the RPC one this example uses.
 ///
 /// Two enums for one concept is a wart, but the conversion is here rather than
@@ -486,7 +502,11 @@ fn setup(args: &[String], allow_create: bool) -> Setup {
         // pinned treasury can still be run. It has to be deliberate: a build
         // that silently stopped charging would look like revenue going to zero
         // rather than like an error.
-        None if std::env::var("ZECP2P_NO_PLATFORM_FEE").is_ok() => {
+        //
+        // The *value* decides, not the presence of the variable. Testing
+        // presence would make `ZECP2P_NO_PLATFORM_FEE=0` turn the fee off,
+        // which reads as the opposite of what it does.
+        None if no_platform_fee_requested() => {
             eprintln!("ZECP2P_NO_PLATFORM_FEE is set: building a two-output release.");
             (0, Vec::new())
         }
@@ -1106,21 +1126,89 @@ fn cmd_verify(args: &[String]) {
 
     let want_script = hex::decode(&record.lp_script).unwrap_or_default();
     if !want_script.is_empty() {
-        if details.pays_script_pubkey != want_script {
+        if details.pays_script_pubkey() != want_script {
             eprintln!("this transaction does not pay the agreed LP script.");
-            eprintln!("  pays       {}", hex::encode(&details.pays_script_pubkey));
+            eprintln!("  pays       {}", hex::encode(details.pays_script_pubkey()));
             eprintln!("  agreed     {}", hex::encode(&want_script));
             std::process::exit(2);
         }
         checked.push("pays the agreed LP script");
     }
 
-    let want_zat = record.amount_zat.saturating_sub(record.fee_zat);
-    if details.pays_zat != want_zat {
-        eprintln!("this transaction pays {} zat, the terms say {want_zat}.", details.pays_zat);
+    // The LP's leg is the escrow less the miner fee *and* the platform fee.
+    // Round-2 review finding 1: this subtracted only the miner fee, so every
+    // fee-bearing release failed here - the testnet live-fire would have ended
+    // at a verify that could not pass.
+    //
+    // The record is the authority, not today's constants, for the same reason
+    // the resume reads it: a treasury rotation between the release and the
+    // verify must not change the verdict on a transaction already mined.
+    let want_zat = record
+        .amount_zat
+        .saturating_sub(record.fee_zat)
+        .saturating_sub(record.platform_fee_zat);
+    if details.pays_zat() != want_zat {
+        eprintln!(
+            "this transaction pays the LP {} zat, the terms say {want_zat}.",
+            details.pays_zat()
+        );
+        eprintln!("  escrow       {} zat", record.amount_zat);
+        eprintln!("  miner fee    {} zat", record.fee_zat);
+        eprintln!("  platform fee {} zat", record.platform_fee_zat);
         std::process::exit(2);
     }
-    checked.push("pays the agreed amount");
+    checked.push("pays the LP the agreed amount");
+
+    // The treasury output. Nobody else is watching this one: the LP checks its
+    // own leg and the user has already refunded or not, so if the platform cut
+    // silently went somewhere else, this is the only place it would show.
+    if record.platform_fee_zat > 0 {
+        let want_treasury = hex::decode(&record.treasury_script).unwrap_or_default();
+        if want_treasury.is_empty() {
+            eprintln!(
+                "the record carries a {} zat platform fee but no treasury script, so there \
+                 is nothing to check the second output against.",
+                record.platform_fee_zat
+            );
+            eprintln!("  The record was written by a build that did not pair the two fields.");
+            std::process::exit(2);
+        }
+        let Some(treasury_out) = details.outputs.get(1) else {
+            eprintln!(
+                "the record carries a {} zat platform fee, but this transaction has only {} \
+                 output(s).",
+                record.platform_fee_zat,
+                details.outputs.len()
+            );
+            eprintln!("  A release that dropped the treasury output is not the release the");
+            eprintln!("  user pre-signed, whatever else about it checks out.");
+            std::process::exit(2);
+        };
+        if treasury_out.script_pubkey != want_treasury {
+            eprintln!("the platform fee went somewhere other than the treasury.");
+            eprintln!("  pays       {}", hex::encode(&treasury_out.script_pubkey));
+            eprintln!("  treasury   {}", hex::encode(&want_treasury));
+            std::process::exit(2);
+        }
+        if treasury_out.value_zat != record.platform_fee_zat {
+            eprintln!(
+                "the treasury output is {} zat, the terms say {}.",
+                treasury_out.value_zat, record.platform_fee_zat
+            );
+            std::process::exit(2);
+        }
+        checked.push("pays the treasury the agreed platform fee");
+    } else if details.outputs.len() > 1 {
+        // The mirror case. A record with no fee against a transaction that has
+        // a second output means the release is not the one this record
+        // describes, and reporting it as sound would be worse than saying
+        // nothing.
+        eprintln!(
+            "the record carries no platform fee, but this transaction has {} outputs.",
+            details.outputs.len()
+        );
+        std::process::exit(2);
+    }
 
     // scriptSig is OP_0 <sig_u> <sig_l> OP_1 <redeem>; sig_u is the first push.
     let len = script_sig[1] as usize;

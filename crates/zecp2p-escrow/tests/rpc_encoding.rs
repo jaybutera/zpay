@@ -91,3 +91,61 @@ fn the_network_chain_field_matches_what_a_node_reports() {
     assert_eq!(Network::Main.chain_field(), "main");
     assert_eq!(Network::Test.chain_field(), "test");
 }
+
+/// `ReleaseDetails` carries every output, not just the first.
+///
+/// Round-2 review finding 1: `verify` read only `vout[0]`, so a fee-bearing
+/// release was checked on its LP leg and never on its treasury leg - the one
+/// output no other party is watching. The struct now holds the whole list, and
+/// the two accessors name the first output for the callers that only want it.
+#[test]
+fn release_details_exposes_every_output_and_names_the_first() {
+    use zecp2p_escrow::rpc::{ReleaseDetails, ReleaseOutput};
+
+    let lp = vec![0x76, 0xa9, 20, 0x09, 0x88, 0xac];
+    let treasury = vec![0x76, 0xa9, 20, 0x7e, 0x88, 0xac];
+    let d = ReleaseDetails {
+        script_sig: vec![0x51],
+        spends_txid: Some("aa".repeat(32)),
+        spends_vout: Some(0),
+        outputs: vec![
+            ReleaseOutput {
+                script_pubkey: lp.clone(),
+                value_zat: 184_600,
+            },
+            ReleaseOutput {
+                script_pubkey: treasury.clone(),
+                value_zat: 400,
+            },
+        ],
+    };
+
+    assert_eq!(d.pays_script_pubkey(), lp, "the first output is the LP's leg");
+    assert_eq!(d.pays_zat(), 184_600);
+    assert_eq!(d.outputs.len(), 2);
+    assert_eq!(d.outputs[1].script_pubkey, treasury);
+    assert_eq!(d.outputs[1].value_zat, 400);
+
+    // The three legs account for the whole escrow: 200000 zat in, 15000 to the
+    // miner, and these two out.
+    assert_eq!(d.outputs[0].value_zat + d.outputs[1].value_zat + 15_000, 200_000);
+}
+
+/// The accessors must not panic on a transaction with no outputs.
+///
+/// `release_details` refuses that shape before constructing the struct, but the
+/// struct is public and a caller can build one; a panicking accessor would turn
+/// a malformed node answer into a crashed verify.
+#[test]
+fn the_first_output_accessors_are_safe_on_an_empty_output_list() {
+    use zecp2p_escrow::rpc::ReleaseDetails;
+
+    let d = ReleaseDetails {
+        script_sig: Vec::new(),
+        spends_txid: None,
+        spends_vout: None,
+        outputs: Vec::new(),
+    };
+    assert!(d.pays_script_pubkey().is_empty());
+    assert_eq!(d.pays_zat(), 0);
+}
