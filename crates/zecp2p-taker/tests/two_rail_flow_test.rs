@@ -52,10 +52,32 @@ const LOCK_CONFIRMED_MS: u64 = 1_788_455_397_380;
 /// jay-butera's `hashedOnchainId`, as the curator answers it.
 const PAYEE_HASH: &str = "853410f0416f12611961e72ee5397ec6839a3f6475467f8a557bbdb3fc8555db";
 
-/// The `INTENT_HASH` the 2026-09-03 mainnet `announce` printed, and the one the
-/// enclave signed over. This is the number that must not move.
+/// The `INTENT_HASH` this rail computes for the 2026-09-03 mainnet escrow.
+///
+/// # It moved once, deliberately, and here is why
+///
+/// Until the platform fee landed, this was
+/// `a37aad5be02179be763bf03547ad4e0a359896b2f6acb8f2dc278536137eec5d` - the
+/// value the mainnet `announce` printed that day and the one the enclave
+/// signed. Adding `platform_fee_zat` and `treasury_script` to `CanonicalTerms`
+/// changed it, because `canonical_json` serializes both fields even when the
+/// fee is zero and the script empty.
+///
+/// **That is a format break, and it invalidates every escrow announced under
+/// the old terms.** An attestation obtained before the change does not fulfil
+/// an intent computed after it. Nothing is at risk from it - the 2026-09-03
+/// escrow was released and spent, and no escrow is open - but a live escrow
+/// spanning the change would have to be refunded at `T` rather than released,
+/// and a build mixing the two formats produces exactly the failure this test
+/// exists to catch: two parties computing different hashes from the same terms
+/// and finding out after the fiat has left.
+///
+/// What the test still checks is unchanged and is the part that protects money:
+/// this daemon and `paid_path` must compute the *same* hash from the same
+/// terms. Pinning the number is how a divergence between them shows up as a
+/// failing test rather than as an unreleasable escrow.
 const MAINNET_INTENT_HASH: &str =
-    "a37aad5be02179be763bf03547ad4e0a359896b2f6acb8f2dc278536137eec5d";
+    "82d45d8854e3249fe8ebbd6d2ece910cc51e2bc5c85fa67e2a74d995d80e8cba";
 
 /// The consensus branch in force on Zcash mainnet when the release was mined.
 const BRANCH: u32 = 0x37a5_165b;

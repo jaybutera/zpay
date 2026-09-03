@@ -1197,14 +1197,29 @@ fn cmd_verify(args: &[String]) {
             );
             std::process::exit(2);
         }
+        // Exactly two, not at least two. A third output is not something this
+        // escrow's release ever has, so a transaction carrying one is not the
+        // transaction the record describes - whatever the first two look like.
+        // Checking the pair and shrugging at the rest would be the same
+        // half-check the fee-free branch below already refuses to make.
+        if details.outputs.len() != 2 {
+            eprintln!(
+                "the record describes a two-output release, but this transaction has {} \
+                 outputs.",
+                details.outputs.len()
+            );
+            std::process::exit(2);
+        }
         checked.push("pays the treasury the agreed platform fee");
-    } else if details.outputs.len() > 1 {
+        checked.push("has no output beyond the LP's and the treasury's");
+    } else if details.outputs.len() != 1 {
         // The mirror case. A record with no fee against a transaction that has
-        // a second output means the release is not the one this record
+        // more than one output means the release is not the one this record
         // describes, and reporting it as sound would be worse than saying
         // nothing.
         eprintln!(
-            "the record carries no platform fee, but this transaction has {} outputs.",
+            "the record carries no platform fee, so its release pays one output, but this \
+             transaction has {}.",
             details.outputs.len()
         );
         std::process::exit(2);

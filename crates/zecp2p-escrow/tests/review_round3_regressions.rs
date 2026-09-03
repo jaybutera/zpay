@@ -94,15 +94,25 @@ fn run_prepare(
         .public_key(&secp)
         .serialize();
 
-    let quote = AcceptedQuote::without_platform_fee(
+    // Built at a height the constructor accepts, then set to the one under
+    // test. R3-2 exercises `prepare_escrow`'s cap, and several of its cases are
+    // heights `AcceptedQuote` itself refuses - so building the quote with them
+    // directly would panic in this helper before the test could assert
+    // anything, which is what happened between rounds 2 and 3.
+    //
+    // Overriding the field afterwards is the honest reproduction of the case:
+    // a caller holding a quote whose timeout is unusable, which `prepare_escrow`
+    // must refuse on its own rather than trusting the quote to have done it.
+    let mut quote = AcceptedQuote::without_platform_fee(
         100_000_000,
         [0x85; 32],
         IDENTITY_RATE_18DEC,
-        quote_refund_height,
+        REFUND_HEIGHT,
         l_pub,
         5_000_000,
     )
     .expect("the fixture quote must build");
+    quote.refund_height = quote_refund_height;
     let lp_terms = CanonicalTerms {
         funding_txid: TXID,
         vout: 0,
