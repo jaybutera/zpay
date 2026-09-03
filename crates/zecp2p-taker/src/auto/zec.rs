@@ -517,6 +517,27 @@ mod tests {
             consensus_branch_id: 0xc8e7_1055,
         };
         assert!(canonical_terms(&terms, 0, 1, [0x85; 32], 1, 0, Vec::new()).is_err());
+
+        // Round-1 review F6: half a fee is refused. A fee with no destination
+        // cannot be paid, and a destination with no fee is an output the
+        // release does not carry; either way this daemon and the user's client
+        // would build different transactions from what both call the same
+        // terms, and nothing would say so until the release failed to
+        // broadcast.
+        let treasury = vec![
+            0x76, 0xa9, 20, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+            0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0x88, 0xac,
+        ];
+        let err = canonical_terms(&terms, 1_500_000, 1, [0x85; 32], 1, 400, Vec::new())
+            .expect_err("a fee with no destination must be refused");
+        assert!(err.to_string().contains("both be set or both be empty"));
+        let err = canonical_terms(&terms, 1_500_000, 1, [0x85; 32], 1, 0, treasury.clone())
+            .expect_err("a destination with no fee must be refused");
+        assert!(err.to_string().contains("both be set or both be empty"));
+
+        // And the honest pairing builds.
+        canonical_terms(&terms, 1_500_000, 1, [0x85; 32], 1, 400, treasury)
+            .expect("a complete fee must build");
         assert!(canonical_terms(&terms, 1_500_000, 0, [0x85; 32], 1, 0, Vec::new()).is_err());
         let err = canonical_terms(&terms, 1_500_000, 1, [0u8; 32], 1, 0, Vec::new()).expect_err("must refuse");
         assert!(err.to_string().contains("payee hash"), "{err}");

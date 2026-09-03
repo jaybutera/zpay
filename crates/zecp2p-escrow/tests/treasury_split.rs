@@ -52,11 +52,14 @@ fn lp_script() -> Vec<u8> {
     p2pkh([0x09; 20])
 }
 
-/// The platform's treasury. In a shipped binary this comes from the pinned
-/// constant in `treasury.rs`; here it is a literal, because what these tests
-/// check is what happens to the bytes, not which bytes they are.
+/// The platform's treasury: the actual pinned testnet constant, not a stand-in.
+///
+/// Using the real one means these tests exercise the same bytes a testnet
+/// live-fire run puts on chain, so a constant that decoded wrongly would fail
+/// here rather than at the node.
 fn treasury_script() -> Vec<u8> {
-    p2pkh([0x7e; 20])
+    zecp2p_escrow::treasury::treasury_script(zecp2p_escrow::address::AddrNetwork::Test)
+        .expect("the testnet treasury is pinned")
 }
 
 /// An address an LP might substitute for the treasury: its own.
@@ -190,17 +193,20 @@ fn a_split_that_leaves_the_lp_nothing_is_refused() {
 }
 
 #[test]
-fn an_empty_treasury_script_is_refused_rather_than_burned() {
-    // An empty scriptPubKey is anyone-can-spend. A fee paid to one is a fee
+fn an_empty_output_script_is_refused_rather_than_burned() {
+    // An empty scriptPubKey is anyone-can-spend. An output paid to one is money
     // handed to whichever miner notices first, and it would confirm silently.
-    let split = ReleaseSplit {
-        payout_script: lp_script(),
-        miner_fee_zat: 15_000,
-        platform_fee_zat: 400,
-        treasury_script: Vec::new(),
-    };
+    //
+    // A fee with an empty treasury is caught earlier still, by the both-or-
+    // neither check, so the case this exercises is the payout leg.
     let secp = Secp256k1::new();
     let terms = escrow_terms(&secp);
+    let split = ReleaseSplit {
+        payout_script: Vec::new(),
+        miner_fee_zat: 15_000,
+        platform_fee_zat: 400,
+        treasury_script: treasury_script(),
+    };
     assert!(matches!(
         build_release_split(&terms, &split),
         Err(TxError::EmptyOutputScript)
@@ -227,12 +233,11 @@ fn changing_the_treasury_output_changes_the_digest() {
     assert_ne!(d(&base), d(&redirected), "the treasury script is signed over");
 
     let mut shrunk = base.clone();
-    shrunk.platform_fee_zat = 1;
+    // Above dust, so this tests the digest rather than the dust gate.
+    shrunk.platform_fee_zat = 100;
     assert_ne!(d(&base), d(&shrunk), "the fee amount is signed over");
 
-    let mut dropped = base.clone();
-    dropped.platform_fee_zat = 0;
-    dropped.treasury_script = Vec::new();
+    let dropped = ReleaseSplit::without_fee(lp_script(), 15_000);
     assert_ne!(d(&base), d(&dropped), "dropping the output is signed over");
 }
 
@@ -258,19 +263,23 @@ fn canonical_with(fee: u64, treasury: Vec<u8>, secp: &Secp256k1<secp256k1_zkp::A
     }
 }
 
-fn quote_with(fee: u64, treasury: Vec<u8>, secp: &Secp256k1<secp256k1_zkp::All>) -> AcceptedQuote {
+/// The quote the user's client actually builds for this escrow, fee and all.
+///
+/// It goes through `AcceptedQuote::at_identity_rate`, the single policy site, so
+/// the fee and the treasury script here are derived exactly as a real client
+/// derives them. A test that assigned them directly would be testing its own
+/// arithmetic rather than the client's - which is why the fields are private.
+fn honest_quote(secp: &Secp256k1<secp256k1_zkp::All>) -> AcceptedQuote {
     let (_, l) = keys();
-    let mut q = AcceptedQuote::at_identity_rate(
+    AcceptedQuote::at_identity_rate(
         1_500_000,
         PAYEE,
         REFUND_HEIGHT,
         l.public_key(secp).serialize(),
         AMOUNT,
+        zecp2p_escrow::address::AddrNetwork::Test,
     )
-    .expect("the quote must build");
-    q.platform_fee_zat = fee;
-    q.treasury_script = treasury;
-    q
+    .expect("the quote must build against the pinned testnet treasury")
 }
 
 fn announcement_for(secp: &Secp256k1<secp256k1_zkp::All>) -> (Announcement, SecretKey, SecretKey) {
@@ -297,8 +306,9 @@ fn an_lp_that_rewrites_the_treasury_address_is_refused_before_funding() {
     let (ann, _, _) = announcement_for(&secp);
     let mut store = MemoryRecordStore::default();
 
-    let quote = quote_with(400, treasury_script(), &secp);
-    let lp_terms = canonical_with(400, lp_own_script(), &secp);
+    let quote = honest_quote(&secp);
+    assert_eq!(quote.platform_fee_zat(), 400, "20 bps of 200000 zat");
+    let lp_terms = canonical_with(quote.platform_fee_zat(), lp_own_script(), &secp);
 
     let err = prepare_escrow(
         &secp,
@@ -344,7 +354,7 @@ fn an_lp_that_shrinks_the_platform_fee_is_refused_too() {
         TXID,
         0,
         BRANCH,
-        &quote_with(400, treasury_script(), &secp),
+        &honest_quote(&secp),
         &canonical_with(1, treasury_script(), &secp),
         &u_priv,
         &ann,
@@ -659,13 +669,30 @@ fn a_fee_below_dust_is_dropped_rather_than_written() {
 }
 
 #[test]
-fn the_default_quote_charges_no_fee_and_names_no_treasury() {
-    // `AcceptedQuote::new` is the fee-free constructor. A caller that wants the
-    // platform cut asks for it by name, so a build with no pinned treasury
-    // cannot quietly start quoting one.
+fn the_default_quote_derives_the_fee_and_the_pinned_treasury() {
+    // The policy is applied by the default constructor, not opted into. A build
+    // that quietly stopped charging would look like revenue going to zero
+    // rather than like an error, so the fee-bearing shape is what a caller gets
+    // without asking.
+    let secp = Secp256k1::new();
+    let q = honest_quote(&secp);
+
+    assert_eq!(q.platform_fee_zat(), default_platform_fee_zat(AMOUNT));
+    assert_eq!(
+        q.treasury_script(),
+        zecp2p_escrow::treasury::treasury_script(zecp2p_escrow::address::AddrNetwork::Test)
+            .unwrap(),
+        "the quote must name the pinned constant and nothing else"
+    );
+}
+
+#[test]
+fn the_fee_free_constructor_says_so_in_its_name() {
+    // The escape hatch exists for tests and for reproducing an escrow announced
+    // before a treasury was pinned. It is not reachable by omission.
     let secp = Secp256k1::new();
     let (_, l) = keys();
-    let q = AcceptedQuote::at_identity_rate(
+    let q = AcceptedQuote::at_identity_rate_without_fee(
         1_500_000,
         PAYEE,
         REFUND_HEIGHT,
@@ -673,21 +700,22 @@ fn the_default_quote_charges_no_fee_and_names_no_treasury() {
         AMOUNT,
     )
     .unwrap();
-    assert_eq!(q.platform_fee_zat, 0);
-    assert!(q.treasury_script.is_empty());
+    assert_eq!(q.platform_fee_zat(), 0);
+    assert!(q.treasury_script().is_empty());
 }
 
 #[test]
-fn asking_for_a_fee_with_no_pinned_treasury_refuses() {
-    // Fail closed. Until an address has been funded and spent from, a build
-    // that would charge a fee has nowhere to put it, and quoting one anyway
-    // would burn every zatoshi it collected.
+fn quoting_a_fee_against_the_unpinned_mainnet_treasury_refuses() {
+    // Fail closed. Mainnet has no address yet, and a build that would charge a
+    // fee there has nowhere to put it; quoting one anyway would burn every
+    // zatoshi it collected. This is what keeps the mainnet constant honest
+    // until a funded-and-spent txid is recorded.
     use zecp2p_escrow::address::AddrNetwork;
     use zecp2p_escrow::client::QuoteError;
 
     let secp = Secp256k1::new();
     let (_, l) = keys();
-    let err = AcceptedQuote::at_identity_rate_with_fee(
+    let err = AcceptedQuote::at_identity_rate(
         1_500_000,
         PAYEE,
         REFUND_HEIGHT,
@@ -695,8 +723,163 @@ fn asking_for_a_fee_with_no_pinned_treasury_refuses() {
         AMOUNT,
         AddrNetwork::Main,
     )
-    .expect_err("no treasury is pinned yet");
+    .expect_err("no mainnet treasury is pinned yet");
     assert!(matches!(err, QuoteError::Treasury(_)), "got {err:?}");
+}
+
+#[test]
+fn a_split_with_only_half_the_fee_set_is_refused() {
+    // Round-1 review F6: a fee with no destination cannot be paid, and a
+    // destination with no fee is an output the release does not carry. Either
+    // half alone means the two parties are building different transactions from
+    // what they believe are the same terms.
+    let fee_no_script = ReleaseSplit {
+        payout_script: lp_script(),
+        miner_fee_zat: 15_000,
+        platform_fee_zat: 400,
+        treasury_script: Vec::new(),
+    };
+    assert!(matches!(
+        fee_no_script.outputs(AMOUNT),
+        Err(TxError::InconsistentFee { fee: 400, .. })
+    ));
+
+    let script_no_fee = ReleaseSplit {
+        payout_script: lp_script(),
+        miner_fee_zat: 15_000,
+        platform_fee_zat: 0,
+        treasury_script: treasury_script(),
+    };
+    assert!(matches!(
+        script_no_fee.outputs(AMOUNT),
+        Err(TxError::InconsistentFee { fee: 0, .. })
+    ));
+}
+
+#[test]
+fn a_dust_payout_leg_is_refused_as_well_as_a_dust_fee() {
+    // The dust rule applies to every output, not only the treasury one. A
+    // release whose LP leg is 53 zat is as non-standard as one whose fee is,
+    // and it would be the LP that discovered it, after paying the fiat.
+    let split = ReleaseSplit {
+        payout_script: lp_script(),
+        miner_fee_zat: AMOUNT - 500,
+        platform_fee_zat: 447,
+        treasury_script: treasury_script(),
+    };
+    assert!(
+        matches!(
+            split.outputs(AMOUNT),
+            Err(TxError::DustOutput { index: 0, value: 53, .. })
+        ),
+        "a 53 zat payout leg must be refused"
+    );
+
+    // 54 zat is the threshold, so one zatoshi more is accepted.
+    let ok = ReleaseSplit {
+        payout_script: lp_script(),
+        miner_fee_zat: AMOUNT - 500,
+        platform_fee_zat: 446,
+        treasury_script: treasury_script(),
+    };
+    let outs = ok.outputs(AMOUNT).expect("54 zat clears the threshold");
+    assert_eq!(outs[0].value_zat, 54);
+}
+
+#[test]
+fn the_taker_refuses_half_a_fee_when_it_rebuilds_terms() {
+    // The taker rebuilds `CanonicalTerms` from what it was told, so it is a
+    // third place the both-or-neither invariant has to hold. Checked here
+    // through the escrow's own terms because the taker crate is downstream;
+    // `zecp2p-taker`'s `canonical_terms` carries the matching refusal and its
+    // own test.
+    //
+    // What makes this worth a test at all: a fee with no destination and a
+    // destination with no fee both hash to terms that look plausible, and the
+    // disagreement only becomes visible as a release nobody can broadcast.
+    let secp = Secp256k1::new();
+    let fee_only = canonical_with(400, Vec::new(), &secp);
+    let script_only = canonical_with(0, treasury_script(), &secp);
+    let honest = canonical_with(400, treasury_script(), &secp);
+
+    // They are distinguishable at the hash, which is what lets any party that
+    // checks refuse them.
+    assert_ne!(fee_only.terms_hash(), honest.terms_hash());
+    assert_ne!(script_only.terms_hash(), honest.terms_hash());
+
+    // And the transaction builder refuses both outright.
+    let terms = escrow_terms(&secp);
+    for bad in [
+        ReleaseSplit {
+            payout_script: lp_script(),
+            miner_fee_zat: 15_000,
+            platform_fee_zat: fee_only.platform_fee_zat,
+            treasury_script: fee_only.treasury_script.clone(),
+        },
+        ReleaseSplit {
+            payout_script: lp_script(),
+            miner_fee_zat: 15_000,
+            platform_fee_zat: script_only.platform_fee_zat,
+            treasury_script: script_only.treasury_script.clone(),
+        },
+    ] {
+        assert!(matches!(
+            build_release_split(&terms, &bad),
+            Err(TxError::InconsistentFee { .. })
+        ));
+    }
+}
+
+/// The failure round 1 called out as the danger of a half-wired feature: a
+/// runner that signs one output set and broadcasts another.
+///
+/// It is worth stating why this is the worst shape rather than merely a bug. By
+/// the time the mismatch matters the LP has already paid the Venmo, the
+/// attestor has already released its scalar, and the transaction the LP holds
+/// carries a signature over a transaction it is not. There is no retry: the
+/// pre-signature cannot be redrawn, and the escrow sits until `T`.
+///
+/// So the shape the code must have is that the digest and the bytes come from
+/// *one* object, and this test is what says so.
+#[test]
+fn the_digest_and_the_broadcast_bytes_come_from_the_same_split() {
+    let secp = Secp256k1::new();
+    let terms = escrow_terms(&secp);
+    let quote = honest_quote(&secp);
+    let miner = release_fee_zat(terms.redeem_script().unwrap().len(), 2);
+
+    // The one object. Everything downstream is derived from it.
+    let split = quote.release_split(&lp_script(), miner);
+
+    let digest = build_release_split(&terms, &split).unwrap().sighash().unwrap();
+    let raw = zecp2p_escrow::tx::serialize_release_split(&terms, &split, &[0x51]).unwrap();
+
+    // The serialized transaction must carry exactly the outputs the digest
+    // committed to: same count, same order, same values, same scripts.
+    let outs = transparent_outputs(&raw);
+    let expected = split.outputs(terms.amount_zat).unwrap();
+    assert_eq!(outs.len(), expected.len(), "output count must match");
+    for (i, (got, want)) in outs.iter().zip(expected.iter()).enumerate() {
+        assert_eq!(got.0, want.value_zat, "output {i} value");
+        assert_eq!(got.1, want.script, "output {i} script");
+    }
+    assert_eq!(outs.len(), 2, "a fee-bearing release pays the LP and the treasury");
+    assert_eq!(outs[1].1, treasury_script(), "and the treasury output is last");
+
+    // The half-wired shape, stated as the thing that must NOT happen: a runner
+    // that signed this digest and then serialized the fee-free transaction
+    // would produce bytes the signature does not cover.
+    let skimmed = zecp2p_escrow::tx::serialize_release(&terms, &lp_script(), miner, &[0x51])
+        .unwrap();
+    assert_ne!(
+        raw, skimmed,
+        "the two-output and one-output releases must not serialize alike"
+    );
+    let skimmed_digest = build_release(&terms, &lp_script(), miner).unwrap().sighash().unwrap();
+    assert_ne!(
+        digest, skimmed_digest,
+        "and their digests must differ, which is what makes the mismatch fatal"
+    );
 }
 
 // ---------------------------------------------------------------------------

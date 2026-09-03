@@ -281,16 +281,21 @@ enum Commands {
         /// intent hash and an attestation that releases nothing.
         #[arg(long)]
         lock_confirmed_ms: u64,
-        /// The platform fee in zatoshis, paid to the treasury as a third output
-        /// on the release.
+        /// The platform fee in zatoshis, to reproduce an escrow that was
+        /// announced under a different treasury from this build's.
         ///
-        /// Part of the terms hash, so it must be the number the user's client
-        /// computed. A watch that guesses it watches a different escrow.
-        #[arg(long, default_value_t = 0)]
-        platform_fee_zat: u64,
-        /// The treasury scriptPubKey, hex. Empty exactly when the fee is zero.
-        #[arg(long, default_value = "")]
-        treasury_script: String,
+        /// Normally omitted. The fee and the treasury script are *derived* from
+        /// the pinned constant in `zecp2p_escrow::treasury` and this rail's
+        /// configured network, exactly as the user's client derives them, so a
+        /// watch that supplies neither watches the escrow the client built.
+        /// Supplying them is for reproducing a recorded run - an escrow
+        /// announced before a treasury rotation, say - and both must be given
+        /// together, since a fee with no destination cannot be paid.
+        #[arg(long, requires = "treasury_script")]
+        platform_fee_zat: Option<u64>,
+        /// The treasury scriptPubKey, hex. Only with --platform-fee-zat.
+        #[arg(long, requires = "platform_fee_zat")]
+        treasury_script: Option<String>,
         /// Treat the user's pre-signature as verified.
         ///
         /// The escrow crate refuses to reach `ReadyToPay` without it. This flag
@@ -1065,15 +1070,66 @@ async fn run_zec_watch(config: &TakerConfig, command: &Commands) -> Result<()> {
     )?;
     println!("payee   : @{claimed} matches the terms' payee hash");
 
+    // Derived, not defaulted. `clap`'s `requires` makes the pair all-or-nothing,
+    // so the only two shapes that reach here are "both given" and "neither".
+    let (platform_fee_zat, treasury_script) = match (platform_fee_zat, treasury_script) {
+        (Some(fee), Some(script)) => {
+            println!(
+                "fee     : {fee} zat to a treasury supplied on the command line, \
+                 reproducing a recorded run"
+            );
+            (
+                *fee,
+                hex::decode(script.trim_start_matches("0x"))
+                    .context("--treasury-script is not hex")?,
+            )
+        }
+        _ => {
+            // The same policy site the user's client uses: the rate from
+            // `treasury::PLATFORM_FEE_BPS`, the address from the constant
+            // pinned for this network. If the two disagree the terms hash
+            // differs and the escrow this watch reports on is not the one the
+            // user funded, which is why nothing here guesses.
+            let quote = zecp2p_escrow::client::AcceptedQuote::at_identity_rate(
+                *usd_6dec,
+                payee_bytes,
+                terms.refund_height,
+                terms.l_pub,
+                terms.amount_zat,
+                match zec.network()? {
+                    zecp2p_escrow::rpc::Network::Main => {
+                        zecp2p_escrow::address::AddrNetwork::Main
+                    }
+                    zecp2p_escrow::rpc::Network::Test => {
+                        zecp2p_escrow::address::AddrNetwork::Test
+                    }
+                },
+            )
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "this escrow cannot be quoted, so its terms cannot be rebuilt: {e}. \
+                     If it was announced under a different treasury, pass \
+                     --platform-fee-zat and --treasury-script to reproduce it."
+                )
+            })?;
+            if quote.platform_fee_zat() > 0 {
+                println!(
+                    "fee     : {} zat to the pinned treasury",
+                    quote.platform_fee_zat()
+                );
+            }
+            (quote.platform_fee_zat(), quote.treasury_script().to_vec())
+        }
+    };
+
     let canonical = zecp2p_taker::auto::zec::canonical_terms(
         &terms,
         *usd_6dec,
         *rate_18dec,
         payee_bytes,
         *lock_confirmed_ms,
-        *platform_fee_zat,
-        hex::decode(treasury_script.trim_start_matches("0x"))
-            .context("--treasury-script is not hex")?,
+        platform_fee_zat,
+        treasury_script,
     )?;
 
     let escrow = zecp2p_taker::auto::zec::WatchedEscrow {

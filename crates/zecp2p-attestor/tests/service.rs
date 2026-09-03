@@ -506,3 +506,36 @@ async fn the_announcement_binds_a_verifiable_outcome_point() {
     )
     .is_err());
 }
+
+/// Round-1 review F6: the attestor mirrors the escrow's both-or-neither rule on
+/// the fee fields.
+///
+/// The attestor is the last party that can refuse cheaply. Once it signs, terms
+/// carrying a fee with no destination - or a destination with no fee - become a
+/// release nobody can broadcast, and by then the LP has paid the fiat.
+#[test]
+fn terms_carrying_half_a_platform_fee_are_refused() {
+    let good = WireTerms::from_terms(&terms());
+    good.decode().expect("the fixture terms must decode");
+
+    let mut fee_only = WireTerms::from_terms(&terms());
+    fee_only.platform_fee_zat = 400;
+    fee_only.treasury_script = String::new();
+    let err = fee_only.decode().expect_err("a fee with no destination");
+    assert!(err.contains("both must be set or both empty"), "got {err}");
+
+    let mut script_only = WireTerms::from_terms(&terms());
+    script_only.platform_fee_zat = 0;
+    script_only.treasury_script = "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac".into();
+    let err = script_only.decode().expect_err("a destination with no fee");
+    assert!(err.contains("both must be set or both empty"), "got {err}");
+
+    // And the honest pairing still decodes, so the check is not simply refusing
+    // everything with a fee in it.
+    let mut both = WireTerms::from_terms(&terms());
+    both.platform_fee_zat = 400;
+    both.treasury_script = "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac".into();
+    let decoded = both.decode().expect("a complete fee must decode");
+    assert_eq!(decoded.platform_fee_zat, 400);
+    assert_eq!(decoded.treasury_script.len(), 25);
+}

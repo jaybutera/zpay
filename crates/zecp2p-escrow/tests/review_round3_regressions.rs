@@ -94,16 +94,15 @@ fn run_prepare(
         .public_key(&secp)
         .serialize();
 
-    let quote = AcceptedQuote {
-        usd_amount_6dec: 100_000_000,
-        payee_hash: [0x85; 32],
-        rate_18dec: IDENTITY_RATE_18DEC,
-        refund_height: quote_refund_height,
+    let quote = AcceptedQuote::without_platform_fee(
+        100_000_000,
+        [0x85; 32],
+        IDENTITY_RATE_18DEC,
+        quote_refund_height,
         l_pub,
-        amount_zat: 5_000_000,
-        platform_fee_zat: 0,
-        treasury_script: Vec::new(),
-    };
+        5_000_000,
+    )
+    .expect("the fixture quote must build");
     let lp_terms = CanonicalTerms {
         funding_txid: TXID,
         vout: 0,
@@ -199,16 +198,15 @@ fn r3_1b_the_derived_escrow_always_refunds_to_the_user() {
         platform_fee_zat: 0,
         treasury_script: Vec::new(),
     };
-    let quote = AcceptedQuote {
-        usd_amount_6dec: 100_000_000,
-        payee_hash: [0x85; 32],
-        rate_18dec: IDENTITY_RATE_18DEC,
-        refund_height: REFUND_HEIGHT,
+    let quote = AcceptedQuote::without_platform_fee(
+        100_000_000,
+        [0x85; 32],
+        IDENTITY_RATE_18DEC,
+        REFUND_HEIGHT,
         l_pub,
-        amount_zat: 5_000_000,
-        platform_fee_zat: 0,
-        treasury_script: Vec::new(),
-    };
+        5_000_000,
+    )
+    .expect("the fixture quote must build");
     let d = SecretKey::from_slice(&[0xd1; 32]).unwrap();
     let k = SecretKey::from_slice(&[0x4b; 32]).unwrap();
     let ann = Announcement {

@@ -44,6 +44,22 @@ pub enum TxError {
     #[error("a transaction with no outputs pays nobody")]
     NoOutputs,
     #[error(
+        "output {index} pays {value} zat, below the {threshold} zat dust threshold; a node \
+         will not relay the transaction, so the release would be unbroadcastable rather \
+         than merely small"
+    )]
+    DustOutput {
+        index: usize,
+        value: u64,
+        threshold: u64,
+    },
+    #[error(
+        "the platform fee is {fee} zat and the treasury script is {script_len} bytes; both \
+         must be set or both empty, since a fee with no destination cannot be paid and a \
+         destination with no fee is an output the release does not carry"
+    )]
+    InconsistentFee { fee: u64, script_len: usize },
+    #[error(
         "the outputs total {outputs} zat, which with the {fee} zat miner fee exceeds the \
          {amount} zat the escrow holds"
     )]
@@ -135,6 +151,19 @@ impl ReleaseSplit {
     /// written as a zero-value output, because a zero-value output is dust and
     /// makes the whole release non-standard.
     pub fn outputs(&self, amount_zat: u64) -> Result<Vec<TxOutSpec>, TxError> {
+        // Both or neither. A fee with no destination cannot be paid, and a
+        // destination with no fee is an output the release does not carry;
+        // either half alone means the two parties are about to build different
+        // transactions from what they believe are the same terms. Refuse here,
+        // where the message names the cause, rather than at the sighash, where
+        // the symptom is a release the LP cannot broadcast.
+        if (self.platform_fee_zat == 0) != self.treasury_script.is_empty() {
+            return Err(TxError::InconsistentFee {
+                fee: self.platform_fee_zat,
+                script_len: self.treasury_script.len(),
+            });
+        }
+
         let committed = self
             .miner_fee_zat
             .checked_add(self.platform_fee_zat)
@@ -163,6 +192,25 @@ impl ReleaseSplit {
                 self.treasury_script.clone(),
                 self.platform_fee_zat,
             ));
+        }
+
+        // Every output must clear dust and name a script. The caller usually
+        // gets this right - `treasury::platform_fee_zat` drops a sub-dust fee to
+        // zero, and the payout leg is large by construction - but "usually" is
+        // not the standard for a transaction nobody can re-sign. A dust output
+        // anywhere makes the whole release non-standard, so a release that is
+        // short by one zatoshi does not confirm at all.
+        for (index, o) in outs.iter().enumerate() {
+            if o.script.is_empty() {
+                return Err(TxError::EmptyOutputScript);
+            }
+            if o.value_zat < crate::treasury::DUST_THRESHOLD_ZAT {
+                return Err(TxError::DustOutput {
+                    index,
+                    value: o.value_zat,
+                    threshold: crate::treasury::DUST_THRESHOLD_ZAT,
+                });
+            }
         }
         Ok(outs)
     }
@@ -377,6 +425,39 @@ fn build(
         script_pubkey,
         amount_zat: terms.amount_zat,
     })
+}
+
+/// A release over an output list given directly, bypassing [`ReleaseSplit`]'s
+/// policy checks.
+///
+/// [`build_release_split`] is what production code calls: it derives the output
+/// set from the split, and refuses a dust output, an empty script, or a fee
+/// without a destination. This builds whatever it is handed.
+///
+/// It exists so the dust boundary can be probed against a real node. Checking
+/// that our threshold matches the node's means broadcasting a transaction our
+/// own gate refuses, and the alternative - a test-only hatch cut into the gate -
+/// would weaken the thing being tested. So the primitive is public and honest
+/// about what it does not check, rather than private with a hole in it.
+///
+/// Do not use it to build a release for a user. `build_vout` still refuses an
+/// empty output set and an empty script, because those produce transactions
+/// that lose money rather than merely fail.
+pub fn build_release_from_outputs(
+    terms: &EscrowTerms,
+    outputs: &[TxOutSpec],
+) -> Result<UnsignedEscrowTx, TxError> {
+    build(terms, outputs, RELEASE_SEQUENCE, 0)
+}
+
+/// Serializes a signed release over an output list given directly. See
+/// [`build_release_from_outputs`] for why this is public.
+pub fn serialize_release_from_outputs(
+    terms: &EscrowTerms,
+    outputs: &[TxOutSpec],
+    script_sig: &[u8],
+) -> Result<Vec<u8>, TxError> {
+    serialize_signed(terms, outputs, RELEASE_SEQUENCE, 0, script_sig)
 }
 
 /// The release transaction of spec 4.3: one escrow input, the split's outputs,

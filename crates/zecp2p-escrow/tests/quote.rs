@@ -4,6 +4,7 @@
 //! to. Refusing a bad one here names the cause; letting it through means the
 //! error surfaces several layers down, naming a consequence.
 
+use zecp2p_escrow::address::AddrNetwork;
 use zecp2p_escrow::client::{AcceptedQuote, QuoteError, MAX_REFUND_HEIGHT, MINIMUM_ESCROW_ZAT};
 use zecp2p_escrow::payment_details::IDENTITY_RATE_18DEC;
 
@@ -16,7 +17,7 @@ fn l_pub() -> [u8; 33] {
 }
 
 fn good() -> Result<AcceptedQuote, QuoteError> {
-    AcceptedQuote::at_identity_rate(1_000_000, PAYEE, 3_500_000, l_pub(), 5_000_000)
+    AcceptedQuote::at_identity_rate(1_000_000, PAYEE, 3_500_000, l_pub(), 5_000_000, AddrNetwork::Test)
 }
 
 #[test]
@@ -29,7 +30,7 @@ fn a_well_formed_quote_is_accepted() {
 #[test]
 fn a_zero_amount_is_refused() {
     assert_eq!(
-        AcceptedQuote::at_identity_rate(1_000_000, PAYEE, 3_500_000, l_pub(), 0),
+        AcceptedQuote::at_identity_rate(1_000_000, PAYEE, 3_500_000, l_pub(), 0, AddrNetwork::Test),
         Err(QuoteError::ZeroAmount)
     );
 }
@@ -38,7 +39,7 @@ fn a_zero_amount_is_refused() {
 fn an_escrow_below_the_dust_and_fee_floor_is_refused() {
     // Spec section 3 sets a 0.001 ZEC minimum. Below it the release fee eats
     // the escrow and the output is dust.
-    let err = AcceptedQuote::at_identity_rate(1_000_000, PAYEE, 3_500_000, l_pub(), 50_000)
+    let err = AcceptedQuote::at_identity_rate(1_000_000, PAYEE, 3_500_000, l_pub(), 50_000, AddrNetwork::Test)
         .unwrap_err();
     assert_eq!(
         err,
@@ -50,12 +51,12 @@ fn an_escrow_below_the_dust_and_fee_floor_is_refused() {
 
     // The floor is 0.001 ZEC *above fees* (R5-8), so 100000 flat is refused.
     assert!(matches!(
-        AcceptedQuote::at_identity_rate(1_000_000, PAYEE, 3_500_000, l_pub(), 100_000),
+        AcceptedQuote::at_identity_rate(1_000_000, PAYEE, 3_500_000, l_pub(), 100_000, AddrNetwork::Test),
         Err(QuoteError::BelowMinimum { .. })
     ));
     assert_eq!(MINIMUM_ESCROW_ZAT, 120_000);
     // And exactly at the floor it is accepted, so the boundary is not off by one.
-    AcceptedQuote::at_identity_rate(1_000_000, PAYEE, 3_500_000, l_pub(), MINIMUM_ESCROW_ZAT)
+    AcceptedQuote::at_identity_rate(1_000_000, PAYEE, 3_500_000, l_pub(), MINIMUM_ESCROW_ZAT, AddrNetwork::Test)
         .unwrap();
 }
 
@@ -63,7 +64,7 @@ fn an_escrow_below_the_dust_and_fee_floor_is_refused() {
 fn a_zero_payout_is_refused() {
     // Locking ZEC for nothing is not a trade.
     assert_eq!(
-        AcceptedQuote::at_identity_rate(0, PAYEE, 3_500_000, l_pub(), 5_000_000),
+        AcceptedQuote::at_identity_rate(0, PAYEE, 3_500_000, l_pub(), 5_000_000, AddrNetwork::Test),
         Err(QuoteError::ZeroPayout)
     );
 }
@@ -80,6 +81,7 @@ fn a_rate_that_is_not_the_identity_rate_is_refused() {
         3_500_000,
         l_pub(),
         5_000_000,
+        AddrNetwork::Test,
     )
     .unwrap_err();
     assert_eq!(
@@ -92,7 +94,7 @@ fn a_rate_that_is_not_the_identity_rate_is_refused() {
 
     // And a rate of 1, which reproduced the round-1 theft.
     assert!(matches!(
-        AcceptedQuote::new(1_000_000, PAYEE, 1, 3_500_000, l_pub(), 5_000_000),
+        AcceptedQuote::new(1_000_000, PAYEE, 1, 3_500_000, l_pub(), 5_000_000, AddrNetwork::Test),
         Err(QuoteError::NonIdentityRate { .. })
     ));
 }
@@ -102,13 +104,13 @@ fn an_unusable_refund_height_is_refused() {
     for t in [0u64, MAX_REFUND_HEIGHT + 1, 1u64 << 32, 1u64 << 62] {
         assert!(
             matches!(
-                AcceptedQuote::at_identity_rate(1_000_000, PAYEE, t, l_pub(), 5_000_000),
+                AcceptedQuote::at_identity_rate(1_000_000, PAYEE, t, l_pub(), 5_000_000, AddrNetwork::Test),
                 Err(QuoteError::RefundHeightOutOfRange { .. })
             ),
             "T={t} must be refused"
         );
     }
-    AcceptedQuote::at_identity_rate(1_000_000, PAYEE, MAX_REFUND_HEIGHT, l_pub(), 5_000_000)
+    AcceptedQuote::at_identity_rate(1_000_000, PAYEE, MAX_REFUND_HEIGHT, l_pub(), 5_000_000, AddrNetwork::Test)
         .expect("the cap itself is acceptable");
 }
 
@@ -116,11 +118,11 @@ fn an_unusable_refund_height_is_refused() {
 fn an_lp_key_that_is_not_a_point_is_refused() {
     // An unspendable escrow the user would discover at T and not before.
     assert_eq!(
-        AcceptedQuote::at_identity_rate(1_000_000, PAYEE, 3_500_000, [0xff; 33], 5_000_000),
+        AcceptedQuote::at_identity_rate(1_000_000, PAYEE, 3_500_000, [0xff; 33], 5_000_000, AddrNetwork::Test),
         Err(QuoteError::BadLpKey)
     );
     assert_eq!(
-        AcceptedQuote::at_identity_rate(1_000_000, PAYEE, 3_500_000, [0x00; 33], 5_000_000),
+        AcceptedQuote::at_identity_rate(1_000_000, PAYEE, 3_500_000, [0x00; 33], 5_000_000, AddrNetwork::Test),
         Err(QuoteError::BadLpKey)
     );
 }
@@ -154,6 +156,6 @@ fn a_one_dollar_escrow_is_close_to_the_floor_at_current_prices() {
     // beyond $1600, which is why the mainnet run is sized in zatoshis.
     let planned = 200_000u64;
     assert!(planned > MINIMUM_ESCROW_ZAT * 3 / 2);
-    AcceptedQuote::at_identity_rate(1_000_000, PAYEE, 3_500_000, l_pub(), planned)
+    AcceptedQuote::at_identity_rate(1_000_000, PAYEE, 3_500_000, l_pub(), planned, AddrNetwork::Test)
         .expect("the planned mainnet size must be quotable");
 }

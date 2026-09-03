@@ -203,6 +203,25 @@ fn hex33(s: &str) -> Result<[u8; 33], String> {
 
 impl WireTerms {
     pub fn decode(&self) -> Result<CanonicalTerms, String> {
+        let treasury_script = hex::decode(self.treasury_script.trim_start_matches("0x"))
+            .map_err(|e| format!("treasury_script is not hex: {e}"))?;
+
+        // Both or neither, the same invariant `tx::ReleaseSplit::outputs`
+        // enforces on the transaction. A fee with no destination cannot be
+        // paid, and a destination with no fee is an output the release does not
+        // carry; either half alone means whoever sent these terms and whoever
+        // built the escrow disagree about the transaction. The attestor is the
+        // party that can still say so cheaply - after it signs, the disagreement
+        // is a release nobody can broadcast.
+        if (self.platform_fee_zat == 0) != treasury_script.is_empty() {
+            return Err(format!(
+                "platform_fee_zat is {} and treasury_script is {} bytes; both must be set \
+                 or both empty",
+                self.platform_fee_zat,
+                treasury_script.len()
+            ));
+        }
+
         Ok(CanonicalTerms {
             funding_txid: hex32(&self.funding_txid)?,
             vout: self.vout,
@@ -215,8 +234,7 @@ impl WireTerms {
             payee_hash: hex32(&self.payee_hash)?,
             lock_confirmed_ms: self.lock_confirmed_ms,
             platform_fee_zat: self.platform_fee_zat,
-            treasury_script: hex::decode(self.treasury_script.trim_start_matches("0x"))
-                .map_err(|e| format!("treasury_script is not hex: {e}"))?,
+            treasury_script,
         })
     }
 

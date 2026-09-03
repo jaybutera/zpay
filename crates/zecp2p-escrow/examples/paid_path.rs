@@ -34,7 +34,8 @@ use zecp2p_escrow::dlc::{
     decrypt_pre_signature, outcome_point, pre_sign, recover_outcome_secret,
     verify_outcome_secret, verify_pre_signature,
 };
-use zecp2p_escrow::fees::release_fee_to_transparent_zat;
+use zecp2p_escrow::client::AcceptedQuote;
+use zecp2p_escrow::fees::release_fee_zat;
 use zecp2p_escrow::keystore;
 use zecp2p_escrow::lp_client::{AttestorClient, WireAttestation};
 use zecp2p_escrow::payment_details::{
@@ -44,7 +45,8 @@ use zecp2p_escrow::rpc::{txid_to_display, Network, RpcChainClient, RpcConfig};
 use zecp2p_escrow::script::release_script_sig;
 use zecp2p_escrow::terms::CanonicalTerms;
 use zecp2p_escrow::tx::{
-    build_release, encode_signature, release_txid, serialize_release, EscrowTerms,
+    build_release_split, encode_signature, release_split_txid, serialize_release_split,
+    EscrowTerms, ReleaseSplit,
 };
 
 fn env(k: &str) -> String {
@@ -137,6 +139,18 @@ impl RunRecord {
     fn save(&self, path: &str) {
         let text = serde_json::to_string_pretty(self).expect("serialize the run record");
         std::fs::write(path, text).expect("write the run record");
+    }
+}
+
+/// The escrow crate's own network enum, from the RPC one this example uses.
+///
+/// Two enums for one concept is a wart, but the conversion is here rather than
+/// inlined so a mainnet run cannot reach a testnet treasury by a mistake in an
+/// argument list.
+fn addr_network(network: Network) -> zecp2p_escrow::address::AddrNetwork {
+    match network {
+        Network::Main => zecp2p_escrow::address::AddrNetwork::Main,
+        Network::Test => zecp2p_escrow::address::AddrNetwork::Test,
     }
 }
 
@@ -311,8 +325,14 @@ struct Setup {
     terms: EscrowTerms,
     canonical: CanonicalTerms,
     redeem: Vec<u8>,
-    fee: u64,
-    lp_script: Vec<u8>,
+    /// The entire output set of the release, miner fee included.
+    ///
+    /// One object, because the digest the user pre-signs and the bytes the LP
+    /// broadcasts are both derived from it. Holding a bare fee and a bare
+    /// script here is what let the two drift: a run that signed a two-output
+    /// digest and then serialized a one-output transaction would pay the fiat
+    /// and produce a release the decrypted signature does not cover.
+    split: ReleaseSplit,
     digest: [u8; 32],
     event_id: [u8; 32],
     record_path: String,
@@ -440,6 +460,62 @@ fn setup(args: &[String], allow_create: bool) -> Setup {
                 .as_millis() as u64
         });
 
+    let usd_amount_6dec = std::env::var("ZECP2P_USD_6DEC")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1_000_000);
+
+    // The platform fee, like every other field a resume must reproduce, is
+    // *read* from the record when there is one and *derived* only on a first
+    // run (R9-1, and round-1 review finding F2). A rotation of the pinned
+    // treasury between the two runs would otherwise move the sighash and strand
+    // a pre-signature that cannot be regenerated.
+    //
+    // On a first run it comes from `AcceptedQuote`, which is the single policy
+    // site: the rate is `treasury::PLATFORM_FEE_BPS` and the address is the
+    // constant pinned for this network. Nothing here supplies either.
+    let (platform_fee_zat, treasury_script) = match prior.as_ref() {
+        // A resume rebuilds what the record describes. Deriving it afresh would
+        // reintroduce exactly the R9-1 failure: a treasury rotation between the
+        // two runs moves the sighash, and the pre-signature cannot be redrawn.
+        Some(r) => (
+            r.platform_fee_zat,
+            hex::decode(&r.treasury_script).expect("recorded treasury script"),
+        ),
+        // The explicit opt-out, checked before the quote so a network with no
+        // pinned treasury can still be run. It has to be deliberate: a build
+        // that silently stopped charging would look like revenue going to zero
+        // rather than like an error.
+        None if std::env::var("ZECP2P_NO_PLATFORM_FEE").is_ok() => {
+            eprintln!("ZECP2P_NO_PLATFORM_FEE is set: building a two-output release.");
+            (0, Vec::new())
+        }
+        None => {
+            // `AcceptedQuote` is the single policy site: the rate is
+            // `treasury::PLATFORM_FEE_BPS` and the address is the constant
+            // pinned for this network. Nothing here supplies either, which is
+            // the point - a fee this example could choose is a fee an operator
+            // could point at itself.
+            let quote = AcceptedQuote::at_identity_rate(
+                usd_amount_6dec,
+                payee_hash,
+                refund_height,
+                l_pub,
+                utxo_amount,
+                addr_network(network),
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("this escrow cannot be quoted: {e}");
+                eprintln!();
+                eprintln!("  If the treasury for this network is not pinned yet, the run can");
+                eprintln!("  proceed without a platform fee by setting ZECP2P_NO_PLATFORM_FEE=1,");
+                eprintln!("  which reproduces the two-output release.");
+                std::process::exit(2);
+            });
+            (quote.platform_fee_zat(), quote.treasury_script().to_vec())
+        }
+    };
+
     let canonical = CanonicalTerms {
         funding_txid,
         vout,
@@ -447,15 +523,12 @@ fn setup(args: &[String], allow_create: bool) -> Setup {
         u_pub,
         l_pub,
         refund_height,
-        usd_amount_6dec: std::env::var("ZECP2P_USD_6DEC")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1_000_000),
+        usd_amount_6dec,
         rate_18dec: IDENTITY_RATE_18DEC,
         payee_hash,
         lock_confirmed_ms: now_ms,
-        platform_fee_zat: 0,
-        treasury_script: Vec::new(),
+        platform_fee_zat,
+        treasury_script: treasury_script.clone(),
     };
     let terms = EscrowTerms {
         funding_txid,
@@ -470,10 +543,16 @@ fn setup(args: &[String], allow_create: bool) -> Setup {
 
     // A resume rebuilds the transaction the record describes, not whatever the
     // environment says now (R9-1).
+    //
+    // The miner fee is sized to the transaction actually being built: three
+    // outputs cost the same 15,000 zat as one, because the release input is
+    // already 3 ZIP 317 actions, but sizing it from the output count means a
+    // fourth output would be priced rather than underpaid.
+    let n_outputs = if platform_fee_zat > 0 { 2 } else { 1 };
     let fee = prior
         .as_ref()
         .map(|r| r.fee_zat)
-        .unwrap_or_else(|| release_fee_to_transparent_zat(redeem.len()));
+        .unwrap_or_else(|| release_fee_zat(redeem.len(), n_outputs));
     let lp_script = match prior.as_ref() {
         Some(r) => hex::decode(&r.lp_script).expect("recorded payout script"),
         None => match std::env::var("ZECP2P_LP_ADDRESS") {
@@ -488,8 +567,19 @@ fn setup(args: &[String], allow_create: bool) -> Setup {
         },
     };
 
-    let digest = build_release(&terms, &lp_script, fee)
-        .unwrap()
+    // The one object both the digest and the broadcast bytes come from.
+    let split = ReleaseSplit {
+        payout_script: lp_script,
+        miner_fee_zat: fee,
+        platform_fee_zat,
+        treasury_script,
+    };
+
+    let digest = build_release_split(&terms, &split)
+        .unwrap_or_else(|e| {
+            eprintln!("this release cannot be built: {e}");
+            std::process::exit(2);
+        })
         .sighash()
         .unwrap();
     let event_id = zecp2p_escrow::dlc::event_id(&funding_txid, vout);
@@ -503,8 +593,7 @@ fn setup(args: &[String], allow_create: bool) -> Setup {
         terms,
         canonical,
         redeem,
-        fee,
-        lp_script,
+        split,
         digest,
         event_id,
         record_path,
@@ -660,8 +749,8 @@ fn cmd_announce(args: &[String]) {
     // Written before anything else, and never regenerated (R9-1).
     let record = RunRecord {
         lock_confirmed_ms: s.canonical.lock_confirmed_ms,
-        platform_fee_zat: s.canonical.platform_fee_zat,
-        treasury_script: hex::encode(&s.canonical.treasury_script),
+        platform_fee_zat: s.split.platform_fee_zat,
+        treasury_script: hex::encode(&s.split.treasury_script),
         terms_hash: hex::encode(s.canonical.terms_hash()),
         event_id: ann.event_id.clone(),
         r: ann.r.clone(),
@@ -669,9 +758,9 @@ fn cmd_announce(args: &[String]) {
         y: hex::encode(y.serialize()),
         release_digest: hex::encode(s.digest),
         pre_signature: hex::encode(pre_sig.as_ref()),
-        lp_script: hex::encode(&s.lp_script),
+        lp_script: hex::encode(&s.split.payout_script),
         amount_zat: s.canonical.amount_zat,
-        fee_zat: s.fee,
+        fee_zat: s.split.miner_fee_zat,
         funding_txid: Some(txid_to_display(&s.terms.funding_txid)),
         funding_vout: Some(s.canonical.vout),
         s: None,
@@ -895,16 +984,31 @@ fn cmd_attest(args: &[String]) {
         &encode_signature(&sig_l),
         &s.redeem,
     );
-    let expected = release_txid(&s.terms, &s.lp_script, s.fee, &script_sig).expect("txid");
-    let raw = serialize_release(&s.terms, &s.lp_script, s.fee, &script_sig).expect("serialize");
+    // Both from `s.split`, the same object the digest above was built from, so
+    // there is no arrangement of flags under which the bytes broadcast differ
+    // from the bytes signed.
+    let expected = release_split_txid(&s.terms, &s.split, &script_sig).expect("txid");
+    let raw = serialize_release_split(&s.terms, &s.split, &script_sig).expect("serialize");
 
     record.raw_release = Some(hex::encode(&raw));
     record.txid = Some(txid_to_display(&expected));
     record.save(&s.record_path);
 
     println!("== release ==");
-    println!("  fee            {} zat", s.fee);
-    println!("  pays           {} zat", s.canonical.amount_zat - s.fee);
+    println!("  miner fee      {} zat", s.split.miner_fee_zat);
+    if s.split.platform_fee_zat > 0 {
+        println!(
+            "  platform fee   {} zat to {}",
+            s.split.platform_fee_zat,
+            hex::encode(&s.split.treasury_script)
+        );
+    } else {
+        println!("  platform fee   none (two-output release)");
+    }
+    println!(
+        "  pays LP        {} zat",
+        s.canonical.amount_zat - s.split.miner_fee_zat - s.split.platform_fee_zat
+    );
     println!("  txid           {}", txid_to_display(&expected));
     broadcast(&s, &raw, &record);
 }

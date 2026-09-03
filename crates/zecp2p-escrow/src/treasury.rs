@@ -16,6 +16,31 @@
 //! Rotation is a config change with a version bump, which is the same posture
 //! `attestation.rs` takes on enclave signer rotation.
 //!
+//! # Two deliberate departures from the design spec
+//!
+//! Both are narrowings, and both are recorded here rather than left for a
+//! reader to discover by diffing.
+//!
+//! **No ceiling.** `v2-fee-token-design.md` writes the fee as
+//! `clamp(amount_zat * fee_bps / 10_000, FLOOR, CEILING)`. Only the floor is
+//! implemented, as the dust gate below. A ceiling would cap the fee on a large
+//! escrow, and adding one is a one-line change to [`platform_fee_zat`] - but a
+//! cap is a number nobody has chosen yet, and a wrong one is worse than none:
+//! it would silently undercharge every escrow above it, and the effect would
+//! show up as revenue that stops tracking volume rather than as an error. When
+//! a figure exists, it goes here and gets a test either side of it.
+//!
+//! **Two outputs, not three.** The design describes the release as paying "the
+//! user's ZEC-equivalent leg, the LP's, and a platform cut". The release this
+//! code builds has two outputs: the counterparty leg and the treasury. There is
+//! no third because there is no user leg on this transaction - the user is paid
+//! in dollars over Venmo, off-chain, and the whole escrow less fees goes to the
+//! LP. The design's own arithmetic agrees (`amount_zat = miner_fee +
+//! platform_fee + lp_output`); the three-output phrasing counts the miner fee as
+//! an output, which it is not. The fee analysis is unaffected either way,
+//! because `fees::release_fee_zat` shows the release input dominates through
+//! three outputs, so the escrow has a spare one in hand.
+//!
 //! # Why the constant is empty
 //!
 //! No treasury address has been funded or spent from yet. The design that
@@ -34,12 +59,25 @@ use crate::address::{script_pubkey_for, AddrNetwork, AddressError};
 /// module note.
 pub const MAINNET_TREASURY_ADDRESS: &str = "";
 
-/// The testnet/regtest treasury address, base58 `tm...` or `t2...`.
+/// The testnet/regtest treasury address, base58 `tm...`.
 ///
-/// Empty for the same reason. Regtest runs pass their own address explicitly
-/// rather than leaning on a constant, so that a regtest default can never be
-/// what a mainnet build falls back to.
-pub const TESTNET_TREASURY_ADDRESS: &str = "";
+/// Pinned so the ship-order testnet live-fire can run a non-zero fee end to
+/// end without a mainnet address existing yet.
+///
+/// Its key is **published on purpose**: it is
+/// `secp256k1` over `sha256("zecp2p-testnet-treasury-v1")`, which is
+/// `0e223008551fb62fa4709df471a27a98e0f54c95f045546a10648da051ad14ea`, and its
+/// hash160 is `1cfbe04cc4c9d693b8483612a54bd72d0ddd109c`. Anyone reading this
+/// file can rederive it and spend from it, which on testnet is the point: the
+/// live-fire check the design asks for is that the address can be spent from,
+/// and a key in the repo makes that reproducible by whoever runs the regtest
+/// suite rather than by whoever happens to hold a wallet.
+///
+/// A published key is safe here and only here. `treasury_script` refuses to
+/// decode a `tm` address under `AddrNetwork::Main`, so this constant cannot
+/// become a mainnet destination by accident, and `MAINNET_TREASURY_ADDRESS`
+/// stays empty until a real one has been funded and spent from.
+pub const TESTNET_TREASURY_ADDRESS: &str = "tmCMbzCuRX3BW95a2GZWDSHvM4THqu5ziTA";
 
 /// The platform cut, in basis points of the escrow amount.
 ///
@@ -66,15 +104,18 @@ pub const PLATFORM_FEE_BPS: u64 = 20;
 /// than a third of its value at the minimum relay rate. Spending a P2PKH output
 /// takes a 148-byte input plus the 34-byte output it came from, and Zcash's
 /// `minRelayTxFee` has been 100 zat/kB since zcashd v1.0.7-1, so the threshold
-/// is `3 * 182 * 100 / 1000 = 54`. Zebra applies the same 54 zat number in its
-/// mempool.
+/// is `3 * 182 * 100 / 1000 = 54`. A P2SH output is 32 bytes rather than 34 and
+/// its input is smaller still, so 54 is the conservative side of the boundary
+/// for either script type.
 ///
 /// This is a constant rather than a node query because both parties must
 /// compute the same number offline, before either has talked to a node - the
-/// counterparty's copy of the release has to match byte for byte. `zcashd` and
-/// `zebrad` agreeing on 54 is what makes that safe; a regtest run against a
-/// live node is what confirms it, and the boundary tests below pin the
-/// arithmetic on this side.
+/// counterparty's copy of the release has to match byte for byte. The
+/// arithmetic is pinned by the tests below; that the *node* agrees is pinned by
+/// `tests/dust_boundary_regtest.rs`, which puts a 53 zat and a 54 zat output in
+/// front of a running node and records which one it relays. That test is
+/// ignored by default and needs `ZECP2P_RPC_URL`, like the rest of the live
+/// suite.
 pub const DUST_THRESHOLD_ZAT: u64 = 54;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -143,21 +184,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_unpinned_treasury_refuses_rather_than_paying_somewhere() {
+    fn the_unpinned_mainnet_treasury_refuses_rather_than_paying_somewhere() {
         // Fail-closed is the point: an unset constant must never decode to a
-        // zero hash, which is an address nobody can spend from.
+        // zero hash, which is an address nobody can spend from. Mainnet stays
+        // unset until an address has been funded and spent from.
         assert_eq!(
             treasury_script(AddrNetwork::Main),
             Err(TreasuryError::Unpinned {
                 network: AddrNetwork::Main
             })
         );
-        assert_eq!(
-            treasury_script(AddrNetwork::Test),
-            Err(TreasuryError::Unpinned {
-                network: AddrNetwork::Test
-            })
+    }
+
+    #[test]
+    fn the_testnet_treasury_decodes_to_the_key_it_documents() {
+        // The pinned testnet address must decode, under testnet, to a P2PKH
+        // script over the hash160 the module comment publishes. If the constant
+        // and the comment ever disagree, the live-fire run would fund an
+        // address whose key nobody can produce.
+        let spk = treasury_script(AddrNetwork::Test).expect("the testnet treasury is pinned");
+        let mut expected = vec![0x76, 0xa9, 20];
+        expected.extend_from_slice(
+            &hex::decode("1cfbe04cc4c9d693b8483612a54bd72d0ddd109c").unwrap(),
         );
+        expected.extend_from_slice(&[0x88, 0xac]);
+        assert_eq!(spk, expected);
+    }
+
+    #[test]
+    fn the_testnet_treasury_cannot_become_a_mainnet_destination() {
+        // The one risk of pinning a published key: that a mainnet build reaches
+        // for it. `script_pubkey_for`'s network check refuses the `tm` prefix
+        // under mainnet, so the fallback does not exist.
+        assert!(matches!(
+            script_pubkey_for(TESTNET_TREASURY_ADDRESS, AddrNetwork::Main),
+            Err(AddressError::WrongNetwork { .. })
+        ));
     }
 
     #[test]
