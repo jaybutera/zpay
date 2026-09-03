@@ -39,7 +39,21 @@ pub enum AppError {
     /// "NEAR Intents error" for every amount below about a dollar and threw
     /// away the only number that would have told them what to type (U1-3).
     #[error("that is below the smallest swap this route can make right now: send at least {zatoshi} zatoshi")]
-    BelowFloor { zatoshi: u64 },
+    BelowFloor {
+        zatoshi: u64,
+        /// The smallest dollar amount that quotes, when the caller asked in
+        /// dollars and the rate was known at the point of the refusal.
+        ///
+        /// U2-3. The page used to convert the zatoshi floor itself, at the net
+        /// rate from the last quote it had seen, while the coordinator sizes a
+        /// dollar amount from a gross probe. The two disagreed by the fee and
+        /// the rounding, and they disagreed in the wrong direction: the page
+        /// suggested $1.08 on a day when $1.09 was the first amount that
+        /// quoted, so a sender who did what they were told was refused again
+        /// with the same number. Whoever owns the conversion has to own both
+        /// halves of it, so the coordinator now names the dollar amount.
+        cents: Option<u64>,
+    },
 
     #[error("zk-p2p curator error: {0}")]
     Zkp2p(String),
@@ -98,8 +112,14 @@ impl IntoResponse for AppError {
         // The page prices in ZEC and in dollars, and needs the floor as a
         // number to convert and to prefill. Prose is for the human; this is for
         // the code.
-        if let AppError::BelowFloor { zatoshi } = &self {
+        if let AppError::BelowFloor { zatoshi, cents } = &self {
             body["min_zatoshi"] = serde_json::json!(zatoshi);
+            // Only present when the caller asked in dollars: it is the first
+            // amount that will actually quote, not a conversion of the floor,
+            // so the page can suggest it and have it work (U2-3).
+            if let Some(c) = cents {
+                body["min_cents"] = serde_json::json!(c);
+            }
         }
 
         if let AppError::TooManyRequests {
@@ -131,6 +151,7 @@ impl AppError {
         match err.downcast_ref::<crate::near::BelowFloor>() {
             Some(below) => AppError::BelowFloor {
                 zatoshi: below.zatoshi,
+                cents: None,
             },
             None => AppError::NearIntents(err.to_string()),
         }

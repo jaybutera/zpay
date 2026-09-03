@@ -101,6 +101,42 @@ for (const a of GOOD_T) {
 check(`refuses every one-character corruption of a t-address (${tCorrupted} of them)`,
   tCaught, tCorrupted);
 
+// ---------- U2-6: the case a QR scanner hands back ----------
+
+// BIP 173 allows an all-upper-case bech32m string, `validateZcashAddress`
+// accepts one, and the server matched `starts_with("u1")` case-sensitively and
+// refused it. `normalizeZcashAddress` is the page's half of that fix: it turns
+// the upper-case form into the one both decoders take, and leaves everything
+// else alone.
+for (const u of GOOD_U) {
+  const upper = u.toUpperCase();
+  check(`accepts the upper-case form of ${u.slice(0, 12)}…`,
+    ZAddr.validateZcashAddress(upper), null);
+  check(`normalises the upper-case form of ${u.slice(0, 12)}… to the one the server takes`,
+    ZAddr.normalizeZcashAddress(upper), u);
+  check(`leaves the lower-case form of ${u.slice(0, 12)}… alone`,
+    ZAddr.normalizeZcashAddress(u), u);
+}
+
+// base58 is case-significant, so a t-address must survive untouched: lowering
+// one would turn a valid address into a different, invalid string.
+for (const a of GOOD_T) {
+  check(`leaves the t-address ${a.slice(0, 8)}… untouched`,
+    ZAddr.normalizeZcashAddress(a), a);
+}
+
+// Mixed case is not a valid bech32m encoding of anything, so it must not be
+// laundered into one by lower-casing it.
+for (const u of GOOD_U) {
+  const mixed = u.slice(0, 20).toUpperCase() + u.slice(20);
+  check(`refuses the mixed-case form of ${u.slice(0, 12)}…`,
+    typeof ZAddr.validateZcashAddress(mixed) === 'string', true);
+  check(`does not launder the mixed-case form of ${u.slice(0, 12)}…`,
+    ZAddr.normalizeZcashAddress(mixed), mixed);
+}
+
+check('trims surrounding whitespace', ZAddr.normalizeZcashAddress(`  ${GOOD_U[0]}  `), GOOD_U[0]);
+
 // ---------- the things that are not addresses ----------
 
 for (const [a, what] of [

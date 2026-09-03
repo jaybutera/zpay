@@ -176,7 +176,7 @@ pub fn check_amount(amount: Amount) -> Result<(), AppError> {
         // number rather than a category error.
         let floor = crate::near::observed_floor();
         if zatoshi < floor {
-            return Err(AppError::BelowFloor { zatoshi: floor });
+            return Err(AppError::BelowFloor { zatoshi: floor, cents: None });
         }
         if zatoshi > MAX_ZATOSHI {
             return Err(AppError::InvalidRequest(format!(

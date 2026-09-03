@@ -227,7 +227,7 @@ impl AppState {
         // Reject what 1Click would reject, before a round trip turns it into a 502.
         let floor = crate::near::observed_floor();
         if request.zec_amount < floor {
-            return Err(AppError::BelowFloor { zatoshi: floor });
+            return Err(AppError::BelowFloor { zatoshi: floor, cents: None });
         }
         crate::near::validate_zec_refund_address(&request.zec_refund_address)
             .map_err(|e| AppError::InvalidRequest(e.to_string()))?;

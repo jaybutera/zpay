@@ -61,8 +61,11 @@ async function api(path, opts = {}) {
     err.status = res.status;
     // The coordinator sends the bridge's real floor alongside the sentence, so
     // the page can convert it and say what to type instead of repeating an
-    // upstream category (U1-3).
+    // upstream category (U1-3). When the ask was in dollars it also sends the
+    // first dollar amount that actually quotes, because the conversion belongs
+    // to whoever does the sizing (U2-3).
     if (body && typeof body.min_zatoshi === 'number') err.minZatoshi = body.min_zatoshi;
+    if (body && typeof body.min_cents === 'number') err.minCents = body.min_cents;
     throw err;
   }
   return body;
@@ -296,9 +299,6 @@ const state = {
   rails: [],
   feeLabel: 'zpay fee',
   poll: null,
-  // Cents per whole ZEC from the last quote that succeeded, so a floor
-  // rejection can be reported in dollars.
-  lastRate: null,
 };
 
 /** Put the secret and the order id in the fragment, which no server sees. */
@@ -366,9 +366,6 @@ async function doQuote() {
       `&rail=${encodeURIComponent($('rail').value)}`
     );
     state.quote = q;
-    // Cents per whole ZEC, kept so a later floor rejection can be quoted in
-    // dollars rather than in zatoshi.
-    if (q.zec_zatoshi > 0) state.lastRate = q.net_cents / (q.zec_zatoshi / 1e8);
     renderQuote(q);
     msg('compose-msg', '');
   } catch (e) {
@@ -381,23 +378,26 @@ async function doQuote() {
 // The bridge has a smallest swap it will make, it moves with the ZEC network
 // fee, and it is the reason a small amount is refused. Saying the number in the
 // unit the sender is typing in is the whole point of carrying it back.
+//
+// U2-3. The dollar figure is the coordinator's, not this page's. Converting the
+// zatoshi floor here used the net rate from the last quote that worked, while
+// the coordinator sizes a dollar amount from a gross probe; the two disagreed
+// by the fee and the rounding, and the page landed a cent low. It suggested
+// $1.08 on a day when $1.09 was the first amount that quoted, so a sender who
+// followed the hint was refused again with the same hint. `min_cents` comes
+// from the same arithmetic that does the sizing, so what it names quotes.
 function floorHint(e) {
   if (!e || typeof e.minZatoshi !== 'number') return null;
 
   const zec = zecString(e.minZatoshi);
-  if (state.unit === 'zec') {
-    return `That is below the smallest swap this route can make right now. Send at least ${zec} ZEC.`;
-  }
+  const inZec = `That is below the smallest swap this route can make right now. Send at least ${zec} ZEC.`;
+  if (state.unit === 'zec') return inZec;
 
-  // In dollars, price the floor so the sender is told a dollar amount rather
-  // than being asked to convert zatoshi themselves. The rate comes from the
-  // last quote that worked; without one, name the ZEC amount.
-  const rate = state.lastRate;
-  if (!rate) {
-    return `That is below the smallest swap this route can make right now. Send at least ${zec} ZEC.`;
-  }
-  const cents = Math.ceil((e.minZatoshi / 1e8) * rate);
-  return `That is below the smallest amount this route can send right now, about ${money(cents)}. Try that or more.`;
+  // No dollar figure means the coordinator could not name one; say the ZEC
+  // rather than compute a number that may not quote.
+  if (typeof e.minCents !== 'number') return inZec;
+
+  return `That is below the smallest amount this route can send right now. ${money(e.minCents)} is the smallest that works.`;
 }
 
 function renderQuote(q) {
@@ -506,7 +506,19 @@ $('form-pay').addEventListener('submit', async (ev) => {
     showPayment(opened);
     startPolling();
   } catch (e) {
-    msg('compose-msg', 'err', e.message);
+    msg('compose-msg', 'err', floorHint(e) || e.message);
+    // U2-4. A refusal that names a spent or expired price means the id this
+    // page is holding will never open anything, so it is dropped and the next
+    // submit re-prices rather than repeating "already been opened at that
+    // price" forever. The server no longer spends the id on a check a
+    // resubmission would fix, so this covers only what is genuinely gone: a
+    // price that expired while the sender typed, or a coordinator restart.
+    if (/price/i.test(e.message) && /(expired|already been opened|not one this coordinator issued)/i.test(e.message)) {
+      state.quote = null;
+      $('quote').hidden = true;
+      if (expiryTimer) clearInterval(expiryTimer);
+      doQuote();
+    }
   } finally {
     btn.disabled = false;
     btn.textContent = 'Continue';
@@ -688,7 +700,13 @@ function validZcashAddress(a) {
 
 $('form-return').addEventListener('submit', async (ev) => {
   ev.preventDefault();
-  const addr = $('return-addr').value.trim();
+  // U2-6. Normalise before validating and before anything is sent. An
+  // all-upper-case unified address is what a QR scanner hands back, it is a
+  // valid bech32m encoding of the same address, and it passed this page and
+  // failed on the server. The field is rewritten too, so the sender sees the
+  // form that will be used rather than one silently swapped behind them.
+  const addr = ZAddr.normalizeZcashAddress($('return-addr').value);
+  $('return-addr').value = addr;
   const bad = validZcashAddress(addr);
   if (bad) { msg('return-msg', 'err', bad); return; }
 

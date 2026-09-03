@@ -127,7 +127,23 @@ pub async fn quote_v2(
     // unit the main route defaults to showing.
     let zatoshi = match amount {
         Amount::Zec { zatoshi } => zatoshi,
-        Amount::Usd { cents } => zatoshi_for_cents(&state, cents).await?,
+        Amount::Usd { cents } => {
+            let (zatoshi, units_per_zec) = zatoshi_for_cents(&state, cents).await?;
+            // U2-3. The dollar amount is refused here, in dollars, by the same
+            // arithmetic that sized it, rather than left for the page to
+            // reconstruct from the zatoshi floor at a rate it computed
+            // differently. `first_quotable_cents` is the smallest whole-cent
+            // amount whose ZEC lands on or above the floor, so a sender told
+            // "try $1.09" gets a quote for $1.09.
+            let floor = crate::near::observed_floor();
+            if zatoshi < floor {
+                return Err(AppError::BelowFloor {
+                    zatoshi: floor,
+                    cents: first_quotable_cents(floor, units_per_zec),
+                });
+            }
+            zatoshi
+        }
     };
 
     let min_rate = crate::api::parse_min_rate_pub(query.min_rate.as_deref())?;
@@ -146,7 +162,11 @@ pub async fn quote_v2(
 
 /// Ask 1Click what a nominal ZEC amount is worth, then invert to find the ZEC
 /// that lands on the requested dollars.
-async fn zatoshi_for_cents(state: &Arc<AppState>, cents: u64) -> Result<u64, AppError> {
+///
+/// Returns the ZEC and the rate it was inverted at, in USDC units per whole
+/// ZEC, so a caller who has to refuse the result can quote the floor back in
+/// dollars using the same number rather than a second, different one (U2-3).
+async fn zatoshi_for_cents(state: &Arc<AppState>, cents: u64) -> Result<(u64, u64), AppError> {
     const PROBE_ZATOSHI: u64 = 100_000_000; // 1 ZEC
 
     let glue = state
@@ -184,8 +204,56 @@ async fn zatoshi_for_cents(state: &Arc<AppState>, cents: u64) -> Result<u64, App
         .saturating_mul(PROBE_ZATOSHI as u128)
         .div_ceil(units_per_zec as u128);
 
-    u64::try_from(zatoshi)
-        .map_err(|_| AppError::InvalidRequest("that is more ZEC than this route takes".to_string()))
+    let zatoshi = u64::try_from(zatoshi).map_err(|_| {
+        AppError::InvalidRequest("that is more ZEC than this route takes".to_string())
+    })?;
+    Ok((zatoshi, units_per_zec))
+}
+
+/// The smallest whole-cent amount that `zatoshi_for_cents` would size at or
+/// above `floor_zatoshi`, at the rate that was just observed.
+///
+/// U2-3. The sizing rounds ZEC *up* from cents, so the boundary is not simply
+/// the floor converted to dollars: at 132,000 zatoshi and 1Click's rate on
+/// 2026-09-03, $1.08 sized to 131,868 zatoshi and was refused while $1.09 sized
+/// to 132,920 and quoted. Naming the cent below the boundary is what made the
+/// old hint useless, so the boundary is found rather than approximated, and it
+/// is found by the same `div_ceil` the sizing uses so the two cannot disagree.
+///
+/// A rate that puts the floor above what a `u64` of cents can hold, or a zero
+/// rate, gives `None` and the page falls back to naming the ZEC amount.
+fn first_quotable_cents(floor_zatoshi: u64, units_per_zec: u64) -> Option<u64> {
+    if units_per_zec == 0 {
+        return None;
+    }
+
+    // The candidate: the floor priced at this rate, rounded up to a whole cent.
+    // In USDC units, `floor_zatoshi * units_per_zec / PROBE_ZATOSHI`, then up to
+    // the next cent, which is 10,000 units.
+    const PROBE_ZATOSHI: u128 = 100_000_000;
+    let floor_units = (floor_zatoshi as u128)
+        .checked_mul(units_per_zec as u128)?
+        .div_ceil(PROBE_ZATOSHI);
+    let mut cents = u64::try_from(floor_units.div_ceil(10_000)).ok()?;
+    if cents == 0 {
+        cents = 1;
+    }
+
+    // Confirm, and step up if the rounding landed a cent short. One step is
+    // always enough at any rate a cent is worth less than the floor's step, and
+    // the loop is bounded anyway so a pathological rate cannot hang the
+    // handler.
+    for _ in 0..4 {
+        let sized = (cents as u128)
+            .checked_mul(10_000)?
+            .checked_mul(PROBE_ZATOSHI)?
+            .div_ceil(units_per_zec as u128);
+        if sized >= floor_zatoshi as u128 {
+            return Some(cents);
+        }
+        cents = cents.checked_add(1)?;
+    }
+    None
 }
 
 /// Take a live 1Click quote and turn it into the net price the sender reads.
@@ -667,6 +735,62 @@ mod tests {
             BackendId::NativeEscrow
         );
         assert!(resolve_backend(Some("something-else")).is_err());
+    }
+
+    /// U2-3, against the day's real numbers. On 2026-09-03 1Click's floor was
+    /// 132,000 zatoshi and one ZEC quoted at 819,907,155 USDC units. Through
+    /// the coordinator, $1.08 was refused and $1.09 quoted at 132,920 zatoshi,
+    /// while the page's own conversion suggested $1.08. The first amount that
+    /// quotes is the one this has to name.
+    #[test]
+    fn the_named_dollar_floor_is_the_first_amount_that_quotes() {
+        let cents = first_quotable_cents(132_000, 819_907_155).expect("a rate this size converts");
+        assert_eq!(cents, 109, "$1.08 was refused on the day this is taken from");
+    }
+
+    /// The property behind that number: whatever it names must survive the
+    /// sizing the quote path actually performs, and the cent below it must not.
+    /// Checked across a wide spread of rates, because a hint that is a cent
+    /// short is worse than no hint at all: the sender does what it says and is
+    /// refused again with the same sentence.
+    #[test]
+    fn the_named_dollar_floor_always_sizes_at_or_above_the_floor() {
+        const PROBE: u128 = 100_000_000;
+        let size = |cents: u64, rate: u64| -> u128 {
+            (cents as u128 * 10_000 * PROBE).div_ceil(rate as u128)
+        };
+
+        for floor in [52_000u64, 100_000, 131_999, 132_000, 250_000, 1_000_000] {
+            for rate in [
+                10_000_000u64,
+                100_000_000,
+                819_907_155,
+                1_076_169_000,
+                3_000_000_000,
+            ] {
+                let cents = first_quotable_cents(floor, rate)
+                    .unwrap_or_else(|| panic!("floor {floor} at rate {rate} named nothing"));
+                assert!(
+                    size(cents, rate) >= floor as u128,
+                    "floor {floor} at rate {rate}: {cents} cents sizes to {} zatoshi, under it",
+                    size(cents, rate)
+                );
+                if cents > 1 {
+                    assert!(
+                        size(cents - 1, rate) < floor as u128,
+                        "floor {floor} at rate {rate}: {} cents also quotes, so {cents} is not the first",
+                        cents - 1
+                    );
+                }
+            }
+        }
+    }
+
+    /// A rate of nothing is not a rate. Naming a dollar amount from it would be
+    /// naming a made-up number, so the page is left to say the ZEC instead.
+    #[test]
+    fn an_impossible_rate_names_no_dollar_amount() {
+        assert_eq!(first_quotable_cents(132_000, 0), None);
     }
 
     #[test]

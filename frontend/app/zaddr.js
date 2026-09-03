@@ -203,7 +203,32 @@
     return 'Use a Zcash address: u1… (shielded) or t1… / t3….';
   }
 
-  global.ZAddr = { validateZcashAddress, base58checkDecode, bech32mValid, sha256 };
+  /// The form of `a` the coordinator accepts, or the input unchanged.
+  ///
+  /// U2-6. BIP 173 lets a bech32m string be all upper case, `bech32mValid`
+  /// allows it, and a QR scanner hands back exactly that, because upper case
+  /// packs into fewer QR modules. The server matched `starts_with("u1")` case
+  /// sensitively and refused the same address as "not a Zcash address", so a
+  /// pasted `U1…` passed this page and failed on submit. Lower-casing here is
+  /// the whole fix on the sender's side: the two encodings are the same
+  /// address, and the lower-case one is what both decoders take.
+  ///
+  /// Transparent addresses are base58, which is case-significant, so they are
+  /// returned untouched. Only bech32m is normalised, and only when the whole
+  /// string is one case, which is the only form the spec allows.
+  function normalizeZcashAddress(a) {
+    const t = (a || '').trim();
+    if (/^U1[0-9A-Z]*$/.test(t)) return t.toLowerCase();
+    return t;
+  }
+
+  global.ZAddr = {
+    validateZcashAddress,
+    normalizeZcashAddress,
+    base58checkDecode,
+    bech32mValid,
+    sha256,
+  };
 })(typeof window !== 'undefined' ? window : globalThis);
 
 if (typeof module !== 'undefined' && module.exports) {
