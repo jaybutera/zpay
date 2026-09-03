@@ -53,7 +53,7 @@ pub async fn stats(
 /// `/quote` runs before the user has given a refund address, but 1Click still
 /// validates the field. Nothing is ever deposited against these quotes, so the
 /// address is never used; a real one is required to start an offramp.
-pub const QUOTE_REFUND_PLACEHOLDER: &str = "t1KhV8ADhTGvVvBpTiEcJGnhTvBBFVFYHXx";
+pub const QUOTE_REFUND_PLACEHOLDER: &str = "t1KhV8ADhTGvVvBpTiEcJGnhTvBBFWERZu7";
 
 /// Quote request query parameters
 #[derive(Debug, Deserialize)]
@@ -105,7 +105,7 @@ pub async fn get_quote(
         .near
         .get_quote(quote_request)
         .await
-        .map_err(|e| AppError::NearIntents(e.to_string()))?;
+        .map_err(AppError::from_quote_error)?;
 
     // Parse USDC amount (6 decimals)
     let usdc_raw: u64 = quote
@@ -538,12 +538,16 @@ fn validate_zec_address(address: &str) -> Result<(), AppError> {
 mod zec_address_tests {
     use super::*;
 
+    /// A t-address is accepted because it decodes, not because it is the right
+    /// length. The old rule checked length and charset, which let
+    /// `t1` plus 32 letters through; base58check does not (U1-4).
     #[test]
-    fn transparent_addresses_are_accepted_at_both_valid_lengths() {
-        // 35 characters
-        assert!(validate_zec_address("t1KhV8ADhTGvVvBpTiEcJGnhTvBBFVFYHXx").is_ok());
-        // 34 characters, which the old api.rs rule rejected
-        assert!(validate_zec_address(&format!("t1{}", "a".repeat(32))).is_ok());
+    fn transparent_addresses_are_accepted_when_they_decode() {
+        assert!(validate_zec_address(QUOTE_REFUND_PLACEHOLDER).is_ok());
+        assert!(
+            validate_zec_address(&format!("t1{}", "a".repeat(32))).is_err(),
+            "a correctly sized string with a wrong checksum is not an address"
+        );
     }
 
     /// The API layer delegates to the one authoritative check, so whatever

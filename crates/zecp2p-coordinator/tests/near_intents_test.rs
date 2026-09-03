@@ -19,7 +19,7 @@ use zecp2p_types::config::NearConfig;
 
 /// A mainnet transparent address, used only as a refund target on quotes that
 /// are never funded.
-const REFUND_TADDR: &str = "t1KhV8ADhTGvVvBpTiEcJGnhTvBBFVFYHXx";
+const REFUND_TADDR: &str = "t1KhV8ADhTGvVvBpTiEcJGnhTvBBFWERZu7";
 
 /// An address we control nothing at; quotes are never funded.
 const RECIPIENT: &str = "0x1234567890123456789012345678901234567890";
@@ -309,7 +309,7 @@ async fn test_live_asset_ids_still_supported() {
 /// Offline: the refund-address rule the live tests exercise.
 #[test]
 fn test_refund_address_validation_offline() {
-    validate_zec_refund_address("t1KhV8ADhTGvVvBpTiEcJGnhTvBBFVFYHXx").expect("t1 accepted");
+    validate_zec_refund_address("t1KhV8ADhTGvVvBpTiEcJGnhTvBBFWERZu7").expect("t1 accepted");
     validate_zec_refund_address("t3Vz22vK5z2LcKEdg16Yv4FFneEL1zg9ojd").expect("t3 accepted");
     assert!(validate_zec_refund_address("u1lq6jn3fkgd0dcxpvdnfrhrqrmvdnvzdmhd").is_err());
     assert!(validate_zec_refund_address("zs1z7rejlpsa98s2rrrfkwmaxu53e4ue0ulcrw").is_err());

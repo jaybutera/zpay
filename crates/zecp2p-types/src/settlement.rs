@@ -369,6 +369,35 @@ impl Stage {
     pub fn is_terminal(&self) -> bool {
         matches!(self, Stage::Done | Stage::Returned | Stage::Failed)
     }
+
+    /// How far up the ladder a stage sits.
+    ///
+    /// The keeper mirrors a session's status onto the order every tick, and the
+    /// session spends one pass in `NearIntentPending` after promotion, which
+    /// maps back to `AwaitingZec`. Without an ordering the status page would
+    /// read "ZEC seen" and then "waiting for your ZEC" again, which tells a
+    /// sender their money was un-received. Returns and failures are not rungs,
+    /// so they carry no rank and replace the ladder outright.
+    pub fn rank(&self) -> Option<u8> {
+        match self {
+            Stage::AwaitingZec => Some(0),
+            Stage::ZecSeen => Some(1),
+            Stage::InEscrow => Some(2),
+            Stage::PaidOut => Some(3),
+            Stage::Done => Some(4),
+            Stage::Returning | Stage::Returned | Stage::Failed => None,
+        }
+    }
+
+    /// The stage to show, given what the session reports and what the order has
+    /// already shown. A rung never goes back down; anything off the ladder wins
+    /// outright, because a return or a failure is news the sender needs.
+    pub fn no_lower_than(self, already_shown: Stage) -> Stage {
+        match (self.rank(), already_shown.rank()) {
+            (Some(new), Some(old)) if new < old => already_shown,
+            _ => self,
+        }
+    }
 }
 
 /// One stage with when it happened.

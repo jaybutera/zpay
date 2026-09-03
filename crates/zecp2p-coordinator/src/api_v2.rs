@@ -132,7 +132,7 @@ async fn zatoshi_for_cents(state: &Arc<AppState>, cents: u64) -> Result<u64, App
         .near
         .get_dry_quote(probe)
         .await
-        .map_err(|e| AppError::NearIntents(e.to_string()))?;
+        .map_err(AppError::from_quote_error)?;
 
     let units_per_zec: u64 = quoted
         .expected_output
@@ -185,7 +185,7 @@ async fn build_live_quote(
         .near
         .get_dry_quote(request)
         .await
-        .map_err(|e| AppError::NearIntents(e.to_string()))?;
+        .map_err(AppError::from_quote_error)?;
 
     let expected_usdc_units: u64 = quoted
         .expected_output
@@ -336,10 +336,17 @@ pub async fn open_order(
 
     let min_rate = crate::api::parse_min_rate_pub(body.overrides.min_rate.as_deref())?;
 
+    // Bounds first, so an amount 1Click would refuse costs no round trip and
+    // comes back as its own number rather than as an upstream category. The
+    // open path skipped this entirely, so an open at 1 zatoshi went all the way
+    // to 1Click and returned a 502 (U1-3).
+    let zatoshi = quote_zatoshi(&body)?;
+    oneclick::check_amount(Amount::Zec { zatoshi })?;
+
     // Re-quote at open time rather than trusting a quote_id the caller sends
     // back. A quote is a price, not a claim: honouring a stale one would let a
     // caller sit on a good rate and open against it later.
-    let quote = build_live_quote(&state, backend, quote_zatoshi(&body)?, min_rate).await?;
+    let quote = build_live_quote(&state, backend, zatoshi, min_rate).await?;
 
     // The rail's payee has to be registered with the curator before a deposit
     // can name it, and a rejection here costs no gas because none has been
@@ -372,7 +379,7 @@ pub async fn open_order(
         .near
         .get_quote(swap)
         .await
-        .map_err(|e| AppError::NearIntents(e.to_string()))?;
+        .map_err(AppError::from_quote_error)?;
 
     let deposit_expiry = chrono::DateTime::from_timestamp(opened_quote.expires_at as i64, 0)
         .unwrap_or_else(|| Utc::now() + chrono::Duration::minutes(5));
@@ -401,6 +408,11 @@ pub async fn open_order(
         refund_address,
         quote: quote.clone(),
         deposit: Some(deposit.clone()),
+        // The outputs of the quote that minted this deposit address, kept so
+        // promotion can bind the session to the swap the sender actually funds
+        // instead of taking a second quote (U1-1).
+        swap_expected_usdc: Some(opened_quote.expected_output.clone()),
+        swap_min_usdc: Some(opened_quote.min_output.clone()),
         overrides: body.overrides.clone(),
         session_uuid: None,
         stage: Stage::AwaitingZec,

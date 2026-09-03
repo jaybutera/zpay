@@ -18,7 +18,16 @@ use alloy::primitives::U256;
 use anyhow::Result;
 use zecp2p_types::settlement::{ReturnState, Stage};
 
-use crate::{db::OrderRecord, state::AppState};
+use crate::{db::OrderRecord, state::{AppState, FundedSwap}};
+
+/// How long past a deposit's stated deadline the keeper keeps asking 1Click
+/// about it.
+///
+/// A sender who broadcasts in the last minute of the window has a transaction
+/// 1Click will still settle, and retiring the order the instant the clock
+/// passes would strand exactly that payment. An hour is far longer than a Zcash
+/// confirmation takes and still bounds the polling set.
+const EXPIRY_GRACE: chrono::Duration = chrono::Duration::hours(1);
 
 /// Map an offramp session's status onto the canonical stage the sender reads.
 ///
@@ -67,6 +76,31 @@ impl AppState {
         let Some(deposit) = &order.deposit else {
             return Ok(());
         };
+
+        // U1-2. 1Click answers PENDING_DEPOSIT for an address long past its
+        // deadline, so status alone never retires an order and the keeper polls
+        // every order it has ever opened, on every tick, ahead of the live
+        // sessions. The deposit deadline is the bound, and it was written to the
+        // row and read by nothing.
+        //
+        // The grace window covers a sender who broadcast just inside the
+        // deadline: 1Click is still willing to settle that, so the keeper keeps
+        // asking for a while after the address stops being advertised.
+        if chrono::Utc::now() > deposit.expires_at + EXPIRY_GRACE {
+            let mut updated = order.clone();
+            updated.stage = Stage::Failed;
+            updated.error = Some(
+                "the deposit window closed before any ZEC arrived; nothing was sent, \
+                 so nothing is owed. Open a new order to try again."
+                    .to_string(),
+            );
+            self.db.update_order(&updated).await?;
+            tracing::info!(
+                order_id = %order.id,
+                "order expired unfunded; no longer polled"
+            );
+            return Ok(());
+        }
 
         // 404 means 1Click has not registered the address it just handed out.
         // That is "not yet", not a failure.
@@ -179,9 +213,39 @@ impl AppState {
                 .unwrap_or(600),
         };
 
-        self.create_offramp(request)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))
+        // U1-1. The session must watch the address the sender actually paid, and
+        // record the outputs of the quote that minted it. Handing the request to
+        // `create_offramp` would take a *second* 1Click quote and store that new
+        // address, so the keeper would poll an address nobody funded, the USDC
+        // on the glue would be credited to no session, and the dead session
+        // would hold the one-session gate shut for the NEAR timeout.
+        let deposit = order
+            .deposit
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("order {} has no deposit to promote", order.id))?;
+
+        let (Some(expected), Some(min)) =
+            (&order.swap_expected_usdc, &order.swap_min_usdc)
+        else {
+            // Orders opened before the columns existed. Re-quoting is the one
+            // thing that must not happen, so this stops rather than guesses.
+            anyhow::bail!(
+                "order {} predates the funded-swap fix and has no recorded quote outputs; \
+                 it cannot be promoted safely and needs manual settlement",
+                order.id
+            )
+        };
+
+        self.create_offramp_for_funded_swap(
+            request,
+            FundedSwap {
+                deposit_address: deposit.address.clone(),
+                expected_output: expected.clone(),
+                min_output: min.clone(),
+            },
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))
     }
 
     /// Copy a session's progress onto the order the sender is watching.
@@ -194,7 +258,10 @@ impl AppState {
             return Ok(());
         };
 
-        let stage = stage_for(session.status);
+        // A session spends one pass in NearIntentPending after promotion, which
+        // maps to AwaitingZec. The order already reads ZecSeen by then, so
+        // mirroring it raw would tell the sender their ZEC was un-received.
+        let stage = stage_for(session.status).no_lower_than(order.stage);
         let returns = self.returns_for(order, &session).await;
 
         if stage == order.stage && returns == order.returns && session.error == order.error {

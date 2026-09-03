@@ -111,6 +111,20 @@ pub struct AppState {
     sessions: RwLock<std::collections::HashMap<uuid::Uuid, OfframpSession>>,
 }
 
+/// A 1Click swap that already exists: an address the sender has been shown, and
+/// the outputs of the quote that minted it.
+///
+/// The main route hands one of these in. Re-quoting instead would mint a second
+/// deposit address and store *that* on the session, so the keeper would poll an
+/// address nobody funded while the sender's USDC sat on the glue attributed to
+/// nothing. That was U1-1.
+#[derive(Debug, Clone)]
+pub struct FundedSwap {
+    pub deposit_address: String,
+    pub expected_output: String,
+    pub min_output: String,
+}
+
 impl AppState {
     pub fn new(
         config: Config,
@@ -129,10 +143,34 @@ impl AppState {
         }
     }
 
-    /// Create a new offramp session
+    /// Create a new offramp session, taking a fresh 1Click quote for it.
+    ///
+    /// This is the `/offramp` path: the caller has not yet been given a deposit
+    /// address, so minting one here is right.
     pub async fn create_offramp(
         self: &Arc<Self>,
         request: OfframpRequest,
+    ) -> Result<OfframpSession, AppError> {
+        self.create_offramp_inner(request, None).await
+    }
+
+    /// Create a session bound to a swap the sender has already funded.
+    ///
+    /// Nothing is quoted here. The address and the two output figures are the
+    /// ones the sender saw and paid against, which is what makes the credit
+    /// attributable and the `CreditExceedsExpected` bound the right one.
+    pub async fn create_offramp_for_funded_swap(
+        self: &Arc<Self>,
+        request: OfframpRequest,
+        swap: FundedSwap,
+    ) -> Result<OfframpSession, AppError> {
+        self.create_offramp_inner(request, Some(swap)).await
+    }
+
+    async fn create_offramp_inner(
+        self: &Arc<Self>,
+        request: OfframpRequest,
+        funded: Option<FundedSwap>,
     ) -> Result<OfframpSession, AppError> {
         // Defence in depth for NEW-1. The glue holds one pot for every session and
         // an ERC-20 transfer names no session, so attribution rests entirely on
@@ -170,45 +208,54 @@ impl AppState {
         let mut session = OfframpSession::new(request.clone(), payee_details_hash);
 
         // Reject what 1Click would reject, before a round trip turns it into a 502.
-        if request.zec_amount < crate::near::MIN_ZEC_ZATOSHI {
-            return Err(AppError::InvalidRequest(format!(
-                "ZEC amount {} zatoshi is below the 1Click minimum of {} zatoshi",
-                request.zec_amount,
-                crate::near::MIN_ZEC_ZATOSHI
-            )));
+        let floor = crate::near::observed_floor();
+        if request.zec_amount < floor {
+            return Err(AppError::BelowFloor { zatoshi: floor });
         }
         crate::near::validate_zec_refund_address(&request.zec_refund_address)
             .map_err(|e| AppError::InvalidRequest(e.to_string()))?;
 
-        // Get quote from NEAR Intents
-        let glue_address = self
-            .chain
-            .glue_contract()
-            .map_err(|e| AppError::Config(e.to_string()))?;
+        // Either the swap the sender already funded, or a fresh one for a
+        // caller who has not been given an address yet. Never both, and never a
+        // second quote over the top of the first.
+        let swap = match funded {
+            Some(existing) => existing,
+            None => {
+                let glue_address = self
+                    .chain
+                    .glue_contract()
+                    .map_err(|e| AppError::Config(e.to_string()))?;
 
-        // Use the helper to create ZEC → USDC on Base request
-        let quote_request = crate::near::NearIntentsClient::zec_to_usdc_base_request(
-            request.zec_amount,
-            &glue_address.to_string(),
-            &request.zec_refund_address,
-            Some(50), // 0.5% slippage
-        );
+                let quote_request = crate::near::NearIntentsClient::zec_to_usdc_base_request(
+                    request.zec_amount,
+                    &glue_address.to_string(),
+                    &request.zec_refund_address,
+                    Some(50), // 0.5% slippage
+                );
 
-        let quote = self
-            .near
-            .get_quote(quote_request)
-            .await
-            .map_err(|e| AppError::NearIntents(e.to_string()))?;
+                let quote = self
+                    .near
+                    .get_quote(quote_request)
+                    .await
+                    .map_err(AppError::from_quote_error)?;
 
-        session.near_deposit_address = Some(quote.deposit_address);
+                FundedSwap {
+                    deposit_address: quote.deposit_address,
+                    expected_output: quote.expected_output,
+                    min_output: quote.min_output,
+                }
+            }
+        };
+
+        session.near_deposit_address = Some(swap.deposit_address);
         session.expected_usdc = Some(
-            U256::from_str_radix(&quote.expected_output, 10)
+            U256::from_str_radix(&swap.expected_output, 10)
                 .map_err(|e| AppError::NearIntents(e.to_string()))?,
         );
         // The guaranteed floor, not the estimate. The keeper waits for this much
         // before crediting the session, so a short delivery cannot promote it.
         session.min_output_usdc = Some(
-            U256::from_str_radix(&quote.min_output, 10)
+            U256::from_str_radix(&swap.min_output, 10)
                 .map_err(|e| AppError::NearIntents(e.to_string()))?,
         );
 

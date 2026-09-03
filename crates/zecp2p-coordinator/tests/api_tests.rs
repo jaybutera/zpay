@@ -486,7 +486,7 @@ async fn test_create_offramp_validates_zec_amount_zero() {
 }
 
 #[tokio::test]
-async fn test_create_offramp_validates_zec_address_length() {
+async fn test_create_offramp_validates_the_zec_refund_address() {
     let app = create_test_app().await;
 
     let body = serde_json::json!({
@@ -494,7 +494,9 @@ async fn test_create_offramp_validates_zec_address_length() {
         "venmo_username": "testuser",
         "user_address": test_user_address(),
         "taker_address": "0x1234567890123456789012345678901234567890",
-        "zec_refund_address": "t1TooShort"  // Valid prefix but wrong length
+        // A valid prefix and nothing else. Since U1-4 this is refused because
+        // it does not decode, not because of its length.
+        "zec_refund_address": "t1TooShort"
     });
 
     let response = app
@@ -516,7 +518,14 @@ async fn test_create_offramp_validates_zec_address_length() {
         .await
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert!(json["error"].as_str().unwrap().contains("length"));
+    assert!(
+        json["error"]
+            .as_str()
+            .unwrap()
+            .contains("transparent address"),
+        "unexpected error: {}",
+        json["error"]
+    );
 }
 
 #[tokio::test]

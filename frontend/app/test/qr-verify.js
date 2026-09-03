@@ -38,9 +38,9 @@ const refMatrix=(t)=>{const q=QRCode.create(t,{errorCorrectionLevel:'M',maskPatt
 
 const cases=[
  'short',
- 'zcash:t1KhV8ADhTGvVvBpTiEcJGnhTvBBFVFYHXx?amount=0.5',
- 'zcash:t1KhV8ADhTGvVvBpTiEcJGnhTvBBFVFYHXx?amount=0.00052&label=zpay%20to%20%40jane-doe%27s%20Venmo',
- 'zcash:t1KhV8ADhTGvVvBpTiEcJGnhTvBBFVFYHXx?amount=1.23456789&label=zpay%20to%20%40a-very-long-venmo-handle%27s%20Venmo',
+ 'zcash:t1KhV8ADhTGvVvBpTiEcJGnhTvBBFWERZu7?amount=0.5',
+ 'zcash:t1KhV8ADhTGvVvBpTiEcJGnhTvBBFWERZu7?amount=0.00052&label=zpay%20to%20%40jane-doe%27s%20Venmo',
+ 'zcash:t1KhV8ADhTGvVvBpTiEcJGnhTvBBFWERZu7?amount=1.23456789&label=zpay%20to%20%40a-very-long-venmo-handle%27s%20Venmo',
  'zcash:t3Vz22vK5z2LcKEdg16Yv4FFneEL1zg9ojd?amount=0.00000001',
  'a'.repeat(100), 'a'.repeat(150), 'a'.repeat(200),
 ];

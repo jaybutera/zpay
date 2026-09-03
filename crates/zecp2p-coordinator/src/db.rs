@@ -78,6 +78,8 @@ impl Database {
                 refund_address TEXT NOT NULL,
                 quote_json TEXT NOT NULL,
                 deposit_json TEXT,
+                swap_expected_usdc TEXT,
+                swap_min_usdc TEXT,
                 overrides_json TEXT NOT NULL,
                 session_uuid TEXT,
                 stage TEXT NOT NULL,
@@ -94,6 +96,22 @@ impl Database {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_orders_stage ON orders(stage)")
             .execute(&self.pool)
             .await?;
+
+        // U1-1. Orders opened before the promotion fix have no record of the
+        // quote their deposit address came from, so the columns are added to
+        // existing databases rather than only to new ones. SQLite has no
+        // `ADD COLUMN IF NOT EXISTS`; a duplicate-column error means the column
+        // is already there, which is the state this is trying to reach.
+        for ddl in [
+            "ALTER TABLE orders ADD COLUMN swap_expected_usdc TEXT",
+            "ALTER TABLE orders ADD COLUMN swap_min_usdc TEXT",
+        ] {
+            if let Err(e) = sqlx::query(ddl).execute(&self.pool).await {
+                if !e.to_string().contains("duplicate column name") {
+                    return Err(e.into());
+                }
+            }
+        }
 
         // Key-value store for tracking state like last processed block
         sqlx::query(
@@ -424,6 +442,14 @@ pub struct OrderRecord {
     pub refund_address: String,
     pub quote: zecp2p_types::settlement::Quote,
     pub deposit: Option<zecp2p_types::settlement::DepositInstruction>,
+    /// The `amountOut` of the 1Click quote that minted `deposit.address`, in
+    /// USDC units. The session the order is promoted into records this rather
+    /// than re-quoting, because the sender funded *this* address against *this*
+    /// price and `CreditExceedsExpected` is checked against it.
+    pub swap_expected_usdc: Option<String>,
+    /// The `minAmountOut` of that same quote: the floor the keeper waits for
+    /// before crediting.
+    pub swap_min_usdc: Option<String>,
     pub overrides: zecp2p_types::settlement::Overrides,
     pub session_uuid: Option<uuid::Uuid>,
     pub stage: zecp2p_types::settlement::Stage,
@@ -439,9 +465,10 @@ impl Database {
             r#"
             INSERT INTO orders (
                 id, backend, rail, handle, session_pubkey, evm_address, refund_address,
-                quote_json, deposit_json, overrides_json, session_uuid, stage,
+                quote_json, deposit_json, swap_expected_usdc, swap_min_usdc,
+                overrides_json, session_uuid, stage,
                 return_json, error, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(order.id.to_string())
@@ -453,6 +480,8 @@ impl Database {
         .bind(&order.refund_address)
         .bind(serde_json::to_string(&order.quote)?)
         .bind(order.deposit.as_ref().map(serde_json::to_string).transpose()?)
+        .bind(&order.swap_expected_usdc)
+        .bind(&order.swap_min_usdc)
         .bind(serde_json::to_string(&order.overrides)?)
         .bind(order.session_uuid.map(|u| u.to_string()))
         .bind(serde_json::to_string(&order.stage)?)
@@ -516,6 +545,8 @@ struct OrderRow {
     refund_address: String,
     quote_json: String,
     deposit_json: Option<String>,
+    swap_expected_usdc: Option<String>,
+    swap_min_usdc: Option<String>,
     overrides_json: String,
     session_uuid: Option<String>,
     stage: String,
@@ -544,6 +575,8 @@ impl TryFrom<OrderRow> for OrderRecord {
             refund_address: r.refund_address,
             quote: serde_json::from_str(&r.quote_json)?,
             deposit: r.deposit_json.as_deref().map(serde_json::from_str).transpose()?,
+            swap_expected_usdc: r.swap_expected_usdc,
+            swap_min_usdc: r.swap_min_usdc,
             overrides: serde_json::from_str(&r.overrides_json)?,
             session_uuid: r.session_uuid.map(|s| s.parse()).transpose()?,
             stage: serde_json::from_str(&r.stage)?,

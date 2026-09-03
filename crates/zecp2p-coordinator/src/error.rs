@@ -32,6 +32,15 @@ pub enum AppError {
     #[error("NEAR Intents error: {0}")]
     NearIntents(String),
 
+    /// The amount is under 1Click's bridge floor, and this is the floor.
+    ///
+    /// Separate from `NearIntents` because it is the sender's fault and the
+    /// sender can fix it. Flattening it into the category error printed
+    /// "NEAR Intents error" for every amount below about a dollar and threw
+    /// away the only number that would have told them what to type (U1-3).
+    #[error("that is below the smallest swap this route can make right now: send at least {zatoshi} zatoshi")]
+    BelowFloor { zatoshi: u64 },
+
     #[error("zk-p2p curator error: {0}")]
     Zkp2p(String),
 
@@ -55,6 +64,9 @@ impl IntoResponse for AppError {
             // sender address. Log it, return the category.
             AppError::Chain(_) => (StatusCode::BAD_GATEWAY, "Chain error".to_string()),
             AppError::NearIntents(_) => (StatusCode::BAD_GATEWAY, "NEAR Intents error".to_string()),
+            // The whole message, floor included: it is not sensitive and it is
+            // the only thing that lets the page say what to type instead.
+            AppError::BelowFloor { .. } => (StatusCode::BAD_REQUEST, self.to_string()),
             AppError::Zkp2p(_) => (StatusCode::BAD_GATEWAY, "zk-p2p curator error".to_string()),
             AppError::Config(_) => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
             AppError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Internal error".to_string()),
@@ -65,6 +77,7 @@ impl IntoResponse for AppError {
             AppError::SessionNotFound
             | AppError::InvalidState(_)
             | AppError::InvalidRequest(_)
+            | AppError::BelowFloor { .. }
             | AppError::Unauthorized(_) => {
                 warn!(error = %self, status = %status, "Client error")
             }
@@ -73,11 +86,33 @@ impl IntoResponse for AppError {
             }
         }
 
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "error": message
         });
+        // The page prices in ZEC and in dollars, and needs the floor as a
+        // number to convert and to prefill. Prose is for the human; this is for
+        // the code.
+        if let AppError::BelowFloor { zatoshi } = &self {
+            body["min_zatoshi"] = serde_json::json!(zatoshi);
+        }
 
         (status, axum::Json(body)).into_response()
+    }
+}
+
+impl AppError {
+    /// Turn a 1Click quote failure into the right kind of error.
+    ///
+    /// A below-the-floor rejection is the sender's to fix and keeps its number;
+    /// everything else is the opaque upstream category, because the raw text
+    /// carries endpoints and request shapes.
+    pub fn from_quote_error(err: anyhow::Error) -> Self {
+        match err.downcast_ref::<crate::near::BelowFloor>() {
+            Some(below) => AppError::BelowFloor {
+                zatoshi: below.zatoshi,
+            },
+            None => AppError::NearIntents(err.to_string()),
+        }
     }
 }
 

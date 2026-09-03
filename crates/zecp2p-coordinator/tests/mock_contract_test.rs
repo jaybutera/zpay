@@ -59,7 +59,7 @@ async fn test_client_parses_mock_quote_and_status() {
     let request = NearIntentsClient::zec_to_usdc_base_request(
         10_000_000,
         "0x1234567890123456789012345678901234567890",
-        "t1KhV8ADhTGvVvBpTiEcJGnhTvBBFVFYHXx",
+        "t1KhV8ADhTGvVvBpTiEcJGnhTvBBFWERZu7",
         Some(50),
     );
 
@@ -112,7 +112,7 @@ async fn test_client_reads_refund_from_mock() {
     let request = NearIntentsClient::zec_to_usdc_base_request(
         10_000_000,
         "0x1234567890123456789012345678901234567890",
-        "t1KhV8ADhTGvVvBpTiEcJGnhTvBBFVFYHXx",
+        "t1KhV8ADhTGvVvBpTiEcJGnhTvBBFWERZu7",
         Some(50),
     );
     let quote = client.get_quote(request).await.expect("quote parses");
@@ -141,7 +141,7 @@ async fn test_incomplete_deposit_is_not_terminal() {
     let request = NearIntentsClient::zec_to_usdc_base_request(
         10_000_000,
         "0x1234567890123456789012345678901234567890",
-        "t1KhV8ADhTGvVvBpTiEcJGnhTvBBFVFYHXx",
+        "t1KhV8ADhTGvVvBpTiEcJGnhTvBBFWERZu7",
         Some(50),
     );
     let quote = client.get_quote(request).await.expect("quote parses");

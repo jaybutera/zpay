@@ -10,12 +10,64 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use zecp2p_types::config::NearConfig;
 
-/// Smallest ZEC deposit 1Click will quote, in zatoshi.
+/// The floor this code assumes when 1Click has not yet told it otherwise.
 ///
-/// Below this the API rejects the quote with
-/// `Amount is too low for bridge, try at least 52000`. Checking locally turns a
-/// raw 400 into an error the caller can act on.
+/// This is a starting guess, not a fact. 1Click's real floor tracks the ZEC
+/// network fee and moves: it was 52,000 zatoshi when this constant was written
+/// and 132,000 on 2026-09-02, a factor of 2.5. Treating the constant as truth
+/// is what made every amount under about $1.07 come back as two words of
+/// "NEAR Intents error" with the real number thrown away (U1-3).
+///
+/// The authority is `observed_floor()`, which holds the last floor 1Click
+/// actually named in a 400. Quote and open paths read that; this constant only
+/// fills in before the first rejection has been seen.
 pub const MIN_ZEC_ZATOSHI: u64 = 52_000;
+
+/// The last floor 1Click named in an `Amount is too low for bridge` rejection.
+///
+/// One number for the process, because the floor is a property of the bridge
+/// and not of a caller. Reading it costs no round trip, so the check that used
+/// to fire against a stale constant now fires against the last thing the API
+/// actually said.
+static OBSERVED_FLOOR: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(MIN_ZEC_ZATOSHI);
+
+/// The floor to check an amount against and to advertise.
+pub fn observed_floor() -> u64 {
+    OBSERVED_FLOOR.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Record a floor 1Click named. Monotonic within a run in neither direction:
+/// the bridge's floor moves both ways with the fee, so the newest number wins.
+fn record_floor(zatoshi: u64) {
+    OBSERVED_FLOOR.store(zatoshi, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Pull the floor out of 1Click's rejection text.
+///
+/// The message is `Amount is too low for bridge, try at least 132000`. Parsing
+/// it is unlovely, but the number is the one thing the sender needs and the API
+/// offers it nowhere else; a missing or reshaped message just yields `None` and
+/// the caller falls back to the category error.
+pub fn parse_floor_from_error(body: &str) -> Option<u64> {
+    let tail = body.split("try at least").nth(1)?;
+    let digits: String = tail
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// An amount 1Click refused as below its bridge floor, carrying that floor.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("amount is below the 1Click bridge floor of {zatoshi} zatoshi")]
+pub struct BelowFloor {
+    pub zatoshi: u64,
+}
 
 /// Asset IDs for commonly used tokens in the NEAR Intents network
 pub mod assets {
@@ -113,6 +165,16 @@ impl NearIntentsClient {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
+
+            // The one rejection a sender can act on: they asked for less than
+            // the bridge takes. Keep the number rather than flattening it into
+            // a category, and remember it so the next quote is checked against
+            // what 1Click said and not against a constant in this file.
+            if let Some(floor) = parse_floor_from_error(&body) {
+                record_floor(floor);
+                return Err(anyhow::Error::new(BelowFloor { zatoshi: floor }));
+            }
+
             anyhow::bail!("Quote request failed with status {}: {}", status, body);
         }
 
@@ -265,18 +327,11 @@ pub fn validate_zec_refund_address(address: &str) -> Result<()> {
     let address = address.trim();
 
     if address.starts_with("t1") || address.starts_with("t3") {
-        // Base58Check t-addresses are 34 or 35 characters. The api.rs copy of
-        // this check insisted on exactly 35, which rejected a valid 34.
-        if address.len() < 34 || address.len() > 35 {
-            anyhow::bail!(
-                "refund address {} is not a valid length for a t-address (expected 34 or 35 characters)",
-                address
-            );
-        }
-        if !address[1..].chars().all(|c| c.is_ascii_alphanumeric()) {
-            anyhow::bail!("refund address {} contains characters base58 does not use", address);
-        }
-        return Ok(());
+        // U1-4. Length and charset are not a checksum: `t1AAAA…` and the repo's
+        // own placeholder with one character changed both passed the old check,
+        // and 1Click accepted them too, so a failed swap would have been
+        // refunded to a string nothing can pay. Decode it properly instead.
+        return validate_transparent_address(address);
     }
 
     if address.starts_with("u1") {
@@ -296,6 +351,58 @@ pub fn validate_zec_refund_address(address: &str) -> Result<()> {
     }
 
     anyhow::bail!("refund address {} is not a Zcash address", address)
+}
+
+/// Check that a `t1` or `t3` string really is a well-formed transparent
+/// address: base58check over the right mainnet version bytes.
+///
+/// `zcash_address` is already a dependency and already decodes the unified case
+/// two branches down, so the same decoder does both rather than a hand-rolled
+/// length check standing in for a checksum.
+fn validate_transparent_address(address: &str) -> Result<()> {
+    use zcash_address::{ConversionError, TryFromAddress, ZcashAddress};
+    use zcash_protocol::consensus::NetworkType;
+
+    /// A witness that the string decoded as a mainnet P2PKH or P2SH address.
+    ///
+    /// `convert_if_network` calls exactly one of these, and only after
+    /// base58check has verified the version bytes and the four-byte checksum,
+    /// so reaching a variant is the proof. Everything else falls through to the
+    /// blanket errors below.
+    struct TransparentOnly;
+
+    impl TryFromAddress for TransparentOnly {
+        type Error = &'static str;
+
+        fn try_from_transparent_p2pkh(
+            _net: NetworkType,
+            _data: [u8; 20],
+        ) -> Result<Self, ConversionError<Self::Error>> {
+            Ok(TransparentOnly)
+        }
+
+        fn try_from_transparent_p2sh(
+            _net: NetworkType,
+            _data: [u8; 20],
+        ) -> Result<Self, ConversionError<Self::Error>> {
+            Ok(TransparentOnly)
+        }
+    }
+
+    let parsed = ZcashAddress::try_from_encoded(address).map_err(|e| {
+        anyhow::anyhow!(
+            "refund address {address} is not a valid Zcash transparent address \
+             (it does not pass base58check): {e}"
+        )
+    })?;
+
+    parsed
+        .convert_if_network::<TransparentOnly>(NetworkType::Main)
+        .map_err(|e| {
+            anyhow::anyhow!("refund address {address} is not a mainnet t-address: {e}")
+        })?;
+
+    Ok(())
 }
 
 /// Check that a `u1` string really is a well-formed unified address.
@@ -662,7 +769,7 @@ mod tests {
         let request = NearIntentsClient::zec_to_usdc_base_request(
             MIN_ZEC_ZATOSHI - 1,
             "0x1234567890123456789012345678901234567890",
-            "t1KhV8ADhTGvVvBpTiEcJGnhTvBBFVFYHXx",
+            "t1KhV8ADhTGvVvBpTiEcJGnhTvBBFWERZu7",
             Some(50),
         );
 
@@ -675,7 +782,7 @@ mod tests {
         let request = NearIntentsClient::zec_to_usdc_base_request(
             MIN_ZEC_ZATOSHI,
             "0x1234567890123456789012345678901234567890",
-            "t1KhV8ADhTGvVvBpTiEcJGnhTvBBFVFYHXx",
+            "t1KhV8ADhTGvVvBpTiEcJGnhTvBBFWERZu7",
             Some(50),
         );
 
@@ -732,7 +839,7 @@ mod tests {
     #[test]
     fn test_validate_accepts_transparent_refund_addresses() {
         for transparent in [
-            "t1KhV8ADhTGvVvBpTiEcJGnhTvBBFVFYHXx",
+            "t1KhV8ADhTGvVvBpTiEcJGnhTvBBFWERZu7",
             "t3Vz22vK5z2LcKEdg16Yv4FFneEL1zg9ojd",
         ] {
             validate_zec_refund_address(transparent)
@@ -874,9 +981,49 @@ mod refund_address_tests {
     /// path every existing session used.
     #[test]
     fn transparent_addresses_still_pass() {
-        validate_zec_refund_address("t1KhV8ADhTGvVvBpTiEcJGnhTvBBFVFYHXx").unwrap();
-        validate_zec_refund_address(&format!("t1{}", "a".repeat(32))).unwrap();
-        validate_zec_refund_address(&format!("t3{}", "a".repeat(32))).unwrap();
+        validate_zec_refund_address("t1KhV8ADhTGvVvBpTiEcJGnhTvBBFWERZu7").unwrap();
+        validate_zec_refund_address("t3Vz22vK5z2LcKEdg16Yv4FFneEL1zg9ojd").unwrap();
+    }
+
+    /// U1-4. Length and charset are not a checksum. `t1AAAA…` and the repo's
+    /// own former placeholder, one character off a real address, were both
+    /// accepted here and by 1Click, so a failed swap would have refunded to a
+    /// string no wallet can spend from.
+    #[test]
+    fn a_t_address_that_fails_base58check_is_refused() {
+        for bad in [
+            // Right prefix, right length, wrong checksum.
+            "t1AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            // The old placeholder: its payload is real, its checksum is not.
+            "t1KhV8ADhTGvVvBpTiEcJGnhTvBBFVFYHXx",
+            // Correctly sized, entirely made up.
+            "t1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "t3aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            assert!(
+                validate_zec_refund_address(bad).is_err(),
+                "{bad} does not pass base58check and must be refused"
+            );
+        }
+    }
+
+    /// A single changed character in a real address must not survive.
+    #[test]
+    fn a_one_character_corruption_of_a_t_address_is_refused() {
+        let good = "t1KhV8ADhTGvVvBpTiEcJGnhTvBBFWERZu7";
+        assert!(validate_zec_refund_address(good).is_ok());
+        for i in 2..good.len() {
+            let mut broken: Vec<char> = good.chars().collect();
+            broken[i] = if broken[i] == 'a' { 'b' } else { 'a' };
+            let broken: String = broken.into_iter().collect();
+            if broken == good {
+                continue;
+            }
+            assert!(
+                validate_zec_refund_address(&broken).is_err(),
+                "{broken} is one character off {good} and must be refused"
+            );
+        }
     }
 
     /// A `u1` prefix is not a unified address. Deciding this locally is what
@@ -923,3 +1070,5 @@ mod refund_address_tests {
         assert!(validate_zec_refund_address("0x0000000000000000000000000000000000000000").is_err());
     }
 }
+
+

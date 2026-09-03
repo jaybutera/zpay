@@ -45,7 +45,7 @@ pub fn capabilities() -> Capabilities {
     Capabilities {
         backend: BackendId::OneclickZkp2p,
         rails: Rail::all().iter().copied().filter(|r| r.is_live()).collect(),
-        min_zatoshi: crate::near::MIN_ZEC_ZATOSHI,
+        min_zatoshi: crate::near::observed_floor(),
         max_zatoshi: MAX_ZATOSHI,
         quote_ttl_seconds: QUOTE_TTL_SECONDS,
         expected_seconds: EXPECTED_SECONDS,
@@ -170,12 +170,13 @@ pub fn default_expiry() -> chrono::DateTime<Utc> {
 /// Check an amount against this backend's bounds before spending a round trip.
 pub fn check_amount(amount: Amount) -> Result<(), AppError> {
     if let Amount::Zec { zatoshi } = amount {
-        if zatoshi < crate::near::MIN_ZEC_ZATOSHI {
-            return Err(AppError::InvalidRequest(format!(
-                "{} zatoshi is below the {} zatoshi minimum this route can swap",
-                zatoshi,
-                crate::near::MIN_ZEC_ZATOSHI
-            )));
+        // The last floor 1Click named, not a constant. Checking locally saves a
+        // round trip when the floor is already known; when it has moved up
+        // since, 1Click's own 400 corrects it and the sender sees the new
+        // number rather than a category error.
+        let floor = crate::near::observed_floor();
+        if zatoshi < floor {
+            return Err(AppError::BelowFloor { zatoshi: floor });
         }
         if zatoshi > MAX_ZATOSHI {
             return Err(AppError::InvalidRequest(format!(

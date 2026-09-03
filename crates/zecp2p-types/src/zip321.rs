@@ -114,8 +114,8 @@ mod tests {
 
     #[test]
     fn the_address_goes_in_the_path_and_the_amount_in_a_parameter() {
-        let uri = payment_uri("t1KhV8ADhTGvVvBpTiEcJGnhTvBBFVFYHXx", 50_000_000, None, None);
-        assert_eq!(uri, "zcash:t1KhV8ADhTGvVvBpTiEcJGnhTvBBFVFYHXx?amount=0.5");
+        let uri = payment_uri("t1KhV8ADhTGvVvBpTiEcJGnhTvBBFWERZu7", 50_000_000, None, None);
+        assert_eq!(uri, "zcash:t1KhV8ADhTGvVvBpTiEcJGnhTvBBFWERZu7?amount=0.5");
     }
 
     #[test]
