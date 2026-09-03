@@ -22,4 +22,5 @@ pub mod payment_details;
 pub mod rpc;
 pub mod script;
 pub mod terms;
+pub mod treasury;
 pub mod tx;

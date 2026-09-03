@@ -41,6 +41,17 @@ pub enum TxError {
     BelowFee { amount: u64, fee: u64 },
     #[error("the output script is empty")]
     EmptyOutputScript,
+    #[error("a transaction with no outputs pays nobody")]
+    NoOutputs,
+    #[error(
+        "the outputs total {outputs} zat, which with the {fee} zat miner fee exceeds the \
+         {amount} zat the escrow holds"
+    )]
+    OutputsExceedEscrow {
+        amount: u64,
+        fee: u64,
+        outputs: u64,
+    },
     #[error("the transparent input index is out of range")]
     BadInputIndex,
     #[error("could not serialize the transaction: {0}")]
@@ -50,6 +61,111 @@ pub enum TxError {
          an unknown value means a network upgrade this binary predates"
     )]
     UnknownBranchId(u32),
+}
+
+/// One output of an escrow spend: where it pays and how much.
+///
+/// A pair rather than two parallel slices, because the pairing is what the
+/// sighash commits to. Two parties that agreed on the same scripts and the same
+/// values but zipped them differently produce different digests, and the way
+/// that failure shows up is a release the LP cannot broadcast after it has
+/// already paid the fiat.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TxOutSpec {
+    pub script: Vec<u8>,
+    pub value_zat: u64,
+}
+
+impl TxOutSpec {
+    pub fn new(script: impl Into<Vec<u8>>, value_zat: u64) -> Self {
+        Self {
+            script: script.into(),
+            value_zat,
+        }
+    }
+}
+
+/// How a release divides the escrow: the miner takes `fee_zat`, the treasury
+/// takes `platform_fee_zat`, and the counterparty output takes the rest.
+///
+/// The platform fee is a *third output* on the release, not a skim taken
+/// somewhere off-chain. Its enforcement is the ZIP 244 SIGHASH_ALL digest: the
+/// user's adaptor pre-signature is made over a transaction whose entire output
+/// set is committed, so an LP holding that pre-signature can broadcast the
+/// transaction that pays the treasury or it can broadcast nothing. There is no
+/// third option in which it keeps the fee, because no signature it can produce
+/// authorises one.
+///
+/// A `platform_fee_zat` of zero means a two-output release and is the shape
+/// every escrow written before this field existed has.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseSplit {
+    /// Where the counterparty leg of the trade is paid.
+    pub payout_script: Vec<u8>,
+    /// The ZIP 317 miner fee, subtracted from the escrow before anyone is paid.
+    pub miner_fee_zat: u64,
+    /// The platform cut, in zatoshis. Zero omits the treasury output entirely.
+    pub platform_fee_zat: u64,
+    /// The treasury scriptPubKey. Ignored when `platform_fee_zat` is zero.
+    pub treasury_script: Vec<u8>,
+}
+
+impl ReleaseSplit {
+    /// A release with no platform fee: the shape the escrow had before the
+    /// treasury output existed.
+    pub fn without_fee(payout_script: impl Into<Vec<u8>>, miner_fee_zat: u64) -> Self {
+        Self {
+            payout_script: payout_script.into(),
+            miner_fee_zat,
+            platform_fee_zat: 0,
+            treasury_script: Vec::new(),
+        }
+    }
+
+    /// The ordered output set for an escrow of `amount_zat`.
+    ///
+    /// **The order is part of the signature.** It is fixed here, once, as
+    /// `[payout, treasury]` with the treasury always last, and nothing sorts
+    /// it: not by value, not by script, and not by which party assembled it.
+    /// Two implementations that ordered these differently would compute
+    /// different digests from identical terms, and this module exists because
+    /// that failure costs the LP money it has already paid out.
+    ///
+    /// The treasury output is omitted when the fee is zero, rather than
+    /// written as a zero-value output, because a zero-value output is dust and
+    /// makes the whole release non-standard.
+    pub fn outputs(&self, amount_zat: u64) -> Result<Vec<TxOutSpec>, TxError> {
+        let committed = self
+            .miner_fee_zat
+            .checked_add(self.platform_fee_zat)
+            .ok_or(TxError::OutputsExceedEscrow {
+                amount: amount_zat,
+                fee: self.miner_fee_zat,
+                outputs: self.platform_fee_zat,
+            })?;
+        let payout = amount_zat
+            .checked_sub(committed)
+            .ok_or(TxError::BelowFee {
+                amount: amount_zat,
+                fee: committed,
+            })?;
+        if payout == 0 {
+            return Err(TxError::OutputsExceedEscrow {
+                amount: amount_zat,
+                fee: self.miner_fee_zat,
+                outputs: self.platform_fee_zat,
+            });
+        }
+
+        let mut outs = vec![TxOutSpec::new(self.payout_script.clone(), payout)];
+        if self.platform_fee_zat > 0 {
+            outs.push(TxOutSpec::new(
+                self.treasury_script.clone(),
+                self.platform_fee_zat,
+            ));
+        }
+        Ok(outs)
+    }
 }
 
 /// Everything both parties need to rebuild the same transaction.
@@ -182,16 +298,36 @@ impl UnsignedEscrowTx {
     }
 }
 
+/// Turns the ordered output specs into the bundle's `vout`, refusing the
+/// shapes a node would.
+///
+/// An empty script is refused rather than encoded: `OP_RETURN`-less empty
+/// scriptPubKeys are anyone-can-spend, so an output built from a script the
+/// caller forgot to set is money handed to the first miner who notices.
+fn build_vout(outputs: &[TxOutSpec]) -> Result<Vec<TxOut>, TxError> {
+    if outputs.is_empty() {
+        return Err(TxError::NoOutputs);
+    }
+    let mut vout = Vec::with_capacity(outputs.len());
+    for o in outputs {
+        if o.script.is_empty() {
+            return Err(TxError::EmptyOutputScript);
+        }
+        vout.push(TxOut::new(
+            Zatoshis::const_from_u64(o.value_zat),
+            Script(Code(o.script.clone())),
+        ));
+    }
+    Ok(vout)
+}
+
 fn build(
     terms: &EscrowTerms,
-    output_script: &[u8],
-    output_value: u64,
+    outputs: &[TxOutSpec],
     sequence: u32,
     lock_time: u32,
 ) -> Result<UnsignedEscrowTx, TxError> {
-    if output_script.is_empty() {
-        return Err(TxError::EmptyOutputScript);
-    }
+    let vout = build_vout(outputs)?;
     let redeem = terms.redeem_script()?;
     let script_pubkey = terms.script_pubkey()?;
 
@@ -206,10 +342,7 @@ fn build(
             (),
             sequence,
         )],
-        vout: vec![TxOut::new(
-            Zatoshis::const_from_u64(output_value),
-            Script(Code(output_script.to_vec())),
-        )],
+        vout,
         authorization: EscrowEffects {
             inputs: vec![prev_out],
         },
@@ -246,21 +379,27 @@ fn build(
     })
 }
 
-/// The release transaction of spec 4.3: one escrow input, one output to the LP,
+/// The release transaction of spec 4.3: one escrow input, the split's outputs,
 /// `nLockTime = 0`, final input.
+pub fn build_release_split(
+    terms: &EscrowTerms,
+    split: &ReleaseSplit,
+) -> Result<UnsignedEscrowTx, TxError> {
+    build(
+        terms,
+        &split.outputs(terms.amount_zat)?,
+        RELEASE_SEQUENCE,
+        0,
+    )
+}
+
+/// A release paying only the LP, with no platform fee.
 pub fn build_release(
     terms: &EscrowTerms,
     lp_output_script: &[u8],
     fee_zat: u64,
 ) -> Result<UnsignedEscrowTx, TxError> {
-    let value = terms
-        .amount_zat
-        .checked_sub(fee_zat)
-        .ok_or(TxError::BelowFee {
-            amount: terms.amount_zat,
-            fee: fee_zat,
-        })?;
-    build(terms, lp_output_script, value, RELEASE_SEQUENCE, 0)
+    build_release_split(terms, &ReleaseSplit::without_fee(lp_output_script, fee_zat))
 }
 
 /// The refund transaction of spec 4.4: `nLockTime = T` and a non-final input,
@@ -279,8 +418,7 @@ pub fn build_refund(
         })?;
     build(
         terms,
-        user_output_script,
-        value,
+        &[TxOutSpec::new(user_output_script.to_vec(), value)],
         REFUND_SEQUENCE,
         u32::try_from(terms.refund_height).map_err(|_| TxError::BadInputIndex)?,
     )
@@ -309,16 +447,15 @@ pub fn zat(v: u64) -> ZatBalance {
 
 /// Serializes a fully signed escrow spend into the bytes a node accepts.
 ///
-/// The escrow's two spending transactions have exactly one transparent input
-/// and one output and no shielded bundle, so this rebuilds the same
+/// The escrow's two spending transactions have exactly one transparent input,
+/// an ordered output set and no shielded bundle, so this rebuilds the same
 /// `TransactionData` with an authorized transparent bundle and freezes it.
 /// Going back through the library rather than hand-rolling the v5 format means
 /// ZIP 225 field ordering, the version group id and the branch id come from the
 /// same code that computed the sighash.
 pub fn serialize_signed(
     terms: &EscrowTerms,
-    output_script: &[u8],
-    output_value: u64,
+    outputs: &[TxOutSpec],
     sequence: u32,
     lock_time: u32,
     script_sig: &[u8],
@@ -326,20 +463,13 @@ pub fn serialize_signed(
     use zcash_primitives::transaction::Authorized as TxAuthorized;
     use zcash_transparent::bundle::Authorized as TransparentAuthorized;
 
-    if output_script.is_empty() {
-        return Err(TxError::EmptyOutputScript);
-    }
-
     let bundle = Bundle::<TransparentAuthorized> {
         vin: vec![zcash_transparent::bundle::TxIn::from_parts(
             terms.outpoint(),
             Script(Code(script_sig.to_vec())),
             sequence,
         )],
-        vout: vec![TxOut::new(
-            Zatoshis::const_from_u64(output_value),
-            Script(Code(output_script.to_vec())),
-        )],
+        vout: build_vout(outputs)?,
         authorization: TransparentAuthorized,
     };
 
@@ -362,26 +492,34 @@ pub fn serialize_signed(
     Ok(bytes)
 }
 
-/// Serializes a signed release (spec 4.3).
+/// Serializes a signed release (spec 4.3), platform fee included.
+///
+/// It rebuilds the output set from the same [`ReleaseSplit`] the digest was
+/// computed from, so the bytes broadcast and the bytes signed cannot drift.
+pub fn serialize_release_split(
+    terms: &EscrowTerms,
+    split: &ReleaseSplit,
+    script_sig: &[u8],
+) -> Result<Vec<u8>, TxError> {
+    serialize_signed(
+        terms,
+        &split.outputs(terms.amount_zat)?,
+        RELEASE_SEQUENCE,
+        0,
+        script_sig,
+    )
+}
+
+/// Serializes a signed release paying only the LP.
 pub fn serialize_release(
     terms: &EscrowTerms,
     lp_output_script: &[u8],
     fee_zat: u64,
     script_sig: &[u8],
 ) -> Result<Vec<u8>, TxError> {
-    let value = terms
-        .amount_zat
-        .checked_sub(fee_zat)
-        .ok_or(TxError::BelowFee {
-            amount: terms.amount_zat,
-            fee: fee_zat,
-        })?;
-    serialize_signed(
+    serialize_release_split(
         terms,
-        lp_output_script,
-        value,
-        RELEASE_SEQUENCE,
-        0,
+        &ReleaseSplit::without_fee(lp_output_script, fee_zat),
         script_sig,
     )
 }
@@ -402,8 +540,7 @@ pub fn serialize_refund(
         })?;
     serialize_signed(
         terms,
-        user_output_script,
-        value,
+        &[TxOutSpec::new(user_output_script.to_vec(), value)],
         REFUND_SEQUENCE,
         u32::try_from(terms.refund_height).map_err(|_| TxError::BadInputIndex)?,
         script_sig,
@@ -443,4 +580,13 @@ pub fn release_txid(
 ) -> Result<[u8; 32], TxError> {
     let raw = serialize_release(terms, lp_output_script, fee_zat, script_sig)?;
     txid_of_signed(&raw)
+}
+
+/// The txid a signed release with a platform-fee output will have.
+pub fn release_split_txid(
+    terms: &EscrowTerms,
+    split: &ReleaseSplit,
+    script_sig: &[u8],
+) -> Result<[u8; 32], TxError> {
+    txid_of_signed(&serialize_release_split(terms, split, script_sig)?)
 }

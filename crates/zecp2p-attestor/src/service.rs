@@ -166,6 +166,15 @@ pub struct WireTerms {
     pub rate_18dec: String,
     pub payee_hash: String,
     pub lock_confirmed_ms: u64,
+    /// The platform cut in zatoshis, and the treasury script it pays. Both feed
+    /// `terms_hash`, so an announcement that omits them pins a different hash
+    /// from the one the client computed and the mismatch surfaces at `/attest`
+    /// rather than as a release nobody can broadcast. Defaulted for the
+    /// no-fee shape, which is what a client that predates the field sends.
+    #[serde(default)]
+    pub platform_fee_zat: u64,
+    #[serde(default)]
+    pub treasury_script: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -205,6 +214,9 @@ impl WireTerms {
             rate_18dec: self.rate_18dec.parse().map_err(|_| "bad rate".to_string())?,
             payee_hash: hex32(&self.payee_hash)?,
             lock_confirmed_ms: self.lock_confirmed_ms,
+            platform_fee_zat: self.platform_fee_zat,
+            treasury_script: hex::decode(self.treasury_script.trim_start_matches("0x"))
+                .map_err(|e| format!("treasury_script is not hex: {e}"))?,
         })
     }
 
@@ -220,6 +232,8 @@ impl WireTerms {
             rate_18dec: t.rate_18dec.to_string(),
             payee_hash: hex::encode(t.payee_hash),
             lock_confirmed_ms: t.lock_confirmed_ms,
+            platform_fee_zat: t.platform_fee_zat,
+            treasury_script: hex::encode(&t.treasury_script),
         }
     }
 }

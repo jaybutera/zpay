@@ -63,6 +63,8 @@ fn poc1_the_client_refuses_lp_authored_fiat_terms() {
         refund_height: REFUND_HEIGHT,
         l_pub: tx_terms.l_pub,
         amount_zat: 5_000_000,
+        platform_fee_zat: 0,
+        treasury_script: Vec::new(),
     };
 
     // What the LP returns in step 1c: chain fields honest, fiat fields its own.
@@ -77,6 +79,8 @@ fn poc1_the_client_refuses_lp_authored_fiat_terms() {
         rate_18dec: IDENTITY_RATE_18DEC,
         payee_hash: LP_VENMO_HASH,
         lock_confirmed_ms: 1_788_315_013_000,
+        platform_fee_zat: 0,
+        treasury_script: Vec::new(),
     };
 
     let ann = Announcement {
@@ -203,6 +207,8 @@ fn poc1b_a_rate_the_user_did_not_accept_is_refused() {
         refund_height: REFUND_HEIGHT,
         l_pub: tx_terms.l_pub,
         amount_zat: 5_000_000,
+        platform_fee_zat: 0,
+        treasury_script: Vec::new(),
     };
     let bent = CanonicalTerms {
         funding_txid: VICTIM_TXID,
@@ -215,6 +221,8 @@ fn poc1b_a_rate_the_user_did_not_accept_is_refused() {
         rate_18dec: 990_881_148_896_019_200,
         payee_hash: USER_VENMO_HASH,
         lock_confirmed_ms: 1_788_315_013_000,
+        platform_fee_zat: 0,
+        treasury_script: Vec::new(),
     };
 
     let mut store = MemoryRecordStore::default();

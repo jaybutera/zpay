@@ -101,6 +101,8 @@ fn run_prepare(
         refund_height: quote_refund_height,
         l_pub,
         amount_zat: 5_000_000,
+        platform_fee_zat: 0,
+        treasury_script: Vec::new(),
     };
     let lp_terms = CanonicalTerms {
         funding_txid: TXID,
@@ -113,6 +115,8 @@ fn run_prepare(
         rate_18dec: IDENTITY_RATE_18DEC,
         payee_hash: [0x85; 32],
         lock_confirmed_ms: 1_788_315_013_000,
+        platform_fee_zat: 0,
+        treasury_script: Vec::new(),
     };
     let ann = Announcement {
         p: d.public_key(&secp),
@@ -192,6 +196,8 @@ fn r3_1b_the_derived_escrow_always_refunds_to_the_user() {
         rate_18dec: IDENTITY_RATE_18DEC,
         payee_hash: [0x85; 32],
         lock_confirmed_ms: 1_788_315_013_000,
+        platform_fee_zat: 0,
+        treasury_script: Vec::new(),
     };
     let quote = AcceptedQuote {
         usd_amount_6dec: 100_000_000,
@@ -200,6 +206,8 @@ fn r3_1b_the_derived_escrow_always_refunds_to_the_user() {
         refund_height: REFUND_HEIGHT,
         l_pub,
         amount_zat: 5_000_000,
+        platform_fee_zat: 0,
+        treasury_script: Vec::new(),
     };
     let d = SecretKey::from_slice(&[0xd1; 32]).unwrap();
     let k = SecretKey::from_slice(&[0x4b; 32]).unwrap();

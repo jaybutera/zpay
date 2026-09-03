@@ -13,7 +13,7 @@ use secp256k1_zkp::{PublicKey, Secp256k1, SecretKey};
 use crate::chain::{ChainClient, ChainError};
 use crate::deadlines::EscrowPolicy;
 use crate::dlc::{outcome_point, pre_sign, verify_pre_signature, DlcError};
-use crate::tx::{build_release, EscrowTerms, TxError};
+use crate::tx::{build_release_split, EscrowTerms, ReleaseSplit, TxError};
 
 /// What the user must have on disk before the funding transaction is
 /// broadcast. Without every field the refund cannot be built.
@@ -77,6 +77,14 @@ pub enum ClientError {
     Tx(String),
     #[error("chain error: {0}")]
     Chain(#[from] ChainError),
+    #[error("treasury error: {0}")]
+    Treasury(String),
+}
+
+impl From<crate::treasury::TreasuryError> for ClientError {
+    fn from(e: crate::treasury::TreasuryError) -> Self {
+        ClientError::Treasury(e.to_string())
+    }
 }
 
 impl From<TxError> for ClientError {
@@ -188,6 +196,19 @@ pub struct AcceptedQuote {
     pub l_pub: [u8; 33],
     /// The escrow amount in zatoshis.
     pub amount_zat: u64,
+    /// The platform cut, in zatoshis, paid as a third output on the release.
+    ///
+    /// Derived by [`AcceptedQuote::new`] from `amount_zat` and the platform's
+    /// own published rate, never taken from the LP. It is in the quote because
+    /// the user is agreeing to it: the fee comes out of the escrow before the
+    /// LP's leg, so it is part of what the user is signing away.
+    pub platform_fee_zat: u64,
+    /// Where that cut is paid.
+    ///
+    /// Empty exactly when `platform_fee_zat` is zero. Filled from the pinned
+    /// constant in [`crate::treasury`] and never from anything the LP sends -
+    /// a treasury address the LP supplies is one it can point at itself.
+    pub treasury_script: Vec<u8>,
 }
 
 /// Why a quote was refused.
@@ -208,6 +229,13 @@ pub enum QuoteError {
     RefundHeightOutOfRange { got: u64, max: u64 },
     #[error("the LP public key is not a valid compressed secp256k1 point")]
     BadLpKey,
+    #[error("the treasury is not usable: {0}")]
+    Treasury(String),
+    #[error(
+        "a platform fee of {fee_zat} zat against a {amount_zat} zat escrow leaves the LP \
+         nothing; the fee is a share of the trade, not the trade"
+    )]
+    FeeExceedsEscrow { amount_zat: u64, fee_zat: u64 },
 }
 
 /// The minimum escrow, spec section 3: "0.001 ZEC above fees".
@@ -270,7 +298,67 @@ impl AcceptedQuote {
             refund_height,
             l_pub,
             amount_zat,
+            // No platform fee unless one is asked for. A quote built by this
+            // constructor is the two-output shape every escrow had before the
+            // treasury output existed.
+            platform_fee_zat: 0,
+            treasury_script: Vec::new(),
         })
+    }
+
+    /// The same quote, with the platform fee charged to the pinned treasury.
+    ///
+    /// The fee and the address are *derived*, not accepted: the rate is
+    /// [`crate::treasury::PLATFORM_FEE_BPS`] and the address is the constant
+    /// compiled into this binary for `network`. Neither is a parameter, because
+    /// a parameter is something a caller relaying an LP's answer could fill in,
+    /// and a treasury address the LP supplies is one it can point at itself.
+    ///
+    /// Below the dust threshold the fee is zero and the release stays
+    /// two-output. Above it, the treasury must be pinned or this refuses: a
+    /// build with no treasury address should not quote a fee it has nowhere to
+    /// pay.
+    pub fn with_platform_fee(
+        usd_amount_6dec: u64,
+        payee_hash: [u8; 32],
+        rate_18dec: u128,
+        refund_height: u64,
+        l_pub: [u8; 33],
+        amount_zat: u64,
+        network: crate::address::AddrNetwork,
+    ) -> Result<Self, QuoteError> {
+        let mut q = Self::new(
+            usd_amount_6dec,
+            payee_hash,
+            rate_18dec,
+            refund_height,
+            l_pub,
+            amount_zat,
+        )?;
+
+        let platform_fee_zat = crate::treasury::default_platform_fee_zat(amount_zat);
+        if platform_fee_zat == 0 {
+            // Below dust there is no treasury script to name. Leaving it empty
+            // rather than filling it anyway keeps `canonical_json` from
+            // committing to an address the transaction does not pay.
+            return Ok(q);
+        }
+
+        // The fee comes out of the escrow before the LP's leg, and an escrow
+        // that pays the platform everything pays the LP nothing. The miner fee
+        // is `MINIMUM_ESCROW_ZAT`'s business; this catches a rate large enough
+        // to swallow what is left.
+        if platform_fee_zat >= amount_zat {
+            return Err(QuoteError::FeeExceedsEscrow {
+                amount_zat,
+                fee_zat: platform_fee_zat,
+            });
+        }
+
+        q.platform_fee_zat = platform_fee_zat;
+        q.treasury_script = crate::treasury::treasury_script(network)
+            .map_err(|e| QuoteError::Treasury(e.to_string()))?;
+        Ok(q)
     }
 
     /// A quote at the identity rate, which is the only rate a ZEC escrow uses.
@@ -289,6 +377,40 @@ impl AcceptedQuote {
             l_pub,
             amount_zat,
         )
+    }
+
+    /// A quote at the identity rate, charging the platform fee.
+    pub fn at_identity_rate_with_fee(
+        usd_amount_6dec: u64,
+        payee_hash: [u8; 32],
+        refund_height: u64,
+        l_pub: [u8; 33],
+        amount_zat: u64,
+        network: crate::address::AddrNetwork,
+    ) -> Result<Self, QuoteError> {
+        Self::with_platform_fee(
+            usd_amount_6dec,
+            payee_hash,
+            crate::payment_details::IDENTITY_RATE_18DEC,
+            refund_height,
+            l_pub,
+            amount_zat,
+            network,
+        )
+    }
+
+    /// The release split this quote implies, given the miner fee.
+    ///
+    /// One place computes it, so the digest the user signs and the bytes the LP
+    /// broadcasts cannot be assembled from different opinions about where the
+    /// treasury output goes or whether there is one.
+    pub fn release_split(&self, lp_output_script: &[u8], miner_fee_zat: u64) -> ReleaseSplit {
+        ReleaseSplit {
+            payout_script: lp_output_script.to_vec(),
+            miner_fee_zat,
+            platform_fee_zat: self.platform_fee_zat,
+            treasury_script: self.treasury_script.clone(),
+        }
     }
 }
 
@@ -392,6 +514,12 @@ pub fn prepare_escrow(
         rate_18dec: quote.rate_18dec,
         payee_hash: quote.payee_hash,
         lock_confirmed_ms: lp_terms.lock_confirmed_ms,
+        // Both derived by the quote from a pinned constant and a published
+        // rate, so an LP that names a different treasury or a different cut
+        // hashes differently and is caught by the comparison below - before the
+        // user has funded anything.
+        platform_fee_zat: quote.platform_fee_zat,
+        treasury_script: quote.treasury_script.clone(),
     };
 
     // 4. Whatever the LP sent must be exactly that. One comparison over the
@@ -440,7 +568,14 @@ pub fn prepare_escrow(
         &announcement.event_id,
         &canonical.terms_hash(),
     )?;
-    let digest = build_release(&terms, lp_output_script, fee_zat)?.sighash()?;
+    // The digest is over the *whole* output set, treasury output included. That
+    // is what makes the fee cost no extra trust: SIGHASH_ALL commits to every
+    // output's value, script and position, so the pre-signature the LP receives
+    // decrypts to a signature over this transaction and no other. An LP that
+    // wants the fee for itself would need a different signature from the user,
+    // and it has no way to produce one.
+    let split = quote.release_split(lp_output_script, fee_zat);
+    let digest = build_release_split(&terms, &split)?.sighash()?;
     let pre_sig = pre_sign(secp, &digest, u_priv, &y);
 
     // The user verifies its own pre-signature before handing it over, so a
@@ -452,6 +587,7 @@ pub fn prepare_escrow(
         outcome_point: y,
         terms,
         canonical,
+        split,
     })
 }
 
@@ -464,6 +600,13 @@ pub struct PreparedEscrow {
     pub outcome_point: PublicKey,
     pub terms: EscrowTerms,
     pub canonical: crate::terms::CanonicalTerms,
+    /// The exact output set the pre-signature was made over.
+    ///
+    /// Returned rather than left for the caller to rebuild, because a caller
+    /// that rebuilt it and got one field wrong would produce a release the
+    /// pre-signature does not authorise, and would find out only after the LP
+    /// had paid the fiat.
+    pub split: ReleaseSplit,
 }
 
 impl core::fmt::Debug for PreparedEscrow {
@@ -471,6 +614,7 @@ impl core::fmt::Debug for PreparedEscrow {
         f.debug_struct("PreparedEscrow")
             .field("terms_hash", &hex::encode(self.canonical.terms_hash()))
             .field("refund_height", &self.terms.refund_height)
+            .field("platform_fee_zat", &self.split.platform_fee_zat)
             .finish()
     }
 }

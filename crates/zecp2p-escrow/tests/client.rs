@@ -71,6 +71,8 @@ fn canonical(t: &EscrowTerms) -> CanonicalTerms {
         rate_18dec: 1_000_000_000_000_000_000,
         payee_hash: [0x85; 32],
         lock_confirmed_ms: 1_788_315_013_000,
+        platform_fee_zat: 0,
+        treasury_script: Vec::new(),
     }
 }
 
@@ -84,6 +86,8 @@ fn quote(c: &CanonicalTerms) -> AcceptedQuote {
         refund_height: c.refund_height,
         l_pub: c.l_pub,
         amount_zat: c.amount_zat,
+        platform_fee_zat: c.platform_fee_zat,
+        treasury_script: c.treasury_script.clone(),
     }
 }
 

@@ -18,8 +18,18 @@ fn base() -> CanonicalTerms {
         rate_18dec: 990_881_148_896_019_200,
         payee_hash: [0x85; 32],
         lock_confirmed_ms: 1_788_315_013_000,
+        // 20 bps of 5_000_000 zat, the rate `treasury::PLATFORM_FEE_BPS` sets.
+        platform_fee_zat: 10_000,
+        treasury_script: TREASURY.to_vec(),
     }
 }
+
+/// A P2PKH scriptPubKey standing in for the treasury. Any 25 bytes serve; what
+/// the tests below check is that the bytes reach the hash, not which bytes.
+const TREASURY: &[u8] = &[
+    0x76, 0xa9, 20, 0xc0, 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xcb,
+    0xcc, 0xcd, 0xce, 0xcf, 0xd0, 0xd1, 0xd2, 0xd3, 0x88, 0xac,
+];
 
 #[test]
 fn the_canonical_json_has_sorted_keys_and_no_whitespace() {
@@ -36,7 +46,7 @@ fn the_canonical_json_has_sorted_keys_and_no_whitespace() {
     let mut sorted = keys.clone();
     sorted.sort_unstable();
     assert_eq!(keys, sorted, "keys are not sorted: {keys:?}");
-    assert_eq!(keys.len(), 10, "all ten fields must be serialized");
+    assert_eq!(keys.len(), 12, "all twelve fields must be serialized");
 }
 
 #[test]
@@ -69,6 +79,8 @@ fn every_field_changes_the_intent_hash() {
         ("rate_18dec", Box::new(|t: &mut CanonicalTerms| t.rate_18dec += 1)),
         ("payee_hash", Box::new(|t: &mut CanonicalTerms| t.payee_hash = [0x86; 32])),
         ("lock_confirmed_ms", Box::new(|t: &mut CanonicalTerms| t.lock_confirmed_ms += 1)),
+        ("platform_fee_zat", Box::new(|t: &mut CanonicalTerms| t.platform_fee_zat += 1)),
+        ("treasury_script", Box::new(|t: &mut CanonicalTerms| t.treasury_script[3] ^= 0xff)),
     ];
 
     for (name, mutate) in mutations {
@@ -112,8 +124,10 @@ fn the_canonical_json_is_a_fixed_vector() {
             "\"l_pub\":\"030303030303030303030303030303030303030303030303030303030303030303\",",
             "\"lock_confirmed_ms\":\"1788315013000\",",
             "\"payee_hash\":\"8585858585858585858585858585858585858585858585858585858585858585\",",
+            "\"platform_fee_zat\":\"10000\",",
             "\"rate_18dec\":\"990881148896019200\",",
             "\"refund_height\":\"3500000\",",
+            "\"treasury_script\":\"76a914c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d388ac\",",
             "\"u_pub\":\"020202020202020202020202020202020202020202020202020202020202020202\",",
             "\"usd_amount_6dec\":\"1000000\",",
             "\"vout\":\"0\"}"

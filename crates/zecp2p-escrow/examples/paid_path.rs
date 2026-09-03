@@ -62,6 +62,17 @@ fn env(k: &str) -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RunRecord {
     lock_confirmed_ms: u64,
+    /// The platform fee and its destination at the time of the first run.
+    ///
+    /// Recorded for the same reason `fee_zat` and `lp_script` are (R9-1): a
+    /// resume must rebuild the transaction the record describes, not the one
+    /// today's constants would produce. A treasury rotation between the two
+    /// runs would otherwise change the sighash and strand a pre-signature that
+    /// cannot be regenerated.
+    #[serde(default)]
+    platform_fee_zat: u64,
+    #[serde(default)]
+    treasury_script: String,
     terms_hash: String,
     event_id: String,
     r: String,
@@ -443,6 +454,8 @@ fn setup(args: &[String], allow_create: bool) -> Setup {
         rate_18dec: IDENTITY_RATE_18DEC,
         payee_hash,
         lock_confirmed_ms: now_ms,
+        platform_fee_zat: 0,
+        treasury_script: Vec::new(),
     };
     let terms = EscrowTerms {
         funding_txid,
@@ -647,6 +660,8 @@ fn cmd_announce(args: &[String]) {
     // Written before anything else, and never regenerated (R9-1).
     let record = RunRecord {
         lock_confirmed_ms: s.canonical.lock_confirmed_ms,
+        platform_fee_zat: s.canonical.platform_fee_zat,
+        treasury_script: hex::encode(&s.canonical.treasury_script),
         terms_hash: hex::encode(s.canonical.terms_hash()),
         event_id: ann.event_id.clone(),
         r: ann.r.clone(),

@@ -281,6 +281,16 @@ enum Commands {
         /// intent hash and an attestation that releases nothing.
         #[arg(long)]
         lock_confirmed_ms: u64,
+        /// The platform fee in zatoshis, paid to the treasury as a third output
+        /// on the release.
+        ///
+        /// Part of the terms hash, so it must be the number the user's client
+        /// computed. A watch that guesses it watches a different escrow.
+        #[arg(long, default_value_t = 0)]
+        platform_fee_zat: u64,
+        /// The treasury scriptPubKey, hex. Empty exactly when the fee is zero.
+        #[arg(long, default_value = "")]
+        treasury_script: String,
         /// Treat the user's pre-signature as verified.
         ///
         /// The escrow crate refuses to reach `ReadyToPay` without it. This flag
@@ -966,6 +976,8 @@ async fn run_zec_watch(config: &TakerConfig, command: &Commands) -> Result<()> {
         payee_hash,
         recipient,
         lock_confirmed_ms,
+        platform_fee_zat,
+        treasury_script,
         assume_presigned,
     } = command
     else {
@@ -1059,6 +1071,9 @@ async fn run_zec_watch(config: &TakerConfig, command: &Commands) -> Result<()> {
         *rate_18dec,
         payee_bytes,
         *lock_confirmed_ms,
+        *platform_fee_zat,
+        hex::decode(treasury_script.trim_start_matches("0x"))
+            .context("--treasury-script is not hex")?,
     )?;
 
     let escrow = zecp2p_taker::auto::zec::WatchedEscrow {

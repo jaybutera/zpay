@@ -94,6 +94,8 @@ fn mainnet_escrow() -> WatchedEscrow {
         1_000_000_000_000_000_000,
         bytes32(PAYEE_HASH),
         LOCK_CONFIRMED_MS,
+        0,
+        Vec::new(),
     )
     .expect("the mainnet terms must build");
 

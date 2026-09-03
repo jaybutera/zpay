@@ -243,6 +243,8 @@ pub fn canonical_terms(
     rate_18dec: u128,
     payee_hash: [u8; 32],
     lock_confirmed_ms: u64,
+    platform_fee_zat: u64,
+    treasury_script: Vec<u8>,
 ) -> Result<CanonicalTerms> {
     if usd_amount_6dec == 0 {
         bail!("an escrow for $0.00 has nothing to pay and nothing to release");
@@ -264,6 +266,18 @@ pub fn canonical_terms(
         );
     }
 
+    // A fee with nowhere to pay it, or a treasury with nothing to pay it, means
+    // the two sides of the trade are about to build different transactions from
+    // the same terms. Refuse here rather than at the sighash.
+    if (platform_fee_zat == 0) != treasury_script.is_empty() {
+        bail!(
+            "platform_fee_zat is {platform_fee_zat} and the treasury script is {} bytes. \
+             They must both be set or both be empty: a fee with no destination cannot be \
+             paid, and a destination with no fee is an output the release does not carry.",
+            treasury_script.len()
+        );
+    }
+
     Ok(CanonicalTerms {
         funding_txid: terms.funding_txid,
         vout: terms.vout,
@@ -275,6 +289,8 @@ pub fn canonical_terms(
         rate_18dec,
         payee_hash,
         lock_confirmed_ms,
+        platform_fee_zat,
+        treasury_script,
     })
 }
 
@@ -315,6 +331,9 @@ mod tests {
             1_000_000_000_000_000_000,
             [0x85; 32],
             1_756_000_000_000,
+            400,
+            vec![0x76, 0xa9, 20, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb,
+                 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0x88, 0xac],
         )
         .unwrap();
         WatchedEscrow {
@@ -497,11 +516,11 @@ mod tests {
             refund_height: 3_471_833,
             consensus_branch_id: 0xc8e7_1055,
         };
-        assert!(canonical_terms(&terms, 0, 1, [0x85; 32], 1).is_err());
-        assert!(canonical_terms(&terms, 1_500_000, 0, [0x85; 32], 1).is_err());
-        let err = canonical_terms(&terms, 1_500_000, 1, [0u8; 32], 1).expect_err("must refuse");
+        assert!(canonical_terms(&terms, 0, 1, [0x85; 32], 1, 0, Vec::new()).is_err());
+        assert!(canonical_terms(&terms, 1_500_000, 0, [0x85; 32], 1, 0, Vec::new()).is_err());
+        let err = canonical_terms(&terms, 1_500_000, 1, [0u8; 32], 1, 0, Vec::new()).expect_err("must refuse");
         assert!(err.to_string().contains("payee hash"), "{err}");
-        let err = canonical_terms(&terms, 1_500_000, 1, [0x85; 32], 0).expect_err("must refuse");
+        let err = canonical_terms(&terms, 1_500_000, 1, [0x85; 32], 0, 0, Vec::new()).expect_err("must refuse");
         assert!(err.to_string().contains("any time"), "{err}");
     }
 

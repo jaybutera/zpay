@@ -86,6 +86,14 @@ pub struct WireTerms {
     pub rate_18dec: String,
     pub payee_hash: String,
     pub lock_confirmed_ms: u64,
+    /// The platform cut in zatoshis. Defaulted so an older attestor that does
+    /// not send the field still decodes - and decodes to *no* fee, which is the
+    /// shape those escrows actually have.
+    #[serde(default)]
+    pub platform_fee_zat: u64,
+    /// The treasury scriptPubKey, hex. Empty exactly when the fee is zero.
+    #[serde(default)]
+    pub treasury_script: String,
 }
 
 impl WireTerms {
@@ -101,6 +109,8 @@ impl WireTerms {
             rate_18dec: t.rate_18dec.to_string(),
             payee_hash: hex::encode(t.payee_hash),
             lock_confirmed_ms: t.lock_confirmed_ms,
+            platform_fee_zat: t.platform_fee_zat,
+            treasury_script: hex::encode(&t.treasury_script),
         }
     }
 }

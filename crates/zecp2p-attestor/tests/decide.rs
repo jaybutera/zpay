@@ -38,6 +38,8 @@ fn terms() -> CanonicalTerms {
         rate_18dec: 1_000_000_000_000_000_000,
         payee_hash: [0x85; 32],
         lock_confirmed_ms: 1_788_315_013_000,
+        platform_fee_zat: 0,
+        treasury_script: Vec::new(),
     }
 }
 

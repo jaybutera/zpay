@@ -157,3 +157,52 @@ fn the_fee_is_monotone_in_input_size() {
         last = f;
     }
 }
+
+/// The design's claim that the platform-fee output is free, priced rather than
+/// assumed.
+///
+/// ZIP 317 charges the larger of the input and output action counts. The
+/// release input is 310 bytes, which is 3 input actions; outputs are 34 bytes
+/// each. So the output side does not bind until there are four of them, and the
+/// escrow's three-output release costs exactly what its one-output release did.
+#[test]
+fn the_release_fee_is_flat_through_three_outputs_and_steps_at_four() {
+    use zecp2p_escrow::fees::release_fee_zat;
+    let rs_len = escrow_redeem_len();
+
+    assert_eq!(release_fee_zat(rs_len, 1), 15_000);
+    assert_eq!(release_fee_zat(rs_len, 2), 15_000);
+    assert_eq!(release_fee_zat(rs_len, 3), 15_000);
+    assert_eq!(
+        release_fee_zat(rs_len, 4),
+        20_000,
+        "the fourth output is the first one that costs anything"
+    );
+
+    // And the library agrees for each shape, so this is ZIP 317 and not the
+    // escrow's own arithmetic agreeing with itself.
+    for n in 1..=4 {
+        assert_eq!(
+            release_fee_zat(rs_len, n),
+            library_fee(
+                release_input_size(rs_len),
+                vec![P2PKH_STANDARD_OUTPUT_SIZE; n],
+                0,
+            ),
+            "disagreement at {n} outputs"
+        );
+    }
+}
+
+/// The 15,000 zat the mainnet run paid was correct, and it was buying two more
+/// outputs than it spent.
+#[test]
+fn the_mainnet_release_paid_for_outputs_it_did_not_use() {
+    let rs_len = escrow_redeem_len();
+    assert_eq!(release_fee_to_transparent_zat(rs_len), 15_000);
+    assert_eq!(
+        zecp2p_escrow::fees::release_fee_zat(rs_len, 3),
+        release_fee_to_transparent_zat(rs_len),
+        "adding the treasury output changes nothing about what the miner takes"
+    );
+}

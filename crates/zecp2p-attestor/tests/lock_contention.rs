@@ -71,6 +71,8 @@ fn terms_for(txid: [u8; 32]) -> CanonicalTerms {
         rate_18dec: IDENTITY_RATE_18DEC,
         payee_hash: [0x85; 32],
         lock_confirmed_ms: NOW_MS,
+        platform_fee_zat: 0,
+        treasury_script: Vec::new(),
     }
 }
 
