@@ -358,6 +358,26 @@ impl RpcChainClient {
 /// first costs 60 s (measured); the second comes from its rejection cache and
 /// is instant. Either clears when the missing input is mined, so a caller that
 /// has already paid the fiat must retry rather than give up.
+/// Whether the node is saying it already holds this transaction.
+///
+/// zebra and zcashd both answer a re-broadcast this way, and neither is a
+/// failure: the transaction is in the mempool or already mined.
+pub fn is_already_accepted(message: &str) -> bool {
+    let m = message.to_lowercase();
+    m.contains("transaction already exists")
+        || m.contains("already in mempool")
+        || m.contains("already exists in mempool")
+        || m.contains("committed to the best chain")
+        || m.contains("txn-already-known")
+        || m.contains("txn-already-in-mempool")
+}
+
+/// The txid of a signed transaction we are about to send or have just sent.
+fn zecp2p_txid_of(raw_tx: &[u8]) -> Result<[u8; 32], ChainError> {
+    crate::tx::txid_of_signed(raw_tx)
+        .map_err(|e| ChainError::Unreachable(format!("could not parse our own release: {e}")))
+}
+
 fn is_not_yet(message: &str) -> bool {
     let m = message.to_lowercase();
     m.contains("could not find transparent input utxo")
@@ -518,11 +538,23 @@ impl ChainClient for RpcChainClient {
 
     fn broadcast(&self, raw_tx: &[u8]) -> Result<[u8; 32], ChainError> {
         self.ensure_network()?;
-        let txid: String = self.call_with(
+        let sent: Result<String, ChainError> = self.call_with(
             &self.broadcast_http,
             "sendrawtransaction",
             serde_json::json!([hex::encode(raw_tx)]),
-        )?;
-        rpc_hex_to_txid(&txid)
+        );
+        match sent {
+            Ok(txid) => rpc_hex_to_txid(&txid),
+            // R11-5 / R10-7: a node saying it already has this transaction is
+            // reporting success. Both answers mean the release is on chain or
+            // in the mempool, which is exactly what we wanted; treating them as
+            // rejections told the LP to "rerun attest to resend" a release that
+            // had already been mined. The node returns no txid with these, so
+            // compute it from the bytes we just sent.
+            Err(ChainError::Rejected(text)) if is_already_accepted(&text) => {
+                zecp2p_txid_of(raw_tx)
+            }
+            Err(e) => Err(e),
+        }
     }
 }

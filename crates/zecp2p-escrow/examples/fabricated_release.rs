@@ -17,7 +17,7 @@ use secp256k1::{Message, PublicKey, Secp256k1, SecretKey};
 
 use zecp2p_escrow::chain::ChainClient;
 use zecp2p_escrow::fees::release_fee_to_transparent_zat;
-use zecp2p_escrow::rpc::{txid_from_display, Network, RpcChainClient, RpcConfig};
+use zecp2p_escrow::rpc::{txid_from_display, txid_to_display, Network, RpcChainClient, RpcConfig};
 use zecp2p_escrow::script::release_script_sig;
 use zecp2p_escrow::tx::{build_release, encode_signature, serialize_release, EscrowTerms};
 
@@ -96,7 +96,7 @@ fn main() {
     println!("raw release     : {}", hex::encode(&raw));
 
     match chain.broadcast(&raw) {
-        Ok(id) => println!("ACCEPTED (BAD!) : {}", hex::encode(id)),
+        Ok(id) => println!("ACCEPTED (BAD!) : {}", txid_to_display(&id)),
         Err(e) => println!("node rejected   : {e}"),
     }
 

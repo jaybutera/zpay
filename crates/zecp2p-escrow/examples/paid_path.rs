@@ -242,8 +242,17 @@ fn test_enclave_address() -> [u8; 20] {
 /// sent. `prove_payment_pinned.mjs` writes exactly these fields; the fixture at
 /// `tests/fixtures/attestation_1000000.json` has the same shape.
 fn attestation_from_prover(path: &str) -> WireAttestation {
-    let text = std::fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("read the prover's export at {path}: {e}"));
+    let text = std::fs::read_to_string(path).unwrap_or_else(|e| {
+        eprintln!("cannot read the prover's export at {path}: {e}");
+        eprintln!();
+        eprintln!("  This is the file step 4 writes. If the prover failed, no");
+        eprintln!("  attestation exists yet and nothing here can proceed: the release");
+        eprintln!("  needs the attestor's scalar, and the attestor needs this file.");
+        eprintln!("  Rerun the prover with OUT set to this path.");
+        eprintln!();
+        eprintln!("  The escrow is untouched and still refunds at T.");
+        std::process::exit(2);
+    });
     let j: serde_json::Value =
         serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse {path}: {e}"));
     let att = &j["attestation"];
@@ -506,6 +515,35 @@ fn enforce_deadlines(s: &Setup, stage: &str) {
     }
 }
 
+/// Warns, without refusing, that a resumed broadcast now races the refund.
+///
+/// Spec 4.5: past `BROADCAST_DEADLINE` the user may sweep at `T`, and whichever
+/// transaction is mined first wins. Refusing here would strand an LP who has
+/// already paid, so this says what is happening instead.
+fn warn_if_past_broadcast_deadline(s: &Setup) {
+    let policy = zecp2p_escrow::deadlines::EscrowPolicy::mainnet_default();
+    let t = s.terms.refund_height as u32;
+    let limit = policy.broadcast_deadline_for_refund_height(t);
+    let height = match s.chain.height() {
+        Ok(h) => h,
+        // A resume must still broadcast if the height cannot be read; the
+        // release is the LP's only claim on a dollar already sent.
+        Err(e) => {
+            println!("  height         unknown ({e}); broadcasting anyway");
+            return;
+        }
+    };
+    println!("  height         {height}  (T {t}, limit {limit})");
+    if height >= limit {
+        println!();
+        println!("  WARNING: past BROADCAST_DEADLINE {limit}. This release now races the");
+        println!("  user's refund, which becomes spendable at {t}. Whichever is mined");
+        println!("  first wins. Broadcasting anyway: the payment has already been sent,");
+        println!("  and this release is the only claim on it.");
+        println!();
+    }
+}
+
 fn attestor_client() -> AttestorClient {
     AttestorClient::new(env("ZECP2P_ATTESTOR_URL"), env("ZECP2P_ATTESTOR_TOKEN"))
         .expect("attestor client")
@@ -635,6 +673,11 @@ fn cmd_attest(args: &[String]) {
         let raw = hex::decode(&raw_hex).expect("recorded release");
         println!("== resuming with the release already built ==");
         println!("  txid           {}", record.txid.clone().unwrap_or_default());
+        // R11-5: a resume must not refuse - the dollar is already gone, and
+        // this release is the only way to be paid for it. But past
+        // BROADCAST_DEADLINE it is racing the refund, and the LP should know
+        // that before waiting on a confirmation that may never come.
+        warn_if_past_broadcast_deadline(&s);
         broadcast(&s, &raw, &record);
         return;
     }
@@ -764,7 +807,16 @@ fn broadcast(s: &Setup, raw: &[u8], record: &RunRecord) {
         }
         Err(e) => {
             println!("  node said      {e}");
-            println!("  the signed release is in {}; rerun `attest` to resend", s.record_path);
+            let retryable = matches!(&e, zecp2p_escrow::lp::LpError::Chain(c) if c.is_retryable());
+            if retryable {
+                println!("  This is not a verdict: the node cannot judge it yet, or could not");
+                println!("  be reached. The signed release is in {}.", s.record_path);
+                println!("  Rerun `attest` to resend; it replays the same bytes.");
+            } else {
+                println!("  The chain refused this release. The signed bytes are in {}.", s.record_path);
+                println!("  Rerunning `attest` will resend the same transaction and get the");
+                println!("  same answer; the escrow refunds at T={}.", s.terms.refund_height);
+            }
             let _ = record;
         }
     }
@@ -793,9 +845,14 @@ fn cmd_verify(args: &[String]) {
     };
     let chain = RpcChainClient::new(cfg).expect("rpc");
 
-    let script_sig = chain
-        .release_script_sig(txid_rpc)
-        .expect("read the mined transaction");
+    let script_sig = chain.release_script_sig(txid_rpc).unwrap_or_else(|e| {
+        eprintln!("cannot read the release {txid_rpc}: {e}");
+        eprintln!();
+        eprintln!("  `verify` reads the transaction the chain holds, so it only works");
+        eprintln!("  once the release is mined. Give it the txid `attest` printed, in");
+        eprintln!("  the order shown, and wait for a confirmation.");
+        std::process::exit(2);
+    });
 
     // scriptSig is OP_0 <sig_u> <sig_l> OP_1 <redeem>; sig_u is the first push.
     let len = script_sig[1] as usize;

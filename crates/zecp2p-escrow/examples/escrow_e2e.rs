@@ -32,7 +32,7 @@ use zecp2p_escrow::fees::refund_fee_to_transparent_zat;
 use zecp2p_escrow::address::{script_pubkey_for, AddrNetwork, AddressError};
 use zecp2p_escrow::keystore::{self, KeyOrigin};
 use zecp2p_escrow::funding::{escrow_address, AddressNetwork};
-use zecp2p_escrow::rpc::{Network, RpcChainClient, RpcConfig};
+use zecp2p_escrow::rpc::{txid_to_display, Network, RpcChainClient, RpcConfig};
 use zecp2p_escrow::script::refund_script_sig;
 use zecp2p_escrow::tx::{build_refund, encode_signature, serialize_refund, EscrowTerms};
 
@@ -58,17 +58,33 @@ const DEV_L: [u8; 32] = [0x22; 32];
 /// Creating a key there would silently derive a *different* address from the
 /// one holding the coin, and the refund would sign for an escrow that does not
 /// exist. `KeystoreError::WouldCreate` says which file was missing instead.
-fn key(var: &str, label_suffix: &str, fallback: [u8; 32], allow_create: bool) -> (SecretKey, KeyOrigin) {
+fn key(
+    var: &str,
+    label_suffix: &str,
+    fallback: [u8; 32],
+    allow_create: bool,
+    minting_command: bool,
+) -> (SecretKey, KeyOrigin) {
     match keystore::from_env(var, label_suffix, fallback, allow_create) {
         Ok(pair) => pair,
         Err(keystore::KeystoreError::WouldCreate { path }) => {
-            eprintln!("refusing to create a key for a command that spends an existing escrow.");
+            eprintln!("refusing to create a key.");
             eprintln!("  missing: {path}");
             eprintln!();
-            eprintln!("  This escrow was funded against a key that already exists. Creating a");
-            eprintln!("  new one would derive a different address and sign for the wrong");
-            eprintln!("  escrow. Point ZECP2P_KEYSTORE/ZECP2P_ESCROW_LABEL at the original");
-            eprintln!("  keystore, or set {var} to the original key.");
+            if minting_command {
+                // `plan` under a mainnet configuration.
+                eprintln!("  On mainnet `plan` only ever loads an existing pair. Creating one");
+                eprintln!("  here would print a different, equally confident-looking address");
+                eprintln!("  from the one that was funded, so a mistyped ZECP2P_ESCROW_LABEL");
+                eprintln!("  cannot silently reprint the ask's address.");
+            } else {
+                eprintln!("  This escrow was funded against a key that already exists. Creating a");
+                eprintln!("  new one would derive a different address and sign for the wrong");
+                eprintln!("  escrow.");
+            }
+            eprintln!();
+            eprintln!("  Point ZECP2P_KEYSTORE/ZECP2P_ESCROW_LABEL at the original keystore,");
+            eprintln!("  or set {var} to the original key.");
             std::process::exit(2);
         }
         Err(e) => {
@@ -141,15 +157,44 @@ fn main() {
 
     // `plan` is the only command that may mint keys; everything else spends an
     // escrow that already exists.
-    let allow_create = cmd == "plan";
-    let (u_priv, u_from) = key("ZECP2P_U_PRIV", "u", DEV_U, allow_create);
-    let (l_priv, l_from) = key("ZECP2P_L_PRIV", "l", DEV_L, allow_create);
+    // R11-4: `plan` may mint a pair on testnet, where a fresh escrow is the
+    // point. On mainnet the pair already exists and a mistyped
+    // ZECP2P_ESCROW_LABEL would otherwise print a *different* t3 address with
+    // the same confidence as the real one, which is the address the ask asks
+    // Casper to fund. Read the configured network straight from the
+    // environment: this decision must not depend on reaching a node.
+    let configured_main = matches!(std::env::var("ZECP2P_RPC_NETWORK").as_deref(), Ok("main"));
+    let allow_create = cmd == "plan" && !configured_main;
+    let minting_command = cmd == "plan";
+    let (u_priv, u_from) = key("ZECP2P_U_PRIV", "u", DEV_U, allow_create, minting_command);
+
+    // R11-8: the refund signs only with `u`, but needs `l_pub` to rebuild the
+    // redeem script. Deriving it from the LP *secret* made the user's exit
+    // depend on a key the user does not control losing nothing. ZECP2P_L_PUB
+    // supplies the public half directly, so a lost or withheld LP key file
+    // cannot strand the escrow.
+    let l_pub_override = std::env::var("ZECP2P_L_PUB").ok().map(|h| {
+        let b = hex::decode(h.trim()).expect("ZECP2P_L_PUB must be 66 hex characters");
+        let arr: [u8; 33] = b
+            .try_into()
+            .expect("ZECP2P_L_PUB must be a 33-byte compressed public key");
+        PublicKey::from_slice(&arr).expect("ZECP2P_L_PUB must be a valid secp256k1 point");
+        arr
+    });
+    let refund_only = cmd == "refund";
+    let (l_priv, l_from) = if refund_only && l_pub_override.is_some() {
+        // Never used to sign on this path; the refund's scriptSig carries only
+        // the user's signature.
+        (SecretKey::from_slice(&DEV_L).unwrap(), KeyOrigin::Development)
+    } else {
+        key("ZECP2P_L_PRIV", "l", DEV_L, allow_create, minting_command)
+    };
     let u_dev = u_from == KeyOrigin::Development;
-    let l_dev = l_from == KeyOrigin::Development;
+    let l_dev = l_from == KeyOrigin::Development && l_pub_override.is_none();
     println!("keys               : u: {u_from:?}, l: {l_from:?}");
     let secp = Secp256k1::new();
     let u_pub = PublicKey::from_secret_key(&secp, &u_priv).serialize();
-    let l_pub = PublicKey::from_secret_key(&secp, &l_priv).serialize();
+    let l_pub = l_pub_override.unwrap_or_else(|| PublicKey::from_secret_key(&secp, &l_priv).serialize());
 
     let (chain, network) = client();
     if network == Network::Main && (u_dev || l_dev) {
@@ -314,7 +359,7 @@ fn main() {
                 );
             }
             match chain.broadcast(&raw) {
-                Ok(id) => println!("BROADCAST OK, txid : {}", hex::encode(id)),
+                Ok(id) => println!("BROADCAST OK, txid : {}", txid_to_display(&id)),
                 Err(e) => println!("node said          : {e}"),
             }
         }

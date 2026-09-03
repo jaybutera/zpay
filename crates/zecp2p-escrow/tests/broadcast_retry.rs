@@ -174,3 +174,39 @@ fn a_release_inside_the_margin_keeps_trying() {
     assert_eq!(txid, [0x43; 32]);
     assert_eq!(naps, 1);
 }
+
+/// R11-5: the strings a node answers a re-broadcast with. Both mean the
+/// release is in the mempool or already mined, and both were reported to the
+/// LP as a rejection telling them to "rerun attest to resend" a release that
+/// had already been mined. Observed from zebra on regtest.
+#[test]
+fn a_re_broadcast_reads_as_success() {
+    for m in [
+        "transaction already exists in mempool",
+        "transaction was committed to the best chain",
+        "txn-already-known",
+        "txn-already-in-mempool",
+    ] {
+        assert!(
+            zecp2p_escrow::rpc::is_already_accepted(m),
+            "{m} should read as success"
+        );
+    }
+}
+
+/// The other half: a real refusal must not be laundered into success, or a
+/// release the chain rejected would be reported as paid.
+#[test]
+fn a_real_rejection_still_reads_as_a_rejection() {
+    for m in [
+        "transaction did not pass consensus validation: ScriptInvalid",
+        "insufficient fee",
+        "transaction is locked until after block height 400",
+        "could not find transparent input UTXO",
+    ] {
+        assert!(
+            !zecp2p_escrow::rpc::is_already_accepted(m),
+            "{m} must not read as success"
+        );
+    }
+}
