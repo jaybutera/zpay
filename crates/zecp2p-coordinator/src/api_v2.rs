@@ -748,6 +748,17 @@ mod tests {
         assert_eq!(cents, 109, "$1.08 was refused on the day this is taken from");
     }
 
+    /// The same check against the rate on 2026-09-03, taken from live dry
+    /// quotes rather than from the audit: the floor was still 132,000 and one
+    /// ZEC quoted at 819,767,684 units. $1.08 sizes to 131,745 zatoshi and
+    /// 1Click refuses it; $1.09 sizes to 132,965 and 1Click quoted it at
+    /// 1,084,699 units out. The rate moved between the two days and the answer
+    /// did not, which is the point: the boundary is computed, not pinned.
+    #[test]
+    fn the_named_dollar_floor_holds_at_a_second_days_rate() {
+        assert_eq!(first_quotable_cents(132_000, 819_767_684), Some(109));
+    }
+
     /// The property behind that number: whatever it names must survive the
     /// sizing the quote path actually performs, and the cent below it must not.
     /// Checked across a wide spread of rates, because a hint that is a cent
