@@ -14,7 +14,7 @@ const SITE = {
 
   // OfframpGlue on Base mainnet (chain 8453). /stats overrides this when the
   // coordinator answers, so a redeploy needs no page edit.
-  glueContract: '0xafc314Ea35Bb05AaDb254F5B4A8e05db8e7739A9',
+  glueContract: '0x617544CC688F7f742cA68B5d9106890500b6C689',
   chainId: 8453,
 
   // Repositories do not exist yet. Swap these when they do.
@@ -58,7 +58,12 @@ const API = (() => {
   if (location.protocol === 'file:' || location.port === '5173' || location.port === '8080') {
     return 'http://127.0.0.1:3000';
   }
-  return '';
+  // Same origin, behind CloudFront's /api/* behaviour. Same-origin means no
+  // preflight, and it keeps the read API on the one hostname the page already
+  // trusts. It answers /stats and /quote in the coordinator's shapes; it is a
+  // snapshot for the counters and a live 1Click call for the quote, until the
+  // coordinator itself gets a public host.
+  return '/api';
 })();
 
 const $ = (id) => document.getElementById(id);
