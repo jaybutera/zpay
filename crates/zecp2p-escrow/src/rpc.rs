@@ -89,6 +89,29 @@ impl RpcConfig {
         }
     }
 
+    /// A hosted endpoint sized for a mainnet run.
+    ///
+    /// Reads on the hosted endpoint answer in about 0.22 s (measured
+    /// 2026-09-02), so the read budget is generous rather than tight. Broadcast
+    /// is the one that matters: zebra holds a spend whose input it cannot find
+    /// for 60 s (R7-6), and a hosted provider adds its own hop, so the budget is
+    /// 120 s.
+    ///
+    /// The provider's own limit is 5 requests a minute keyless, which no
+    /// timeout can fix - a caller must pace itself. `lp::broadcast_release_until_deadline`
+    /// takes the sleep as an argument for that reason.
+    pub fn hosted(url: impl Into<String>, network: Network) -> Self {
+        Self {
+            url: url.into(),
+            user: None,
+            password: None,
+            api_key_header: None,
+            network,
+            timeout: Duration::from_secs(60),
+            broadcast_timeout: Duration::from_secs(120),
+        }
+    }
+
     /// A local node with cookie or `rpcuser` auth. This is the shape the real
     /// zebrad box will use, and nothing else about the adapter changes.
     pub fn local(url: impl Into<String>, user: &str, password: &str, network: Network) -> Self {

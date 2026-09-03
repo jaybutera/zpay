@@ -51,6 +51,8 @@ fn main() {
     p2pkh.extend_from_slice(&[0x88, 0xac]);
 
     let url = std::env::var("ZECP2P_RPC_URL").expect("set ZECP2P_RPC_URL");
+    // A hosted endpoint needs a longer broadcast budget than a local node; see
+    // `RpcConfig::hosted`.
     let mut cfg = RpcConfig::public(url, Network::Test);
     cfg.timeout = Duration::from_secs(45);
     let chain = RpcChainClient::new(cfg).expect("rpc");

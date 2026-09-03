@@ -124,3 +124,36 @@ fn an_lp_key_that_is_not_a_point_is_refused() {
         Err(QuoteError::BadLpKey)
     );
 }
+
+/// The mainnet $1 test sits close to the floor, and it is worth knowing where.
+///
+/// `MINIMUM_ESCROW_ZAT` is 120000, which is spec section 3's "0.001 ZEC above
+/// fees". At ZEC = $815 a dollar is 122699 zat, so a $1 escrow clears the floor
+/// by 2699 zat - about 2.2% of price movement. Above roughly $833 a dollar of
+/// ZEC is *below* the floor and `AcceptedQuote::new` refuses it.
+///
+/// That is the floor doing its job, not a bug: an escrow that small releases
+/// less than it costs to argue about. But it means the mainnet run must size in
+/// zatoshis rather than dollars, and this test is where the number lives.
+#[test]
+fn a_one_dollar_escrow_is_close_to_the_floor_at_current_prices() {
+    let one_dollar_at_815 = 122_699u64;
+    assert!(
+        one_dollar_at_815 > MINIMUM_ESCROW_ZAT,
+        "a $1 escrow must clear the floor at the price the run was planned at"
+    );
+
+    // The price at which it stops clearing.
+    let breaking_price = 1e8 / MINIMUM_ESCROW_ZAT as f64;
+    assert!(
+        (breaking_price - 833.0).abs() < 1.0,
+        "the floor bites at about $833/ZEC, got {breaking_price}"
+    );
+
+    // 200000 zat has real headroom: it stays above the floor until ZEC is
+    // beyond $1600, which is why the mainnet run is sized in zatoshis.
+    let planned = 200_000u64;
+    assert!(planned > MINIMUM_ESCROW_ZAT * 3 / 2);
+    AcceptedQuote::at_identity_rate(1_000_000, PAYEE, 3_500_000, l_pub(), planned)
+        .expect("the planned mainnet size must be quotable");
+}

@@ -226,8 +226,15 @@ fn main() {
         Ok("main") => Network::Main,
         _ => Network::Test,
     };
-    let mut cfg = RpcConfig::public(env("ZECP2P_RPC_URL"), network);
-    cfg.timeout = Duration::from_secs(45);
+    // A hosted endpoint needs a longer broadcast budget than a local node; see
+    // `RpcConfig::hosted`.
+    let url = env("ZECP2P_RPC_URL");
+    let mut cfg = if url.contains("127.0.0.1") || url.contains("localhost") {
+        RpcConfig::public(url, network)
+    } else {
+        RpcConfig::hosted(url, network)
+    };
+    cfg.timeout = cfg.timeout.max(Duration::from_secs(45));
     let chain = RpcChainClient::new(cfg).expect("rpc");
     let branch = chain.consensus_branch_id().expect("branch");
     let height = chain.height().expect("height");

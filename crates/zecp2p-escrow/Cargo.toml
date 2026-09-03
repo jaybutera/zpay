@@ -37,6 +37,7 @@ rand = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls"] }
 
 [dev-dependencies]
+tempfile = { workspace = true }
 hex-literal = "0.4"
 zcash_script = { version = "0.4", features = ["signature-validation", "test-dependencies"] }
 sha3 = "0.10"

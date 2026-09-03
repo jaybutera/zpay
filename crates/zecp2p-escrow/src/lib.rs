@@ -14,6 +14,7 @@ pub mod depth;
 pub mod dlc;
 pub mod fees;
 pub mod funding;
+pub mod keystore;
 pub mod lp;
 pub mod lp_client;
 pub mod payment_details;

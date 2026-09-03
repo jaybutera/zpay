@@ -46,17 +46,31 @@ use zecp2p_escrow::tx::{build_refund, encode_signature, serialize_refund, Escrow
 const DEV_U: [u8; 32] = [0x11; 32];
 const DEV_L: [u8; 32] = [0x22; 32];
 
-fn key(var: &str, fallback: [u8; 32]) -> (SecretKey, bool) {
-    match std::env::var(var) {
-        Ok(h) => {
-            let bytes = hex::decode(h.trim()).expect("key must be 64 hex characters");
-            (
-                SecretKey::from_slice(&bytes).expect("key must be a valid secp256k1 scalar"),
-                false,
-            )
-        }
-        Err(_) => (SecretKey::from_slice(&fallback).unwrap(), true),
+/// Resolves a key: an explicit one from the environment, one from the
+/// per-escrow keystore, or the public development key.
+///
+/// Spec section 2 wants an ephemeral key per escrow. `ZECP2P_KEYSTORE` plus
+/// `ZECP2P_ESCROW_LABEL` gives that: a fresh key the first time a label is
+/// seen, the same key on every resume, written 0600 before it is returned.
+fn key(var: &str, label_suffix: &str, fallback: [u8; 32]) -> (SecretKey, bool) {
+    if let Ok(h) = std::env::var(var) {
+        let bytes = hex::decode(h.trim()).expect("key must be 64 hex characters");
+        return (
+            SecretKey::from_slice(&bytes).expect("key must be a valid secp256k1 scalar"),
+            false,
+        );
     }
+    if let (Ok(dir), Ok(label)) = (
+        std::env::var("ZECP2P_KEYSTORE"),
+        std::env::var("ZECP2P_ESCROW_LABEL"),
+    ) {
+        let ks = zecp2p_escrow::keystore::Keystore::new(dir);
+        let k = ks
+            .load_or_create(&format!("{label}-{label_suffix}"))
+            .expect("keystore");
+        return (SecretKey::from_slice(&k.secret_bytes()).unwrap(), false);
+    }
+    (SecretKey::from_slice(&fallback).unwrap(), true)
 }
 
 fn client() -> (RpcChainClient, Network) {
@@ -65,8 +79,14 @@ fn client() -> (RpcChainClient, Network) {
         Ok("main") => Network::Main,
         _ => Network::Test,
     };
-    let mut cfg = RpcConfig::public(url, network);
-    cfg.timeout = Duration::from_secs(45);
+    // A hosted endpoint needs a longer broadcast budget than a local node; see
+    // `RpcConfig::hosted`.
+    let mut cfg = if url.contains("127.0.0.1") || url.contains("localhost") {
+        RpcConfig::public(url, network)
+    } else {
+        RpcConfig::hosted(url, network)
+    };
+    cfg.timeout = cfg.timeout.max(Duration::from_secs(45));
     (RpcChainClient::new(cfg).expect("rpc client"), network)
 }
 
@@ -147,8 +167,8 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let cmd = args.get(1).map(String::as_str).unwrap_or("plan");
 
-    let (u_priv, u_dev) = key("ZECP2P_U_PRIV", DEV_U);
-    let (l_priv, l_dev) = key("ZECP2P_L_PRIV", DEV_L);
+    let (u_priv, u_dev) = key("ZECP2P_U_PRIV", "u", DEV_U);
+    let (l_priv, l_dev) = key("ZECP2P_L_PRIV", "l", DEV_L);
     let secp = Secp256k1::new();
     let u_pub = PublicKey::from_secret_key(&secp, &u_priv).serialize();
     let l_pub = PublicKey::from_secret_key(&secp, &l_priv).serialize();
@@ -187,9 +207,16 @@ fn main() {
             // ZECP2P_REFUND_DELAY lets a regtest run reach T by mining a few
             // blocks instead of 1152. Criterion 13 asks that every height be
             // derived from config, and this is that config.
-            let refund_height = match std::env::var("ZECP2P_REFUND_DELAY") {
-                Ok(d) => height + d.parse::<u32>().expect("ZECP2P_REFUND_DELAY"),
-                Err(_) => policy.proposed_refund_height(height),
+            // `ZECP2P_REFUND_HEIGHT` pins T outright. Without it T moves with
+            // every block, and so does the escrow address - which is no use for
+            // a funding instruction someone has to act on later.
+            let refund_height = match (
+                std::env::var("ZECP2P_REFUND_HEIGHT"),
+                std::env::var("ZECP2P_REFUND_DELAY"),
+            ) {
+                (Ok(t), _) => t.parse::<u32>().expect("ZECP2P_REFUND_HEIGHT"),
+                (Err(_), Ok(d)) => height + d.parse::<u32>().expect("ZECP2P_REFUND_DELAY"),
+                _ => policy.proposed_refund_height(height),
             };
             let plan =
                 escrow_address(&u_pub, &l_pub, refund_height as u64, amount_zat, addr_network)
