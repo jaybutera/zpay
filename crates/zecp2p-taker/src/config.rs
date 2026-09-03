@@ -154,6 +154,17 @@ impl ZecConfig {
     }
 }
 
+/// Expand a leading `~` the way the rest of this config's paths are written.
+fn shellexpand_home(path: &str) -> String {
+    match path.strip_prefix("~/") {
+        Some(rest) => match std::env::var("HOME") {
+            Ok(home) => format!("{home}/{rest}"),
+            Err(_) => path.to_string(),
+        },
+        None => path.to_string(),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkConfig {
     pub base_rpc_url: String,
@@ -261,6 +272,26 @@ pub struct VenmoConfig {
     /// Abort if the page has not settled within this many seconds.
     #[serde(default = "default_venmo_timeout")]
     pub timeout_seconds: u64,
+    /// Where the Venmo sign-in credentials live, for unattended re-login.
+    ///
+    /// A separate file from this one, and not committed: this config is shipped
+    /// as `config.taker.example.toml` and carries no secrets, while that file
+    /// carries a live Venmo password. Keeping them apart is what lets the
+    /// example be committed at all.
+    ///
+    /// Absent means no re-login: the health check still runs and still reports
+    /// a dead session, it just cannot repair one. That is the shipped default,
+    /// because a daemon that types a password into a page it discovered is a
+    /// step past one that reads an open tab, and it should be taken on purpose.
+    #[serde(default = "default_credentials_path")]
+    pub credentials_path: Option<String>,
+}
+
+/// The path the example config points at. Optional so an operator who has not
+/// created the file gets the daemon they had before rather than a start-up
+/// failure; `Credentials::load` is what refuses a file that exists but is wrong.
+fn default_credentials_path() -> Option<String> {
+    Some("config/venmo.local.toml".to_string())
 }
 
 fn default_note() -> String {
@@ -333,6 +364,7 @@ impl Default for VenmoConfig {
             cdp_url: "http://127.0.0.1:9222".to_string(),
             note: default_note(),
             timeout_seconds: default_venmo_timeout(),
+            credentials_path: default_credentials_path(),
         }
     }
 }
@@ -385,6 +417,29 @@ impl TakerConfig {
         config.validate_urls()?;
 
         Ok(config)
+    }
+
+    /// Load the Venmo sign-in credentials, if there are any to load.
+    ///
+    /// Three outcomes rather than two, and the middle one is the point:
+    ///
+    /// - no path configured, or the file does not exist: `Ok(None)`. The daemon
+    ///   runs exactly as it did before this feature, health-checking and
+    ///   reporting without repairing.
+    /// - the file exists and is usable: `Ok(Some(..))`.
+    /// - the file exists and is wrong: `Err`. A file that is present but holds
+    ///   the placeholder, or a mode anyone can read, is a mistake worth failing
+    ///   at startup for. Silently downgrading it to "no credentials" would hide
+    ///   the misconfiguration until the first expiry, with nobody watching.
+    pub fn venmo_credentials(&self) -> anyhow::Result<Option<crate::auto::login::Credentials>> {
+        let Some(path) = self.venmo.credentials_path.as_deref() else {
+            return Ok(None);
+        };
+        let path = shellexpand_home(path);
+        if !std::path::Path::new(&path).exists() {
+            return Ok(None);
+        }
+        crate::auto::login::Credentials::load(&path).map(Some)
     }
 
     /// Require https for every service URL this config will fetch from.

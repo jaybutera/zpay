@@ -65,6 +65,15 @@ max_age_hours = 12
 cdp_url = "http://127.0.0.1:9222"
 note = "thanks"
 timeout_seconds = 120
+# Where the Venmo sign-in credentials live, for unattended re-login. Not this
+# file: this one is committed and carries no secrets, that one holds a live
+# password and is gitignored. Copy config/venmo.example.toml to it and fill it
+# in, then run `zecp2p-taker venmo-health` to see whether an expiry could be
+# repaired without a human.
+#
+# If the file is absent the daemon behaves exactly as it did before: the health
+# check still runs and still reports a dead session, it just cannot fix one.
+credentials_path = "config/venmo.local.toml"
 
 [zkp2p]
 # The curator that issues payeeDetails hashes. The agent asks it what the

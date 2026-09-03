@@ -175,9 +175,120 @@ impl VenmoBrowser {
     ///
     /// Venmo bounces signed-out users to a login URL. Detecting that here turns
     /// an expired cookie into a clear message instead of a hung selector wait.
+    ///
+    /// The markers live in [`crate::auto::login::SIGNED_OUT_MARKERS`] rather
+    /// than here so the payment path and the health check cannot end up
+    /// disagreeing about what signed out looks like. Two copies of this list
+    /// would drift, and the direction they drift matters: a payment path with
+    /// the shorter list carries on into a login page.
     pub fn session_looks_live(tab: &CdpTab) -> bool {
-        let url = tab.url.to_ascii_lowercase();
-        !(url.contains("/signin") || url.contains("/login") || url.contains("account/sign-in"))
+        !crate::auto::login::url_is_signed_out(&tab.url)
+    }
+
+    /// Find the Venmo tab, or open one.
+    ///
+    /// [`Self::find_venmo_tab`] is the payment path's version and deliberately
+    /// refuses to create anything: a payment that opened its own tab would be a
+    /// payment driving a page nobody had signed into. This is the health
+    /// check's version, and it exists because a browser restart leaves no Venmo
+    /// tab at all. Without it, that case is indistinguishable from an expiry
+    /// and the daemon waits forever for a tab nobody is going to open.
+    pub async fn find_or_open_venmo_tab(&self) -> Result<CdpTab> {
+        if let Ok(tab) = self.find_venmo_tab().await {
+            return Ok(tab);
+        }
+
+        // `PUT /json/new?url=` is the CDP call that creates a tab. It answers
+        // with the same target shape `/json/list` uses.
+        let target: CdpTarget = self
+            .http
+            .put(format!(
+                "{}/json/new?{}",
+                self.cdp_url,
+                urlencoding_minimal(crate::auto::login::SIGNIN_URL)
+            ))
+            .timeout(self.timeout)
+            .send()
+            .await
+            .with_context(|| {
+                format!(
+                    "no browser answering CDP at {} to open a Venmo tab in",
+                    self.cdp_url
+                )
+            })?
+            .json()
+            .await
+            .context("the CDP endpoint would not open a new tab")?;
+
+        let ws_url = target
+            .ws_url
+            .ok_or_else(|| anyhow::anyhow!("the new tab exposes no debugger socket"))?;
+
+        Ok(CdpTab {
+            id: target.id,
+            url: if target.url.is_empty() {
+                crate::auto::login::SIGNIN_URL.to_string()
+            } else {
+                target.url
+            },
+            ws_url,
+        })
+    }
+
+    /// Read the session's state without driving anything.
+    ///
+    /// The distinction between "signed out" and "no tab" is the whole reason
+    /// this returns a state rather than a bool: they need different repairs.
+    pub async fn probe_session(&self) -> crate::auto::health::SessionState {
+        use crate::auto::health::SessionState;
+
+        match self.find_venmo_tab().await {
+            Ok(tab) => {
+                // The URL is what `/json/list` last reported, which can lag a
+                // client-side navigation. Ask the page itself when we can; fall
+                // back to the listing when the socket will not answer.
+                let url = match self.current_url(&tab).await {
+                    Ok(url) => url,
+                    Err(_) => tab.url.clone(),
+                };
+                if crate::auto::login::url_is_signed_out(&url) {
+                    SessionState::SignedOut { url }
+                } else {
+                    SessionState::Live { url }
+                }
+            }
+            Err(e) => {
+                // "No Venmo tab" and "no browser" are different failures with
+                // different fixes, and `find_venmo_tab` reports both. The
+                // listing is what tells them apart: if it answered at all, the
+                // browser is up.
+                let reachable = self
+                    .http
+                    .get(format!("{}/json/list", self.cdp_url))
+                    .timeout(self.timeout)
+                    .send()
+                    .await
+                    .is_ok();
+                if reachable {
+                    SessionState::NoTab
+                } else {
+                    SessionState::NoBrowser {
+                        why: format!("{e:#}"),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Ask the page for its own current URL.
+    async fn current_url(&self, tab: &CdpTab) -> Result<String> {
+        let value = self.evaluate(tab, "location.href").await?;
+        Ok(value
+            .get("result")
+            .and_then(|r| r.get("value"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string())
     }
 
     /// Build the sequence of CDP steps a payment needs.
@@ -689,6 +800,51 @@ pub struct CdpTab {
     pub id: String,
     pub url: String,
     pub ws_url: String,
+}
+
+/// Percent-encode a URL for CDP's `/json/new?<url>` query.
+///
+/// Written out rather than pulled in: the only input is [`crate::auto::login::SIGNIN_URL`],
+/// a constant in this repository, and a dependency to encode one known string is
+/// a dependency to audit for nothing. It encodes conservatively, so a character
+/// it does not know about is escaped rather than passed through.
+fn urlencoding_minimal(url: &str) -> String {
+    let mut out = String::with_capacity(url.len() * 2);
+    for byte in url.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+/// The health check drives the browser through this rather than through the
+/// payment API, so the two paths cannot be confused for one another.
+///
+/// Everything here is login and inspection. Nothing in this impl can reach a
+/// [`PaymentStep`], which is asserted in `auto::login`'s own tests.
+impl crate::auto::health::SessionDriver for VenmoBrowser {
+    async fn probe(&self) -> crate::auto::health::SessionState {
+        self.probe_session().await
+    }
+
+    async fn run_step(&self, step: &crate::auto::login::LoginStep) -> Result<serde_json::Value> {
+        let tab = self.find_or_open_venmo_tab().await?;
+        self.evaluate(&tab, &step.to_expression()).await
+    }
+
+    async fn await_step(&self, step: &crate::auto::login::LoginStep, what: &str) -> Result<()> {
+        let tab = self.find_or_open_venmo_tab().await?;
+        self.wait_for_expression(&tab, &step.to_expression(), what)
+            .await
+    }
+
+    async fn ensure_tab(&self) -> Result<()> {
+        self.find_or_open_venmo_tab().await.map(|_| ())
+    }
 }
 
 /// Convert a USDC amount (6 decimals) into the string Venmo's field wants.

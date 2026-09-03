@@ -95,6 +95,22 @@ enum Commands {
     /// Check that the browser has a usable, logged-in Venmo tab
     CheckVenmo,
 
+    /// Report the Venmo session's health and what the daemon could do about it.
+    ///
+    /// Runs one health check and prints the answer, plus whether an expiry
+    /// could be repaired without a human. Use it after filling in
+    /// `config/venmo.local.toml` to find out whether the daemon will actually
+    /// survive an expiry before trusting it to run overnight.
+    ///
+    /// With `--relogin` it drives the login form for real, which types the
+    /// configured password into Venmo's sign-in page. Without it, nothing is
+    /// typed and nothing is clicked.
+    VenmoHealth {
+        /// Actually attempt a sign-in if the session is dead.
+        #[arg(long)]
+        relogin: bool,
+    },
+
     /// Re-derive an attestation for an intent whose payment is already sent.
     ///
     /// The daemon's own attestation path, run against an intent that already
@@ -314,6 +330,12 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // The session report needs no key: it reads the browser and, with
+    // --relogin, drives the login form. Neither sends a transaction.
+    if let Commands::VenmoHealth { relogin } = &cli.command {
+        return run_venmo_health(&config, *relogin).await;
+    }
+
     // Driving the payment page needs no key either: it stops before the click
     // and sends nothing on-chain.
     if let Commands::TestPay {
@@ -413,6 +435,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::CheckVenmo
+        | Commands::VenmoHealth { .. }
         | Commands::TestPay { .. }
         | Commands::FindPayment { .. }
         | Commands::Rails { .. }
@@ -1160,6 +1183,18 @@ async fn run_auto<P: alloy::providers::Provider + Clone>(
             config.session.user_agent.clone(),
         );
 
+    // The Venmo session supervisor, running on its own timer beside the fill
+    // loop rather than inside it.
+    //
+    // `once` gets no supervisor: a single scan that exits has no long-lived
+    // session to keep alive, and spawning a background task that outlives the
+    // work is how a `--once` run stops being once.
+    let session_health = if once {
+        None
+    } else {
+        Some(spawn_session_supervisor(config).await?)
+    };
+
     let mut from_block = watcher.start_block().await?;
     println!("watching glue {} from block {from_block}", config.contracts.glue_contract);
     if dry_run {
@@ -1190,6 +1225,7 @@ async fn run_auto<P: alloy::providers::Provider + Clone>(
                     dry_run,
                     recipient_override.as_deref(),
                     auto_yes,
+                    session_health.as_ref(),
                 )
                 .await
                 {
@@ -1210,6 +1246,160 @@ async fn run_auto<P: alloy::providers::Provider + Clone>(
     }
 }
 
+/// Report the session's health, and optionally repair it.
+///
+/// The one command an operator runs after filling in the credentials file, and
+/// the answer it gives is the one that matters: whether this daemon can survive
+/// an expiry on its own, or whether it will stop and wait for a person.
+async fn run_venmo_health(config: &TakerConfig, relogin: bool) -> Result<()> {
+    use zecp2p_taker::auto::health::{SessionDriver, Supervisor, Tick};
+
+    let credentials = config
+        .venmo_credentials()
+        .context("the Venmo credentials file is present but not usable")?;
+
+    match &config.venmo.credentials_path {
+        Some(path) if credentials.is_some() => println!("credentials : {path}"),
+        Some(path) => println!("credentials : {path} (not present)"),
+        None => println!("credentials : none configured"),
+    }
+
+    let browser = std::sync::Arc::new(VenmoBrowser::new(
+        config.venmo.cdp_url.clone(),
+        config.venmo.timeout_seconds,
+    ));
+
+    let state = browser.probe().await;
+    println!("session     : {}", state.summary());
+
+    // Readiness is reported from the credentials as configured, so the line
+    // says what the *daemon* would do rather than what this invocation will.
+    // Building it from the withheld set would tell an operator who has
+    // configured everything correctly that they have configured nothing.
+    println!(
+        "readiness   : {}",
+        Supervisor::new(
+            std::sync::Arc::new(VenmoBrowser::new(
+                config.venmo.cdp_url.clone(),
+                config.venmo.timeout_seconds,
+            )),
+            credentials.clone(),
+        )
+        .readiness()
+    );
+
+    // `--relogin` is what separates a report from an action, so the supervisor
+    // that actually runs only gets credentials when the operator asked for one.
+    // Without the flag this cannot type a password even if auto_relogin is set.
+    let mut supervisor = Supervisor::new(browser, if relogin { credentials } else { None });
+
+    if !relogin {
+        if !state.is_live() {
+            println!(
+                "\nThe session is not usable. Re-run with --relogin to have the \n\
+                 taker try to sign back in, or sign in by hand."
+            );
+        }
+        return Ok(());
+    }
+
+    let tick = supervisor.check_once().await;
+    println!("\nresult      : {tick:?}");
+    match tick {
+        Tick::Healthy => println!("The session was already fine; nothing was driven."),
+        Tick::Recovered => println!("Signed back in. The session is live."),
+        Tick::AwaitingHumanCode { what_to_do, .. } => {
+            println!("{what_to_do}");
+            std::process::exit(2);
+        }
+        other if other.needs_operator() => std::process::exit(1),
+        _ => std::process::exit(1),
+    }
+    Ok(())
+}
+
+/// The last thing the session supervisor reported, shared with the fill loop.
+///
+/// The fill loop reads this rather than probing the browser itself. That is the
+/// whole ordering the health check exists to establish: by the time a deposit
+/// arrives, whether the session is usable is already known, instead of being
+/// discovered with a trade in hand.
+type SessionHealth = std::sync::Arc<std::sync::Mutex<zecp2p_taker::auto::health::Tick>>;
+
+/// Start the session supervisor on its own task.
+///
+/// Returns the shared cell it publishes into. The task is detached and runs for
+/// the life of the process, which is the point: a check that only ran when a
+/// deposit arrived would be the thing this replaces.
+async fn spawn_session_supervisor(config: &TakerConfig) -> Result<SessionHealth> {
+    use zecp2p_taker::auto::health::{Supervisor, Tick};
+
+    // Loaded at startup, so a credentials file that exists but is unusable
+    // stops the daemon here rather than at the first expiry. A file that is
+    // simply absent is not an error: that is the daemon this repository had
+    // before, health-checking and reporting without repairing.
+    let credentials = config
+        .venmo_credentials()
+        .context("the Venmo credentials file is present but not usable")?;
+
+    let browser = std::sync::Arc::new(VenmoBrowser::new(
+        config.venmo.cdp_url.clone(),
+        config.venmo.timeout_seconds,
+    ));
+    let supervisor = Supervisor::new(browser, credentials);
+    println!("venmo session: {}", supervisor.readiness());
+
+    let shared: SessionHealth = std::sync::Arc::new(std::sync::Mutex::new(Tick::Healthy));
+    let publish = shared.clone();
+    tokio::spawn(async move {
+        supervisor
+            .run(move |tick| {
+                if let Ok(mut slot) = publish.lock() {
+                    *slot = tick.clone();
+                }
+            })
+            .await
+    });
+
+    Ok(shared)
+}
+
+/// Refuse to start a fill while the session is known to be dead.
+///
+/// Checked alongside the cookie check rather than instead of it: they are
+/// different credentials with different failure modes. The cookie is what the
+/// enclave replays after the payment; the browser session is what sends it.
+/// Either one dead means the fill cannot finish, and both are cheaper to find
+/// here than after the money has left.
+fn require_healthy_session(health: Option<&SessionHealth>) -> Result<()> {
+    use zecp2p_taker::auto::health::Tick;
+
+    let Some(health) = health else {
+        return Ok(());
+    };
+    let tick = health.lock().map(|t| t.clone()).unwrap_or(Tick::Healthy);
+    match &tick {
+        Tick::Healthy | Tick::Recovered => Ok(()),
+        // A first failed attempt is not a reason to refuse: the supervisor is
+        // still retrying and the session may well be back before this fill
+        // needs it. The states below are the ones that will not fix themselves.
+        Tick::ReloginFailed { .. } => Ok(()),
+        Tick::NeedsOperator { why, .. } => bail!(
+            "the Venmo session is not usable and will not repair itself: {why}\n\n\
+             Checked before signalling on purpose: failing here costs nothing."
+        ),
+        Tick::AwaitingHumanCode { what_to_do, .. } => bail!(
+            "the Venmo re-login is waiting for a human: {what_to_do}\n\n\
+             Nothing was signalled or paid."
+        ),
+        Tick::GaveUp { attempts } => bail!(
+            "the Venmo session is dead after {attempts} failed sign-in attempts, and \
+             the daemon has stopped trying to avoid locking the account. Sign in by \
+             hand and restart."
+        ),
+    }
+}
+
 /// Plan one deposit and take it as far as the gates allow.
 #[allow(clippy::too_many_arguments)]
 async fn handle_one<P: alloy::providers::Provider + Clone>(
@@ -1222,10 +1412,16 @@ async fn handle_one<P: alloy::providers::Provider + Clone>(
     dry_run: bool,
     recipient_override: Option<&str>,
     auto_yes: bool,
+    session_health: Option<&SessionHealth>,
 ) -> Result<Outcome> {
     // Everything free comes first. The cookie check is here rather than before
     // the attestation because a dead cookie found after the payment means the
     // fiat is gone and only cancelIntent recovers the stake.
+    //
+    // The browser session is checked in the same breath and for the same
+    // reason. The supervisor already knows the answer, so this reads its last
+    // report rather than asking the browser again.
+    require_healthy_session(session_health)?;
     require_usable_session(store)?;
 
     let escrow = IEscrowTaker::new(config.contracts.zkp2p_escrow, provider);

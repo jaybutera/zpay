@@ -21,6 +21,10 @@
 //! - [`journal`]: durable state across the one window where a crash costs money.
 //! - [`cookie`]: the stored Venmo session, and the check that runs before
 //!   anything is spent.
+//! - [`login`]: signing back in when the session has gone, and the 2FA split
+//!   that decides whether that can happen with nobody watching.
+//! - [`health`]: the timer that finds a dead session before a payment does, and
+//!   the re-login it triggers.
 //! - [`pipeline`]: the state machine, and the gates phase 1 leaves closed.
 //! - [`watch`]: the glue's own `OfframpProcessed` log, filtered to zpay orders
 //!   by the one field no other contract can forge.
@@ -48,8 +52,10 @@ pub mod daemon;
 pub mod cookie;
 pub mod fiat;
 pub mod gating;
+pub mod health;
 pub mod intent;
 pub mod journal;
+pub mod login;
 pub mod money;
 pub mod pipeline;
 pub mod rail;
