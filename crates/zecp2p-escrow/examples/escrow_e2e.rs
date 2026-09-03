@@ -184,8 +184,10 @@ fn main() {
     let refund_only = cmd == "refund";
     let (l_priv, l_from) = if refund_only && l_pub_override.is_some() {
         // Never used to sign on this path; the refund's scriptSig carries only
-        // the user's signature.
-        (SecretKey::from_slice(&DEV_L).unwrap(), KeyOrigin::Development)
+        // the user's signature. R12-4: report where `l_pub` actually came from.
+        // Labelling a supplied public key "Development" named the one origin a
+        // mainnet run refuses to start on, for a run that is entirely correct.
+        (SecretKey::from_slice(&DEV_L).unwrap(), KeyOrigin::Environment)
     } else {
         key("ZECP2P_L_PRIV", "l", DEV_L, allow_create, minting_command)
     };

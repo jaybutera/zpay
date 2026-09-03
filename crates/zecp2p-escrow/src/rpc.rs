@@ -58,6 +58,20 @@ impl Network {
 /// longer budget.
 pub const DEFAULT_BROADCAST_TIMEOUT: Duration = Duration::from_secs(90);
 
+/// How many rate-limit waits one call will sit through before giving up.
+///
+/// The hosted endpoint's window is 60 s wide, so three retries covers a call
+/// that arrives at the very start of a saturated window and then contends with
+/// the attestor for the next two. Past that something other than pacing is
+/// wrong and the caller should hear about it.
+pub const DEFAULT_RATE_LIMIT_RETRIES: u32 = 3;
+
+/// The wait when the response carries no `Retry-After`, which the measured
+/// endpoint does not send. Its window is 5 requests per sliding 60 s, so a
+/// full minute is what actually clears it; a shorter wait just burns another
+/// request against the same window.
+pub const DEFAULT_RATE_LIMIT_WAIT: Duration = Duration::from_secs(60);
+
 #[derive(Debug, Clone)]
 pub struct RpcConfig {
     pub url: String,
@@ -73,6 +87,16 @@ pub struct RpcConfig {
     /// Budget for `sendrawtransaction`, which a node may sit on far longer
     /// than a read. See [`DEFAULT_BROADCAST_TIMEOUT`].
     pub broadcast_timeout: Duration,
+    /// How many times to wait out a rate limit before giving up on one call.
+    ///
+    /// R12-1: the keyless hosted endpoint answers 5 requests per sliding
+    /// minute and 429 after that, and the runner and the attestor share that
+    /// window. A single `attest` makes more calls than that, so without this
+    /// the run panics partway through, *after* the fiat has been sent. Zero
+    /// disables the wait.
+    pub rate_limit_retries: u32,
+    /// How long to wait when the response carries no `Retry-After`.
+    pub rate_limit_wait: Duration,
 }
 
 impl RpcConfig {
@@ -86,6 +110,8 @@ impl RpcConfig {
             network,
             timeout: Duration::from_secs(30),
             broadcast_timeout: DEFAULT_BROADCAST_TIMEOUT,
+            rate_limit_retries: DEFAULT_RATE_LIMIT_RETRIES,
+            rate_limit_wait: DEFAULT_RATE_LIMIT_WAIT,
         }
     }
 
@@ -97,9 +123,11 @@ impl RpcConfig {
     /// for 60 s (R7-6), and a hosted provider adds its own hop, so the budget is
     /// 120 s.
     ///
-    /// The provider's own limit is 5 requests a minute keyless, which no
-    /// timeout can fix - a caller must pace itself. `lp::broadcast_release_until_deadline`
-    /// takes the sleep as an argument for that reason.
+    /// The provider's own limit is 5 requests a minute keyless. No timeout can
+    /// fix that, but the adapter waits the window out and retries rather than
+    /// failing the call: see `rate_limit_retries`. R12-1 staged the alternative
+    /// and a single `attest` panicked partway through, after the fiat was
+    /// already sent.
     pub fn hosted(url: impl Into<String>, network: Network) -> Self {
         Self {
             url: url.into(),
@@ -109,6 +137,8 @@ impl RpcConfig {
             network,
             timeout: Duration::from_secs(60),
             broadcast_timeout: Duration::from_secs(120),
+            rate_limit_retries: DEFAULT_RATE_LIMIT_RETRIES,
+            rate_limit_wait: DEFAULT_RATE_LIMIT_WAIT,
         }
     }
 
@@ -123,6 +153,8 @@ impl RpcConfig {
             network,
             timeout: Duration::from_secs(30),
             broadcast_timeout: DEFAULT_BROADCAST_TIMEOUT,
+            rate_limit_retries: DEFAULT_RATE_LIMIT_RETRIES,
+            rate_limit_wait: DEFAULT_RATE_LIMIT_WAIT,
         }
     }
 }
@@ -137,6 +169,9 @@ pub struct RpcChainClient {
     /// the check happens automatically rather than relying on a caller to
     /// remember it (round 2 finding 6).
     network_checked: std::sync::atomic::AtomicBool,
+    /// How the client waits out a rate limit. Injectable so a test can prove
+    /// the retry sequence without sitting through three real minutes.
+    sleep: Box<dyn Fn(Duration) + Send + Sync>,
 }
 
 impl std::fmt::Debug for RpcChainClient {
@@ -212,7 +247,16 @@ impl RpcChainClient {
             http,
             broadcast_http,
             network_checked: std::sync::atomic::AtomicBool::new(false),
+            sleep: Box::new(std::thread::sleep),
         })
+    }
+
+    /// Replaces the rate-limit wait, so a test can assert the retry sequence
+    /// without sitting through three real minutes. The recorded durations are
+    /// what the client would have slept.
+    pub fn with_sleep(mut self, sleep: impl Fn(Duration) + Send + Sync + 'static) -> Self {
+        self.sleep = Box::new(sleep);
+        self
     }
 
     /// Runs [`check_network`] once, then remembers.
@@ -267,22 +311,41 @@ impl RpcChainClient {
             "params": params,
         });
 
-        let mut req = http.post(&self.config.url).json(&body);
-        if let (Some(u), Some(p)) = (&self.config.user, &self.config.password) {
-            req = req.basic_auth(u, Some(p));
-        }
-        if let Some((name, value)) = &self.config.api_key_header {
-            req = req.header(name.as_str(), value.as_str());
-        }
+        // R12-1: the hosted endpoint allows 5 keyless requests per sliding
+        // minute, and the runner and the attestor share that window. A single
+        // `attest` makes more calls than that, so a rate limit hit partway
+        // through used to abort the run *after* the fiat had been sent. Waiting
+        // the window out and retrying is the only thing that makes the runbook
+        // true as written; the alternative is asking an operator to count
+        // seconds between commands with money already gone.
+        let mut waits_left = self.config.rate_limit_retries;
+        let (status, text) = loop {
+            let mut req = http.post(&self.config.url).json(&body);
+            if let (Some(u), Some(p)) = (&self.config.user, &self.config.password) {
+                req = req.basic_auth(u, Some(p));
+            }
+            if let Some((name, value)) = &self.config.api_key_header {
+                req = req.header(name.as_str(), value.as_str());
+            }
 
-        let response = req
-            .send()
-            .map_err(|e| ChainError::Unreachable(format!("{method}: {e}")))?;
+            let response = req
+                .send()
+                .map_err(|e| ChainError::Unreachable(format!("{method}: {e}")))?;
 
-        let status = response.status();
-        let text = response
-            .text()
-            .map_err(|e| ChainError::Unreachable(format!("{method}: {e}")))?;
+            let status = response.status();
+            let retry_after = retry_after_of(response.headers());
+            let text = response
+                .text()
+                .map_err(|e| ChainError::Unreachable(format!("{method}: {e}")))?;
+
+            if waits_left > 0 && is_rate_limited(status.as_u16(), &text) {
+                waits_left -= 1;
+                let wait = retry_after.unwrap_or(self.config.rate_limit_wait);
+                (self.sleep)(wait);
+                continue;
+            }
+            break (status, text);
+        };
 
         if !status.is_success() {
             // A hosted provider's rate limit arrives here, and it is an
@@ -358,6 +421,36 @@ impl RpcChainClient {
 /// first costs 60 s (measured); the second comes from its rejection cache and
 /// is instant. Either clears when the missing input is mined, so a caller that
 /// has already paid the fiat must retry rather than give up.
+/// Whether this response is the provider's rate limit rather than a node
+/// answer.
+///
+/// R12-1 measured both shapes from the hosted endpoint: a plain HTTP 429, and
+/// a 503 whose body carries the upstream 429. Matching only the status code
+/// would miss the second, which is the one that actually aborted the staged
+/// `attest` run.
+pub fn is_rate_limited(status: u16, body: &str) -> bool {
+    if status == 429 {
+        return true;
+    }
+    // A gateway wrapping the upstream limit. Only treat a 5xx this way when the
+    // body names the limit, so a genuine node outage is not retried as one.
+    if (500..=599).contains(&status) {
+        let b = body.to_lowercase();
+        return b.contains("429") || b.contains("too many requests") || b.contains("rate limit");
+    }
+    false
+}
+
+/// `Retry-After`, when the provider sends one, as either seconds or an HTTP
+/// date. Capped so a hostile or confused value cannot park the run for hours
+/// with a deadline approaching.
+fn retry_after_of(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    const MAX: u64 = 120;
+    let raw = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    let secs = raw.trim().parse::<u64>().ok()?;
+    Some(Duration::from_secs(secs.min(MAX)))
+}
+
 /// Whether the node is saying it already holds this transaction.
 ///
 /// zebra and zcashd both answer a re-broadcast this way, and neither is a
@@ -460,12 +553,26 @@ impl RpcChainClient {
     /// holds, not out of the runner's own memory, or the check proves only that
     /// the runner is self-consistent.
     pub fn release_script_sig(&self, txid_rpc_order: &str) -> Result<Vec<u8>, ChainError> {
+        Ok(self.release_details(txid_rpc_order)?.script_sig)
+    }
+
+    /// What a mined release actually spends and pays.
+    ///
+    /// R11-8 / R12-5: `verify` recovered the outcome secret from a scriptSig
+    /// without ever checking that the transaction it came from spends *this*
+    /// escrow or pays the LP. Any transaction whose first input carried a
+    /// two-signature scriptSig would have satisfied it, so a passing
+    /// `CRITERION 6 HOLDS` proved less than it appeared to.
+    pub fn release_details(&self, txid_rpc_order: &str) -> Result<ReleaseDetails, ChainError> {
         #[derive(serde::Deserialize)]
         struct Tx {
             vin: Vec<Vin>,
+            vout: Vec<Vout>,
         }
         #[derive(serde::Deserialize)]
         struct Vin {
+            txid: Option<String>,
+            vout: Option<u32>,
             #[serde(rename = "scriptSig")]
             script_sig: ScriptSig,
         }
@@ -473,20 +580,53 @@ impl RpcChainClient {
         struct ScriptSig {
             hex: String,
         }
+        #[derive(serde::Deserialize)]
+        struct Vout {
+            value: f64,
+            #[serde(rename = "scriptPubKey")]
+            script_pubkey: Spk,
+        }
+        #[derive(serde::Deserialize)]
+        struct Spk {
+            hex: String,
+        }
 
         let tx: Tx = self.call(
             "getrawtransaction",
             serde_json::json!([txid_rpc_order, 1]),
         )?;
-        let hex_str = &tx
+        let vin = tx
             .vin
             .first()
-            .ok_or_else(|| ChainError::Unreachable("the transaction has no inputs".into()))?
-            .script_sig
-            .hex;
-        hex::decode(hex_str)
-            .map_err(|e| ChainError::Unreachable(format!("bad scriptSig hex: {e}")))
+            .ok_or_else(|| ChainError::Unreachable("the transaction has no inputs".into()))?;
+        let script_sig = hex::decode(&vin.script_sig.hex)
+            .map_err(|e| ChainError::Unreachable(format!("bad scriptSig hex: {e}")))?;
+        let vout0 = tx
+            .vout
+            .first()
+            .ok_or_else(|| ChainError::Unreachable("the transaction has no outputs".into()))?;
+
+        Ok(ReleaseDetails {
+            script_sig,
+            spends_txid: vin.txid.clone(),
+            spends_vout: vin.vout,
+            pays_script_pubkey: hex::decode(&vout0.script_pubkey.hex)
+                .map_err(|e| ChainError::Unreachable(format!("bad scriptPubKey hex: {e}")))?,
+            pays_zat: zec_to_zat(vout0.value)?,
+        })
     }
+}
+
+/// The parts of a mined release `verify` checks against the terms.
+#[derive(Debug, Clone)]
+pub struct ReleaseDetails {
+    pub script_sig: Vec<u8>,
+    /// The outpoint the first input spends, as the node prints it.
+    pub spends_txid: Option<String>,
+    pub spends_vout: Option<u32>,
+    /// The first output's script and amount.
+    pub pays_script_pubkey: Vec<u8>,
+    pub pays_zat: u64,
 }
 
 impl ChainClient for RpcChainClient {

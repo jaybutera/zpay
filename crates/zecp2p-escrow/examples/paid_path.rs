@@ -76,6 +76,14 @@ struct RunRecord {
     /// The escrow amount and fee at the time of the first run.
     amount_zat: u64,
     fee_zat: u64,
+    /// The outpoint this release must spend, so `verify` can check that the
+    /// transaction it read is this escrow's release and not some other
+    /// transaction with a two-signature scriptSig (R12-5). Optional so a
+    /// record written before this field still loads.
+    #[serde(default)]
+    funding_txid: Option<String>,
+    #[serde(default)]
+    funding_vout: Option<u32>,
     /// Set once the attestor has published it.
     s: Option<String>,
     /// Set once the release is assembled; this is what a resumed run broadcasts.
@@ -632,6 +640,8 @@ fn cmd_announce(args: &[String]) {
         lp_script: hex::encode(&s.lp_script),
         amount_zat: s.canonical.amount_zat,
         fee_zat: s.fee,
+        funding_txid: Some(txid_to_display(&s.terms.funding_txid)),
+        funding_vout: Some(s.canonical.vout),
         s: None,
         raw_release: None,
         txid: None,
@@ -714,6 +724,26 @@ fn cmd_attest(args: &[String]) {
             hex::decode(hexs).unwrap().try_into().unwrap()
         }
         None => {
+            // R11-8 / R12-2: read the attestation before touching the network.
+            // The check is free and local, while the identity and re-announce
+            // calls each spend one of five requests in the hosted endpoint's
+            // minute. Discovering a missing file *after* them wasted two calls
+            // and, on the staged run, put the rate limit between the operator
+            // and a scalar they had already paid for.
+            let wire = match args.get(6) {
+                Some(path) => Some(attestation_from_prover(path)),
+                None => {
+                    if s.network == Network::Main {
+                        eprintln!(
+                            "a mainnet run needs the prover's export: \
+                             paid_path attest <txid> <vout> <T> <payee_hash> <attestation.json>"
+                        );
+                        std::process::exit(2);
+                    }
+                    None
+                }
+            };
+
             let attestor = attestor_client();
             let (p_hex, build) = attestor.identity().expect("identity");
             if s.network == Network::Main && build.contains("test-signer") {
@@ -726,15 +756,9 @@ fn cmd_attest(args: &[String]) {
             assert_eq!(recheck.r, record.r, "the attestor no longer holds this R");
 
             // R9-3: a real attestation from the prover, or the test key off mainnet.
-            let wire = match args.get(6) {
-                Some(path) => attestation_from_prover(path),
+            let wire = match wire {
+                Some(w) => w,
                 None => {
-                    if s.network == Network::Main {
-                        panic!(
-                            "a mainnet run needs the prover's export: \
-                             paid_path attest <txid> <vout> <T> <payee_hash> <attestation.json>"
-                        );
-                    }
                     eprintln!("WARNING: signing the attestation with the test key. Testnet only.");
                     let (att, sig, det) =
                         attestation_for(&s.canonical, s.canonical.lock_confirmed_ms + 60_000);
@@ -742,9 +766,38 @@ fn cmd_attest(args: &[String]) {
                 }
             };
 
+            // R12-3: by this point the fiat has been sent. A refusal here must
+            // say what to do next, not print a Rust panic and leave the
+            // operator to guess whether the money is gone.
             let got = attestor
                 .attest(&record.event_id, &s.canonical, wire)
-                .expect("attest");
+                .unwrap_or_else(|e| {
+                    eprintln!("the attestor refused to publish the scalar:");
+                    eprintln!("  {e}");
+                    eprintln!();
+                    eprintln!("  The escrow has NOT been released and no coin has moved.");
+                    eprintln!("  The pre-signature and this run's state are saved in");
+                    eprintln!("  {}.", s.record_path);
+                    eprintln!();
+                    eprintln!("  A 4xx means the attestation did not match these terms: usually");
+                    eprintln!("  the prover ran with a different INTENT_HASH, amount or payee");
+                    eprintln!("  than `announce` printed, or against a different payment. Rerun");
+                    eprintln!("  the prover with the values `announce` printed, then:");
+                    eprintln!(
+                        "    paid_path attest {} {} {} <payee_hash> <attestation.json>",
+                        zecp2p_escrow::rpc::txid_to_display(&s.terms.funding_txid),
+                        s.canonical.vout,
+                        s.terms.refund_height
+                    );
+                    eprintln!();
+                    eprintln!("  If it cannot be resolved before block {}, take the refund:", s.terms.refund_height);
+                    eprintln!(
+                        "    escrow_e2e refund {} {} <t1 refund address>",
+                        zecp2p_escrow::rpc::txid_to_display(&s.terms.funding_txid),
+                        s.canonical.vout
+                    );
+                    std::process::exit(3);
+                });
             record.s = Some(hex::encode(got));
             record.save(&s.record_path);
             got
@@ -845,7 +898,7 @@ fn cmd_verify(args: &[String]) {
     };
     let chain = RpcChainClient::new(cfg).expect("rpc");
 
-    let script_sig = chain.release_script_sig(txid_rpc).unwrap_or_else(|e| {
+    let details = chain.release_details(txid_rpc).unwrap_or_else(|e| {
         eprintln!("cannot read the release {txid_rpc}: {e}");
         eprintln!();
         eprintln!("  `verify` reads the transaction the chain holds, so it only works");
@@ -853,6 +906,47 @@ fn cmd_verify(args: &[String]) {
         eprintln!("  the order shown, and wait for a confirmation.");
         std::process::exit(2);
     });
+    let script_sig = details.script_sig.clone();
+
+    // R11-8 / R12-5: criterion 6 is about *this* escrow's release. Without
+    // these, any transaction whose first input carried a two-signature
+    // scriptSig would satisfy the recovery below, and a green
+    // `CRITERION 6 HOLDS` would prove nothing about where the coin went.
+    let mut checked = Vec::new();
+    if let Some(want_txid) = record.funding_txid.as_deref() {
+        let got = details.spends_txid.as_deref().unwrap_or("");
+        if !got.eq_ignore_ascii_case(want_txid) {
+            eprintln!("this transaction does not spend the escrow.");
+            eprintln!("  it spends  {got}");
+            eprintln!("  escrow is  {want_txid}");
+            std::process::exit(2);
+        }
+        if let (Some(want_vout), Some(got_vout)) = (record.funding_vout, details.spends_vout) {
+            if want_vout != got_vout {
+                eprintln!("this transaction spends vout {got_vout}, the escrow is vout {want_vout}.");
+                std::process::exit(2);
+            }
+        }
+        checked.push("spends the escrow outpoint");
+    }
+
+    let want_script = hex::decode(&record.lp_script).unwrap_or_default();
+    if !want_script.is_empty() {
+        if details.pays_script_pubkey != want_script {
+            eprintln!("this transaction does not pay the agreed LP script.");
+            eprintln!("  pays       {}", hex::encode(&details.pays_script_pubkey));
+            eprintln!("  agreed     {}", hex::encode(&want_script));
+            std::process::exit(2);
+        }
+        checked.push("pays the agreed LP script");
+    }
+
+    let want_zat = record.amount_zat.saturating_sub(record.fee_zat);
+    if details.pays_zat != want_zat {
+        eprintln!("this transaction pays {} zat, the terms say {want_zat}.", details.pays_zat);
+        std::process::exit(2);
+    }
+    checked.push("pays the agreed amount");
 
     // scriptSig is OP_0 <sig_u> <sig_l> OP_1 <redeem>; sig_u is the first push.
     let len = script_sig[1] as usize;
@@ -867,6 +961,9 @@ fn cmd_verify(args: &[String]) {
     .expect("recorded pre-signature");
 
     println!("mined txid     {txid_rpc}");
+    for c in &checked {
+        println!("  checked      {c}");
+    }
     println!("record         {}", args[2]);
     match recover_outcome_secret(&secp, &pre_sig, &sig_u, &y) {
         Ok(rec) => {
