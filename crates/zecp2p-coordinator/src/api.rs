@@ -537,20 +537,36 @@ mod zec_address_tests {
         assert!(validate_zec_address(&format!("t1{}", "a".repeat(32))).is_ok());
     }
 
-    /// The two validators used to disagree: this layer accepted `zs`, and the
-    /// near.rs one rejected it, so the failure landed after a curator round trip
-    /// had already been spent.
+    /// The API layer delegates to the one authoritative check, so whatever
+    /// `near.rs` decides is what the boundary decides. Since 2026-09-02 that
+    /// means a real unified address passes and a malformed one does not; both
+    /// strings here are malformed, which is why both are still refused.
     #[test]
-    fn shielded_addresses_are_rejected_here_not_later() {
-        for shielded in [
+    fn malformed_addresses_are_rejected_here_not_later() {
+        for bad in [
             "zs1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
             "u1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
         ] {
             assert!(
-                validate_zec_address(shielded).is_err(),
-                "{shielded} must be refused at the API boundary"
+                validate_zec_address(bad).is_err(),
+                "{bad} must be refused at the API boundary"
             );
         }
+    }
+
+    /// And a unified address the sender's wallet would actually give them is
+    /// accepted at this boundary, not just deeper in.
+    #[test]
+    fn a_real_unified_address_passes_the_boundary() {
+        use zcash_address::unified::{self, Encoding};
+        let ua = unified::Address::try_from_items(vec![
+            unified::Receiver::Orchard([3u8; 43]),
+            unified::Receiver::P2pkh([7u8; 20]),
+        ])
+        .unwrap()
+        .encode(&zcash_protocol::consensus::NetworkType::Main);
+
+        validate_zec_address(&ua).expect("a unified address is a refund destination");
     }
 
     #[test]

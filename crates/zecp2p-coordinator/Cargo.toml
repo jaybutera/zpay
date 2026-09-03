@@ -32,6 +32,10 @@ k256 = "0.13"
 ripemd = "0.1"
 sha2 = "0.10"
 async-trait = "0.1"
+# Unified address decoding, so a refund can go to the address a Zcash user
+# actually has. The escrow crate already depends on these.
+zcash_address = "0.13"
+zcash_protocol = "0.10"
 
 [dev-dependencies]
 tempfile = "3"

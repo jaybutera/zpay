@@ -217,10 +217,22 @@ impl QuoteRequest {
     }
 }
 
-/// 1Click only accepts a transparent Zcash address for refunds.
+/// Check a Zcash address the way 1Click checks it.
 ///
-/// Unified (`u1`) and Sapling (`zs`) addresses are rejected by the API, so funds
-/// refunded from a swap always land in the transparent pool.
+/// This used to reject every shielded form on the stated grounds that the API
+/// does. Dry quotes on 2026-09-02 say otherwise: 1Click accepts a unified
+/// address as both `refundTo` and `recipient`, including a shielded-only one,
+/// and refuses a malformed string with `refundTo is not valid`. The evidence
+/// is in `docs/plans/ux-simplification.md` section 10.1, and the addresses it
+/// was taken with are built by `crates/zecp2p-escrow/examples/ua_probe.rs`.
+///
+/// So a unified address is accepted here, which is what lets a failed swap
+/// refund straight to the address a Zcash user actually has rather than to a
+/// transparent hop the page then has to sweep.
+///
+/// Sapling (`zs`) and Sprout (`zc`) stay refused. Neither has been probed
+/// against the live API, and a bare Sapling address is not what any current
+/// wallet hands a user to receive with.
 pub fn validate_zec_refund_address(address: &str) -> Result<()> {
     let address = address.trim();
 
@@ -239,14 +251,46 @@ pub fn validate_zec_refund_address(address: &str) -> Result<()> {
         return Ok(());
     }
 
-    if address.starts_with("u1") || address.starts_with("zs") || address.starts_with("zc") {
+    if address.starts_with("u1") {
+        // Decode it rather than pattern-match the prefix: `u1` followed by
+        // anything is not a unified address, and 1Click would answer 400 for a
+        // string that fails its bech32m checksum. Deciding here costs no round
+        // trip and names the problem.
+        return validate_unified_address(address);
+    }
+
+    if address.starts_with("zs") || address.starts_with("zc") {
         anyhow::bail!(
-            "refund address {} is shielded; 1Click only accepts a transparent t1/t3 address",
+            "refund address {} is a Sapling or Sprout address. Use a unified address \
+             (u1...) or a transparent one (t1.../t3...)",
             address
         );
     }
 
-    anyhow::bail!("refund address {} is not a Zcash transparent address", address)
+    anyhow::bail!("refund address {} is not a Zcash address", address)
+}
+
+/// Check that a `u1` string really is a well-formed unified address.
+///
+/// Bech32m over the `u` HRP, with the ZIP 316 f4jumble and the padding the
+/// spec requires. `zcash_address` owns that logic; reimplementing it here is
+/// how the first version of this probe ended up testing its own checksum bug
+/// instead of the API.
+fn validate_unified_address(address: &str) -> Result<()> {
+    use zcash_address::unified::Encoding;
+
+    let (network, _ua) = zcash_address::unified::Address::decode(address)
+        .map_err(|e| anyhow::anyhow!("refund address {address} is not a valid unified address: {e}"))?;
+
+    if network != zcash_protocol::consensus::NetworkType::Main {
+        anyhow::bail!(
+            "refund address {} is a {:?} address, not a mainnet one",
+            address,
+            network
+        );
+    }
+
+    Ok(())
 }
 
 /// Simplified quote response
@@ -610,22 +654,51 @@ mod tests {
         request.validate().expect("52000 zatoshi is quotable");
     }
 
+    /// This test used to assert that every shielded address is refused, on the
+    /// stated grounds that 1Click rejects them. Dry quotes on 2026-09-02 show
+    /// it accepts a unified address as `refundTo`, so the rule changed and this
+    /// test changed with it (`docs/plans/ux-simplification.md`, section 10.1).
+    ///
+    /// Both strings below are still refused, and the first one shows why the
+    /// old test passed for the wrong reason: it is not a valid unified address
+    /// at all, so it was failing a checksum rather than a format rule.
     #[test]
-    fn test_validate_rejects_shielded_refund_address() {
-        for shielded in [
+    fn test_validate_rejects_malformed_and_sapling_refund_addresses() {
+        for bad in [
             "u1lq6jn3fkgd0dcxpvdnfrhrqrmvdnvzdmhdpvzdshgqe8gksv5x4nzn6vhpwzvz",
             "zs1z7rejlpsa98s2rrrfkwmaxu53e4ue0ulcrw0h4x5g8jl04tak0d3mm47vdtahatqrlkngh9sly",
         ] {
             let request = NearIntentsClient::zec_to_usdc_base_request(
                 1_000_000,
                 "0x1234567890123456789012345678901234567890",
-                shielded,
+                bad,
                 Some(50),
             );
 
-            let err = request.validate().expect_err("shielded refundTo is rejected");
-            assert!(err.to_string().contains("shielded"), "got: {}", err);
+            request
+                .validate()
+                .expect_err("a malformed or Sapling refundTo is rejected");
         }
+    }
+
+    /// And the shape that is now accepted, built rather than typed.
+    #[test]
+    fn test_validate_accepts_a_real_unified_refund_address() {
+        use zcash_address::unified::{self, Encoding};
+        let ua = unified::Address::try_from_items(vec![
+            unified::Receiver::Orchard([3u8; 43]),
+            unified::Receiver::P2pkh([7u8; 20]),
+        ])
+        .unwrap()
+        .encode(&zcash_protocol::consensus::NetworkType::Main);
+
+        let request = NearIntentsClient::zec_to_usdc_base_request(
+            1_000_000,
+            "0x1234567890123456789012345678901234567890",
+            &ua,
+            Some(50),
+        );
+        request.validate().expect("a unified refundTo is quotable");
     }
 
     #[test]
@@ -736,5 +809,89 @@ mod tests {
             assert!(!s.is_terminal(), "{s:?} should not be terminal");
             assert!(!s.is_success(), "{s:?} should not be success");
         }
+    }
+}
+
+/// The refund validator, after 2026-09-02 widened it to unified addresses.
+///
+/// The addresses here are built by `zcash_address` rather than typed, which is
+/// the lesson from the first probe: hand-written `u1` and `zs` strings failed
+/// their own checksum, so the 400s they drew said nothing about the format.
+#[cfg(test)]
+mod refund_address_tests {
+    use super::validate_zec_refund_address;
+    use zcash_address::unified::{self, Encoding};
+
+    fn mainnet_ua(items: Vec<unified::Receiver>) -> String {
+        unified::Address::try_from_items(items)
+            .expect("a legal receiver set")
+            .encode(&zcash_protocol::consensus::NetworkType::Main)
+    }
+
+    /// The finding that motivated the change: 1Click takes a unified address,
+    /// so a refund can go straight to the address a Zcash user actually holds.
+    #[test]
+    fn a_unified_address_is_accepted() {
+        let both = mainnet_ua(vec![
+            unified::Receiver::Orchard([3u8; 43]),
+            unified::Receiver::P2pkh([7u8; 20]),
+        ]);
+        validate_zec_refund_address(&both).expect("orchard + transparent UA");
+
+        let shielded_only = mainnet_ua(vec![unified::Receiver::Orchard([3u8; 43])]);
+        validate_zec_refund_address(&shielded_only).expect("shielded-only UA");
+    }
+
+    /// Transparent addresses still pass, at both valid lengths. This is the
+    /// path every existing session used.
+    #[test]
+    fn transparent_addresses_still_pass() {
+        validate_zec_refund_address("t1KhV8ADhTGvVvBpTiEcJGnhTvBBFVFYHXx").unwrap();
+        validate_zec_refund_address(&format!("t1{}", "a".repeat(32))).unwrap();
+        validate_zec_refund_address(&format!("t3{}", "a".repeat(32))).unwrap();
+    }
+
+    /// A `u1` prefix is not a unified address. Deciding this locally is what
+    /// turns 1Click's bare "refundTo is not valid" into something actionable,
+    /// and it is the exact mistake the first probe made.
+    #[test]
+    fn a_u1_string_that_fails_its_checksum_is_refused() {
+        assert!(validate_zec_refund_address("u1notarealaddressatall").is_err());
+        // A real UA with one character changed: the checksum must catch it.
+        let good = mainnet_ua(vec![unified::Receiver::Orchard([3u8; 43])]);
+        let mut broken = good.clone();
+        let last = broken.pop().unwrap();
+        broken.push(if last == 'q' { 'p' } else { 'q' });
+        assert!(
+            validate_zec_refund_address(&broken).is_err(),
+            "a one-character corruption of {good} must not pass"
+        );
+    }
+
+    /// A testnet address would have the funds refunded to a chain the sender is
+    /// not on.
+    #[test]
+    fn a_testnet_unified_address_is_refused() {
+        let testnet = unified::Address::try_from_items(vec![unified::Receiver::Orchard([3u8; 43])])
+            .unwrap()
+            .encode(&zcash_protocol::consensus::NetworkType::Test);
+        assert!(validate_zec_refund_address(&testnet).is_err());
+    }
+
+    /// Sapling and Sprout stay refused, and say what to use instead.
+    #[test]
+    fn sapling_and_sprout_are_refused_with_an_actionable_message() {
+        for a in ["zs1qqqqqqqqqqqqqqqqqqqq", "zcaaaaaaaaaaaaaaaaaaaa"] {
+            let e = validate_zec_refund_address(a).unwrap_err().to_string();
+            assert!(e.contains("u1"), "{a} should point at unified addresses: {e}");
+        }
+    }
+
+    #[test]
+    fn nonsense_is_still_nonsense() {
+        assert!(validate_zec_refund_address("").is_err());
+        assert!(validate_zec_refund_address("bc1qxy2kgdygjrsqtzq2n0yrf249").is_err());
+        assert!(validate_zec_refund_address("t1short").is_err());
+        assert!(validate_zec_refund_address("0x0000000000000000000000000000000000000000").is_err());
     }
 }
