@@ -174,33 +174,56 @@ main { flex: 1; }
 .msg.info { border-left-color: var(--blue); }
 .msg .btn { margin-top: 8px; }
 
-/* ---------- pay block ---------- */
+/* ---------- pay block ----------
+   The QR is the thing on this screen, so it gets the width: a white tile on
+   its own row, then the address as a one-line strip, then the two buttons as
+   a pair. The white belongs to the tile, not the page, and the canvas is drawn
+   at four times its box so a phone at 2x still gets square modules. */
 
-.qr-row { display: flex; gap: 16px; align-items: flex-start; }
-.qr-link { display: inline-block; line-height: 0; border-radius: 4px; flex: none; }
-#qr {
-  width: 176px; height: 176px;
-  /* The white quiet zone belongs to the code, so a scanner sees the contrast
-     it needs on a dark page. */
+.pay-qr { display: flex; justify-content: center; margin: 2px 0 16px; }
+.qr-tile {
+  display: flex; flex-direction: column; align-items: center; gap: 8px;
+  flex: none;
+  line-height: 0;
+  padding: 12px 12px 9px;
   background: #fff;
-  border-radius: 4px;
+  border-radius: 6px;
+  box-shadow: 0 0 0 1px var(--line), 0 12px 32px rgba(0,0,0,.45);
+  text-decoration: none;
+  transition: box-shadow .15s ease;
 }
-.qr-side { flex: 1; min-width: 0; }
-.addr {
-  font: 12.5px/1.6 var(--mono);
-  word-break: break-all;
+.qr-tile:hover, .qr-tile:focus-visible {
+  text-decoration: none;
+  box-shadow: 0 0 0 1px var(--blue), 0 0 22px var(--blue-glow), 0 12px 32px rgba(0,0,0,.45);
+}
+.qr-tile .qr-cap { line-height: 1; font-size: 9px; letter-spacing: 1.6px; color: #6b7480; }
+#qr { width: 168px; height: 168px; display: block; }
+#qr[hidden] { display: none; }
+
+.addr-strip {
+  container-type: inline-size;
   background: var(--bg);
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  padding: 10px 11px;
+  padding: 9px 12px 10px;
   margin: 0 0 10px;
+}
+.addr-strip .addr-label { display: block; font-size: 9.5px; letter-spacing: 1.4px; color: var(--text-mute); margin-bottom: 5px; }
+.addr {
+  font: 13px/1.5 var(--mono);
+  word-break: break-all;
   color: #fff;
+  margin: 0;
 }
-.addr.small { font-size: 11px; color: var(--text-dim); max-height: 140px; overflow: auto; }
-@media (max-width: 480px) {
-  .qr-row { flex-direction: column; align-items: center; }
-  .qr-side { width: 100%; }
+.addr.small {
+  font-size: 11px; line-height: 1.6; color: var(--text-dim); max-height: 140px; overflow: auto;
+  background: var(--bg); border: 1px solid var(--line); border-radius: var(--radius); padding: 10px 11px;
 }
+/* A t-address is 35 characters. Where the card column is at its narrowest
+   the strip is a few pixels short of that at 13px, so step down instead of
+   breaking the address across two lines. */
+@container (max-width: 272px) { .addr-strip .addr { font-size: 12px; } }
+.pay-btns { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 
 /* ---------- stage and ladder ---------- */
 

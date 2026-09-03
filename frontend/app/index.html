@@ -120,19 +120,21 @@
 
         <div id="pay-block">
           <h2 class="h2">Send <span class="mono" id="pay-amount"></span> to this address</h2>
-          <div class="qr-row">
-            <a class="qr-link" id="pay-uri" href="#" aria-label="Open in your wallet">
-              <canvas id="qr" width="176" height="176" aria-label="Payment QR code"></canvas>
+          <div class="pay-qr">
+            <a class="qr-tile" id="pay-uri" href="#" aria-label="Open in your wallet">
+              <canvas id="qr" width="704" height="704" aria-label="Payment QR code"></canvas>
+              <span class="qr-cap label">scan to pay</span>
             </a>
-            <div class="qr-side">
-              <div class="addr" id="pay-addr"></div>
-              <div class="btns">
-                <button type="button" class="btn small" id="btn-copy-addr">Copy address</button>
-                <a class="btn small" id="pay-open" href="#">Open in wallet</a>
-              </div>
-              <p class="hint">Exactly this amount, in one transaction. <span id="pay-to"></span></p>
-            </div>
           </div>
+          <div class="addr-strip">
+            <span class="label addr-label">address</span>
+            <div class="addr" id="pay-addr"></div>
+          </div>
+          <div class="btns pay-btns">
+            <button type="button" class="btn small primary" id="btn-copy-addr">Copy address</button>
+            <a class="btn small" id="pay-open" href="#">Open in wallet</a>
+          </div>
+          <p class="hint">Exactly this amount, in one transaction. <span id="pay-to"></span></p>
         </div>
 
         <div id="stage-block" hidden>
