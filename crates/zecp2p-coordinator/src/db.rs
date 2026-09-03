@@ -369,10 +369,6 @@ struct SessionRow {
     error: Option<String>,
     created_at: String,
     updated_at: String,
-    /// When the sweep last reached this order. Read only by the ordering in
-    /// `get_open_orders`, so it is carried on the row and not on the record.
-    #[allow(dead_code)]
-    last_polled_at: Option<String>,
 }
 
 impl SessionRow {

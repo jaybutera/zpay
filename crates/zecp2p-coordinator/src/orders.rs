@@ -54,6 +54,18 @@ const MAX_POLLING_WINDOW: chrono::Duration = chrono::Duration::hours(6);
 /// 1Click is slow.
 const ORDER_SWEEP_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// A hard cap on how many orders one tick polls, on top of the wall-clock
+/// budget.
+///
+/// The budget alone makes what a tick covers a function of how fast 1Click and
+/// this machine happen to be, which is fine in production and useless in a
+/// test: a sweep that covers the whole set in one pass cannot demonstrate a
+/// rotation, and whether it does depends on load. This bounds a tick by a
+/// number instead, so the property is testable without pinning wall-clock
+/// timings, and in production it binds only when 1Click is answering faster
+/// than about six milliseconds a call, which it never has.
+const ORDER_SWEEP_MAX_PER_TICK: usize = 800;
+
 /// Map an offramp session's status onto the canonical stage the sender reads.
 ///
 /// The five rungs are the same words on both backends, which is what lets one
@@ -100,6 +112,10 @@ impl AppState {
         let mut swept = 0usize;
 
         for order in orders {
+            if swept >= self.order_sweep_max_per_tick() {
+                tracing::debug!(swept, total, "order sweep hit its per-tick cap");
+                break;
+            }
             if started.elapsed() > ORDER_SWEEP_BUDGET {
                 tracing::warn!(
                     swept,
@@ -216,7 +232,35 @@ impl AppState {
 
         // Settled. This is the tick that spends gas, and the first one that
         // does anything on chain for this order.
-        let session = self.create_session_for_order(order).await?;
+        //
+        // U2-5. A settled order that can *never* be promoted must say so on the
+        // row. The pre-column case bails rather than re-quoting, which is
+        // right, but the bail went only to the log: the order kept its place in
+        // the open set, was polled every tick with `error: None`, and the
+        // sender's page read "Waiting for your ZEC" for an order whose ZEC had
+        // arrived, until the window closed and retired it.
+        //
+        // Only that case writes the note. A chain call that failed, an RPC that
+        // dropped, a curator that answered 500: all of those succeed on a later
+        // tick, and putting "this needs a hand" on the page for one of them
+        // would alarm a sender whose payment is about to go through by itself.
+        let session = match self.create_session_for_order(order).await {
+            Ok(session) => session,
+            Err(e) => {
+                if self.cannot_ever_be_promoted(order) {
+                    let note = format!(
+                        "your ZEC arrived and the swap settled, but this order cannot be \
+                         finished automatically: {e}. Keep this link; nothing is lost."
+                    );
+                    if order.error.as_deref() != Some(note.as_str()) {
+                        let mut updated = order.clone();
+                        updated.error = Some(note);
+                        self.db.update_order(&updated).await?;
+                    }
+                }
+                return Err(e);
+            }
+        };
 
         let mut updated = order.clone();
         updated.session_uuid = Some(session.id);
@@ -230,6 +274,33 @@ impl AppState {
         );
 
         Ok(())
+    }
+
+    /// How many orders one tick may poll.
+    ///
+    /// `ORDER_SWEEP_MAX_PER_TICK` unless `ZECP2P_ORDER_SWEEP_MAX_PER_TICK` says
+    /// otherwise. The override exists so the sweep tests can make a tick cover
+    /// a known fraction of the open set and assert the rotation directly,
+    /// rather than inferring it from how fast a mock replied on the day.
+    fn order_sweep_max_per_tick(&self) -> usize {
+        std::env::var("ZECP2P_ORDER_SWEEP_MAX_PER_TICK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(ORDER_SWEEP_MAX_PER_TICK)
+    }
+
+    /// Whether this order is missing something promotion can never recover.
+    ///
+    /// Today that is only the pre-column case from U1-1: an order opened before
+    /// `swap_expected_usdc` and `swap_min_usdc` existed has no record of the
+    /// quote its deposit address came from, and the one thing promotion must
+    /// not do is take a second quote to fill them in. Every other promotion
+    /// failure is worth retrying on the next tick.
+    fn cannot_ever_be_promoted(&self, order: &OrderRecord) -> bool {
+        order.deposit.is_none()
+            || order.swap_expected_usdc.is_none()
+            || order.swap_min_usdc.is_none()
     }
 
     /// The last moment this order's deposit address is worth polling.
