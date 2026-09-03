@@ -53,7 +53,7 @@ pub async fn stats(
 /// `/quote` runs before the user has given a refund address, but 1Click still
 /// validates the field. Nothing is ever deposited against these quotes, so the
 /// address is never used; a real one is required to start an offramp.
-const QUOTE_REFUND_PLACEHOLDER: &str = "t1KhV8ADhTGvVvBpTiEcJGnhTvBBFVFYHXx";
+pub const QUOTE_REFUND_PLACEHOLDER: &str = "t1KhV8ADhTGvVvBpTiEcJGnhTvBBFVFYHXx";
 
 /// Quote request query parameters
 #[derive(Debug, Deserialize)]
@@ -428,6 +428,15 @@ pub async fn withdraw_offramp(
 
 /// Parse ZEC amount from decimal string to zatoshi
 /// Handles up to 8 decimal places (ZEC precision)
+pub fn parse_zec_amount_pub(amount_str: &str) -> Result<u64, AppError> {
+    parse_zec_amount(amount_str)
+}
+
+/// Reused by `/v2`, so both APIs accept exactly the same rate syntax.
+pub fn parse_min_rate_pub(rate_str: Option<&str>) -> Result<U256, AppError> {
+    parse_min_rate(rate_str)
+}
+
 fn parse_zec_amount(amount_str: &str) -> Result<u64, AppError> {
     // Remove any whitespace
     let amount_str = amount_str.trim();

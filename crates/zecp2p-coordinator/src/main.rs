@@ -8,6 +8,7 @@
 //! - Monitors zk-p2p for fulfillment
 
 mod api;
+mod api_v2;
 mod backend;
 mod auth;
 mod chain;
@@ -99,6 +100,13 @@ async fn main() -> Result<()> {
         .route("/deposits/open", get(api::list_open_deposits))
         .route("/offramp/{id}/rescue", post(api::rescue_offramp))
         .route("/offramp/{id}/withdraw", post(api::withdraw_offramp))
+        // The backend-agnostic route both the main and advanced front ends use.
+        // `/offramp` above stays as it is and becomes the advanced route's API,
+        // so nothing on the CLI changes.
+        .route("/v2/capabilities", get(api_v2::capabilities))
+        .route("/v2/quote", get(api_v2::quote_v2))
+        .route("/v2/orders", post(api_v2::open_order))
+        .route("/v2/orders/{id}", get(api_v2::get_order))
         // An explicit list, not Any. With Any, any page a user visits could drive
         // a loopback coordinator through their browser.
         .layer(cors_layer(&config))

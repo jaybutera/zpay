@@ -59,6 +59,42 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
+        // Main-route orders.
+        //
+        // An order is deliberately not a session. A session costs keeper gas the
+        // moment it is created, and the main route's session keys are free, so an
+        // order stays a row here and a 1Click quote until the ZEC is seen. The
+        // session_uuid column is null until the keeper promotes it, and that
+        // promotion is where createSession and creditSession go in one tick.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS orders (
+                id TEXT PRIMARY KEY,
+                backend TEXT NOT NULL,
+                rail TEXT NOT NULL,
+                handle TEXT NOT NULL,
+                session_pubkey TEXT NOT NULL,
+                evm_address TEXT NOT NULL,
+                refund_address TEXT NOT NULL,
+                quote_json TEXT NOT NULL,
+                deposit_json TEXT,
+                overrides_json TEXT NOT NULL,
+                session_uuid TEXT,
+                stage TEXT NOT NULL,
+                return_json TEXT,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_orders_stage ON orders(stage)")
+            .execute(&self.pool)
+            .await?;
+
         // Key-value store for tracking state like last processed block
         sqlx::query(
             r#"
@@ -358,6 +394,168 @@ impl SessionRow {
             error: self.error,
             created_at: DateTime::parse_from_rfc3339(&self.created_at)?.with_timezone(&chrono::Utc),
             updated_at: DateTime::parse_from_rfc3339(&self.updated_at)?.with_timezone(&chrono::Utc),
+        })
+    }
+}
+
+// =============================================================================
+// Main-route orders
+// =============================================================================
+
+/// One main-route order, as it is stored.
+///
+/// The distinction from `OfframpSession` is deliberate and is the reason this
+/// is a separate table: a session exists on-chain and costs keeper gas, an
+/// order is a row and a quote. `session_uuid` is `None` until the keeper sees
+/// the ZEC and promotes the order into a session.
+#[derive(Debug, Clone)]
+pub struct OrderRecord {
+    pub id: uuid::Uuid,
+    pub backend: zecp2p_types::settlement::BackendId,
+    pub destination: zecp2p_types::settlement::PayoutDestination,
+    /// Compressed secp256k1, hex. Never a secret: the page keeps that in the
+    /// status link's fragment, which no server sees.
+    pub session_pubkey: String,
+    /// Derived from `session_pubkey`; becomes `session.user` on promotion.
+    pub evm_address: String,
+    /// What 1Click was given as `refundTo`. Either the sender's own address, on
+    /// an advanced-route order or one that named one, or the session key's
+    /// transparent address.
+    pub refund_address: String,
+    pub quote: zecp2p_types::settlement::Quote,
+    pub deposit: Option<zecp2p_types::settlement::DepositInstruction>,
+    pub overrides: zecp2p_types::settlement::Overrides,
+    pub session_uuid: Option<uuid::Uuid>,
+    pub stage: zecp2p_types::settlement::Stage,
+    pub returns: zecp2p_types::settlement::ReturnState,
+    pub error: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl Database {
+    pub async fn insert_order(&self, order: &OrderRecord) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO orders (
+                id, backend, rail, handle, session_pubkey, evm_address, refund_address,
+                quote_json, deposit_json, overrides_json, session_uuid, stage,
+                return_json, error, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(order.id.to_string())
+        .bind(order.backend.as_str())
+        .bind(order.destination.rail.as_str())
+        .bind(&order.destination.handle)
+        .bind(&order.session_pubkey)
+        .bind(&order.evm_address)
+        .bind(&order.refund_address)
+        .bind(serde_json::to_string(&order.quote)?)
+        .bind(order.deposit.as_ref().map(serde_json::to_string).transpose()?)
+        .bind(serde_json::to_string(&order.overrides)?)
+        .bind(order.session_uuid.map(|u| u.to_string()))
+        .bind(serde_json::to_string(&order.stage)?)
+        .bind(serde_json::to_string(&order.returns)?)
+        .bind(&order.error)
+        .bind(order.created_at.to_rfc3339())
+        .bind(order.updated_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn update_order(&self, order: &OrderRecord) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE orders SET
+                deposit_json = ?, session_uuid = ?, stage = ?, return_json = ?,
+                error = ?, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(order.deposit.as_ref().map(serde_json::to_string).transpose()?)
+        .bind(order.session_uuid.map(|u| u.to_string()))
+        .bind(serde_json::to_string(&order.stage)?)
+        .bind(serde_json::to_string(&order.returns)?)
+        .bind(&order.error)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(order.id.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_order(&self, id: uuid::Uuid) -> Result<Option<OrderRecord>> {
+        let row: Option<OrderRow> = sqlx::query_as("SELECT * FROM orders WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(OrderRecord::try_from).transpose()
+    }
+
+    /// Orders the keeper still has work to do on.
+    pub async fn get_open_orders(&self) -> Result<Vec<OrderRecord>> {
+        let rows: Vec<OrderRow> = sqlx::query_as(
+            r#"SELECT * FROM orders WHERE stage NOT IN ('"done"', '"returned"', '"failed"')"#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(OrderRecord::try_from).collect()
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct OrderRow {
+    id: String,
+    backend: String,
+    rail: String,
+    handle: String,
+    session_pubkey: String,
+    evm_address: String,
+    refund_address: String,
+    quote_json: String,
+    deposit_json: Option<String>,
+    overrides_json: String,
+    session_uuid: Option<String>,
+    stage: String,
+    return_json: Option<String>,
+    error: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
+impl TryFrom<OrderRow> for OrderRecord {
+    type Error = anyhow::Error;
+
+    fn try_from(r: OrderRow) -> Result<Self> {
+        Ok(OrderRecord {
+            id: r.id.parse()?,
+            backend: r
+                .backend
+                .parse()
+                .map_err(|e: String| anyhow::anyhow!(e))?,
+            destination: zecp2p_types::settlement::PayoutDestination {
+                rail: r.rail.parse().map_err(|e: String| anyhow::anyhow!(e))?,
+                handle: r.handle,
+            },
+            session_pubkey: r.session_pubkey,
+            evm_address: r.evm_address,
+            refund_address: r.refund_address,
+            quote: serde_json::from_str(&r.quote_json)?,
+            deposit: r.deposit_json.as_deref().map(serde_json::from_str).transpose()?,
+            overrides: serde_json::from_str(&r.overrides_json)?,
+            session_uuid: r.session_uuid.map(|s| s.parse()).transpose()?,
+            stage: serde_json::from_str(&r.stage)?,
+            returns: r
+                .return_json
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()?
+                .unwrap_or(zecp2p_types::settlement::ReturnState::None),
+            error: r.error,
+            created_at: chrono::DateTime::parse_from_rfc3339(&r.created_at)?.with_timezone(&chrono::Utc),
+            updated_at: chrono::DateTime::parse_from_rfc3339(&r.updated_at)?.with_timezone(&chrono::Utc),
         })
     }
 }
