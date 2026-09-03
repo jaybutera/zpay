@@ -613,3 +613,101 @@ async fn an_unfunded_order_expires_and_stops_being_polled() {
     state.tick_orders().await.expect("second tick");
     assert_eq!(near.quote_count(), calls_before);
 }
+
+/// A handle the curator rejects must not burn the price the sender is holding.
+///
+/// U2-4. `open_order` spent the quote id before asking the curator whether the
+/// handle existed, so a typo answered "check the handle matches the account's
+/// exact spelling" with the id already gone, and the corrected resubmission
+/// answered "an order has already been opened at that price". No order existed
+/// either time, and the only way out was to change the amount so a new quote
+/// was taken. The two messages together tell a sender to do something that
+/// cannot work.
+#[tokio::test]
+#[ignore = "requires anvil and forge"]
+async fn a_rejected_handle_leaves_the_price_usable() {
+    let anvil = Anvil::start();
+    std::env::set_var("COORDINATOR_PRIVATE_KEY", KEEPER_PRIVATE_KEY);
+
+    let (usdc_addr, escrow_addr, glue_addr) = test_utils::deploy_enhanced_contracts(&anvil.url);
+    let (_near, near_url) = start_near_mock().await;
+    let zkp2p = MockZkp2pServer::start().await;
+
+    let temp = TempDir::new().expect("temp dir");
+    let db_path = temp.path().join("typo.db").to_string_lossy().to_string();
+    let config = test_utils::test_config_for(
+        &anvil.url, &near_url, &zkp2p.api_url(), usdc_addr, escrow_addr, glue_addr, &db_path,
+    );
+
+    let db = zecp2p_coordinator::db::Database::new(&db_path).await.expect("db");
+    db.run_migrations().await.expect("migrations");
+    let chain = zecp2p_coordinator::chain::ChainClient::new(&config).await.expect("chain");
+    let state = Arc::new(zecp2p_coordinator::state::AppState::new(
+        config.clone(), db, chain,
+        zecp2p_coordinator::near::NearIntentsClient::new(&config.near),
+        zecp2p_coordinator::zkp2p::Zkp2pClient::new(&config.zkp2p),
+    ));
+
+    let session_key = PrivateKeySigner::random();
+    let pubkey_hex = {
+        use k256::elliptic_curve::sec1::ToEncodedPoint;
+        let p = session_key.credential().verifying_key().as_affine().to_encoded_point(true);
+        hex::encode(p.as_bytes())
+    };
+
+    let quote = zecp2p_coordinator::api_v2::test_entry::quote(&state, 50_000_000).await
+        .expect("quote");
+
+    let sign = |handle: &str| {
+        let scope = format!("{}:venmo:{handle}", quote.quote_id);
+        let msg = zecp2p_coordinator::auth::ownership_message("open", session_key.address(), &scope);
+        session_key.sign_message_sync(msg.as_bytes()).expect("sign").to_string()
+    };
+    let body = |handle: &str| zecp2p_types::settlement::OpenRequest {
+        quote_id: quote.quote_id.clone(),
+        destination: zecp2p_types::settlement::PayoutDestination {
+            rail: zecp2p_types::settlement::Rail::Venmo,
+            handle: handle.to_string(),
+        },
+        session_pubkey: pubkey_hex.clone(),
+        overrides: Default::default(),
+    };
+
+    // The typo: the curator says no.
+    zkp2p.set_reject(true);
+    let typo = "mispelt";
+    let refused = zecp2p_coordinator::api_v2::test_entry::open(&state, &sign(typo), body(typo))
+        .await
+        .expect_err("the curator rejected this handle, so the open must fail");
+    let refused = refused.to_string();
+    assert!(
+        refused.contains("payment network") || refused.contains("spelling"),
+        "the sender must be told the handle is the problem, not the price: {refused}"
+    );
+
+    // The sender fixes the handle and submits again against the same price.
+    zkp2p.set_reject(false);
+    let fixed = "speltright";
+    let opened = zecp2p_coordinator::api_v2::test_entry::open(&state, &sign(fixed), body(fixed))
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "U2-4: the corrected handle was refused with {e:?}. The rejected open \
+                 spent the quote, so the sender was told to fix the handle and then \
+                 told the price was gone, with no order created either time."
+            )
+        });
+
+    let order = state.db.get_order(opened.order_id).await.expect("get").expect("order");
+    assert_eq!(order.destination.handle, fixed);
+    assert_eq!(order.stage, Stage::AwaitingZec);
+
+    // The single-use property still has to hold: the price is spent now, and a
+    // third open against it is refused however good the handle is (U1-2).
+    let replay = zecp2p_coordinator::api_v2::test_entry::open(&state, &sign(fixed), body(fixed)).await;
+    assert!(
+        replay.is_err(),
+        "the quote opened a second order; single-use is what makes the signature \
+         single-use, and reordering the checks must not have cost it"
+    );
+}
