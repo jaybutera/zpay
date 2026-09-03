@@ -242,3 +242,74 @@ fn a_real_5xx_is_not_treated_as_a_rate_limit() {
     assert!(is_rate_limited(503, "HTTP 429 Too Many Requests"));
     assert!(is_rate_limited(502, "rate limit exceeded"));
 }
+
+/// R13-3: the digits alone are not enough. A 5xx that happens to carry 429 in
+/// a height, an amount or a txid is a node that is down, and retrying it
+/// three times costs three minutes against a deadline.
+#[test]
+fn a_coincidental_429_in_an_unrelated_error_is_not_a_rate_limit() {
+    for body in [
+        "could not find transparent input UTXO at height 3471429",
+        "insufficient funds: 429000 zat available",
+        "no such transaction 429aa71d4b4f2e5835379786b4bceb34c04e716b8e788239a0a3cef8cbe6b2f15",
+        "internal error 4290",
+        "block 429 is not on the best chain",
+    ] {
+        assert!(
+            !is_rate_limited(503, body),
+            "{body:?} is an outage, not a rate limit"
+        );
+    }
+}
+
+/// The shapes a provider actually uses to say it, which must still match.
+#[test]
+fn the_real_rate_limit_shapes_still_match() {
+    for body in [
+        "upstream error: HTTP 429 Too Many Requests",
+        "{\"status\": 429}",
+        "{\"code\": 429}",
+        "Too Many Requests",
+        "rate limit exceeded, retry later",
+        "upstream returned 429",
+    ] {
+        assert!(is_rate_limited(503, body), "{body:?} is a rate limit");
+    }
+}
+
+/// R13-1: the attestor reads the chain through the same rate-limited endpoint
+/// and waits out a 429 *inside* the request, so the client that calls it must
+/// outlast that wait. At 60 s the budget expired at exactly the moment the
+/// attestor was sleeping, and a cold attestor at step 5 hit this every time:
+/// the run exited calling a timeout a refusal and told the operator to re-run
+/// the prover, with the fiat already sent and nothing signed.
+#[test]
+fn the_attestor_client_outlasts_the_attestors_own_rate_limit_waits() {
+    use zecp2p_escrow::lp_client::ATTESTOR_TIMEOUT;
+    use zecp2p_escrow::rpc::{DEFAULT_RATE_LIMIT_RETRIES, DEFAULT_RATE_LIMIT_WAIT};
+
+    let worst_case = DEFAULT_RATE_LIMIT_WAIT * DEFAULT_RATE_LIMIT_RETRIES;
+    assert!(
+        ATTESTOR_TIMEOUT > worst_case,
+        "the attestor may sleep {worst_case:?} waiting out limits, but its client \
+         gives up after {ATTESTOR_TIMEOUT:?}"
+    );
+}
+
+/// A timeout is not a refusal, and must stay retryable: an LP that reads it as
+/// a verdict abandons an escrow it has already paid for.
+#[test]
+fn a_timeout_is_retryable_and_distinct_from_a_refusal() {
+    use zecp2p_escrow::lp_client::LpClientError;
+
+    let timed_out = LpClientError::TimedOut("timed out".into());
+    assert!(timed_out.is_retryable());
+    assert!(!matches!(timed_out, LpClientError::Refused { .. }));
+
+    // A 4xx is the attestor having looked and said no; that one is final.
+    assert!(!LpClientError::Refused {
+        status: 400,
+        message: "different intent".into()
+    }
+    .is_retryable());
+}

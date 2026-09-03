@@ -335,7 +335,24 @@ fn setup(args: &[String], allow_create: bool) -> Setup {
     };
     cfg.timeout = cfg.timeout.max(Duration::from_secs(45));
     let chain = RpcChainClient::new(cfg).expect("rpc");
-    let branch = chain.consensus_branch_id().expect("branch");
+    // R13-2: this is the first chain read of every command, and on `attest` it
+    // happens after the fiat has been sent. A node outage here used to be a raw
+    // panic one call before the resume path, so the operator saw a backtrace
+    // rather than the two commands that matter.
+    let branch = chain.consensus_branch_id().unwrap_or_else(|e| {
+        let shown = args[2].trim();
+        eprintln!("cannot reach the node: {e}");
+        eprintln!();
+        eprintln!("  Nothing has been signed or broadcast by this command, and no");
+        eprintln!("  coin has moved. This is the node or the provider, not the escrow.");
+        eprintln!();
+        eprintln!("  Retry the same command when it answers again:");
+        eprintln!("    paid_path attest {shown} {vout} {refund_height} <payee_hash> <attestation.json>");
+        eprintln!();
+        eprintln!("  The escrow refunds at block {refund_height} with the user key alone:");
+        eprintln!("    escrow_e2e refund {shown} {vout} <t1 refund address>");
+        std::process::exit(4);
+    });
 
     // R9-2: from the keystore the runbook creates, not only ZECP2P_U_PRIV.
     // R9-7: a mainnet run will not silently create a second pair.
@@ -772,6 +789,51 @@ fn cmd_attest(args: &[String]) {
             let got = attestor
                 .attest(&record.event_id, &s.canonical, wire)
                 .unwrap_or_else(|e| {
+                    let txid = zecp2p_escrow::rpc::txid_to_display(&s.terms.funding_txid);
+                    let vout = s.canonical.vout;
+                    let t = s.terms.refund_height;
+
+                    // R13-1: a timeout is not a refusal. The attestor reads the
+                    // chain through the same rate-limited endpoint and can be
+                    // asleep inside the request; telling the operator to re-run
+                    // the prover here sent them to fix something that was not
+                    // broken, with the fiat already sent.
+                    if matches!(e, zecp2p_escrow::lp_client::LpClientError::TimedOut(_)) {
+                        eprintln!("the attestor did not answer in time:");
+                        eprintln!("  {e}");
+                        eprintln!();
+                        eprintln!("  Nothing is wrong with the attestation. The attestor reads the");
+                        eprintln!("  chain through the same rate-limited endpoint, so it may still");
+                        eprintln!("  be waiting out a limit, and dropping this connection may have");
+                        eprintln!("  cancelled its work.");
+                        eprintln!();
+                        eprintln!("  Do NOT re-run the prover. Wait a minute and run exactly this");
+                        eprintln!("  again; the pre-signature in {} is reused.", s.record_path);
+                        eprintln!(
+                            "    paid_path attest {txid} {vout} {t} <payee_hash> <attestation.json>"
+                        );
+                        eprintln!();
+                        eprintln!("  The escrow has NOT been released and no coin has moved.");
+                        eprintln!("  If it still will not complete before block {t}, refund:");
+                        eprintln!("    escrow_e2e refund {txid} {vout} <t1 refund address>");
+                        std::process::exit(4);
+                    }
+
+                    if e.is_retryable() {
+                        eprintln!("the attestor could not answer:");
+                        eprintln!("  {e}");
+                        eprintln!();
+                        eprintln!("  This is an availability problem, not a verdict on the");
+                        eprintln!("  attestation. Do NOT re-run the prover. Retry the same command:");
+                        eprintln!(
+                            "    paid_path attest {txid} {vout} {t} <payee_hash> <attestation.json>"
+                        );
+                        eprintln!();
+                        eprintln!("  The escrow has NOT been released. It refunds at block {t}:");
+                        eprintln!("    escrow_e2e refund {txid} {vout} <t1 refund address>");
+                        std::process::exit(4);
+                    }
+
                     eprintln!("the attestor refused to publish the scalar:");
                     eprintln!("  {e}");
                     eprintln!();
@@ -784,18 +846,11 @@ fn cmd_attest(args: &[String]) {
                     eprintln!("  than `announce` printed, or against a different payment. Rerun");
                     eprintln!("  the prover with the values `announce` printed, then:");
                     eprintln!(
-                        "    paid_path attest {} {} {} <payee_hash> <attestation.json>",
-                        zecp2p_escrow::rpc::txid_to_display(&s.terms.funding_txid),
-                        s.canonical.vout,
-                        s.terms.refund_height
+                        "    paid_path attest {txid} {vout} {t} <payee_hash> <attestation.json>"
                     );
                     eprintln!();
-                    eprintln!("  If it cannot be resolved before block {}, take the refund:", s.terms.refund_height);
-                    eprintln!(
-                        "    escrow_e2e refund {} {} <t1 refund address>",
-                        zecp2p_escrow::rpc::txid_to_display(&s.terms.funding_txid),
-                        s.canonical.vout
-                    );
+                    eprintln!("  If it cannot be resolved before block {t}, take the refund:");
+                    eprintln!("    escrow_e2e refund {txid} {vout} <t1 refund address>");
                     std::process::exit(3);
                 });
             record.s = Some(hex::encode(got));

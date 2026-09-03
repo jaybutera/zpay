@@ -28,10 +28,28 @@ use crate::terms::CanonicalTerms;
 /// make the LP allocate.
 pub const MAX_RESPONSE_BYTES: u64 = 64 * 1024;
 
+/// How long to wait for an attestor answer.
+///
+/// It must exceed the attestor's own rate-limit waiting, which is up to three
+/// 60 s windows, plus its chain reads. Staged in review: the cold-attestor
+/// `attest` that failed at 60 s completed in one run of 120 s with this.
+pub const ATTESTOR_TIMEOUT: Duration = Duration::from_secs(300);
+
 #[derive(Debug, thiserror::Error)]
 pub enum LpClientError {
     #[error("the attestor is unreachable: {0}")]
     Unreachable(String),
+    /// The attestor did not answer inside the client's budget.
+    ///
+    /// R13-1: this is not a refusal, and must never be reported as one. The
+    /// attestor reads the chain through the same rate-limited endpoint the
+    /// runner does, so at `attest` its first `gettxout` can be the sixth call
+    /// in the provider's minute and it sleeps inside the request. A timeout
+    /// here means the work may still be in flight, or was cancelled when this
+    /// client dropped the connection; either way the answer is to wait and run
+    /// the same command again, not to re-run the prover.
+    #[error("the attestor did not answer in time: {0}")]
+    TimedOut(String),
     #[error("the attestor refused with {status}: {message}")]
     Refused { status: u16, message: String },
     #[error("the attestor's answer did not parse: {0}")]
@@ -47,7 +65,7 @@ impl LpClientError {
     /// escrow it has already paid for.
     pub fn is_retryable(&self) -> bool {
         match self {
-            LpClientError::Unreachable(_) => true,
+            LpClientError::Unreachable(_) | LpClientError::TimedOut(_) => true,
             LpClientError::Refused { status, .. } => *status >= 500,
             LpClientError::BadAnswer(_) => false,
         }
@@ -169,7 +187,14 @@ impl std::fmt::Debug for AttestorClient {
 impl AttestorClient {
     pub fn new(base_url: impl Into<String>, token: impl Into<String>) -> Result<Self, LpClientError> {
         let http = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(60))
+            // R13-1: the attestor reads the chain through the same
+            // rate-limited endpoint the runner does, and waits out a 429
+            // *inside* the request. At `attest` on a cold attestor its first
+            // `gettxout` is reliably the sixth call in the provider's minute,
+            // so a 60 s budget here expired at the same moment the attestor
+            // was sleeping and the run died calling it a refusal. The attestor
+            // may wait up to three windows; this must outlast that.
+            .timeout(ATTESTOR_TIMEOUT)
             .build()
             .map_err(|e| LpClientError::Unreachable(e.to_string()))?;
         Ok(Self {
@@ -227,7 +252,7 @@ impl AttestorClient {
             .http
             .get(format!("{}{path}", self.base_url))
             .send()
-            .map_err(|e| LpClientError::Unreachable(e.to_string()))?;
+            .map_err(Self::send_error)?;
         Self::parse(resp)
     }
 
@@ -242,8 +267,17 @@ impl AttestorClient {
             .bearer_auth(&self.token)
             .json(body)
             .send()
-            .map_err(|e| LpClientError::Unreachable(e.to_string()))?;
+            .map_err(Self::send_error)?;
         Self::parse(resp)
+    }
+
+    /// Separates "did not answer in time" from "could not be reached at all".
+    fn send_error(e: reqwest::Error) -> LpClientError {
+        if e.is_timeout() {
+            LpClientError::TimedOut(e.to_string())
+        } else {
+            LpClientError::Unreachable(e.to_string())
+        }
     }
 
     fn parse<T: serde::de::DeserializeOwned>(

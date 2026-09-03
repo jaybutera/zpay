@@ -434,9 +434,52 @@ pub fn is_rate_limited(status: u16, body: &str) -> bool {
     }
     // A gateway wrapping the upstream limit. Only treat a 5xx this way when the
     // body names the limit, so a genuine node outage is not retried as one.
+    //
+    // R13-3: matching the bare digits "429" anywhere was too loose. A block
+    // height like 3471429, an amount like 429000 or a txid beginning 429a
+    // would all have bought three 60 s sleeps against a node that was simply
+    // down. "429" now counts only as a standalone token, never as part of a
+    // longer number or word.
     if (500..=599).contains(&status) {
         let b = body.to_lowercase();
-        return b.contains("429") || b.contains("too many requests") || b.contains("rate limit");
+        if b.contains("too many requests") || b.contains("rate limit") || b.contains("ratelimit")
+        {
+            return true;
+        }
+        return names_status_429(&b);
+    }
+    false
+}
+
+/// Whether the body names 429 *as an HTTP status*.
+///
+/// Standalone digits are not enough on their own: "block 429 is not on the
+/// best chain" is an outage and "upstream returned 429" is a rate limit, and
+/// both carry a bare 429. So the number must be its own token (never part of
+/// a height like 3471429 or an amount like 429000) *and* sit next to a word
+/// that makes it a status. Anything else is treated as an outage, which is the
+/// safe way to be wrong: a missed rate limit costs one failed call, while a
+/// misread outage costs three 60 s sleeps against a deadline.
+fn names_status_429(haystack: &str) -> bool {
+    const STATUS_WORDS: [&str; 7] = [
+        "http", "status", "code", "returned", "error", "response", "upstream",
+    ];
+    let bytes = haystack.as_bytes();
+    let mut from = 0;
+    while let Some(pos) = haystack[from..].find("429") {
+        let start = from + pos;
+        let end = start + 3;
+        let standalone = (start == 0 || !bytes[start - 1].is_ascii_alphanumeric())
+            && (end >= bytes.len() || !bytes[end].is_ascii_alphanumeric());
+        if standalone {
+            // Look back a short way for a word that makes this a status rather
+            // than a height or an amount.
+            let window = &haystack[start.saturating_sub(24)..start];
+            if STATUS_WORDS.iter().any(|w| window.contains(w)) {
+                return true;
+            }
+        }
+        from = start + 3;
     }
     false
 }
