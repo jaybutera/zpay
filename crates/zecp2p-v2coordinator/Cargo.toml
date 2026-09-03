@@ -1,0 +1,58 @@
+[package]
+name = "zecp2p-v2coordinator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Coordinator for the native Zcash escrow: the LP's side of the v2 offramp"
+
+[[bin]]
+name = "zecp2p-v2coordinator"
+path = "src/main.rs"
+
+[lib]
+name = "zecp2p_v2coordinator"
+path = "src/lib.rs"
+
+[features]
+# Lets a test drive the fiat leg without a browser or an enclave. The
+# production binary has no path that settles without a real payment.
+test-rails = []
+
+[dependencies]
+zecp2p-escrow = { path = "../zecp2p-escrow" }
+zecp2p-taker = { path = "../zecp2p-taker" }
+zecp2p-types = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+reqwest = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+hex = { workspace = true }
+dotenvy = { workspace = true }
+chrono = { workspace = true }
+rand = { workspace = true }
+clap = { workspace = true }
+secp256k1 = { version = "0.30", features = ["rand", "global-context"] }
+secp256k1-zkp = { version = "0.11", features = ["rand", "rand-std", "std", "global-context"] }
+alloy = { workspace = true }
+sha2 = "0.10"
+async-trait = "0.1"
+
+[[example]]
+name = "local_stack"
+path = "examples/local_stack.rs"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tower = { workspace = true }
+http-body-util = "0.1"
+zecp2p-attestor = { path = "../zecp2p-attestor", features = ["test-signer"] }
+zecp2p-escrow = { path = "../zecp2p-escrow", features = ["test-signer"] }
+zecp2p-v2coordinator = { path = ".", features = ["test-rails"] }

@@ -1,0 +1,79 @@
+# The v2 escrow coordinator. Secrets come from the environment, never from here.
+#
+# Required in the environment:
+#   ZECP2P_LP_PRIV        the LP key, 64 hex. Half of every escrow this serves.
+#   ZECP2P_ATTESTOR_TOKEN the attestor's bearer token.
+
+[server]
+host = "127.0.0.1"
+port = 3000
+state_dir = "~/.zecp2p/v2coordinator"
+# Origins allowed to call the API from a browser. Empty means same-origin only,
+# which is what a deployment serving the page itself wants.
+allowed_origins = []
+
+[zec]
+rpc_url = "http://127.0.0.1:8232"
+# rpc_user / rpc_password for a local zcashd or zebrad.
+# rpc_api_key_header / rpc_api_key for a hosted provider that keys on a header.
+network = "test"
+refund_hours = 24
+block_seconds = 75
+# How the funding output is found. `block_scan` walks blocks and works on any
+# node, including zebrad. `address_index` is one `getaddressutxos` call and
+# needs zcashd with addressindex=1.
+scanner = "block_scan"
+scan_lookback_blocks = 200
+
+[attestor]
+url = "http://127.0.0.1:8480"
+token = "set-ZECP2P_ATTESTOR_TOKEN-instead"
+# Required on mainnet. This process relays the attestor's announcement to the
+# page, so an unpinned key means the coordinator could name an attestor whose
+# scalar it holds and decrypt the user's pre-signature without paying.
+# pubkey = ""
+
+[lp]
+# Where the LP takes its leg of the release.
+payout_address = "tmVHejhMFq979Z7oRwseWMW7snYoQsj22yn"
+key_env = "ZECP2P_LP_PRIV"
+# keystore_dir = "~/.zecp2p/keys"
+key_label = "v2coordinator-lp"
+
+[quote]
+rate_usd_per_zec = 40.25
+# 20 bps, the rate treasury.rs carries. Zero disables the treasury output.
+fee_bps = 20
+min_zat = 120000
+max_zat = 5000000000
+quote_seconds = 300
+# The ceiling on one Venmo payment. The last line against a units/dollars
+# confusion, and the operator's own limit on a single trade.
+max_payment_cents = 2500
+
+[serve]
+# Whose escrows this coordinator fronts fiat for. An empty list with
+# allow_any_handle unset refuses every order: unlike the Base rail's
+# `only_user`, silence here does not mean "serve everyone".
+handles = []
+allow_any_handle = false
+# false drives the browser and stops at the irreversible step.
+live_payments = false
+
+[venmo]
+cdp_url = "http://127.0.0.1:9222"
+note = "thanks"
+timeout_seconds = 120
+session_path = "venmo-session.json"
+session_max_age_hours = 12
+# sender_id = ""   # the numeric Venmo id, not the @handle
+
+[zkp2p]
+# HTTPS is required except on loopback: anyone who can answer a plaintext
+# request here returns any payee hash they like, and the dollars go to their
+# handle.
+api_url = "https://api.zkp2p.xyz"
+
+[attestation]
+service_url = "https://attestation-service.zkp2p.xyz"
+# repo_root = "~/src/zecp2p"   # where scripts/proof/prove_payment_pinned.mjs lives
