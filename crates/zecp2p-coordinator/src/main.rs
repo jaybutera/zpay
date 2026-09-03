@@ -15,6 +15,7 @@ mod chain;
 mod db;
 mod error;
 mod near;
+mod orders;
 mod state;
 mod zkp2p;
 

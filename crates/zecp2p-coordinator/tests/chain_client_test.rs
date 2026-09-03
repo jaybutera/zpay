@@ -33,6 +33,7 @@ fn test_config() -> Config {
         },
         zkp2p: zecp2p_types::config::Zkp2pConfig::default(),
         keeper: zecp2p_types::config::KeeperConfig::default(),
+        fee: zecp2p_types::config::FeeConfig::default(),
         attestation: zecp2p_types::config::AttestationConfig::default(),
         server: zecp2p_types::config::ServerConfig {
             host: "127.0.0.1".to_string(),

@@ -10,5 +10,6 @@ pub mod chain;
 pub mod db;
 pub mod error;
 pub mod near;
+pub mod orders;
 pub mod state;
 pub mod zkp2p;

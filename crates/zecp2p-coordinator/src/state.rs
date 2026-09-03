@@ -495,6 +495,13 @@ impl AppState {
     }
 
     async fn keeper_tick(self: &Arc<Self>) -> Result<()> {
+        // Main-route orders first. An unfunded order has no session and no gas
+        // spent against it; this pass is what turns a funded one into a session,
+        // sending createSession and creditSession in the same tick.
+        if let Err(e) = self.tick_orders().await {
+            tracing::warn!("order tick error: {e}");
+        }
+
         // Load active sessions
         let sessions = self.db.get_active_sessions().await?;
 
