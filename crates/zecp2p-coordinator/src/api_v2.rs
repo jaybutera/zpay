@@ -371,13 +371,48 @@ pub async fn open_order(
 
     let min_rate = crate::api::parse_min_rate_pub(body.overrides.min_rate.as_deref())?;
 
+    // U2-1. An unfunded order costs whoever opened it nothing and costs the
+    // keeper a 1Click status call every tick until its window closes. The rate
+    // limiter slows the opening; it does not bound how many can be outstanding,
+    // and a caller who spends three and a half minutes can fill the sweep's
+    // whole budget and hold it. Two caps bound it instead: one per session key,
+    // which is what a real sender has one of, and one across the coordinator,
+    // which is the number the sweep's budget is actually sized against.
+    //
+    // Both are checked before the quote is spent, so hitting one costs the
+    // caller their price and nothing else.
+    check_the_unfunded_backlog(&state, &body.session_pubkey).await?;
+
+    // U2-4. The checks that cost no 1Click round trip run *before* the quote is
+    // spent. The curator is the one that a sender realistically fails: a
+    // mistyped handle came back "check the spelling", and by then the id was
+    // burned, so correcting the handle and resubmitting answered "an order has
+    // already been opened at that price" and the only way out was to change the
+    // amount. The handle is checked here, against the price the sender is still
+    // holding, and the id is spent below only once nothing cheap can refuse it.
+    let valid = state
+        .zkp2p
+        .validate_venmo_payee(&destination.handle)
+        .await
+        .map_err(|e| AppError::Zkp2p(e.to_string()))?;
+    if !valid {
+        return Err(AppError::InvalidRequest(format!(
+            "{} was rejected by the payment network. Check the handle matches the \
+             account's exact spelling.",
+            destination.describe()
+        )));
+    }
+
     // Spend the quote. This is the single-use gate: an id the coordinator never
     // issued, one that has expired, and one already opened against are all
     // refused here, before any 1Click round trip. The audit opened 31 orders
     // from one signature and one from an invented id; both stop here (U1-2).
     //
     // It runs after `require_owner` so an unauthenticated caller cannot burn
-    // somebody else's price by guessing at ids.
+    // somebody else's price by guessing at ids. Everything from here on either
+    // creates the order or fails for a reason a resubmission would not fix, so
+    // this is the last point at which the id can be spent without stranding a
+    // sender who can still act.
     let zatoshi = state
         .quotes
         .spend(body.quote_id.trim())
@@ -394,22 +429,6 @@ pub async fn open_order(
     // back. A quote is a price, not a claim: honouring a stale one would let a
     // caller sit on a good rate and open against it later.
     let quote = build_live_quote(&state, backend, zatoshi, min_rate).await?;
-
-    // The rail's payee has to be registered with the curator before a deposit
-    // can name it, and a rejection here costs no gas because none has been
-    // spent yet.
-    let valid = state
-        .zkp2p
-        .validate_venmo_payee(&destination.handle)
-        .await
-        .map_err(|e| AppError::Zkp2p(e.to_string()))?;
-    if !valid {
-        return Err(AppError::InvalidRequest(format!(
-            "{} was rejected by the payment network. Check the handle matches the \
-             account's exact spelling.",
-            destination.describe()
-        )));
-    }
 
     let glue = state
         .chain
@@ -485,6 +504,60 @@ pub async fn open_order(
         // Backend A needs nothing from the sender after the ZEC is sent.
         client_steps: Vec::new(),
     }))
+}
+
+/// How many orders one session key may have open and unfunded at once.
+///
+/// A real sender has one. Two is a sender who opened the page twice, or came
+/// back to a link and started again; three is a sender being patient with a
+/// flaky wallet. Four is nobody, so the cap sits there.
+const MAX_UNFUNDED_PER_KEY: i64 = 4;
+
+/// How many unfunded orders the coordinator will hold across every caller.
+///
+/// Session keys are free, so the per-key cap bounds one caller and not the
+/// sweep. This is the number the sweep's budget is sized against: at 1Click's
+/// measured status latency of about 0.2 s, a five-second budget covers roughly
+/// twenty-five orders, so a cap of 200 puts the worst case at eight ticks, or
+/// two minutes at the default fifteen-second interval, before any order is
+/// polled again. Raising it lengthens that; lowering it starts refusing real
+/// senders sooner in a queue.
+const MAX_UNFUNDED_TOTAL: i64 = 200;
+
+/// Refuse an open that would push the unfunded backlog past what the keeper can
+/// sweep in bounded time (U2-1).
+async fn check_the_unfunded_backlog(
+    state: &Arc<AppState>,
+    session_pubkey: &str,
+) -> Result<(), AppError> {
+    let mine = state
+        .db
+        .count_unfunded_orders_for_key(session_pubkey.trim())
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    if mine >= MAX_UNFUNDED_PER_KEY {
+        return Err(AppError::InvalidRequest(format!(
+            "you already have {mine} orders waiting for ZEC. Send to one of those, \
+             or wait for them to close, before opening another."
+        )));
+    }
+
+    let all = state
+        .db
+        .count_unfunded_orders()
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    if all >= MAX_UNFUNDED_TOTAL {
+        // Not the caller's fault, so it reads as a queue rather than as a
+        // refusal, and it is the one condition here worth a log line: reaching
+        // it means either a real rush or the flooding this cap exists for.
+        tracing::warn!(unfunded = all, "the unfunded backlog is full; refusing new orders");
+        return Err(AppError::TooManyRequests {
+            retry_after_seconds: 60,
+        });
+    }
+
+    Ok(())
 }
 
 /// A hash over the terms the order was opened on, so a sender can check the

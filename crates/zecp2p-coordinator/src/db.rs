@@ -86,7 +86,8 @@ impl Database {
                 return_json TEXT,
                 error TEXT,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                last_polled_at TEXT
             )
             "#,
         )
@@ -105,6 +106,11 @@ impl Database {
         for ddl in [
             "ALTER TABLE orders ADD COLUMN swap_expected_usdc TEXT",
             "ALTER TABLE orders ADD COLUMN swap_min_usdc TEXT",
+            // U2-1. The sweep orders by this, so an order that missed a pass
+            // sorts ahead of one that did not. A row from before the column
+            // existed has NULL here, which sorts first in SQLite, so those get
+            // polled before anything else and then take their turn.
+            "ALTER TABLE orders ADD COLUMN last_polled_at TEXT",
         ] {
             if let Err(e) = sqlx::query(ddl).execute(&self.pool).await {
                 if !e.to_string().contains("duplicate column name") {
@@ -363,6 +369,10 @@ struct SessionRow {
     error: Option<String>,
     created_at: String,
     updated_at: String,
+    /// When the sweep last reached this order. Read only by the ordering in
+    /// `get_open_orders`, so it is carried on the row and not on the record.
+    #[allow(dead_code)]
+    last_polled_at: Option<String>,
 }
 
 impl SessionRow {
@@ -523,20 +533,83 @@ impl Database {
         row.map(OrderRecord::try_from).transpose()
     }
 
-    /// Orders the keeper still has work to do on, oldest first.
+    /// Orders the keeper still has work to do on, least recently polled first.
     ///
-    /// The ordering is what makes the sweep's time budget fair: an order that
-    /// misses a pass is at the front of the next one, so a large open set slows
-    /// every order down rather than starving the oldest indefinitely.
+    /// U2-1. This used to be `ORDER BY created_at ASC`, and the sweep's time
+    /// budget walked it from the front every tick. Nothing recorded where the
+    /// budget ran out, so the same front was re-polled forever and everything
+    /// behind it was never polled at all: twenty-five unfunded orders costing
+    /// nothing starved every real order opened for the next three days, and
+    /// each was then retired with "nothing was sent".
+    ///
+    /// Ordering by `last_polled_at` makes the sweep a rotation. An order the
+    /// budget did not reach keeps its stale timestamp and sorts ahead of every
+    /// order that was reached, so a set of `N` orders against a budget that
+    /// covers `B` of them gives every order a poll within `ceil(N / B)` ticks
+    /// rather than never. A row that has never been polled has NULL here, which
+    /// SQLite sorts first, so a newly opened order is seen on the next tick.
+    ///
+    /// `created_at` stays as the tiebreak, so orders polled in the same second
+    /// keep a stable, oldest-first order among themselves.
     pub async fn get_open_orders(&self) -> Result<Vec<OrderRecord>> {
         let rows: Vec<OrderRow> = sqlx::query_as(
             r#"SELECT * FROM orders
                WHERE stage NOT IN ('"done"', '"returned"', '"failed"')
-               ORDER BY created_at ASC"#,
+               ORDER BY last_polled_at ASC, created_at ASC"#,
         )
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(OrderRecord::try_from).collect()
+    }
+
+    /// Record that the sweep reached this order, so the next tick starts behind
+    /// it rather than in front of it.
+    ///
+    /// Written whether or not the poll changed anything: the point is the
+    /// rotation, and an order that was polled and found unchanged has had its
+    /// turn exactly as much as one that moved.
+    pub async fn mark_order_polled(&self, id: uuid::Uuid) -> Result<()> {
+        sqlx::query("UPDATE orders SET last_polled_at = ? WHERE id = ?")
+            .bind(chrono::Utc::now().to_rfc3339())
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// How many orders this session key has open and unfunded right now.
+    ///
+    /// U2-1. An unfunded order costs its opener nothing and costs the keeper a
+    /// 1Click status call on every tick for as long as 1Click's deposit window
+    /// lasts, which was three days. Counting them is what lets the open path
+    /// refuse the twenty-sixth rather than let one caller fill the sweep.
+    pub async fn count_unfunded_orders_for_key(&self, session_pubkey: &str) -> Result<i64> {
+        let (n,): (i64,) = sqlx::query_as(
+            r#"SELECT COUNT(*) FROM orders
+               WHERE session_pubkey = ?
+                 AND session_uuid IS NULL
+                 AND stage NOT IN ('"done"', '"returned"', '"failed"')"#,
+        )
+        .bind(session_pubkey)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(n)
+    }
+
+    /// How many orders are open and unfunded across every caller.
+    ///
+    /// The per-key cap bounds one caller; keys are free, so this bounds the
+    /// sweep itself. It is the number the budget is sized against, not a
+    /// fairness rule, so it is deliberately far above what any real day needs.
+    pub async fn count_unfunded_orders(&self) -> Result<i64> {
+        let (n,): (i64,) = sqlx::query_as(
+            r#"SELECT COUNT(*) FROM orders
+               WHERE session_uuid IS NULL
+                 AND stage NOT IN ('"done"', '"returned"', '"failed"')"#,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(n)
     }
 }
 
@@ -560,6 +633,10 @@ struct OrderRow {
     error: Option<String>,
     created_at: String,
     updated_at: String,
+    /// When the sweep last reached this order. Read only by the ordering in
+    /// `get_open_orders`, so it is carried on the row and not on the record.
+    #[allow(dead_code)]
+    last_polled_at: Option<String>,
 }
 
 impl TryFrom<OrderRow> for OrderRecord {

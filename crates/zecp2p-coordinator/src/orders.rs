@@ -29,6 +29,23 @@ use crate::{db::OrderRecord, state::{AppState, FundedSwap}};
 /// confirmation takes and still bounds the polling set.
 const EXPIRY_GRACE: chrono::Duration = chrono::Duration::hours(1);
 
+/// The longest the keeper will watch one deposit address, measured from when
+/// the order was opened.
+///
+/// U2-1 and U2-7. The coordinator asks 1Click for a ten-minute deadline and
+/// 1Click answers with its own, which on 2026-09-03 was three days. Storing
+/// that unexamined made the polling set as large as 1Click cares to make it,
+/// and an unfunded order held a place in the sweep for seventy-three hours at
+/// no cost to whoever opened it.
+///
+/// Six hours is the compromise the audit asked for. It is far longer than the
+/// twenty minutes the page promises and far longer than any Zcash confirmation,
+/// so a real sender is never cut off; it is short enough that a backlog of
+/// unfunded orders drains the same day rather than the same week. It only ever
+/// shortens: a 1Click deadline sooner than this still wins, because polling an
+/// address 1Click has already closed is polling nothing.
+const MAX_POLLING_WINDOW: chrono::Duration = chrono::Duration::hours(6);
+
 /// How long one tick may spend polling orders before it gives up and lets the
 /// next tick continue.
 ///
@@ -59,11 +76,23 @@ pub fn stage_for(status: zecp2p_types::OfframpStatus) -> Stage {
 impl AppState {
     /// One pass over the orders the keeper still has work to do on.
     ///
-    /// Bounded by a wall-clock budget. Expiry keeps the open set small, but the
-    /// set is fed by an endpoint anyone can call, so the sweep must not be able
-    /// to consume a whole tick however many rows it finds. Orders left over are
-    /// picked up next tick: `get_open_orders` returns oldest-first, and an
-    /// order that misses a pass loses nothing but a poll.
+    /// Bounded by a wall-clock budget, and fair. The budget exists because the
+    /// open set is fed by an endpoint anyone can call and the sweep must not be
+    /// able to consume a whole tick however many rows it finds.
+    ///
+    /// U2-1. The budget alone was the defect. `get_open_orders` returned
+    /// oldest-first and this walked it from the front on every tick, recording
+    /// nothing, so the same twenty-five orders were polled forever and every
+    /// order behind them was polled never. Marking each order as it is reached
+    /// and ordering the query by that mark turns the walk into a rotation: an
+    /// order the budget did not reach sorts ahead of every order that was
+    /// reached, so with `N` open orders and a budget covering `B`, every order
+    /// is polled within `ceil(N / B)` ticks.
+    ///
+    /// The mark is written before the poll rather than after. A poll that fails
+    /// or hangs must still cost its subject a turn, or one order that always
+    /// errors holds the front of the queue and the starvation comes straight
+    /// back by another route.
     pub async fn tick_orders(self: &Arc<Self>) -> Result<()> {
         let orders = self.db.get_open_orders().await?;
         let total = orders.len();
@@ -75,9 +104,12 @@ impl AppState {
                 tracing::warn!(
                     swept,
                     total,
-                    "order sweep hit its time budget; the rest wait for the next tick"
+                    "order sweep hit its time budget; the rest lead the next tick"
                 );
                 break;
+            }
+            if let Err(e) = self.db.mark_order_polled(order.id).await {
+                tracing::warn!(order_id = %order.id, "could not record the poll: {e}");
             }
             if let Err(e) = self.advance_order(&order).await {
                 tracing::warn!(order_id = %order.id, "error advancing order: {e}");
@@ -107,33 +139,41 @@ impl AppState {
         // U1-2. 1Click answers PENDING_DEPOSIT for an address long past its
         // deadline, so status alone never retires an order and the keeper polls
         // every order it has ever opened, on every tick, ahead of the live
-        // sessions. The deposit deadline is the bound, and it was written to the
-        // row and read by nothing.
-        //
-        // The grace window covers a sender who broadcast just inside the
-        // deadline: 1Click is still willing to settle that, so the keeper keeps
-        // asking for a while after the address stops being advertised.
-        if chrono::Utc::now() > deposit.expires_at + EXPIRY_GRACE {
-            let mut updated = order.clone();
-            updated.stage = Stage::Failed;
-            updated.error = Some(
-                "the deposit window closed before any ZEC arrived; nothing was sent, \
-                 so nothing is owed. Open a new order to try again."
-                    .to_string(),
-            );
-            self.db.update_order(&updated).await?;
-            tracing::info!(
-                order_id = %order.id,
-                "order expired unfunded; no longer polled"
-            );
-            return Ok(());
-        }
+        // sessions. The deadline is the bound, and it was written to the row
+        // and read by nothing.
+        let past_the_window = chrono::Utc::now() > self.polling_deadline(order);
 
         // 404 means 1Click has not registered the address it just handed out.
         // That is "not yet", not a failure.
         let Some(status) = self.near.get_status(&deposit.address).await? else {
+            if past_the_window {
+                self.retire_unfunded(order, "1Click has no record of the deposit address")
+                    .await?;
+            }
             return Ok(());
         };
+
+        // U2-1. Retirement now happens *after* the status call, not instead of
+        // it. The old code read the clock, wrote "nothing was sent, so nothing
+        // is owed", and never asked. For an order the sweep had been starving,
+        // that sentence was false as often as it was true: the sender's ZEC had
+        // been swapped, the USDC was sitting on the glue attributed to nothing,
+        // and the page told them nothing was owed.
+        //
+        // Asking first costs one status call per order per lifetime, which is
+        // what a single ordinary tick already costs, and it turns the sentence
+        // into a fact. A settled or refunded order past its window falls
+        // through to the branches below and is handled as what it is.
+        if past_the_window && !status.status.is_success()
+            && status.status != crate::near::IntentStatus::Refunded
+        {
+            self.retire_unfunded(
+                order,
+                &format!("1Click reports {:?} past the deposit window", status.status),
+            )
+            .await?;
+            return Ok(());
+        }
 
         if status.status == crate::near::IntentStatus::Refunded {
             // The swap failed and 1Click sent the ZEC to refund_address. When
@@ -189,6 +229,46 @@ impl AppState {
             "order funded; created the on-chain session in the tick that saw the ZEC"
         );
 
+        Ok(())
+    }
+
+    /// The last moment this order's deposit address is worth polling.
+    ///
+    /// The sooner of 1Click's own deadline plus a grace window, and the
+    /// coordinator's own cap measured from when the order was opened. See
+    /// `MAX_POLLING_WINDOW` for why the cap exists.
+    fn polling_deadline(&self, order: &OrderRecord) -> chrono::DateTime<chrono::Utc> {
+        let oneclick = order
+            .deposit
+            .as_ref()
+            .map(|d| d.expires_at + EXPIRY_GRACE)
+            .unwrap_or(order.created_at);
+        oneclick.min(order.created_at + MAX_POLLING_WINDOW)
+    }
+
+    /// Retire an order that 1Click has been asked about and does not report as
+    /// funded.
+    ///
+    /// The sentence the sender reads says nothing arrived, and by the time this
+    /// runs that has been checked against 1Click rather than inferred from the
+    /// clock (U2-1, U2-5). `why` is for the log, not for the sender: it records
+    /// which answer 1Click gave, so an order retired wrongly can be traced to
+    /// the reply that retired it.
+    async fn retire_unfunded(self: &Arc<Self>, order: &OrderRecord, why: &str) -> Result<()> {
+        let mut updated = order.clone();
+        updated.stage = Stage::Failed;
+        updated.error = Some(
+            "the deposit window closed and the bridge never saw any ZEC at this address. \
+             Nothing was sent, so nothing is owed. If you did send ZEC, keep this link \
+             and get in touch; the payment is traceable from the address above."
+                .to_string(),
+        );
+        self.db.update_order(&updated).await?;
+        tracing::info!(
+            order_id = %order.id,
+            why,
+            "order retired unfunded after asking 1Click; no longer polled"
+        );
         Ok(())
     }
 
