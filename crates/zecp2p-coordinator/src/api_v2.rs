@@ -609,3 +609,48 @@ mod tests {
         assert!(parse_amount("25", "eur").is_err());
     }
 }
+
+/// Entry points for the funded end-to-end test.
+///
+/// These call the real handlers with real extractors, so the quote registry,
+/// the auth check, the rate limiter and the 1Click round trips are all in the
+/// path. They exist because the test drives the coordinator in-process rather
+/// than over a socket; they add no behaviour of their own.
+#[doc(hidden)]
+pub mod test_entry {
+    use super::*;
+
+    /// `GET /v2/quote?amount=<zatoshi>&unit=zec`.
+    pub async fn quote(state: &Arc<AppState>, zatoshi: u64) -> Result<Quote, AppError> {
+        let zec = format!("{}.{:08}", zatoshi / 100_000_000, zatoshi % 100_000_000);
+        let Json(q) = quote_v2(
+            State(state.clone()),
+            None,
+            HeaderMap::new(),
+            Query(QuoteV2Query {
+                amount: zec,
+                unit: "zec".to_string(),
+                rail: "venmo".to_string(),
+                backend: None,
+                min_rate: None,
+            }),
+        )
+        .await?;
+        Ok(q)
+    }
+
+    /// `POST /v2/orders`, with the signature in the header the real route reads.
+    pub async fn open(
+        state: &Arc<AppState>,
+        signature: &str,
+        body: OpenRequest,
+    ) -> Result<Opened, AppError> {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            crate::auth::SIGNATURE_HEADER,
+            signature.parse().expect("a signature is a valid header value"),
+        );
+        let Json(opened) = open_order(State(state.clone()), None, headers, Json(body)).await?;
+        Ok(opened)
+    }
+}

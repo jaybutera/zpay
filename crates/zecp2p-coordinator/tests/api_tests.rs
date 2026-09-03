@@ -233,7 +233,7 @@ async fn test_create_offramp_validates_addresses() {
         "venmo_username": "testuser",
         "user_address": "not-an-address",
         "taker_address": "0x1234567890123456789012345678901234567890",
-        "zec_refund_address": "t1VJnUz9FDy7WfFxqXwMZJWVxzMrRD7MvBA"
+        "zec_refund_address": "t1StbPM4X3j4FGM57HpGnb9BMbS7C1nFW1r"
     });
 
     let response = app
@@ -270,7 +270,7 @@ async fn test_create_offramp_validates_zec_amount() {
         "venmo_username": "testuser",
         "user_address": "0x1234567890123456789012345678901234567890",
         "taker_address": "0x1234567890123456789012345678901234567890",
-        "zec_refund_address": "t1VJnUz9FDy7WfFxqXwMZJWVxzMrRD7MvBA"
+        "zec_refund_address": "t1StbPM4X3j4FGM57HpGnb9BMbS7C1nFW1r"
     });
 
     let response = app
@@ -395,7 +395,7 @@ async fn test_create_offramp_validates_venmo_username_too_short() {
         "venmo_username": "x",  // Too short
         "user_address": "0x1234567890123456789012345678901234567890",
         "taker_address": "0x1234567890123456789012345678901234567890",
-        "zec_refund_address": "t1VJnUz9FDy7WfFxqXwMZJWVxzMrRD7MvBA"
+        "zec_refund_address": "t1StbPM4X3j4FGM57HpGnb9BMbS7C1nFW1r"
     });
 
     let response = app
@@ -428,7 +428,7 @@ async fn test_create_offramp_validates_venmo_username_invalid_chars() {
         "venmo_username": "test@user!",  // Invalid characters
         "user_address": "0x1234567890123456789012345678901234567890",
         "taker_address": "0x1234567890123456789012345678901234567890",
-        "zec_refund_address": "t1VJnUz9FDy7WfFxqXwMZJWVxzMrRD7MvBA"
+        "zec_refund_address": "t1StbPM4X3j4FGM57HpGnb9BMbS7C1nFW1r"
     });
 
     let response = app
@@ -461,7 +461,7 @@ async fn test_create_offramp_validates_zec_amount_zero() {
         "venmo_username": "testuser",
         "user_address": "0x1234567890123456789012345678901234567890",
         "taker_address": "0x1234567890123456789012345678901234567890",
-        "zec_refund_address": "t1VJnUz9FDy7WfFxqXwMZJWVxzMrRD7MvBA"
+        "zec_refund_address": "t1StbPM4X3j4FGM57HpGnb9BMbS7C1nFW1r"
     });
 
     let response = app
@@ -537,7 +537,7 @@ async fn test_create_offramp_validates_min_rate_negative() {
         "venmo_username": "testuser",
         "user_address": test_user_address(),
         "taker_address": "0x1234567890123456789012345678901234567890",
-        "zec_refund_address": "t1VJnUz9FDy7WfFxqXwMZJWVxzMrRD7MvBA",
+        "zec_refund_address": "t1StbPM4X3j4FGM57HpGnb9BMbS7C1nFW1r",
         "min_rate": "-10"  // Negative rate
     });
 
@@ -579,7 +579,7 @@ async fn test_create_offramp_accepts_a_request_with_no_taker() {
         "zec_amount": "0.5",
         "venmo_username": "testuser",
         "user_address": "0x1234567890123456789012345678901234567890",
-        "zec_refund_address": "t1VJnUz9FDy7WfFxqXwMZJWVxzMrRD7MvBA"
+        "zec_refund_address": "t1StbPM4X3j4FGM57HpGnb9BMbS7C1nFW1r"
     });
 
     let response = app
@@ -617,7 +617,7 @@ async fn test_create_offramp_still_rejects_a_bad_taker() {
         "venmo_username": "testuser",
         "user_address": "0x1234567890123456789012345678901234567890",
         "taker_address": "not-an-address",
-        "zec_refund_address": "t1VJnUz9FDy7WfFxqXwMZJWVxzMrRD7MvBA"
+        "zec_refund_address": "t1StbPM4X3j4FGM57HpGnb9BMbS7C1nFW1r"
     });
 
     let response = app
@@ -651,7 +651,7 @@ async fn creating_an_offramp_without_a_signature_is_refused() {
         "zec_amount": "0.5",
         "venmo_username": "testuser",
         "user_address": test_user_address(),
-        "zec_refund_address": "t1VJnUz9FDy7WfFxqXwMZJWVxzMrRD7MvBA"
+        "zec_refund_address": "t1StbPM4X3j4FGM57HpGnb9BMbS7C1nFW1r"
     });
 
     let response = app
@@ -689,7 +689,7 @@ async fn opening_a_session_that_names_someone_elses_address_is_refused() {
         "zec_amount": "0.5",
         "venmo_username": "testuser",
         "user_address": format!("{victim:?}"),
-        "zec_refund_address": "t1VJnUz9FDy7WfFxqXwMZJWVxzMrRD7MvBA"
+        "zec_refund_address": "t1StbPM4X3j4FGM57HpGnb9BMbS7C1nFW1r"
     });
 
     let response = app
@@ -717,7 +717,7 @@ async fn a_create_signature_does_not_transfer_to_another_amount() {
         "zec_amount": "5.0",
         "venmo_username": "testuser",
         "user_address": test_user_address(),
-        "zec_refund_address": "t1VJnUz9FDy7WfFxqXwMZJWVxzMrRD7MvBA"
+        "zec_refund_address": "t1StbPM4X3j4FGM57HpGnb9BMbS7C1nFW1r"
     });
 
     let response = app

@@ -347,3 +347,116 @@ async fn mock_zkp2p_create(
         })),
     )
 }
+
+/// Deploy the enhanced local set: MockUSDC, MockEscrowWithOrchestrator, OfframpGlue.
+///
+/// The plain `deploy_contracts` above uses `DeployLocal`, which has no
+/// orchestrator, so a test that drives the keeper past the deposit needs this
+/// one instead.
+#[allow(dead_code)]
+pub fn deploy_enhanced_contracts(rpc_url: &str) -> (Address, Address, Address) {
+    let project_root = std::env::current_dir()
+        .expect("current dir")
+        .parent()
+        .expect("parent")
+        .parent()
+        .expect("workspace root")
+        .to_path_buf();
+
+    let output = Command::new("forge")
+        .current_dir(project_root.join("contracts"))
+        .args([
+            "script",
+            "script/DeployLocalEnhanced.s.sol:DeployLocalEnhanced",
+            "--rpc-url",
+            rpc_url,
+            "--broadcast",
+        ])
+        .output()
+        .expect("forge must be installed to run this test");
+
+    if !output.status.success() {
+        panic!(
+            "forge script failed:\nstderr: {}\nstdout: {}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut usdc = None;
+    let mut escrow = None;
+    let mut glue = None;
+
+    for line in stdout.lines() {
+        let t = line.trim();
+        if t.starts_with("MockUSDC deployed at:") {
+            usdc = Some(parse_address(t));
+        } else if t.starts_with("MockEscrowWithOrchestrator deployed at:") {
+            escrow = Some(parse_address(t));
+        } else if t.starts_with("OfframpGlue deployed at:") {
+            glue = Some(parse_address(t));
+        }
+    }
+
+    (
+        usdc.expect("MockUSDC address"),
+        escrow.expect("MockEscrowWithOrchestrator address"),
+        glue.expect("OfframpGlue address"),
+    )
+}
+
+#[allow(dead_code)]
+fn parse_address(line: &str) -> Address {
+    line.split_whitespace()
+        .rfind(|s| s.starts_with("0x") && s.len() == 42)
+        .expect("an address on the line")
+        .parse()
+        .expect("a valid address")
+}
+
+/// A config pointed at a local anvil and the two mock services.
+#[allow(dead_code)]
+pub fn test_config_for(
+    anvil_url: &str,
+    near_url: &str,
+    zkp2p_url: &str,
+    usdc: Address,
+    escrow: Address,
+    glue: Address,
+    db_path: &str,
+) -> zecp2p_types::Config {
+    zecp2p_types::Config {
+        network: zecp2p_types::config::NetworkConfig {
+            base_rpc_url: anvil_url.to_string(),
+            base_sepolia_rpc_url: Some(anvil_url.to_string()),
+            chain_id: 31337,
+        },
+        contracts: zecp2p_types::config::ContractConfig {
+            usdc,
+            zkp2p_escrow: escrow,
+            zkp2p_orchestrator: escrow,
+            stake_vault: zecp2p_types::config::DEFAULT_STAKE_VAULT.parse().unwrap(),
+            glue_contract: Some(glue),
+        },
+        near: zecp2p_types::config::NearConfig {
+            api_url: near_url.to_string(),
+            default_timeout: 600,
+        },
+        zkp2p: zecp2p_types::config::Zkp2pConfig {
+            api_url: zkp2p_url.to_string(),
+            ..Default::default()
+        },
+        keeper: zecp2p_types::config::KeeperConfig::default(),
+        fee: zecp2p_types::config::FeeConfig::default(),
+        attestation: zecp2p_types::config::AttestationConfig::default(),
+        server: zecp2p_types::config::ServerConfig {
+            host: "127.0.0.1".to_string(),
+            port: 3000,
+            ..Default::default()
+        },
+        database: zecp2p_types::config::DatabaseConfig {
+            path: db_path.to_string(),
+        },
+    }
+}

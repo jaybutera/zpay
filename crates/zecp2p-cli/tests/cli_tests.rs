@@ -333,7 +333,7 @@ fn offramp_refuses_a_user_address_that_is_not_the_signers() {
         "--venmo",
         "someone",
         "--zec-address",
-        "t1VJnUz9FDy7WfFxqXwMZJWVxzMrRD7MvBA",
+        "t1StbPM4X3j4FGM57HpGnb9BMbS7C1nFW1r",
         "--private-key",
         TEST_KEY,
         "--user-address",
@@ -363,7 +363,7 @@ fn offramp_derives_the_user_address_from_the_key() {
         "--venmo",
         "someone",
         "--zec-address",
-        "t1VJnUz9FDy7WfFxqXwMZJWVxzMrRD7MvBA",
+        "t1StbPM4X3j4FGM57HpGnb9BMbS7C1nFW1r",
         "--private-key",
         TEST_KEY,
     ]);

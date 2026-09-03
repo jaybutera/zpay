@@ -433,7 +433,7 @@ async fn test_http_full_offramp_flow() {
         "venmo_username": "httptest",
         "user_address": TEST_USER,
         "taker_address": TEST_USER,
-        "zec_refund_address": "t1VJnUz9FDy7WfFxqXwMZJWVxzMrRD7MvBA",
+        "zec_refund_address": "t1StbPM4X3j4FGM57HpGnb9BMbS7C1nFW1r",
         "min_rate": "25",
         "timeout_seconds": 600
     });
@@ -553,7 +553,7 @@ async fn test_http_error_handling() {
             "venmo_username": "test",
             "user_address": TEST_USER,
             "taker_address": TEST_USER,
-            "zec_refund_address": "t1VJnUz9FDy7WfFxqXwMZJWVxzMrRD7MvBA"
+            "zec_refund_address": "t1StbPM4X3j4FGM57HpGnb9BMbS7C1nFW1r"
         }))
         .send()
         .await
@@ -571,7 +571,7 @@ async fn test_http_error_handling() {
             "venmo_username": "x", // Too short
             "user_address": TEST_USER,
             "taker_address": TEST_USER,
-            "zec_refund_address": "t1VJnUz9FDy7WfFxqXwMZJWVxzMrRD7MvBA"
+            "zec_refund_address": "t1StbPM4X3j4FGM57HpGnb9BMbS7C1nFW1r"
         }))
         .send()
         .await
@@ -615,7 +615,7 @@ async fn test_http_rescue_requires_valid_state() {
         "venmo_username": "rescuetest",
         "user_address": TEST_USER,
         "taker_address": TEST_USER,
-        "zec_refund_address": "t1VJnUz9FDy7WfFxqXwMZJWVxzMrRD7MvBA"
+        "zec_refund_address": "t1StbPM4X3j4FGM57HpGnb9BMbS7C1nFW1r"
     });
 
     let resp = client
