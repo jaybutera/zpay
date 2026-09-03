@@ -108,6 +108,7 @@ impl AppState {
     pub async fn tick_orders(self: &Arc<Self>) -> Result<()> {
         let orders = self.db.get_open_orders().await?;
         let total = orders.len();
+        let shedding = self.orders_to_shed().await;
         let started = std::time::Instant::now();
         let mut swept = 0usize;
 
@@ -127,7 +128,7 @@ impl AppState {
             if let Err(e) = self.db.mark_order_polled(order.id).await {
                 tracing::warn!(order_id = %order.id, "could not record the poll: {e}");
             }
-            if let Err(e) = self.advance_order(&order).await {
+            if let Err(e) = self.advance_order(&order, shedding.contains(&order.id)).await {
                 tracing::warn!(order_id = %order.id, "error advancing order: {e}");
             }
             swept += 1;
@@ -135,11 +136,68 @@ impl AppState {
         Ok(())
     }
 
-    async fn advance_order(self: &Arc<Self>, order: &OrderRecord) -> Result<()> {
+    /// The unfunded orders this tick will close early because the queue is
+    /// deeper than the coordinator wants to carry (U3-2).
+    ///
+    /// The round 2 fix bounded the backlog by refusing new opens once 200 rows
+    /// were outstanding, and that turned a flood into a lockout: two hundred
+    /// rows from fifty free session keys, roughly five minutes of requests, and
+    /// every new sender got 429 for the six hours it took those rows to time
+    /// out one by one. A queue that sheds is a queue nobody can jam: above the
+    /// high-water mark the stalest rows are asked about and retired now rather
+    /// than at hour six, so the backlog drains at the rate the sweep runs
+    /// instead of the rate a clock ticks.
+    ///
+    /// Two things keep this from touching a real sender. Nothing under an hour
+    /// old is a candidate, and the page's promise is twenty minutes. And a
+    /// candidate is not retired here: it is marked, and `promote_if_funded`
+    /// runs the same 1Click check every retirement runs, so an order whose ZEC
+    /// the bridge has seen survives shedding exactly as it survives its window
+    /// closing (U3-1).
+    ///
+    /// An error reading the counts sheds nothing. Shedding is a relief valve,
+    /// and a valve that opens because a query failed is worse than one that
+    /// stays shut.
+    async fn orders_to_shed(&self) -> std::collections::HashSet<uuid::Uuid> {
+        let empty = std::collections::HashSet::new();
+
+        let unfunded = match self.db.count_unfunded_orders().await {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!("could not count the unfunded backlog: {e}");
+                return empty;
+            }
+        };
+        let over = unfunded - crate::api_v2::MAX_UNFUNDED_SHED_ABOVE;
+        if over <= 0 {
+            return empty;
+        }
+
+        let cutoff = chrono::Utc::now() - crate::api_v2::SHED_NOTHING_YOUNGER_THAN;
+        match self.db.oldest_unfunded_orders_before(cutoff, over).await {
+            Ok(candidates) => {
+                if !candidates.is_empty() {
+                    tracing::warn!(
+                        unfunded,
+                        shedding = candidates.len(),
+                        "the unfunded backlog is over its high-water mark; \
+                         closing the stalest orders early after asking 1Click"
+                    );
+                }
+                candidates.into_iter().map(|o| o.id).collect()
+            }
+            Err(e) => {
+                tracing::warn!("could not list the stalest unfunded orders: {e}");
+                empty
+            }
+        }
+    }
+
+    async fn advance_order(self: &Arc<Self>, order: &OrderRecord, shed: bool) -> Result<()> {
         match order.session_uuid {
             // Not yet funded: watch the deposit address, and promote when the
             // swap settles.
-            None => self.promote_if_funded(order).await,
+            None => self.promote_if_funded(order, shed).await,
             // Already a session: mirror its stage and its returns onto the
             // order, so the status page reads one object.
             Some(session_uuid) => self.mirror_session(order, session_uuid).await,
@@ -147,7 +205,7 @@ impl AppState {
     }
 
     /// Watch 1Click, and turn a funded order into a session.
-    async fn promote_if_funded(self: &Arc<Self>, order: &OrderRecord) -> Result<()> {
+    async fn promote_if_funded(self: &Arc<Self>, order: &OrderRecord, shed: bool) -> Result<()> {
         let Some(deposit) = &order.deposit else {
             return Ok(());
         };
@@ -157,7 +215,13 @@ impl AppState {
         // every order it has ever opened, on every tick, ahead of the live
         // sessions. The deadline is the bound, and it was written to the row
         // and read by nothing.
-        let past_the_window = chrono::Utc::now() > self.polling_deadline(order);
+        let now = chrono::Utc::now();
+        // `shed` is the backlog relief valve (U3-2): it closes the window on the
+        // stalest unfunded orders when the queue is deeper than the sweep wants
+        // to carry. It reaches only the retirement branch below, which asks
+        // 1Click first, so a shed order that turns out to be funded is promoted
+        // and not retired.
+        let past_the_window = shed || now > self.polling_deadline(order);
 
         // 404 means 1Click has not registered the address it just handed out.
         // That is "not yet", not a failure.
@@ -169,25 +233,40 @@ impl AppState {
             return Ok(());
         };
 
-        // U2-1. Retirement now happens *after* the status call, not instead of
-        // it. The old code read the clock, wrote "nothing was sent, so nothing
-        // is owed", and never asked. For an order the sweep had been starving,
-        // that sentence was false as often as it was true: the sender's ZEC had
-        // been swapped, the USDC was sitting on the glue attributed to nothing,
-        // and the page told them nothing was owed.
+        // U2-1, then U3-1. Retirement happens *after* the status call, not
+        // instead of it. The old code read the clock, wrote "nothing was sent,
+        // so nothing is owed", and never asked. For an order the sweep had been
+        // starving, that sentence was false as often as it was true: the
+        // sender's ZEC had been swapped, the USDC was sitting on the glue
+        // attributed to nothing, and the page told them nothing was owed.
         //
-        // Asking first costs one status call per order per lifetime, which is
-        // what a single ordinary tick already costs, and it turns the sentence
-        // into a fact. A settled or refunded order past its window falls
-        // through to the branches below and is handled as what it is.
-        if past_the_window && !status.status.is_success()
-            && status.status != crate::near::IntentStatus::Refunded
-        {
-            self.retire_unfunded(
-                order,
-                &format!("1Click reports {:?} past the deposit window", status.status),
-            )
-            .await?;
+        // Asking was not enough. The first fix retired on every answer except
+        // SUCCESS and REFUNDED, and three of the four answers that left mean
+        // 1Click has the sender's ZEC: KNOWN_DEPOSIT_TX (the transaction is
+        // seen), PROCESSING (the swap is running) and INCOMPLETE_DEPOSIT (ZEC
+        // arrived, under the quote, refunded by 1Click at its own deadline,
+        // which was three days on every order the audit opened). FAILED means
+        // the swap ran and failed, which is also not "never saw any ZEC". So a
+        // sender whose wallet took its fee out of the amount instead of on top
+        // was retired at hour six with "nothing is owed", dropped out of
+        // `get_open_orders`, and was never polled again when the refund landed
+        // on day three.
+        //
+        // Only PENDING_DEPOSIT, and the 404 above, mean what the sentence says.
+        // Every other status falls through to the branches below, which handle
+        // it as what it is, and stays in the polling set until 1Click's own
+        // deadline plus the grace hour: a deposit 1Click has acknowledged is
+        // money somebody sent, and the sweep can afford to watch it for as long
+        // as 1Click says it is still working on it.
+        if status.status == crate::near::IntentStatus::PendingDeposit {
+            if past_the_window {
+                let why = if shed {
+                    "1Click still reports PENDING_DEPOSIT and the backlog is shedding"
+                } else {
+                    "1Click still reports PENDING_DEPOSIT past the window"
+                };
+                self.retire_unfunded(order, why).await?;
+            }
             return Ok(());
         }
 
@@ -219,13 +298,63 @@ impl AppState {
             return Ok(());
         }
 
+        // The bound for a deposit 1Click has seen. SUCCESS and REFUNDED are
+        // already gone by here: the first is promoted at the bottom however
+        // late it is, the second was recorded above. What is left is a swap
+        // 1Click is still working on, or one it says it failed and has not
+        // refunded, and neither of those is worth polling past the deadline
+        // 1Click set for itself. Guarding on the status rather than on position
+        // is what keeps a settled order that sat past that deadline from being
+        // failed instead of promoted, which is the stranding this whole section
+        // exists to stop.
+        //
+        // The bound itself: `polling_deadline` shortens 1Click's window to the
+        // coordinator's six hours because an unfunded address is worth nothing
+        // to anyone; an address with ZEC on it is worth exactly the deposit, so
+        // this one is 1Click's own deadline plus the grace hour. Reaching it
+        // means 1Click has been reporting an in-flight swap past the point
+        // where it promised to refund it, which no longer resolves by being
+        // polled.
+        if !status.status.is_success() && now > self.seen_deposit_deadline(order) {
+            let mut updated = order.clone();
+            updated.stage = Stage::Failed;
+            updated.error = Some(format!(
+                "the bridge saw your ZEC but has not finished the swap, and its own \
+                 deadline has passed (it last reported {:?}). Keep this link and get in \
+                 touch; the payment is traceable from the address above.",
+                status.status
+            ));
+            self.db.update_order(&updated).await?;
+            tracing::warn!(
+                order_id = %order.id,
+                status = ?status.status,
+                "order had a deposit 1Click acknowledged and never settled; no longer polled"
+            );
+            return Ok(());
+        }
+
         if !status.status.is_success() {
-            // Still moving, or terminally failed with nothing to return yet.
-            if status.status.is_terminal() {
-                let mut updated = order.clone();
-                updated.stage = Stage::Failed;
-                updated.error = Some("the swap did not complete".to_string());
-                self.db.update_order(&updated).await?;
+            // Everything still moving, and FAILED.
+            //
+            // U3-1. FAILED used to write `Stage::Failed` on the spot, which
+            // takes the order out of `get_open_orders` and stops the polling for
+            // good. That is the same stranding as the retirement it sits next
+            // to, one status along: 1Click has the sender's ZEC either way, and
+            // an order it has failed still owes that ZEC back, which arrives as
+            // REFUNDED on a later tick and is what the branch above exists to
+            // record. Nothing but a settled swap or a returned deposit takes an
+            // order out of the set before the deadline the deposit came with.
+            //
+            // The row still says what happened, so the page is not silent while
+            // this runs its course, and the note is written once rather than on
+            // every tick.
+            if status.status == crate::near::IntentStatus::Failed {
+                let note = "the bridge could not complete the swap. If your ZEC reached it,                             it is refunded to the return address; this page follows that.";
+                if order.error.as_deref() != Some(note) {
+                    let mut updated = order.clone();
+                    updated.error = Some(note.to_string());
+                    self.db.update_order(&updated).await?;
+                }
             }
             return Ok(());
         }
@@ -315,6 +444,28 @@ impl AppState {
             .map(|d| d.expires_at + EXPIRY_GRACE)
             .unwrap_or(order.created_at);
         oneclick.min(order.created_at + MAX_POLLING_WINDOW)
+    }
+
+    /// The last moment an order whose deposit 1Click has acknowledged is worth
+    /// polling.
+    ///
+    /// U3-1. `polling_deadline` shortens 1Click's window to six hours because
+    /// an address nobody paid costs the sweep a status call a tick and is worth
+    /// nothing. That reasoning does not survive a deposit: 1Click reporting
+    /// KNOWN_DEPOSIT_TX, PROCESSING or INCOMPLETE_DEPOSIT means ZEC is at the
+    /// address, and 1Click refunds an under-deposit at its own deadline, which
+    /// was three days on every order the audit opened. Retiring at hour six
+    /// dropped the order out of the polling set before the money moved.
+    ///
+    /// So this is 1Click's deadline plus the same grace hour, with no cap of
+    /// the coordinator's own. The set stays bounded because reaching this
+    /// branch takes a real deposit, which costs whoever made it the ZEC.
+    fn seen_deposit_deadline(&self, order: &OrderRecord) -> chrono::DateTime<chrono::Utc> {
+        order
+            .deposit
+            .as_ref()
+            .map(|d| d.expires_at + EXPIRY_GRACE)
+            .unwrap_or(order.created_at + MAX_POLLING_WINDOW)
     }
 
     /// Retire an order that 1Click has been asked about and does not report as

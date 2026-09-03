@@ -52,6 +52,14 @@ struct StatusMock {
     asked: Arc<Mutex<Vec<String>>>,
     /// Addresses to answer SUCCESS for. Everything else is PENDING_DEPOSIT.
     settled: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Addresses to answer some other 1Click status for.
+    ///
+    /// U3-1. The mock used to answer SUCCESS or PENDING_DEPOSIT and nothing
+    /// else, which is exactly why the shipped tests could not see that
+    /// KNOWN_DEPOSIT_TX, PROCESSING, INCOMPLETE_DEPOSIT and FAILED were all
+    /// being retired as "never saw any ZEC". Any of the seven can be set now,
+    /// and `settle` is the special case of setting SUCCESS.
+    answers: Arc<Mutex<std::collections::HashMap<String, String>>>,
     /// Milliseconds each status call takes. 1Click's own was 170 to 210 ms.
     /// Left at zero by these tests: the per-tick cap is what bounds a sweep
     /// here, and real latency on top of it would only make them slower.
@@ -63,12 +71,21 @@ impl StatusMock {
         Self {
             asked: Arc::new(Mutex::new(Vec::new())),
             settled: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            answers: Arc::new(Mutex::new(std::collections::HashMap::new())),
             latency_ms: Arc::new(AtomicUsize::new(latency_ms)),
         }
     }
 
     fn settle(&self, address: &str) {
         self.settled.lock().unwrap().insert(address.to_string());
+    }
+
+    /// Answer `status` for this address until told otherwise.
+    fn answer(&self, address: &str, status: &str) {
+        self.answers
+            .lock()
+            .unwrap()
+            .insert(address.to_string(), status.to_string());
     }
 
     fn times_asked_about(&self, address: &str) -> usize {
@@ -130,8 +147,19 @@ async fn status_handler(
     mock.asked.lock().unwrap().push(q.deposit_address.clone());
 
     let delivered = mock.settled.lock().unwrap().contains(&q.deposit_address);
+    let status = if delivered {
+        "SUCCESS".to_string()
+    } else {
+        mock.answers
+            .lock()
+            .unwrap()
+            .get(&q.deposit_address)
+            .cloned()
+            .unwrap_or_else(|| "PENDING_DEPOSIT".to_string())
+    };
+    let delivered = delivered || status == "SUCCESS";
     Json(StatusResp {
-        status: if delivered { "SUCCESS" } else { "PENDING_DEPOSIT" }.to_string(),
+        status,
         swap_details: SwapDetails {
             amount_out: delivered.then(|| "1500000".to_string()),
             refunded_amount: Some("0".to_string()),
@@ -649,4 +677,256 @@ async fn the_unfunded_backlog_is_counted_per_key_and_in_total() {
         "a promoted order is no longer unfunded"
     );
     assert_eq!(state.db.count_unfunded_orders().await.expect("count"), 7);
+}
+
+// ---------------------------------------------------------------------------
+// U3-1: a deposit 1Click has seen is not "never saw any ZEC"
+// ---------------------------------------------------------------------------
+
+/// The four statuses that are neither SUCCESS nor REFUNDED, past the window.
+///
+/// Three of them mean 1Click has the sender's ZEC. `KNOWN_DEPOSIT_TX` is the
+/// deposit transaction seen; `PROCESSING` is the swap running, and 1Click sits
+/// there for as long as it sits there; `INCOMPLETE_DEPOSIT` is a wallet that
+/// took its fee out of the amount instead of on top, which 1Click refunds at
+/// its own deadline, three days out on every order the audit opened. The
+/// fourth, `FAILED`, means the swap ran and failed, which is also not "nothing
+/// was sent".
+///
+/// The round 2 fix asked 1Click before retiring and then retired on every one
+/// of these anyway. `Failed` is out of `get_open_orders`, so the order stopped
+/// being polled, and when the swap settled the sender's USDC landed on the glue
+/// attributed to nothing while the page read "Nothing was sent, so nothing is
+/// owed."
+const SEEN_BUT_NOT_SETTLED: [&str; 4] = [
+    "KNOWN_DEPOSIT_TX",
+    "PROCESSING",
+    "INCOMPLETE_DEPOSIT",
+    "FAILED",
+];
+
+/// None of the four is retired past the window, and each is still polled and
+/// promoted when it flips to SUCCESS.
+///
+/// The arrangement is the audit's: opened 361 minutes ago, so the
+/// coordinator's own six-hour cap is what closed the window, with 1Click's
+/// three-day deadline still open, which is what 1Click actually issues.
+#[tokio::test]
+async fn a_deposit_1click_has_seen_is_not_retired_at_the_window() {
+    let (near, near_url) = start_status_mock(0).await;
+    let temp = TempDir::new().expect("temp dir");
+    let db_path = temp.path().join("seen.db").to_string_lossy().to_string();
+    let state = coordinator_with(&near_url, &db_path).await;
+
+    let now = chrono::Utc::now();
+    let mut ids = Vec::new();
+
+    for status in SEEN_BUT_NOT_SETTLED {
+        let address = format!("t1Seen{status}");
+        let order = order_at(
+            &address,
+            now - chrono::Duration::minutes(361),
+            now + chrono::Duration::days(3),
+        );
+        near.answer(&address, status);
+        ids.push((status, address, order.id));
+        state.db.insert_order(&order).await.expect("insert");
+    }
+
+    // A control: same age, same window, and 1Click has seen nothing. This one
+    // is supposed to be retired, and it is what makes the assertions below
+    // about the other four a statement about the status and not about the
+    // clock.
+    let never = order_at(
+        "t1NothingArrived",
+        now - chrono::Duration::minutes(361),
+        now + chrono::Duration::days(3),
+    );
+    let never_id = never.id;
+    state.db.insert_order(&never).await.expect("insert");
+
+    tick_capped_at(&state, 100).await;
+
+    for (status, address, id) in &ids {
+        let after = state.db.get_order(*id).await.expect("get").expect("order");
+        assert!(
+            near.times_asked_about(address) > 0,
+            "1Click was never asked about the {status} order"
+        );
+        assert_ne!(
+            after.stage,
+            Stage::Failed,
+            "U3-1: 1Click reports {status}, which means it has the sender's ZEC, \
+             and the order was retired anyway. Stage is {:?} and the sender reads \
+             {:?}",
+            after.stage,
+            after.error
+        );
+        assert!(
+            !after
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("never saw any ZEC"),
+            "U3-1: the {status} order was told nothing was sent: {:?}",
+            after.error
+        );
+    }
+
+    let control = state.db.get_order(never_id).await.expect("get").expect("order");
+    assert_eq!(
+        control.stage,
+        Stage::Failed,
+        "the control was PENDING_DEPOSIT past its window and must still be retired, \
+         or the fix has simply stopped retiring anything"
+    );
+
+    // The half the round 2 fix could not reach: the swap settles later, and
+    // the order has to still be in the polling set to see it.
+    let open_now: std::collections::HashSet<uuid::Uuid> = state
+        .db
+        .get_open_orders()
+        .await
+        .expect("open")
+        .into_iter()
+        .map(|o| o.id)
+        .collect();
+    for (status, _, id) in &ids {
+        assert!(
+            open_now.contains(id),
+            "U3-1: the {status} order left the polling set, so nothing will ever \
+             notice when its swap settles"
+        );
+    }
+
+    for (_, address, _) in &ids {
+        near.settle(address);
+    }
+    let calls_before: Vec<usize> = ids
+        .iter()
+        .map(|(_, a, _)| near.times_asked_about(a))
+        .collect();
+
+    tick_capped_at(&state, 100).await;
+
+    for ((status, address, id), before) in ids.iter().zip(calls_before) {
+        assert!(
+            near.times_asked_about(address) > before,
+            "U3-1: the {status} order was not polled after it settled. That is the \
+             stranding: the USDC is on the glue attributed to nothing."
+        );
+
+        // Promotion itself needs a chain, and this test has none, so what the
+        // sweep can be held to is that it saw the SUCCESS and tried. The
+        // marker is the absence of the retirement: an order that reached the
+        // promotion branch and failed at the first chain call is still open
+        // and still says nothing about money not being owed.
+        let after = state.db.get_order(*id).await.expect("get").expect("order");
+        assert!(
+            !after
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("nothing is owed"),
+            "U3-1: the settled {status} order still reads as owing nothing: {:?}",
+            after.error
+        );
+    }
+}
+
+/// An in-flight deposit keeps its place in the rotation, tick after tick.
+///
+/// The test above checks the four statuses once each. This one checks that the
+/// survival lasts: six ticks of PROCESSING past the coordinator's window, six
+/// status calls, and the order still open to see the seventh. Under the round 2
+/// fix the first tick retired it and the other five polled nothing at all, so
+/// the count is what separates a fix from a coincidence.
+#[tokio::test]
+async fn a_deposit_seen_past_the_window_still_promotes_when_it_settles() {
+    let (near, near_url) = start_status_mock(0).await;
+    let temp = TempDir::new().expect("temp dir");
+    let db_path = temp.path().join("late-promote.db").to_string_lossy().to_string();
+    let state = coordinator_with(&near_url, &db_path).await;
+
+    let now = chrono::Utc::now();
+    let address = "t1ProcessingThenPaid";
+    let order = order_at(
+        address,
+        now - chrono::Duration::minutes(361),
+        now + chrono::Duration::days(3),
+    );
+    let id = order.id;
+    near.answer(address, "PROCESSING");
+    state.db.insert_order(&order).await.expect("insert");
+
+    // Six ticks of an in-flight swap past the window. Under the round 2 fix
+    // the first of these retired it and the other five polled nothing.
+    for _ in 0..6 {
+        tick_capped_at(&state, 100).await;
+    }
+    assert_eq!(
+        near.times_asked_about(address),
+        6,
+        "an in-flight deposit has to keep being polled: it was asked about {} \
+         times in six ticks",
+        near.times_asked_about(address)
+    );
+
+    let after = state.db.get_order(id).await.expect("get").expect("order");
+    assert_eq!(after.stage, Stage::AwaitingZec);
+
+    // And when 1Click finishes, the sweep is still there to see it.
+    near.settle(address);
+    tick_capped_at(&state, 100).await;
+    assert_eq!(near.times_asked_about(address), 7);
+}
+
+/// An in-flight deposit is still bounded: 1Click's own deadline plus the grace
+/// hour ends the polling.
+///
+/// The fix must not trade a stranding for an unbounded polling set. A swap
+/// 1Click has been reporting as in flight past the deadline it set itself is
+/// not going to resolve by being asked again, and the sender is told what was
+/// seen rather than that nothing was.
+#[tokio::test]
+async fn an_in_flight_deposit_is_bounded_by_1clicks_own_deadline() {
+    let (near, near_url) = start_status_mock(0).await;
+    let temp = TempDir::new().expect("temp dir");
+    let db_path = temp.path().join("seen-bound.db").to_string_lossy().to_string();
+    let state = coordinator_with(&near_url, &db_path).await;
+
+    let now = chrono::Utc::now();
+    let address = "t1ProcessingForever";
+    // 1Click's deadline passed ninety minutes ago, so it is past that deadline
+    // plus the grace hour too.
+    let order = order_at(
+        address,
+        now - chrono::Duration::hours(4),
+        now - chrono::Duration::minutes(90),
+    );
+    let id = order.id;
+    near.answer(address, "PROCESSING");
+    state.db.insert_order(&order).await.expect("insert");
+
+    tick_capped_at(&state, 100).await;
+
+    let after = state.db.get_order(id).await.expect("get").expect("order");
+    assert_eq!(
+        after.stage,
+        Stage::Failed,
+        "a swap 1Click reports in flight past its own deadline is not polled forever"
+    );
+    let message = after.error.unwrap_or_default();
+    assert!(
+        message.contains("saw your ZEC"),
+        "the sender has to be told what was seen, not that nothing was: {message}"
+    );
+    assert!(
+        !message.contains("never saw any ZEC"),
+        "the wrong sentence again: {message}"
+    );
+
+    // And it leaves the set, so the bound is real.
+    tick_capped_at(&state, 100).await;
+    assert_eq!(near.times_asked_about(address), 1);
 }
