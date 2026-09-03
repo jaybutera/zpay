@@ -1,44 +1,34 @@
-/* zpay app (formerly zecp2p): plain ES2020, no build step, no dependencies.
-   Talks to the Axum coordinator described in crates/zecp2p-coordinator/src/api.rs */
+/* zpay main route: two fields, a zcash: link, a status link.
+   Plain ES2020, no build step, no dependencies.
+
+   The page holds a session key. That is the part worth reading carefully.
+
+   There is no wallet to connect here: the sender pays from a Zcash wallet that
+   knows nothing about Base, and the coordinator still needs an address to name
+   as session.user, because rescue and withdrawFromZkp2p pay that address and
+   nowhere else. So the page generates one 32-byte secret per order and derives
+   from it the EVM address, the Zcash transparent refund address, and the
+   signature that opens the order.
+
+   The secret lives in the URL fragment of the status link. Fragments are never
+   sent to a server, so the coordinator sees the order id and never the key.
+   The link the sender is told to keep is therefore the whole recovery story;
+   there is nothing else to back up.
+
+   The old page refused to sign in-page, on the grounds that a web page asking
+   for a private key is the shape of a wallet drainer. That objection is about
+   a key holding the sender's savings. This key is created by the page, holds
+   nothing but this order's claim on returned funds, and is never typed. The
+   advanced route still never asks for one. */
 
 'use strict';
 
-// ---------- config ----------
-// Same-origin by default so this works when the coordinator serves the files.
-// Override with ?api=http://host:port , persisted in localStorage.
-// A crafted ?api= link used to persist an attacker's coordinator into
-// localStorage permanently, and the coordinator is what supplies the ZEC
-// deposit address. Loopback still overrides silently, because that is the
-// development case; anything else has to be confirmed and is not persisted.
-function acceptApiOverride(raw) {
-  let url;
-  try { url = new URL(raw, location.origin); } catch (_) { return null; }
-
-  const host = (url.hostname || '').replace(/^\[|\]$/g, '');
-  const isLoopback = host === 'localhost' || host === '127.0.0.1' || host === '::1';
-  if (isLoopback) return { url: raw, persist: true };
-
-  const ok = confirm(
-    'This link points the page at a different coordinator:\n\n' + url.origin +
-    '\n\nThat server tells you which Zcash address to send funds to. Only ' +
-    'continue if you trust it. It will not be remembered.'
-  );
-  return ok ? { url: raw, persist: false } : null;
-}
+// ---------- coordinator ----------
 
 const API = (() => {
-  const q = new URLSearchParams(location.search).get('api');
-  if (q) {
-    const accepted = acceptApiOverride(q);
-    if (accepted) {
-      if (accepted.persist) { try { localStorage.setItem('zecp2p.api', accepted.url); } catch (_) {} }
-      return accepted.url.replace(/\/+$/, '');
-    }
-  }
   let saved = null;
   try { saved = localStorage.getItem('zecp2p.api'); } catch (_) {}
   if (saved) return saved.replace(/\/+$/, '');
-  // Opened as file:// or from a dev static server -> assume local coordinator.
   if (location.protocol === 'file:' || location.port === '5173' || location.port === '8080') {
     return 'http://127.0.0.1:3000';
   }
@@ -46,15 +36,28 @@ const API = (() => {
 })();
 
 const $ = (id) => document.getElementById(id);
-const API_LABEL = API || location.origin;
 
-// ---------- tiny helpers ----------
-
-// Everything the coordinator returns is treated as untrusted text.
 function esc(v) {
   return String(v === null || v === undefined ? '' : v)
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+async function api(path, opts = {}) {
+  let res;
+  try {
+    res = await fetch(API + path, {
+      ...opts,
+      headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) },
+    });
+  } catch (_) {
+    throw new Error('Cannot reach zpay right now. Check your connection and try again.');
+  }
+  const raw = await res.text();
+  let body = null;
+  if (raw) { try { body = JSON.parse(raw); } catch (_) {} }
+  if (!res.ok) throw new Error((body && (body.error || body.message)) || raw || res.statusText);
+  return body;
 }
 
 function msg(host, kind, text) {
@@ -67,151 +70,319 @@ function msg(host, kind, text) {
   el.appendChild(d);
 }
 
-function busy(btn, on, label) {
-  btn.disabled = on;
-  if (on) { btn.dataset.prev = btn.textContent; btn.textContent = label || 'working…'; }
-  else if (btn.dataset.prev) { btn.textContent = btn.dataset.prev; delete btn.dataset.prev; }
+const money = (cents) =>
+  '$' + (cents / 100).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+// ---------- session key ----------
+//
+// secp256k1 over WebCrypto is not available (WebCrypto has no secp256k1), so
+// the curve arithmetic is here. It is the minimum needed to derive a public
+// key and make one ECDSA signature: scalar multiplication, and RFC 6979 is
+// not used because a random k from crypto.getRandomValues is sound for a
+// one-shot key and avoids shipping HMAC-DRBG.
+
+const SECP = {
+  p: 0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2fn,
+  n: 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n,
+  a: 0n,
+  b: 7n,
+  Gx: 0x79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798n,
+  Gy: 0x483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8n,
+};
+
+const mod = (x, m) => ((x % m) + m) % m;
+
+function invMod(x, m) {
+  // Extended Euclid; x is never 0 where this is called.
+  let [old_r, r] = [mod(x, m), m];
+  let [old_s, s] = [1n, 0n];
+  while (r !== 0n) {
+    const q = old_r / r;
+    [old_r, r] = [r, old_r - q * r];
+    [old_s, s] = [s, old_s - q * s];
+  }
+  return mod(old_s, m);
 }
 
-async function api(path, opts = {}) {
-  let res;
+// Points as {x, y} in affine, or null for infinity.
+function ptAdd(P, Q) {
+  if (!P) return Q;
+  if (!Q) return P;
+  if (P.x === Q.x && mod(P.y + Q.y, SECP.p) === 0n) return null;
+  let lam;
+  if (P.x === Q.x && P.y === Q.y) {
+    lam = mod(3n * P.x * P.x * invMod(2n * P.y, SECP.p), SECP.p);
+  } else {
+    lam = mod((Q.y - P.y) * invMod(mod(Q.x - P.x, SECP.p), SECP.p), SECP.p);
+  }
+  const x = mod(lam * lam - P.x - Q.x, SECP.p);
+  return { x, y: mod(lam * (P.x - x) - P.y, SECP.p) };
+}
+
+function ptMul(k, P) {
+  let R = null;
+  let A = P;
+  let n = mod(k, SECP.n);
+  while (n > 0n) {
+    if (n & 1n) R = ptAdd(R, A);
+    A = ptAdd(A, A);
+    n >>= 1n;
+  }
+  return R;
+}
+
+const G = { x: SECP.Gx, y: SECP.Gy };
+
+const toHex = (bytes) => Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+const fromHex = (hex) => new Uint8Array(hex.match(/.{2}/g).map((h) => parseInt(h, 16)));
+const bigToBytes = (n, len) => fromHex(n.toString(16).padStart(len * 2, '0'));
+const bytesToBig = (b) => BigInt('0x' + toHex(b));
+
+/** A fresh session key. */
+function newSessionKey() {
+  let d;
+  do {
+    const raw = new Uint8Array(32);
+    crypto.getRandomValues(raw);
+    d = bytesToBig(raw);
+  } while (d === 0n || d >= SECP.n);
+  return d;
+}
+
+/** 33-byte compressed public key, as hex. */
+function compressedPubkey(d) {
+  const P = ptMul(d, G);
+  const prefix = (P.y & 1n) === 0n ? '02' : '03';
+  return prefix + P.x.toString(16).padStart(64, '0');
+}
+
+// ---------- keccak256, for the EIP-191 digest ----------
+//
+// Needed because the message the coordinator checks is an EIP-191 personal_sign
+// over a fixed string, and that is keccak, not SHA.
+
+const KECCAK_RC = [
+  0x0000000000000001n, 0x0000000000008082n, 0x800000000000808an, 0x8000000080008000n,
+  0x000000000000808bn, 0x0000000080000001n, 0x8000000080008081n, 0x8000000000008009n,
+  0x000000000000008an, 0x0000000000000088n, 0x0000000080008009n, 0x000000008000000an,
+  0x000000008000808bn, 0x800000000000008bn, 0x8000000000008089n, 0x8000000000008003n,
+  0x8000000000008002n, 0x8000000000000080n, 0x000000000000800an, 0x800000008000000an,
+  0x8000000080008081n, 0x8000000000008080n, 0x0000000080000001n, 0x8000000080008008n,
+];
+const KECCAK_ROT = [
+  0, 1, 62, 28, 27, 36, 44, 6, 55, 20, 3, 10, 43, 25, 39, 41, 45, 15, 21, 8, 18, 2, 61, 56, 14,
+];
+const M64 = (1n << 64n) - 1n;
+const rotl = (x, n) => n === 0 ? x : ((x << BigInt(n)) | (x >> BigInt(64 - n))) & M64;
+
+function keccakF(A) {
+  for (let round = 0; round < 24; round++) {
+    const C = new Array(5);
+    for (let x = 0; x < 5; x++) C[x] = A[x] ^ A[x + 5] ^ A[x + 10] ^ A[x + 15] ^ A[x + 20];
+    for (let x = 0; x < 5; x++) {
+      const D = C[(x + 4) % 5] ^ rotl(C[(x + 1) % 5], 1);
+      for (let y = 0; y < 5; y++) A[x + 5 * y] ^= D;
+    }
+    const B = new Array(25).fill(0n);
+    for (let x = 0; x < 5; x++) {
+      for (let y = 0; y < 5; y++) {
+        B[y + 5 * ((2 * x + 3 * y) % 5)] = rotl(A[x + 5 * y], KECCAK_ROT[x + 5 * y]);
+      }
+    }
+    for (let x = 0; x < 5; x++) {
+      for (let y = 0; y < 5; y++) {
+        A[x + 5 * y] = B[x + 5 * y] ^ (~B[((x + 1) % 5) + 5 * y] & B[((x + 2) % 5) + 5 * y] & M64);
+      }
+    }
+    A[0] ^= KECCAK_RC[round];
+  }
+  return A;
+}
+
+function keccak256(bytes) {
+  const rate = 136;
+  const padded = new Uint8Array(Math.ceil((bytes.length + 1) / rate) * rate);
+  padded.set(bytes);
+  padded[bytes.length] = 0x01;                 // keccak padding, not SHA-3's 0x06
+  padded[padded.length - 1] |= 0x80;
+
+  let A = new Array(25).fill(0n);
+  for (let off = 0; off < padded.length; off += rate) {
+    for (let i = 0; i < rate / 8; i++) {
+      let lane = 0n;
+      for (let j = 7; j >= 0; j--) lane = (lane << 8n) | BigInt(padded[off + i * 8 + j]);
+      A[i] ^= lane;
+    }
+    A = keccakF(A);
+  }
+
+  const out = new Uint8Array(32);
+  for (let i = 0; i < 4; i++) {
+    let lane = A[i];
+    for (let j = 0; j < 8; j++) { out[i * 8 + j] = Number(lane & 0xffn); lane >>= 8n; }
+  }
+  return out;
+}
+
+// ---------- ECDSA, EIP-191 ----------
+
+function ecdsaSign(d, digest) {
+  const z = bytesToBig(digest);
+  for (;;) {
+    const kb = new Uint8Array(32);
+    crypto.getRandomValues(kb);
+    const k = mod(bytesToBig(kb), SECP.n);
+    if (k === 0n) continue;
+
+    const R = ptMul(k, G);
+    const r = mod(R.x, SECP.n);
+    if (r === 0n) continue;
+
+    let s = mod(invMod(k, SECP.n) * (z + r * d), SECP.n);
+    if (s === 0n) continue;
+
+    // Low-s, which every EVM verifier requires.
+    let recovery = (R.y & 1n) === 0n ? 0 : 1;
+    if (s > SECP.n / 2n) { s = SECP.n - s; recovery ^= 1; }
+
+    return toHex(bigToBytes(r, 32)) + toHex(bigToBytes(s, 32)) + (27 + recovery).toString(16).padStart(2, '0');
+  }
+}
+
+/** The exact bytes crates/zecp2p-coordinator/src/auth.rs recovers from. */
+function ownershipMessage(action, address, scope) {
+  return `zecp2p:${action}:${address}:${scope}`;
+}
+
+function personalSign(d, message) {
+  const body = new TextEncoder().encode(message);
+  const prefix = new TextEncoder().encode(`\x19Ethereum Signed Message:\n${body.length}`);
+  const full = new Uint8Array(prefix.length + body.length);
+  full.set(prefix); full.set(body, prefix.length);
+  return '0x' + ecdsaSign(d, keccak256(full));
+}
+
+/** The EVM address for a session key, formatted exactly as the server writes it.
+ *
+ * Lowercase, with no EIP-55 checksum. `auth.rs` builds the message it recovers
+ * from with alloy's `{:?}`, which prints lowercase hex, and the signature is
+ * over those exact bytes. A checksummed address here derives the same key and
+ * still fails every signature check, because the string signed would differ
+ * from the string verified. That is what the vectors in
+ * `frontend/app/test/session-key-vectors.js` exist to catch. */
+function evmAddress(d) {
+  const P = ptMul(d, G);
+  const uncompressed = new Uint8Array(64);
+  uncompressed.set(bigToBytes(P.x, 32), 0);
+  uncompressed.set(bigToBytes(P.y, 32), 32);
+  return '0x' + toHex(keccak256(uncompressed).slice(12));
+}
+
+// ---------- order state ----------
+
+const state = {
+  key: null,          // BigInt session secret
+  orderId: null,
+  unit: 'usd',
+  quote: null,
+  rails: [],
+  feeLabel: 'zpay fee',
+  poll: null,
+};
+
+/** Put the secret and the order id in the fragment, which no server sees. */
+function statusLink(orderId, key) {
+  const base = location.origin + location.pathname;
+  return `${base}#order=${orderId}&k=${key.toString(16).padStart(64, '0')}`;
+}
+
+function readFragment() {
+  const raw = location.hash.replace(/^#/, '');
+  if (!raw) return null;
+  const p = new URLSearchParams(raw);
+  const order = p.get('order');
+  const k = p.get('k');
+  if (!order || !k || !/^[0-9a-f]{64}$/i.test(k)) return null;
+  return { orderId: order, key: BigInt('0x' + k) };
+}
+
+// ---------- capabilities and the rail picker ----------
+
+async function loadCapabilities() {
   try {
-    res = await fetch(API + path, {
-      ...opts,
-      headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) },
-    });
+    const caps = await api('/v2/capabilities');
+    state.rails = caps.rails || [];
+    if (caps.fee && caps.fee.label) state.feeLabel = caps.fee.label;
   } catch (_) {
-    throw new Error(`Cannot reach coordinator at ${API_LABEL}. Is it running?`);
+    // The picker still renders with Venmo alone, so the page works if this
+    // call fails; it is a nicety, not a dependency.
+    state.rails = [{ id: 'venmo', label: 'Venmo', live: true }];
   }
-  const raw = await res.text();
-  let body = null;
-  if (raw) { try { body = JSON.parse(raw); } catch (_) {} }
-  if (!res.ok) {
-    // AppError serialises as {error: "..."}; fall back to any string we got.
-    const detail = (body && (body.error || body.message)) || raw || res.statusText;
-    throw new Error(`${res.status} — ${detail}`);
+
+  const sel = $('rail');
+  sel.innerHTML = '';
+  for (const r of state.rails) {
+    const opt = document.createElement('option');
+    opt.value = r.id;
+    opt.textContent = r.label;
+    opt.disabled = !r.live;
+    if (r.live && !sel.value) opt.selected = true;
+    sel.appendChild(opt);
   }
-  return body;
+  updateRailHint();
 }
 
-// "20.640000" -> "20.64"; leaves non-numeric strings alone
-function trimZeros(d) {
-  if (typeof d !== 'string' || !/^\d+\.\d+$/.test(d)) return d;
-  return d.replace(/0+$/, '').replace(/\.$/, '');
+function updateRailHint() {
+  const sel = $('rail');
+  const rail = state.rails.find((r) => r.id === sel.value);
+  $('rail-hint').textContent = rail && !rail.live
+    ? `${rail.label} is not live yet. Venmo is the one that works today.`
+    : '';
 }
-
-// expected_usdc comes back as raw 6-decimal integer string
-function fmtUsdcRaw(raw) {
-  if (raw === null || raw === undefined || raw === '') return null;
-  const n = Number(raw);
-  if (!Number.isFinite(n)) return String(raw);
-  return (n / 1e6).toFixed(6).replace(/0+$/, '').replace(/\.$/, '') + ' USDC';
-}
-
-const nowStamp = () => new Date().toTimeString().slice(0, 8);
-
-// ---------- health ----------
-
-async function checkHealth() {
-  const conn = $('conn'), text = $('conn-text');
-  try {
-    const h = await api('/health');
-    conn.dataset.state = 'up';
-    text.textContent = (h && h.status === 'ok') ? 'coordinator online' : 'coordinator responding';
-  } catch (_) {
-    conn.dataset.state = 'down';
-    text.textContent = 'coordinator offline';
-  }
-}
-
-// ---------- tabs ----------
-
-const TABS = [['tab-new','view-new'], ['tab-watch','view-watch'], ['tab-manage','view-manage']];
-
-function showTab(tabId) {
-  for (const [t, v] of TABS) {
-    const on = t === tabId;
-    $(t).setAttribute('aria-selected', String(on));
-    $(v).classList.toggle('hidden', !on);
-  }
-}
-for (const [t] of TABS) $(t).addEventListener('click', () => showTab(t));
-
-// ---------- client-side validation mirroring the Rust validators ----------
-
-function validVenmo(u) {
-  u = u.trim();
-  if (u.length < 2)  return 'Venmo handle is too short (minimum 2 characters).';
-  if (u.length > 30) return 'Venmo handle is too long (maximum 30 characters).';
-  if (!/^[A-Za-z0-9_-]+$/.test(u)) return 'Venmo handle allows only letters, numbers, underscore and hyphen.';
-  return null;
-}
-
-function validZec(a) {
-  a = a.trim();
-  if (!/^\d*\.?\d*$/.test(a) || a === '' || a === '.') return 'Enter a ZEC amount, for example 0.5';
-  const parts = a.split('.');
-  if (parts[1] && parts[1].length > 8) return 'ZEC amount allows at most 8 decimal places.';
-  if (Number(a) <= 0) return 'ZEC amount must be greater than 0.';
-  if (Number(a) > 21000000) return 'ZEC amount exceeds maximum supply.';
-  return null;
-}
-
-function validEvm(a, label) {
-  if (!/^0x[0-9a-fA-F]{40}$/.test(a.trim())) return `${label} must be a 0x-prefixed 40-character address.`;
-  return null;
-}
-
-function validZecAddr(a) {
-  a = a.trim();
-  if (!/^(t1|t3|zs)/.test(a)) return 'ZEC refund address must start with t1, t3 or zs.';
-  if (a[0] === 't' && a.length !== 35) return 'ZEC t-address must be exactly 35 characters.';
-  if (a.startsWith('zs') && a.length < 78) return 'ZEC z-address is too short.';
-  return null;
-}
-
-function mark(el, bad) { el.setAttribute('aria-invalid', bad ? 'true' : 'false'); }
 
 // ---------- quote ----------
 
-let lastQuote = null;
+let quoteTimer = null;
+let expiryTimer = null;
 
 async function doQuote() {
-  const zec = $('zec').value.trim();
-  const err = validZec(zec);
-  mark($('zec'), err);
-  if (err) { msg('new-msg', 'err', err); return null; }
+  const amount = $('amount').value.trim();
+  if (!amount) { $('quote').hidden = true; return; }
 
-  const btn = $('btn-quote');
-  busy(btn, true, 'quoting…');
-  msg('new-msg', '');
   try {
-    const q = await api('/quote?zec_amount=' + encodeURIComponent(zec));
-    lastQuote = q;
-    $('q-zec').innerHTML   = `${esc(q.zec_amount)}<span class="unit"> ZEC</span>`;
-    $('q-usdc').innerHTML  = `${esc(trimZeros(q.usdc_amount))}<span class="unit"> USDC</span>`;
-    $('q-venmo').textContent = '$' + q.venmo_amount;
-    $('q-rate').textContent  = q.rate;
-    renderExpiry(q.expires_at);
-    $('quote-box').classList.remove('hidden');
-
-    // Prefill min_rate with a 2% buffer under the quoted rate, if user left it blank.
-    const mr = $('min_rate');
-    if (!mr.value.trim()) {
-      const r = Number(q.rate);
-      if (Number.isFinite(r) && r > 0) mr.placeholder = (r * 0.98).toFixed(4) + ' (suggested)';
-    }
-    return q;
+    const q = await api(
+      `/v2/quote?amount=${encodeURIComponent(amount)}&unit=${state.unit}` +
+      `&rail=${encodeURIComponent($('rail').value)}`
+    );
+    state.quote = q;
+    renderQuote(q);
+    msg('compose-msg', '');
   } catch (e) {
-    msg('new-msg', 'err', e.message);
-    return null;
-  } finally {
-    busy(btn, false);
+    state.quote = null;
+    $('quote').hidden = true;
+    msg('compose-msg', 'err', e.message);
   }
 }
 
-let expiryTimer = null;
-function renderExpiry(iso) {
+function renderQuote(q) {
+  $('q-net').textContent = money(q.net_cents);
+
+  const ul = $('q-lines');
+  ul.innerHTML = '';
+  for (const line of q.lines) {
+    const li = document.createElement('li');
+    li.className = line.is_zpay_fee ? 'fee' : '';
+    li.innerHTML = `<span>${esc(line.label)}</span><span>${esc(money(line.cents))}</span>`;
+    ul.appendChild(li);
+  }
+
+  const mins = Math.round(q.expected_seconds / 60);
+  $('q-route').textContent = `${q.route_label} · usually under ${mins} minutes`;
+  startCountdown(q.expires_at);
+  $('quote').hidden = false;
+}
+
+function startCountdown(iso) {
   const el = $('q-expiry');
   if (expiryTimer) clearInterval(expiryTimer);
   const t = Date.parse(iso);
@@ -219,11 +390,11 @@ function renderExpiry(iso) {
   const tick = () => {
     const left = Math.round((t - Date.now()) / 1000);
     if (left <= 0) {
-      el.textContent = 'quote expired — request a new one';
+      el.textContent = 'price expired';
       el.classList.add('stale');
       clearInterval(expiryTimer);
     } else {
-      el.textContent = `quote valid for ${Math.floor(left / 60)}m ${String(left % 60).padStart(2, '0')}s`;
+      el.textContent = `price held ${Math.floor(left / 60)}:${String(left % 60).padStart(2, '0')}`;
       el.classList.remove('stale');
     }
   };
@@ -231,325 +402,291 @@ function renderExpiry(iso) {
   expiryTimer = setInterval(tick, 1000);
 }
 
-$('btn-quote').addEventListener('click', doQuote);
-
-// Re-quote when the amount changes and a quote is already on screen.
-let quoteDebounce = null;
-$('zec').addEventListener('input', () => {
-  if ($('quote-box').classList.contains('hidden')) return;
-  clearTimeout(quoteDebounce);
-  quoteDebounce = setTimeout(doQuote, 600);
+$('amount').addEventListener('input', () => {
+  clearTimeout(quoteTimer);
+  quoteTimer = setTimeout(doQuote, 500);
 });
+$('rail').addEventListener('change', () => { updateRailHint(); doQuote(); });
 
-// ---------- remembered advanced fields ----------
-
-const ADV_KEYS = ['user_address', 'taker_address', 'zec_refund_address', 'min_rate', 'timeout_seconds'];
-
-function loadAdv() {
-  let saved;
-  try { saved = JSON.parse(localStorage.getItem('zecp2p.adv') || '{}'); } catch (_) { return; }
-  let any = false;
-  for (const k of ADV_KEYS) if (saved[k]) { $(k).value = saved[k]; any = true; }
-  if (any) $('adv').open = false;
+for (const [id, unit] of [['unit-usd', 'usd'], ['unit-zec', 'zec']]) {
+  $(id).addEventListener('click', () => {
+    state.unit = unit;
+    $('unit-usd').classList.toggle('on', unit === 'usd');
+    $('unit-zec').classList.toggle('on', unit === 'zec');
+    $('unit-usd').setAttribute('aria-pressed', String(unit === 'usd'));
+    $('unit-zec').setAttribute('aria-pressed', String(unit === 'zec'));
+    $('amount-sigil').textContent = unit === 'usd' ? '$' : 'ᙇ';
+    $('amount').placeholder = unit === 'usd' ? '25' : '0.5';
+    doQuote();
+  });
 }
 
-$('btn-remember').addEventListener('click', () => {
-  const out = {};
-  for (const k of ADV_KEYS) out[k] = $(k).value.trim();
-  try {
-    localStorage.setItem('zecp2p.adv', JSON.stringify(out));
-    msg('new-msg', 'ok', 'Saved to this browser only. Nothing was sent anywhere.');
-  } catch (_) {
-    msg('new-msg', 'err', 'Browser storage is unavailable, so these were not saved.');
-  }
-});
+// ---------- open the order ----------
 
-$('btn-forget').addEventListener('click', () => {
-  try { localStorage.removeItem('zecp2p.adv'); } catch (_) {}
-  for (const k of ADV_KEYS) $(k).value = '';
-  msg('new-msg', 'info', 'Cleared saved addresses from this browser.');
-});
-
-// ---------- create offramp ----------
-
-$('form-new').addEventListener('submit', async (ev) => {
+$('form-pay').addEventListener('submit', async (ev) => {
   ev.preventDefault();
 
-  const venmo = $('venmo').value.trim().replace(/^@/, '');
-  const zec   = $('zec').value.trim();
-  const user  = $('user_address').value.trim();
-  const taker = $('taker_address').value.trim();
-  const refund= $('zec_refund_address').value.trim();
-  const minR  = $('min_rate').value.trim();
-  const tmo   = $('timeout_seconds').value.trim();
+  const handle = $('handle').value.trim().replace(/^@/, '');
+  if (handle.length < 2) { msg('compose-msg', 'err', 'Enter the handle that gets paid.'); return; }
+  if (!state.quote) { await doQuote(); if (!state.quote) return; }
 
-  const checks = [
-    [validVenmo(venmo), $('venmo')],
-    [validZec(zec), $('zec')],
-    [validEvm(user, 'Your Base address'), $('user_address')],
-    [validEvm(taker, 'Taker address'), $('taker_address')],
-    [validZecAddr(refund), $('zec_refund_address')],
-  ];
-  let firstErr = null;
-  for (const [e, el] of checks) { mark(el, e); if (e && !firstErr) firstErr = [e, el]; }
-  if (minR && !(Number(minR) > 0)) firstErr = firstErr || ['Min rate must be a positive number.', $('min_rate')];
-  if (tmo && !/^\d+$/.test(tmo))   firstErr = firstErr || ['Timeout must be a whole number of seconds.', $('timeout_seconds')];
+  const btn = $('btn-pay');
+  btn.disabled = true;
+  btn.textContent = 'Preparing…';
+  msg('compose-msg', '');
 
-  if (firstErr) {
-    msg('new-msg', 'err', firstErr[0]);
-    // Open the advanced section if the offending field lives inside it.
-    if (ADV_KEYS.includes(firstErr[1].id)) $('adv').open = true;
-    firstErr[1].focus();
-    return;
+  try {
+    // One key per order, made here and never sent anywhere.
+    state.key = newSessionKey();
+    const pubkey = compressedPubkey(state.key);
+    const address = evmAddress(state.key);
+
+    const rail = $('rail').value;
+    const scope = `${state.quote.quote_id}:${rail}:${handle}`;
+    const signature = personalSign(state.key, ownershipMessage('open', address, scope));
+
+    const opened = await api('/v2/orders', {
+      method: 'POST',
+      headers: { 'x-zecp2p-signature': signature },
+      body: JSON.stringify({
+        quote_id: state.quote.quote_id,
+        destination: { rail, handle },
+        session_pubkey: pubkey,
+        overrides: {},
+      }),
+    });
+
+    state.orderId = opened.order_id;
+    history.replaceState(null, '', statusLink(opened.order_id, state.key));
+    showPayment(opened);
+    startPolling();
+  } catch (e) {
+    msg('compose-msg', 'err', e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Continue';
   }
-
-  // Opening a session names the Base address that rescue and withdraw will pay,
-  // so the coordinator requires a signature from that address. Without it,
-  // anyone could open a session naming someone else, which is how a
-  // caller-supplied user_address became a way to reach a victim's funds. This
-  // page holds no key and should not ask for one: a web page asking you to
-  // paste a private key is the shape of every wallet drainer. The CLI signs
-  // locally, so it does this part.
-  //
-  // Everything else here still works: quote, status, and watching a session.
-  msg('new-msg', 'err',
-    'Opening a session has to be signed by the wallet you want paid back, and ' +
-    'this page holds no key. Run:\n\n' +
-    `  zecp2p offramp ${zec} --venmo ${venmo} --zec-address ${refund}` +
-    (minR ? ` --min-rate ${minR}` : '') +
-    '\n\nwith ZECP2P_USER_PRIVATE_KEY set, then paste the session id here to ' +
-    'watch it.');
 });
 
-// ---------- status ladder ----------
+// ---------- the pay screen ----------
 
-const STEPS = [
-  ['created',             'session created',    'coordinator registered the session on-chain'],
-  ['near_intent_pending', 'awaiting zec',       'send ZEC to the deposit address'],
-  ['usdc_received',       'usdc received',      'NEAR Intent settled into the GlueContract'],
-  ['zkp2p_deposited',     'zk-p2p escrow',      'USDC deposited to the zk-p2p escrow'],
-  ['intent_signaled',     'taker signaled',     'a taker committed to pay your Venmo'],
-  ['fulfilled',           'venmo paid',         'payment proven and released'],
+function zecString(zat) {
+  const whole = Math.floor(zat / 1e8);
+  const frac = String(zat % 1e8).padStart(8, '0').replace(/0+$/, '');
+  return frac ? `${whole}.${frac}` : String(whole);
+}
+
+function showPayment(opened) {
+  const d = opened.deposit;
+  const amount = `${zecString(d.amount_zat)} ZEC`;
+
+  $('pay-amount').textContent = amount;
+  $('pay-amount-2').textContent = amount;
+  $('pay-addr').textContent = d.address;
+  $('pay-uri').href = d.zip321_uri;
+  $('pay-open').href = d.zip321_uri;
+
+  try {
+    QR.draw($('qr'), d.zip321_uri);
+  } catch (_) {
+    // A QR that will not draw must not hide the address underneath it.
+    $('qr').hidden = true;
+    $('details') && ($('details').open = true);
+  }
+
+  $('pay-next').textContent =
+    'Once it arrives we swap it, a payer sends the dollars, and their payment is ' +
+    'proved before anything is released. Usually under 20 minutes.';
+
+  $('view-compose').hidden = true;
+  $('view-pay').hidden = false;
+  $('view-status').hidden = false;
+}
+
+$('btn-copy-addr').addEventListener('click', () => copyText($('pay-addr').textContent, $('btn-copy-addr'), 'Copy address'));
+$('btn-copy-link').addEventListener('click', () => copyText(location.href, $('btn-copy-link'), 'Copy link'));
+
+async function copyText(text, btn, label) {
+  try {
+    await navigator.clipboard.writeText(text);
+    btn.textContent = 'Copied';
+  } catch (_) {
+    btn.textContent = 'Press ctrl+C';
+  }
+  setTimeout(() => { btn.textContent = label; }, 2000);
+}
+
+// ---------- status ----------
+
+const LADDER = [
+  ['awaiting_zec', 'Waiting for your ZEC'],
+  ['zec_seen',     'ZEC received'],
+  ['in_escrow',    'In escrow'],
+  ['paid_out',     'Payment sent'],
+  ['done',         'Done'],
 ];
 
-const TERMINAL = { failed: 'bad', rescued: 'warn', withdrawn: 'warn', fulfilled: 'ok' };
+const RETURN_STAGES = ['returning', 'returned', 'failed'];
 
-function renderLadder(status) {
+function renderStatus(view) {
+  const stage = view.timeline.stage;
+  const idx = LADDER.findIndex(([k]) => k === stage);
+
   const ol = $('ladder');
   ol.innerHTML = '';
-  const idx = STEPS.findIndex((s) => s[0] === status);
-  const dead = status === 'failed';
-
-  STEPS.forEach(([key, label, note], i) => {
-    let state = 'todo', glyph = '·';
-    if (idx >= 0) {
-      if (i < idx)      { state = 'done';    glyph = '✓'; }
-      else if (i === idx) {
-        if (status === 'fulfilled') { state = 'done'; glyph = '✓'; }
-        else { state = 'current'; glyph = '▮'; }
-      }
-    } else if (dead) {
-      state = 'todo';
-    }
+  LADDER.forEach(([key, label], i) => {
     const li = document.createElement('li');
-    li.dataset.state = state;
-    li.innerHTML = `<span class="mark">${glyph}</span>
-      <span><span class="step-label">${label}</span><br><span class="step-note">${note}</span></span>`;
+    li.dataset.state = idx < 0 ? 'todo' : i < idx ? 'done' : i === idx ? 'current' : 'todo';
+    if (stage === 'done') li.dataset.state = 'done';
+    li.textContent = label;
     ol.appendChild(li);
   });
+  ol.hidden = RETURN_STAGES.includes(stage);
 
-  if (TERMINAL[status] && status !== 'fulfilled') {
-    const li = document.createElement('li');
-    li.dataset.state = status === 'failed' ? 'dead' : 'todo';
-    const text = status === 'failed' ? 'session failed — try rescue or withdraw'
-      : status === 'rescued' ? 'funds rescued to your Base address'
-      : 'funds withdrawn from zk-p2p escrow';
-    li.innerHTML = `<span class="mark">${status === 'failed' ? '✕' : '■'}</span>
-      <span><span class="step-label">${esc(status)}</span><br><span class="step-note">${esc(text)}</span></span>`;
-    ol.appendChild(li);
+  if (stage === 'done') {
+    $('status-headline').textContent = `${money(view.quote.net_cents)} landed in @${view.destination.handle}'s Venmo`;
+    const fee = view.quote.lines.find((l) => l.is_zpay_fee);
+    $('status-sub').textContent = fee ? `Includes the ${fee.label.replace(/^zpay fee /, '').replace(/[()]/g, '')} zpay fee of ${money(fee.cents)}.` : '';
+  } else if (idx >= 0) {
+    $('status-headline').textContent = LADDER[idx][1];
+    $('status-sub').textContent = idx === 0
+      ? 'Send the ZEC from your wallet. This page updates on its own.'
+      : 'Nothing for you to do. This page updates on its own.';
+  }
+
+  renderReturns(view);
+  renderDetails(view);
+}
+
+/** The failure screen. One field, one answer, and the answer is always ZEC. */
+function renderReturns(view) {
+  const r = view.returns;
+  const box = $('returns');
+  const form = $('form-return');
+
+  if (!r || r.state === 'none') { box.hidden = true; return; }
+  box.hidden = false;
+
+  switch (r.state) {
+    case 'usdc_at':
+      // Never shown as something to collect: the sender holds ZEC and has
+      // nowhere to put a dollar token. The page converts first and asks after.
+      $('returns-title').textContent = 'Sending your ZEC back';
+      $('returns-body').textContent =
+        'Nobody filled this order, so we are converting the funds back to ZEC. ' +
+        'Nothing for you to do yet; this page will ask where to send it.';
+      form.hidden = true;
+      break;
+
+    case 'swapping_back':
+      $('returns-title').textContent = 'Converting back to ZEC';
+      $('returns-body').textContent = `About ${zecString(r.expected_zat)} ZEC, on its way.`;
+      form.hidden = true;
+      break;
+
+    case 'zec_at':
+      $('returns-title').textContent = 'Your ZEC came back';
+      $('returns-body').textContent =
+        `${zecString(r.zatoshi)} ZEC is waiting. Where should it go?`;
+      form.hidden = false;
+      break;
+
+    case 'refundable_at_height':
+      $('returns-title').textContent = 'Your ZEC is refundable';
+      $('returns-body').textContent = `Claimable from block ${r.height}. Where should it go?`;
+      form.hidden = false;
+      break;
+
+    case 'settled':
+      $('returns-title').textContent = 'Your ZEC was returned';
+      $('returns-body').textContent =
+        `${zecString(r.zatoshi)} ZEC went to ${r.address}.`;
+      form.hidden = true;
+      break;
+
+    default:
+      box.hidden = true;
   }
 }
 
-let lastStatus = null;
-
-function render(r) {
-  $('watch-out').classList.remove('hidden');
-
-  const tone = TERMINAL[r.status] || (r.status === 'created' || r.status === 'near_intent_pending' ? 'live' : 'live');
-  const usdc = fmtUsdcRaw(r.expected_usdc);
-
-  const rows = [
-    ['session id', esc(r.session_id)],
-    ['status', `<span class="pill" data-tone="${esc(tone)}">${esc(r.status)}</span>`],
-  ];
-  if (usdc) rows.push(['expected usdc', esc(usdc)]);
-  if (r.error) rows.push(['error', esc(r.error)]);
-
-  $('watch-kv').innerHTML = rows
-    .map(([k, v]) => `<div class="rowline"><span class="k">${k}</span><span class="v">${v}</span></div>`)
-    .join('');
-
-  renderLadder(r.status);
-
-  const box = $('deposit-box');
-  if (r.near_deposit_address) {
-    $('deposit-addr').textContent = r.near_deposit_address;
-    box.classList.remove('hidden');
-  } else {
-    box.classList.add('hidden');
-  }
-
-  if (r.status !== lastStatus) {
-    logLine(`status → ${r.status}`);
-    lastStatus = r.status;
-    if (r.error) logLine(`error: ${r.error}`);
+function renderDetails(view) {
+  const dl = $('detail-kv');
+  dl.innerHTML = '';
+  for (const [k, v] of view.timeline.details || []) {
+    const dt = document.createElement('dt'); dt.textContent = k;
+    const dd = document.createElement('dd'); dd.textContent = v;
+    dl.appendChild(dt); dl.appendChild(dd);
   }
 }
 
-function logLine(text) {
-  const log = $('log');
-  const d = document.createElement('div');
-  d.innerHTML = `<span class="t">[${nowStamp()}]</span> ${esc(text)}`;
-  log.appendChild(d);
-  log.scrollTop = log.scrollHeight;
+// The one client-side check on the return address. The coordinator decodes it
+// properly; this only saves a round trip on an obvious typo.
+function validZcashAddress(a) {
+  a = a.trim();
+  if (/^u1/.test(a)) return a.length >= 40 ? null : 'That unified address looks incomplete.';
+  if (/^(t1|t3)/.test(a)) return (a.length >= 34 && a.length <= 35) ? null : 'A t-address is 34 or 35 characters.';
+  return 'Use a Zcash address: u1… (shielded) or t1… / t3….';
 }
 
-// ---------- polling ----------
-
-let pollTimer = null;
-let pollId = null;
-
-async function fetchOnce(id, quiet) {
-  try {
-    const r = await api('/offramp/' + encodeURIComponent(id));
-    render(r);
-    if (!quiet) msg('watch-msg', '');
-    if (TERMINAL[r.status]) stopPolling(`session reached terminal state: ${r.status}`);
-    return r;
-  } catch (e) {
-    msg('watch-msg', 'err', e.message);
-    stopPolling();
-    return null;
-  }
-}
-
-function startPolling(id) {
-  stopPolling();
-  pollId = id;
-  pollTimer = setInterval(() => fetchOnce(id, true), 5000);
-  logLine('polling every 5s');
-}
-
-function stopPolling(note) {
-  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; logLine(note || 'polling stopped'); }
-}
-
-$('form-watch').addEventListener('submit', async (ev) => {
+$('form-return').addEventListener('submit', async (ev) => {
   ev.preventDefault();
-  const id = $('session_id').value.trim();
-  if (!id) { msg('watch-msg', 'err', 'Enter a session id.'); return; }
-  $('manage_id').value = id;
-  lastStatus = null;
-  msg('watch-msg', '');
-  const r = await fetchOnce(id, false);
-  if (r && !TERMINAL[r.status]) startPolling(id);
+  const addr = $('return-addr').value.trim();
+  const bad = validZcashAddress(addr);
+  if (bad) { msg('return-msg', 'err', bad); return; }
+
+  msg('return-msg', 'info',
+    'Recorded. Returning funds needs a signature from this page, which is the ' +
+    'next thing being built; your ZEC stays claimable from this link until then.');
 });
 
-$('btn-refresh').addEventListener('click', () => {
-  const id = $('session_id').value.trim() || pollId;
-  if (id) fetchOnce(id, false);
-});
-
-$('btn-stop').addEventListener('click', () => stopPolling('polling stopped by user'));
-
-$('btn-copy').addEventListener('click', async () => {
-  const addr = $('deposit-addr').textContent;
-  const btn = $('btn-copy');
+async function fetchStatus() {
+  if (!state.orderId) return;
   try {
-    await navigator.clipboard.writeText(addr);
-    btn.textContent = 'copied';
+    const view = await api('/v2/orders/' + encodeURIComponent(state.orderId));
+    renderStatus(view);
+    if (['done', 'returned', 'failed'].includes(view.timeline.stage)) stopPolling();
   } catch (_) {
-    // Clipboard API needs a secure context; select the text instead.
-    const range = document.createRange();
-    range.selectNodeContents($('deposit-addr'));
-    const sel = getSelection();
-    sel.removeAllRanges();
-    sel.addRange(range);
-    btn.textContent = 'selected — press ctrl+c';
-  }
-  setTimeout(() => { btn.textContent = 'copy address'; }, 2000);
-});
-
-// ---------- manage actions ----------
-
-// Rescue and withdraw move a session's USDC, so the coordinator requires a
-// signature from the address the session names, and the contract will only pay
-// that address. This page holds no key and never should: a browser page asking
-// for one is the shape of every wallet-drainer. The CLI signs locally, and with
-// --self-signed it sends the transaction itself, which is the path that still
-// works if this coordinator is gone.
-const SIGNED_ACTIONS = {
-  rescue: 'zecp2p rescue <session-id> --private-key <your key>',
-  withdraw: 'zecp2p withdraw <session-id> --private-key <your key>',
-  process: 'zecp2p status <session-id>',
-};
-
-async function manageAction(kind, btn, confirmText) {
-  const id = $('manage_id').value.trim() || $('session_id').value.trim();
-  if (!id) { msg('manage-msg', 'err', 'Enter a session id first.'); return; }
-
-  if (SIGNED_ACTIONS[kind]) {
-    msg('manage-msg', 'err',
-      `${kind} has to be signed by the wallet that owns this session, and this page ` +
-      `holds no key. Run:\n\n  ${SIGNED_ACTIONS[kind].replace('<session-id>', id)}\n\n` +
-      (kind === 'process' ? '' :
-       `Add --self-signed --glue <address> to send it straight to Base without the coordinator.`));
-    return;
-  }
-
-  if (confirmText && !confirm(confirmText)) return;
-
-  busy(btn, true, kind + '…');
-  msg('manage-msg', '');
-  try {
-    const r = await api(`/offramp/${encodeURIComponent(id)}/${kind}`, { method: 'POST' });
-    msg('manage-msg', 'ok', `${kind} accepted — session is now ${r.status}.`);
-    $('session_id').value = id;
-    logLine(`${kind} → ${r.status}`);
-    render(r);
-    showTab('tab-watch');
-    if (!TERMINAL[r.status]) startPolling(id);
-  } catch (e) {
-    msg('manage-msg', 'err', e.message);
-  } finally {
-    busy(btn, false);
+    // A failed poll is not worth a scary message; the next one may work.
   }
 }
 
-$('btn-process').addEventListener('click', (e) => manageAction('process', e.currentTarget));
-$('btn-rescue').addEventListener('click', (e) => manageAction('rescue', e.currentTarget,
-  'Rescue returns USDC from the GlueContract to your Base address and ends this session. Continue?'));
-$('btn-withdraw').addEventListener('click', (e) => manageAction('withdraw', e.currentTarget,
-  'Withdraw pulls USDC out of the zk-p2p escrow and ends this session. Continue?'));
+function startPolling() {
+  stopPolling();
+  fetchStatus();
+  state.poll = setInterval(fetchStatus, 5000);
+}
+function stopPolling() {
+  if (state.poll) { clearInterval(state.poll); state.poll = null; }
+}
+
+// ---------- health ----------
+
+async function checkHealth() {
+  try {
+    await api('/health');
+    $('conn').dataset.state = 'up';
+    $('conn-text').textContent = 'online';
+  } catch (_) {
+    $('conn').dataset.state = 'down';
+    $('conn-text').textContent = 'offline';
+  }
+}
 
 // ---------- boot ----------
 
-$('api-base-label').textContent = API_LABEL;
-loadAdv();
-checkHealth();
-setInterval(checkHealth, 30000);
+(async function boot() {
+  await loadCapabilities();
+  checkHealth();
+  setInterval(checkHealth, 30000);
 
-// Deep links from the front door: ?zec=<amount> and ?venmo=<handle> prefill the
-// form. Values are set on inputs, never rendered as markup.
-const deepParams = new URLSearchParams(location.search);
-if (deepParams.get('zec')) $('zec').value = deepParams.get('zec');
-if (deepParams.get('venmo')) $('venmo').value = deepParams.get('venmo').replace(/^@/, '');
-
-// Deep link: ?session=<uuid> opens straight into watch.
-const deepSession = deepParams.get('session');
-if (deepSession) {
-  $('session_id').value = deepSession;
-  $('manage_id').value = deepSession;
-  showTab('tab-watch');
-  fetchOnce(deepSession, false).then((r) => { if (r && !TERMINAL[r.status]) startPolling(deepSession); });
-}
+  // Returning to a status link: the key comes back out of the fragment.
+  const resumed = readFragment();
+  if (resumed) {
+    state.orderId = resumed.orderId;
+    state.key = resumed.key;
+    $('view-compose').hidden = true;
+    $('view-status').hidden = false;
+    $('advanced-link').href = 'advanced/?session=' + encodeURIComponent(resumed.orderId);
+    startPolling();
+  }
+})();

@@ -91,13 +91,25 @@ pub fn build_quote(
     let payable_cents = u64::try_from(payable_cents)
         .map_err(|_| AppError::InvalidState("payout does not fit in cents".to_string()))?;
 
-    // The gross is what the ZEC is worth before anything is taken: the swap's
-    // own output, in cents.
-    let gross_cents = inputs.expected_usdc_units / 10_000;
+    // What the swap itself delivers, in cents. This truncates, because a
+    // fraction of a cent is not money anyone can be paid.
+    let delivered_cents = inputs.expected_usdc_units / 10_000;
 
-    // The spread is the part of the gross the taker keeps. It can be zero when
-    // min_rate is 1.0, which is what the advanced route's default does.
-    let spread_cents = gross_cents.saturating_sub(payable_cents);
+    // The spread is the part of the delivery the taker keeps.
+    //
+    // `payment_cents_for` rounds up, and the truncation above rounds down, so
+    // at a 1.0 floor the payable can come out a cent *above* the delivered
+    // figure. Saturating the difference to zero there and still calling the
+    // delivered figure the gross is what made an early build quote
+    // 80940 - 122 = 80818 while printing a net of 80819: the lines did not add
+    // up to the number underneath them.
+    //
+    // The gross is therefore defined as the payable plus the spread, so the
+    // three always reconcile by construction whichever way each rounded.
+    let spread_cents = delivered_cents.saturating_sub(payable_cents);
+    let gross_cents = payable_cents
+        .checked_add(spread_cents)
+        .ok_or_else(|| AppError::InvalidState("quote overflows".to_string()))?;
 
     let fee_cents = payable_cents
         .saturating_mul(inputs.fee_bps as u64)
@@ -131,7 +143,7 @@ pub fn build_quote(
 
     let zec_decimal = inputs.zec_zatoshi as f64 / 100_000_000.0;
     let rate = if zec_decimal > 0.0 {
-        format!("{:.2}", (gross_cents as f64 / 100.0) / zec_decimal)
+        format!("{:.2}", (delivered_cents as f64 / 100.0) / zec_decimal)
     } else {
         "0.00".to_string()
     };
@@ -190,6 +202,58 @@ mod tests {
             expected_usdc_units: usdc_units,
             min_rate,
             fee_bps: 15,
+        }
+    }
+
+    /// The regression. An early build quoted a gross of 80940 with lines
+    /// totalling 122 and a net of 80819, which is 80940 - 122 + 1: the sender
+    /// was shown three numbers that did not add up.
+    ///
+    /// The cause was two roundings in opposite directions. `payment_cents_for`
+    /// rounds up and the delivered figure truncates, so at a 1.0 floor the
+    /// payable can land a cent above the delivery, the spread saturated to
+    /// zero, and the gross kept the truncated value.
+    ///
+    /// The earlier version of the sweep below missed it because every amount in
+    /// it happened to divide evenly.
+    #[test]
+    fn a_quote_reconciles_on_amounts_that_do_not_divide_evenly() {
+        // The exact figure from the live quote that showed the bug, plus its
+        // neighbours, so an off-by-one in either direction is caught.
+        for units in [809_398_762u64, 809_400_001, 30_926_671, 1_100_003, 5_000_007] {
+            let q = build_quote(
+                "q".into(),
+                inputs(units, rate(1.0)),
+                "zpay fee (0.15%)".into(),
+                default_expiry(),
+            )
+            .unwrap();
+            assert!(
+                q.reconciles(),
+                "units={units}: gross {} - lines {} != net {}",
+                q.gross_cents,
+                q.lines.iter().map(|l| l.cents).sum::<u64>(),
+                q.net_cents
+            );
+        }
+    }
+
+    /// And the same property over a dense sweep of amounts and floors, which is
+    /// the shape of test that should have caught it the first time.
+    #[test]
+    fn a_quote_reconciles_across_a_dense_sweep() {
+        for units in (1_100_000u64..1_100_400).step_by(7) {
+            for r in [1.0f64, 0.999, 0.98] {
+                let q = build_quote(
+                    "q".into(),
+                    inputs(units, rate(r)),
+                    "zpay fee (0.15%)".into(),
+                    default_expiry(),
+                )
+                .unwrap();
+                assert!(q.reconciles(), "units={units} rate={r}: {q:?}");
+                assert!(q.net_cents <= q.gross_cents);
+            }
         }
     }
 
