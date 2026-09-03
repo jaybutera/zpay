@@ -490,7 +490,11 @@ pub async fn open_order(
         Some(named) => {
             crate::near::validate_zec_refund_address(named)
                 .map_err(|e| AppError::InvalidRequest(e.to_string()))?;
-            named.to_string()
+            // U3-8. Stored in the one form that decodes everywhere: validation
+            // folds case for a unified address, so keeping what was typed would
+            // put `U1…` on the row and hand it to 1Click, whose own decoder
+            // takes the lower-case form.
+            crate::near::canonical_zec_address(named)
         }
         None => identity.transparent_address.clone(),
     };
@@ -857,6 +861,75 @@ mod tests {
         assert!(resolve_backend(Some("something-else")).is_err());
     }
 
+    /// U3-3. A dollar ask that 1Click itself refuses comes back with the floor
+    /// and no dollar figure, because `from_quote_error` runs where no rate is
+    /// in hand. The caller has one, from the probe that sized the ask, so it
+    /// fills the number in.
+    ///
+    /// The case is not exotic: `observed_floor()` is a guess until 1Click has
+    /// rejected something in this process, so on a cold start the local check
+    /// passes an amount 1Click will refuse. It happens once per process, and
+    /// the process is restarted to deploy, so the first dollar sender after
+    /// every deploy is the one who gets it. The page then renders a ZEC amount
+    /// under a dollar sign.
+    #[test]
+    fn a_dollar_ask_refused_upstream_still_names_a_dollar_amount() {
+        // The numbers from the audit: 1Click's floor is 132,000 and one ZEC is
+        // 819,907,155 units, and the rate is known because the ask was in
+        // dollars.
+        let filled = fill_in_the_dollar_floor(
+            AppError::BelowFloor { zatoshi: 132_000, cents: None },
+            Some(819_907_155),
+        );
+        match filled {
+            AppError::BelowFloor { zatoshi, cents } => {
+                assert_eq!(zatoshi, 132_000);
+                assert_eq!(
+                    cents,
+                    Some(109),
+                    "U3-3: the refusal named no dollar amount, so the page prints \
+                     a ZEC figure under a dollar sign"
+                );
+            }
+            other => panic!("the refusal changed shape: {other:?}"),
+        }
+    }
+
+    /// A ZEC ask has no rate behind it, so there is nothing to name and nothing
+    /// is invented. The page falls back to the zatoshi figure, which is the
+    /// unit that caller asked in.
+    #[test]
+    fn a_zec_ask_refused_upstream_is_left_alone() {
+        let untouched = fill_in_the_dollar_floor(
+            AppError::BelowFloor { zatoshi: 132_000, cents: None },
+            None,
+        );
+        assert!(matches!(
+            untouched,
+            AppError::BelowFloor { zatoshi: 132_000, cents: None }
+        ));
+    }
+
+    /// And a refusal that already carries its dollar amount, or is not about
+    /// the floor at all, passes through untouched.
+    #[test]
+    fn only_a_floor_refusal_missing_its_cents_is_filled_in() {
+        let already = fill_in_the_dollar_floor(
+            AppError::BelowFloor { zatoshi: 132_000, cents: Some(150) },
+            Some(819_907_155),
+        );
+        assert!(matches!(
+            already,
+            AppError::BelowFloor { cents: Some(150), .. }
+        ));
+
+        let other = fill_in_the_dollar_floor(
+            AppError::NearIntents("the bridge is down".to_string()),
+            Some(819_907_155),
+        );
+        assert!(matches!(other, AppError::NearIntents(_)));
+    }
+
     /// U2-3, against the day's real numbers. On 2026-09-03 1Click's floor was
     /// 132,000 zatoshi and one ZEC quoted at 819,907,155 USDC units. Through
     /// the coordinator, $1.08 was refused and $1.09 quoted at 132,920 zatoshi,
@@ -958,6 +1031,25 @@ pub mod test_entry {
             Query(QuoteV2Query {
                 amount: zec,
                 unit: "zec".to_string(),
+                rail: "venmo".to_string(),
+                backend: None,
+                min_rate: None,
+            }),
+        )
+        .await?;
+        Ok(q)
+    }
+
+    /// `GET /v2/quote?amount=<dollars>&unit=usd`, the deep link's own path.
+    pub async fn quote_usd(state: &Arc<AppState>, cents: u64) -> Result<Quote, AppError> {
+        let dollars = format!("{}.{:02}", cents / 100, cents % 100);
+        let Json(q) = quote_v2(
+            State(state.clone()),
+            None,
+            HeaderMap::new(),
+            Query(QuoteV2Query {
+                amount: dollars,
+                unit: "usd".to_string(),
                 rail: "venmo".to_string(),
                 backend: None,
                 min_rate: None,

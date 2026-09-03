@@ -338,14 +338,19 @@ pub fn validate_zec_refund_address(address: &str) -> Result<()> {
 
     // U3-8. Bech32m is case-insensitive and a wallet is free to hand a user an
     // all-upper-case `U1…`, which several do for QR codes; the page lower-cases
-    // one before it validates and the server used to refuse it as "not a Zcash
-    // address". The prefix match is on a lower-cased copy so both sides agree,
-    // and the decoders below get the string the caller sent: `zcash_address`
-    // does its own case handling, and a mixed-case string, which is the one
-    // form bech32m really does forbid, still fails there rather than here.
-    let prefix = address.to_ascii_lowercase();
+    // one in the return form before it validates and the server used to match
+    // `u1` case-sensitively and refuse it as "not a Zcash address", so the two
+    // halves disagreed about the same address.
+    //
+    // The prefix match and the unified decoder both work on a lower-cased copy.
+    // `zcash_address` does not fold case itself: it hands the string to a
+    // bech32m decoder that takes one case or the other, and the upper-case form
+    // it will not take is the form a QR code carries. Base58check, which is what
+    // the transparent branch decodes, is case-*sensitive*, so that branch gets
+    // the string as sent and a `T1…` is still refused, correctly.
+    let folded = address.to_ascii_lowercase();
 
-    if prefix.starts_with("t1") || prefix.starts_with("t3") {
+    if folded.starts_with("t1") || folded.starts_with("t3") {
         // U1-4. Length and charset are not a checksum: `t1AAAA…` and the repo's
         // own placeholder with one character changed both passed the old check,
         // and 1Click accepted them too, so a failed swap would have been
@@ -353,15 +358,15 @@ pub fn validate_zec_refund_address(address: &str) -> Result<()> {
         return validate_transparent_address(address);
     }
 
-    if prefix.starts_with("u1") {
+    if folded.starts_with("u1") {
         // Decode it rather than pattern-match the prefix: `u1` followed by
         // anything is not a unified address, and 1Click would answer 400 for a
         // string that fails its bech32m checksum. Deciding here costs no round
         // trip and names the problem.
-        return validate_unified_address(address);
+        return validate_unified_address(&folded);
     }
 
-    if prefix.starts_with("zs") || prefix.starts_with("zc") {
+    if folded.starts_with("zs") || folded.starts_with("zc") {
         anyhow::bail!(
             "refund address {} is a Sapling or Sprout address. Use a unified address \
              (u1...) or a transparent one (t1.../t3...)",
@@ -370,6 +375,26 @@ pub fn validate_zec_refund_address(address: &str) -> Result<()> {
     }
 
     anyhow::bail!("refund address {} is not a Zcash address", address)
+}
+
+/// The form of a Zcash address to store and to send upstream.
+///
+/// U3-8. Validation folds case so an upper-case `U1…` from a QR code is the
+/// same address it is; storing what the caller typed would then hand 1Click a
+/// string its own decoder may not take, and put a form on the row that does not
+/// match what a later lookup compares against. A unified address is bech32m and
+/// its canonical form is lower case, so that is what is kept. A transparent
+/// address is base58check, where case carries data, so it is kept exactly.
+///
+/// Call this only on a string `validate_zec_refund_address` has accepted.
+pub fn canonical_zec_address(address: &str) -> String {
+    let address = address.trim();
+    let folded = address.to_ascii_lowercase();
+    if folded.starts_with("u1") {
+        folded
+    } else {
+        address.to_string()
+    }
 }
 
 /// Check that a `t1` or `t3` string really is a well-formed transparent
@@ -853,6 +878,31 @@ mod tests {
             Some(50),
         );
         request.validate().expect("a unified refundTo is quotable");
+    }
+
+    /// U3-8. Bech32m is case-insensitive and wallets hand out the upper-case
+    /// form for QR codes. The page lower-cases one in the return form before it
+    /// validates; the server matched `u1` case-sensitively and refused `U1…` as
+    /// "not a Zcash address", so the two halves disagreed about the same
+    /// address. They agree now, and the string still has to decode.
+    #[test]
+    fn an_upper_case_unified_address_is_the_same_address() {
+        use zcash_address::unified::{self, Encoding};
+        let ua = unified::Address::try_from_items(vec![
+            unified::Receiver::Orchard([3u8; 43]),
+            unified::Receiver::P2pkh([7u8; 20]),
+        ])
+        .unwrap()
+        .encode(&zcash_protocol::consensus::NetworkType::Main);
+
+        validate_zec_refund_address(&ua).expect("the lower-case form is accepted");
+        validate_zec_refund_address(&ua.to_uppercase())
+            .expect("U3-8: the same address in upper case must be the same address");
+
+        // And the fix is a case fold, not a shortcut past the checksum: a string
+        // that only looks like an address is still refused in either case.
+        assert!(validate_zec_refund_address("U1NOTAREALADDRESSATALL").is_err());
+        assert!(validate_zec_refund_address("u1notarealaddressatall").is_err());
     }
 
     #[test]
