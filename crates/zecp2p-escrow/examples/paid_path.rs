@@ -40,7 +40,7 @@ use zecp2p_escrow::lp_client::{AttestorClient, WireAttestation};
 use zecp2p_escrow::payment_details::{
     IDENTITY_RATE_18DEC, USD_FIAT_CURRENCY, VENMO_PAYMENT_METHOD,
 };
-use zecp2p_escrow::rpc::{txid_to_rpc_hex, Network, RpcChainClient, RpcConfig};
+use zecp2p_escrow::rpc::{txid_to_display, Network, RpcChainClient, RpcConfig};
 use zecp2p_escrow::script::release_script_sig;
 use zecp2p_escrow::terms::CanonicalTerms;
 use zecp2p_escrow::tx::{
@@ -84,9 +84,35 @@ struct RunRecord {
 }
 
 impl RunRecord {
+    /// Loads a run record, distinguishing "no run yet" from "the run's record
+    /// is damaged".
+    ///
+    /// Round 10: both used to return `None`, so a corrupt record read as a
+    /// fresh start. A resume would then draw a new nonce and re-sign, which is
+    /// precisely the R9-1 failure the record exists to prevent. A damaged
+    /// record stops the run instead.
     fn load(path: &str) -> Option<Self> {
-        let text = std::fs::read_to_string(path).ok()?;
-        serde_json::from_str(&text).ok()
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) => {
+                eprintln!("cannot read the run record at {path}: {e}");
+                eprintln!("  Refusing to treat an unreadable record as a fresh run.");
+                std::process::exit(2);
+            }
+        };
+        match serde_json::from_str(&text) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                eprintln!("the run record at {path} is corrupt: {e}");
+                eprintln!();
+                eprintln!("  Refusing to start over: this escrow may already have a");
+                eprintln!("  pre-signature outstanding, and re-signing with a fresh nonce");
+                eprintln!("  would leak the user key if the first signature is also seen.");
+                eprintln!("  Restore the record, or refund the escrow at T.");
+                std::process::exit(2);
+            }
+        }
     }
 
     fn save(&self, path: &str) {
@@ -267,10 +293,12 @@ struct Setup {
 
 /// Everything both subcommands need, derived once so they cannot disagree.
 fn setup(args: &[String], allow_create: bool) -> Setup {
-    let funding_txid: [u8; 32] = hex::decode(args[2].trim())
-        .expect("txid hex")
-        .try_into()
-        .expect("32 bytes");
+    // Round 10 finding 2: every tool now takes the txid in display order - what
+    // an explorer, `getblock` and `fund_escrow`'s own output show - and
+    // converts internally. This one used to take the reverse, so the same
+    // escrow needed two different strings depending on the command.
+    let funding_txid = zecp2p_escrow::rpc::txid_from_display(args[2].trim())
+        .expect("txid must be 64 hex characters, as an explorer prints it");
     let vout: u32 = args[3].parse().expect("vout");
     let refund_height: u64 = args[4].parse().expect("T");
     let payee_hash: [u8; 32] = hex::decode(args[5].trim())
@@ -437,6 +465,47 @@ fn setup(args: &[String], allow_create: bool) -> Setup {
     }
 }
 
+/// Refuses to proceed once the escrow is too close to `T`.
+///
+/// Round 10 finding 3: an escrow funded 35 blocks before `T` still printed
+/// "SEND THE DOLLAR", and a release was accepted 15 blocks past
+/// `BROADCAST_DEADLINE`. The runbook had a cutoff; nothing enforced it. Past
+/// these heights the run cannot finish, and the money would go out for an
+/// escrow that ends in a refund.
+fn enforce_deadlines(s: &Setup, stage: &str) {
+    let policy = zecp2p_escrow::deadlines::EscrowPolicy::mainnet_default();
+    let t = s.terms.refund_height as u32;
+    let height = s.chain.height().expect("height");
+
+    let (limit, what) = match stage {
+        // `announce` is followed by a Venmo payment, so it is gated on the
+        // deadline for paying.
+        "announce" => (
+            policy.pay_deadline_for_refund_height(t),
+            "PAY_DEADLINE: the LP must not send Venmo at or after this height",
+        ),
+        // `attest` ends in a broadcast.
+        _ => (
+            policy.broadcast_deadline_for_refund_height(t),
+            "BROADCAST_DEADLINE: a release broadcast after this races the refund",
+        ),
+    };
+
+    println!("  height         {height}  (T {t}, limit {limit})");
+    if height >= limit {
+        eprintln!();
+        eprintln!("REFUSING TO PROCEED.");
+        eprintln!("  height {height} is at or past {limit}");
+        eprintln!("  {what}");
+        eprintln!();
+        eprintln!(
+            "  The escrow is safe: at height {t} the user key alone refunds it. Run:"
+        );
+        eprintln!("    escrow_e2e refund <txid> <vout> <t1 refund address>");
+        std::process::exit(3);
+    }
+}
+
 fn attestor_client() -> AttestorClient {
     AttestorClient::new(env("ZECP2P_ATTESTOR_URL"), env("ZECP2P_ATTESTOR_TOKEN"))
         .expect("attestor client")
@@ -462,6 +531,7 @@ fn cmd_announce(args: &[String]) {
     println!("  value          {} zat", s.canonical.amount_zat);
     println!("  T              {}", s.canonical.refund_height);
     println!("  terms hash     {}", hex::encode(s.canonical.terms_hash()));
+    enforce_deadlines(&s, "announce");
 
     let attestor = attestor_client();
     let (p_hex, build) = attestor.identity().expect("identity");
@@ -569,6 +639,8 @@ fn cmd_attest(args: &[String]) {
         return;
     }
 
+    enforce_deadlines(&s, "attest");
+
     let y = secp256k1_zkp::PublicKey::from_slice(&hex::decode(&record.y).unwrap())
         .expect("recorded Y");
     let pre_sig =
@@ -661,13 +733,13 @@ fn cmd_attest(args: &[String]) {
     let raw = serialize_release(&s.terms, &s.lp_script, s.fee, &script_sig).expect("serialize");
 
     record.raw_release = Some(hex::encode(&raw));
-    record.txid = Some(txid_to_rpc_hex(&expected));
+    record.txid = Some(txid_to_display(&expected));
     record.save(&s.record_path);
 
     println!("== release ==");
     println!("  fee            {} zat", s.fee);
     println!("  pays           {} zat", s.canonical.amount_zat - s.fee);
-    println!("  txid           {}", txid_to_rpc_hex(&expected));
+    println!("  txid           {}", txid_to_display(&expected));
     broadcast(&s, &raw, &record);
 }
 
@@ -681,13 +753,13 @@ fn broadcast(s: &Setup, raw: &[u8], record: &RunRecord) {
         || std::thread::sleep(Duration::from_secs(15)),
     ) {
         Ok(id) => {
-            println!("  node accepted  {}", txid_to_rpc_hex(&id));
+            println!("  node accepted  {}", txid_to_display(&id));
             println!();
             println!("verify criterion 6 once it is mined:");
             println!(
                 "  paid_path verify {} {}",
                 s.record_path,
-                txid_to_rpc_hex(&id)
+                txid_to_display(&id)
             );
         }
         Err(e) => {

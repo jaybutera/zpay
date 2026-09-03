@@ -29,6 +29,8 @@ use zecp2p_escrow::chain::{ChainClient, ChainError};
 use zecp2p_escrow::deadlines::EscrowPolicy;
 use zecp2p_escrow::depth::required_depth;
 use zecp2p_escrow::fees::refund_fee_to_transparent_zat;
+use zecp2p_escrow::address::{script_pubkey_for, AddrNetwork, AddressError};
+use zecp2p_escrow::keystore::{self, KeyOrigin};
 use zecp2p_escrow::funding::{escrow_address, AddressNetwork};
 use zecp2p_escrow::rpc::{Network, RpcChainClient, RpcConfig};
 use zecp2p_escrow::script::refund_script_sig;
@@ -46,31 +48,34 @@ use zecp2p_escrow::tx::{build_refund, encode_signature, serialize_refund, Escrow
 const DEV_U: [u8; 32] = [0x11; 32];
 const DEV_L: [u8; 32] = [0x22; 32];
 
-/// Resolves a key: an explicit one from the environment, one from the
-/// per-escrow keystore, or the public development key.
+/// Resolves a key through the shared keystore.
 ///
 /// Spec section 2 wants an ephemeral key per escrow. `ZECP2P_KEYSTORE` plus
 /// `ZECP2P_ESCROW_LABEL` gives that: a fresh key the first time a label is
 /// seen, the same key on every resume, written 0600 before it is returned.
-fn key(var: &str, label_suffix: &str, fallback: [u8; 32]) -> (SecretKey, bool) {
-    if let Ok(h) = std::env::var(var) {
-        let bytes = hex::decode(h.trim()).expect("key must be 64 hex characters");
-        return (
-            SecretKey::from_slice(&bytes).expect("key must be a valid secp256k1 scalar"),
-            false,
-        );
+///
+/// `allow_create` is false for every command that spends an existing escrow.
+/// Creating a key there would silently derive a *different* address from the
+/// one holding the coin, and the refund would sign for an escrow that does not
+/// exist. `KeystoreError::WouldCreate` says which file was missing instead.
+fn key(var: &str, label_suffix: &str, fallback: [u8; 32], allow_create: bool) -> (SecretKey, KeyOrigin) {
+    match keystore::from_env(var, label_suffix, fallback, allow_create) {
+        Ok(pair) => pair,
+        Err(keystore::KeystoreError::WouldCreate { path }) => {
+            eprintln!("refusing to create a key for a command that spends an existing escrow.");
+            eprintln!("  missing: {path}");
+            eprintln!();
+            eprintln!("  This escrow was funded against a key that already exists. Creating a");
+            eprintln!("  new one would derive a different address and sign for the wrong");
+            eprintln!("  escrow. Point ZECP2P_KEYSTORE/ZECP2P_ESCROW_LABEL at the original");
+            eprintln!("  keystore, or set {var} to the original key.");
+            std::process::exit(2);
+        }
+        Err(e) => {
+            eprintln!("keystore: {e}");
+            std::process::exit(2);
+        }
     }
-    if let (Ok(dir), Ok(label)) = (
-        std::env::var("ZECP2P_KEYSTORE"),
-        std::env::var("ZECP2P_ESCROW_LABEL"),
-    ) {
-        let ks = zecp2p_escrow::keystore::Keystore::new(dir);
-        let k = ks
-            .load_or_create(&format!("{label}-{label_suffix}"))
-            .expect("keystore");
-        return (SecretKey::from_slice(&k.secret_bytes()).unwrap(), false);
-    }
-    (SecretKey::from_slice(&fallback).unwrap(), true)
 }
 
 fn client() -> (RpcChainClient, Network) {
@@ -108,72 +113,25 @@ fn retry<T>(label: &str, mut f: impl FnMut() -> Result<T, ChainError>) -> T {
     panic!("{label}: still rate limited");
 }
 
-fn p2pkh_from_t_addr(addr: &str) -> Vec<u8> {
-    // Minimal base58check decode for a t1/t3 address, enough to build an output.
-    const ALPHABET: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-    let mut num: Vec<u8> = Vec::new();
-    for c in addr.bytes() {
-        let mut carry = ALPHABET
-            .iter()
-            .position(|a| *a == c)
-            .expect("address is not base58") as u32;
-        for d in num.iter_mut() {
-            carry += (*d as u32) * 58;
-            *d = (carry & 0xff) as u8;
-            carry >>= 8;
-        }
-        while carry > 0 {
-            num.push((carry & 0xff) as u8);
-            carry >>= 8;
-        }
-    }
-    let zeros = addr.bytes().take_while(|b| *b == b'1').count();
-    let mut full = vec![0u8; zeros];
-    full.extend(num.iter().rev());
-    assert!(full.len() >= 26, "address too short: {addr}");
-
-    // R5-7: check the trailing four bytes against the double-SHA256 of the
-    // payload. Without this a single mistyped character sends the refund to a
-    // hash nobody holds - TAZ on the testnet run, the escrow on the mainnet one.
-    let (payload, checksum) = full.split_at(full.len() - 4);
-    let expected = {
-        use sha2::{Digest, Sha256};
-        Sha256::digest(Sha256::digest(payload))
+/// Decodes a spend destination, refusing anything the library's address
+/// rules reject. The rules live in `zecp2p_escrow::address` so they can be
+/// unit-tested without a mainnet node.
+fn p2pkh_from_t_addr(addr: &str, network: Network) -> Vec<u8> {
+    let want = match network {
+        Network::Main => AddrNetwork::Main,
+        Network::Test => AddrNetwork::Test,
     };
-    assert_eq!(
-        checksum,
-        &expected[..4],
-        "address checksum does not match; {addr} is mistyped"
-    );
-
-    // R9-8: check the version prefix rather than the leading characters, so a
-    // testnet address under a mainnet config is refused instead of decoding to
-    // an unspendable hash. Mainnet t1 = 1cb8, t3 = 1cbd; testnet tm = 1d25,
-    // t2 = 1cba.
-    let prefix = [full[0], full[1]];
-    const KNOWN: [([u8; 2], bool); 4] = [
-        ([0x1c, 0xb8], false),
-        ([0x1c, 0xbd], true),
-        ([0x1d, 0x25], false),
-        ([0x1c, 0xba], true),
-    ];
-    let is_p2sh = KNOWN
-        .iter()
-        .find(|(p, _)| *p == prefix)
-        .unwrap_or_else(|| panic!("{addr} has version prefix {prefix:02x?}, which is not a Zcash transparent address"))
-        .1;
-
-    let hash = &full[2..22];
-    if is_p2sh {
-        let mut s = vec![0xa9, 20];
-        s.extend_from_slice(hash);
-        s.push(0x87);
-        s
-    } else {
-        let mut s = vec![0x76, 0xa9, 20];
-        s.extend_from_slice(hash);
-        s.extend_from_slice(&[0x88, 0xac]);
-        s
+    match script_pubkey_for(addr, want) {
+        Ok(spk) => spk,
+        Err(e) => {
+            eprintln!("refusing to build a transaction paying {addr}:");
+            eprintln!("  {e}");
+            if matches!(e, AddressError::WrongNetwork { .. }) {
+                eprintln!();
+                eprintln!("  It would confirm and pay a hash nobody holds a key for.");
+            }
+            std::process::exit(2);
+        }
     }
 }
 
@@ -181,8 +139,14 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let cmd = args.get(1).map(String::as_str).unwrap_or("plan");
 
-    let (u_priv, u_dev) = key("ZECP2P_U_PRIV", "u", DEV_U);
-    let (l_priv, l_dev) = key("ZECP2P_L_PRIV", "l", DEV_L);
+    // `plan` is the only command that may mint keys; everything else spends an
+    // escrow that already exists.
+    let allow_create = cmd == "plan";
+    let (u_priv, u_from) = key("ZECP2P_U_PRIV", "u", DEV_U, allow_create);
+    let (l_priv, l_from) = key("ZECP2P_L_PRIV", "l", DEV_L, allow_create);
+    let u_dev = u_from == KeyOrigin::Development;
+    let l_dev = l_from == KeyOrigin::Development;
+    println!("keys               : u: {u_from:?}, l: {l_from:?}");
     let secp = Secp256k1::new();
     let u_pub = PublicKey::from_secret_key(&secp, &u_priv).serialize();
     let l_pub = PublicKey::from_secret_key(&secp, &l_priv).serialize();
@@ -329,7 +293,7 @@ fn main() {
             // fee is the transparent one. Paying the shielded number here
             // overpays for actions the transaction does not have (R7-2).
             let fee = refund_fee_to_transparent_zat(redeem.len());
-            let out_script = p2pkh_from_t_addr(dest);
+            let out_script = p2pkh_from_t_addr(dest, network);
             let unsigned = build_refund(&terms, &out_script, fee).expect("build refund");
             let digest = unsigned.sighash().expect("sighash");
 
@@ -379,6 +343,8 @@ fn main() {
     }
 }
 
+/// Display order, the same as every other tool (round 10 finding 2).
 fn parse_txid(s: &str) -> [u8; 32] {
-    zecp2p_escrow::rpc::rpc_hex_to_txid(s.trim()).expect("txid must be 64 hex characters")
+    zecp2p_escrow::rpc::txid_from_display(s.trim())
+        .expect("txid must be 64 hex characters, as an explorer prints it")
 }

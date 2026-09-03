@@ -17,7 +17,7 @@ use secp256k1::{Message, PublicKey, Secp256k1, SecretKey};
 
 use zecp2p_escrow::chain::ChainClient;
 use zecp2p_escrow::fees::release_fee_to_transparent_zat;
-use zecp2p_escrow::rpc::{rpc_hex_to_txid, Network, RpcChainClient, RpcConfig};
+use zecp2p_escrow::rpc::{txid_from_display, Network, RpcChainClient, RpcConfig};
 use zecp2p_escrow::script::release_script_sig;
 use zecp2p_escrow::tx::{build_release, encode_signature, serialize_release, EscrowTerms};
 
@@ -33,7 +33,7 @@ fn p2pkh(hash: [u8; 20]) -> Vec<u8> {
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
-    let txid = rpc_hex_to_txid(a[1].trim()).expect("txid");
+    let txid = txid_from_display(a[1].trim()).expect("txid, as an explorer prints it");
     let vout: u32 = a[2].parse().expect("vout");
     let refund_height: u64 = a[3].parse().expect("T");
 

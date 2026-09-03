@@ -398,6 +398,25 @@ pub fn txid_to_rpc_hex(txid: &[u8; 32]) -> String {
     hex::encode(reversed)
 }
 
+/// Parses a txid as a human reads it: the order every explorer, `getblock` and
+/// `getrawtransaction` prints.
+///
+/// Round 10 finding 2: `escrow_e2e` and `fund_escrow` reversed their argument
+/// while `paid_path` took it raw, so the same escrow needed two different
+/// strings depending on the command, and the runbook documented the wrong one
+/// for `refund`. Getting it backwards is not loud - the tool reports "the
+/// escrow output must exist" or the attestor answers a 503 the LP is told to
+/// retry - so every tool now takes this one order and converts internally.
+pub fn txid_from_display(s: &str) -> Result<[u8; 32], ChainError> {
+    rpc_hex_to_txid(s)
+}
+
+/// Renders a txid the way a human reads it, and the way every tool here now
+/// accepts it. The same string round-trips through [`txid_from_display`].
+pub fn txid_to_display(txid: &[u8; 32]) -> String {
+    txid_to_rpc_hex(txid)
+}
+
 /// The inverse of [`txid_to_rpc_hex`].
 pub fn rpc_hex_to_txid(s: &str) -> Result<[u8; 32], ChainError> {
     let bytes = hex::decode(s)

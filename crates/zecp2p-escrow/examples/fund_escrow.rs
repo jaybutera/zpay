@@ -25,7 +25,7 @@ use zcash_transparent::address::Script;
 use zcash_transparent::bundle::{Authorized as TAuthorized, Bundle, OutPoint, TxIn, TxOut};
 
 use zecp2p_escrow::chain::ChainClient;
-use zecp2p_escrow::rpc::{rpc_hex_to_txid, Network, RpcChainClient, RpcConfig};
+use zecp2p_escrow::rpc::{txid_from_display, Network, RpcChainClient, RpcConfig};
 use zecp2p_escrow::tx::encode_signature;
 
 /// The regtest miner key, from `miner_addr.rs`. Regtest coin, worth nothing.
@@ -33,7 +33,7 @@ const MINER_KEY: [u8; 32] = [0x5e; 32];
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
-    let txid = rpc_hex_to_txid(a[1].trim()).expect("txid");
+    let txid = txid_from_display(a[1].trim()).expect("txid, as an explorer prints it");
     let vout: u32 = a[2].parse().expect("vout");
     let value_zat: u64 = a[3].parse().expect("input value in zat");
     let escrow_spk = hex::decode(a[4].trim()).expect("escrow scriptPubKey hex");
@@ -120,7 +120,12 @@ fn main() {
 
     println!("funding raw : {}", hex::encode(&raw));
     match chain.broadcast(&raw) {
-        Ok(id) => println!("FUNDING TXID: {}", hex::encode(id)),
+        // Display order, so this line can be pasted straight into the next
+        // command (round 10 finding 2).
+        Ok(id) => println!(
+            "FUNDING TXID: {}",
+            zecp2p_escrow::rpc::txid_to_rpc_hex(&id)
+        ),
         Err(e) => println!("node said   : {e}"),
     }
 }

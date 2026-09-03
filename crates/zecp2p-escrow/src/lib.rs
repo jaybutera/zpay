@@ -6,6 +6,7 @@
 //! the P2SH address, and the transaction builders whose ZIP 244 digest both
 //! sides sign.
 
+pub mod address;
 pub mod attestation;
 pub mod chain;
 pub mod client;
