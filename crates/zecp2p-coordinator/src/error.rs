@@ -67,6 +67,17 @@ pub enum AppError {
     /// The caller is asking faster than this endpoint serves.
     #[error("too many requests; try again in {retry_after_seconds}s")]
     TooManyRequests { retry_after_seconds: u64 },
+
+    /// The coordinator is holding as many unfunded orders as it can sweep, and
+    /// this caller is not the reason.
+    ///
+    /// U3-2. The backlog cap used to answer "too many requests", which is a
+    /// sentence about the caller. A sender who has opened nothing and is
+    /// standing behind two hundred rows somebody else opened has not sent too
+    /// much of anything, and telling them they have sends them away rather than
+    /// back in a minute. Same status and same `Retry-After`; different subject.
+    #[error("the queue is full right now, not your fault; try again in {retry_after_seconds}s")]
+    QueueFull { retry_after_seconds: u64 },
 }
 
 impl IntoResponse for AppError {
@@ -89,6 +100,7 @@ impl IntoResponse for AppError {
             AppError::Config(_) => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
             AppError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Internal error".to_string()),
             AppError::TooManyRequests { .. } => (StatusCode::TOO_MANY_REQUESTS, self.to_string()),
+            AppError::QueueFull { .. } => (StatusCode::TOO_MANY_REQUESTS, self.to_string()),
         };
 
         // Log errors with appropriate level
@@ -98,6 +110,7 @@ impl IntoResponse for AppError {
             | AppError::InvalidRequest(_)
             | AppError::BelowFloor { .. }
             | AppError::TooManyRequests { .. }
+            | AppError::QueueFull { .. }
             | AppError::Unauthorized(_) => {
                 warn!(error = %self, status = %status, "Client error")
             }
@@ -123,6 +136,9 @@ impl IntoResponse for AppError {
         }
 
         if let AppError::TooManyRequests {
+            retry_after_seconds,
+        }
+        | AppError::QueueFull {
             retry_after_seconds,
         } = &self
         {

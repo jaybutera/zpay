@@ -336,7 +336,16 @@ impl QuoteRequest {
 pub fn validate_zec_refund_address(address: &str) -> Result<()> {
     let address = address.trim();
 
-    if address.starts_with("t1") || address.starts_with("t3") {
+    // U3-8. Bech32m is case-insensitive and a wallet is free to hand a user an
+    // all-upper-case `U1…`, which several do for QR codes; the page lower-cases
+    // one before it validates and the server used to refuse it as "not a Zcash
+    // address". The prefix match is on a lower-cased copy so both sides agree,
+    // and the decoders below get the string the caller sent: `zcash_address`
+    // does its own case handling, and a mixed-case string, which is the one
+    // form bech32m really does forbid, still fails there rather than here.
+    let prefix = address.to_ascii_lowercase();
+
+    if prefix.starts_with("t1") || prefix.starts_with("t3") {
         // U1-4. Length and charset are not a checksum: `t1AAAA…` and the repo's
         // own placeholder with one character changed both passed the old check,
         // and 1Click accepted them too, so a failed swap would have been
@@ -344,7 +353,7 @@ pub fn validate_zec_refund_address(address: &str) -> Result<()> {
         return validate_transparent_address(address);
     }
 
-    if address.starts_with("u1") {
+    if prefix.starts_with("u1") {
         // Decode it rather than pattern-match the prefix: `u1` followed by
         // anything is not a unified address, and 1Click would answer 400 for a
         // string that fails its bech32m checksum. Deciding here costs no round
@@ -352,7 +361,7 @@ pub fn validate_zec_refund_address(address: &str) -> Result<()> {
         return validate_unified_address(address);
     }
 
-    if address.starts_with("zs") || address.starts_with("zc") {
+    if prefix.starts_with("zs") || prefix.starts_with("zc") {
         anyhow::bail!(
             "refund address {} is a Sapling or Sprout address. Use a unified address \
              (u1...) or a transparent one (t1.../t3...)",

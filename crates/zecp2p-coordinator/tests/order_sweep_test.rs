@@ -1012,3 +1012,211 @@ async fn a_backward_clock_step_does_not_starve_the_rotation() {
         unpolled.iter().take(3).collect::<Vec<_>>()
     );
 }
+
+// ---------------------------------------------------------------------------
+// U3-2: a full queue must not be a lockout
+// ---------------------------------------------------------------------------
+
+/// The backlog is counted per source address, not only per session key.
+///
+/// The per-key cap of four bounds nobody: keys are free and the page mints a
+/// new one on every submit, so the audit's flood of two hundred rows from fifty
+/// distinct keys never touched it. From one address it is two hundred rows
+/// here, and eight is the cap.
+#[tokio::test]
+async fn the_backlog_is_counted_per_source_address() {
+    let (_near, near_url) = start_status_mock(0).await;
+    let temp = TempDir::new().expect("temp dir");
+    let db_path = temp.path().join("per-source.db").to_string_lossy().to_string();
+    let state = coordinator_with(&near_url, &db_path).await;
+
+    let now = chrono::Utc::now();
+    let expires = now + chrono::Duration::hours(2);
+
+    // The audit's flood: fifty free keys, one address.
+    for i in 0..50 {
+        let mut order = order_at(&format!("t1Flood{i:08}"), now, expires);
+        order.session_pubkey = format!("free-key-{i}");
+        state
+            .db
+            .insert_order_from_source(&order, Some("203.0.113.7"))
+            .await
+            .expect("insert");
+    }
+    let mut real = order_at("t1ARealSender", now, expires);
+    real.session_pubkey = "a-real-key".to_string();
+    state
+        .db
+        .insert_order_from_source(&real, Some("198.51.100.4"))
+        .await
+        .expect("insert");
+
+    assert_eq!(
+        state
+            .db
+            .count_unfunded_orders_from_source("203.0.113.7")
+            .await
+            .expect("count"),
+        50,
+        "the flood has to be visible as one caller's, or the only cap that sees \
+         it is the global one and the global one refuses everybody"
+    );
+    assert_eq!(
+        state
+            .db
+            .count_unfunded_orders_from_source("198.51.100.4")
+            .await
+            .expect("count"),
+        1,
+        "one address's backlog must not be charged to another"
+    );
+    // And the per-key count still says what it always said, which is the point:
+    // fifty free keys look like fifty senders to it.
+    assert_eq!(
+        state
+            .db
+            .count_unfunded_orders_for_key("free-key-0")
+            .await
+            .expect("count"),
+        1
+    );
+}
+
+/// A full queue sheds its stalest rows instead of sitting full for six hours.
+///
+/// The lockout was the shape of the round 2 cap: an unfunded order left the
+/// count when it was promoted, which costs money, or when it was retired, which
+/// happened at hour six, so two hundred rows bought six hours of 429 for every
+/// new sender. Above the high-water mark the sweep now closes the oldest
+/// unfunded orders early, and it asks 1Click about each one first (U3-1), so
+/// the drain is at the rate the sweep runs.
+#[tokio::test]
+async fn a_full_backlog_sheds_its_stalest_orders_instead_of_locking_up() {
+    let (near, near_url) = start_status_mock(0).await;
+    let temp = TempDir::new().expect("temp dir");
+    let db_path = temp.path().join("shed.db").to_string_lossy().to_string();
+    let state = coordinator_with(&near_url, &db_path).await;
+
+    let now = chrono::Utc::now();
+    // A queue over the global cap, so the coordinator is refusing every new
+    // open at the moment the tick starts, and every row is two hours old and
+    // well inside its own six-hour window, so nothing here is retired by the
+    // clock. That is the lockout: under the round 2 cap this state lasted until
+    // the last of them timed out.
+    const FLOOD: usize = 420;
+    let mut ids = Vec::new();
+    for i in 0..FLOOD {
+        let order = order_at(
+            &format!("t1Stale{i:08}"),
+            now - chrono::Duration::hours(2) - chrono::Duration::seconds(i as i64),
+            now + chrono::Duration::hours(4),
+        );
+        ids.push(order.id);
+        state.db.insert_order(&order).await.expect("insert");
+    }
+
+    // A real sender's order, opened a minute ago, at the back of the queue.
+    let fresh = order_at("t1JustOpened", now - chrono::Duration::minutes(1), now + chrono::Duration::hours(6));
+    let fresh_id = fresh.id;
+    state.db.insert_order(&fresh).await.expect("insert");
+
+    let before = state.db.count_unfunded_orders().await.expect("count");
+    assert_eq!(before, FLOOD as i64 + 1);
+    assert!(
+        before >= zecp2p_coordinator::api_v2::MAX_UNFUNDED_TOTAL,
+        "the arrangement has to start locked out, or there is nothing to shed"
+    );
+
+    tick_capped_at(&state, 1000).await;
+
+    let after = state.db.count_unfunded_orders().await.expect("count");
+    assert!(
+        after < before,
+        "U3-2: the backlog stood at {before} and one tick shed nothing. A queue \
+         that cannot drain is a lockout: every new sender gets 429 until the \
+         rows time out on their own."
+    );
+
+    // It sheds down to the high-water mark and stops there, rather than
+    // emptying the queue every tick.
+    assert!(
+        after >= 200,
+        "the shedding overshot: {after} left, and the mark is 200. Orders inside \
+         their own window are not supposed to be thrown away wholesale."
+    );
+
+    // The number that matters: a queue below the global cap admits the next
+    // open. That is the lockout, stated as the condition the open path checks.
+    assert!(
+        after < zecp2p_coordinator::api_v2::MAX_UNFUNDED_TOTAL,
+        "U3-2: {after} unfunded orders against a cap of {}. Every new sender is \
+         refused, and none of them did anything.",
+        zecp2p_coordinator::api_v2::MAX_UNFUNDED_TOTAL
+    );
+
+    // The sender who just opened is not the one shed.
+    let fresh = state.db.get_order(fresh_id).await.expect("get").expect("order");
+    assert_eq!(
+        fresh.stage,
+        Stage::AwaitingZec,
+        "an order a minute old was shed. Nothing under an hour is a candidate, \
+         and the page promises twenty minutes."
+    );
+
+    // And 1Click was asked about everything that was shed, so a shed order
+    // somebody had actually paid would have been promoted rather than retired.
+    assert!(
+        near.total_calls() >= (before - after) as usize,
+        "U3-2 and U3-1 together: {} orders were shed on {} status calls. \
+         Shedding without asking is the round 2 stranding again, by a third door.",
+        before - after,
+        near.total_calls()
+    );
+}
+
+/// Shedding never takes an order 1Click reports as paid.
+///
+/// The relief valve runs through the same retirement branch every window
+/// closure runs through, so a shed candidate whose deposit the bridge has seen
+/// is left alone. That is the whole reason the shedding marks orders rather
+/// than deleting them.
+#[tokio::test]
+async fn shedding_leaves_an_order_whose_deposit_1click_has_seen() {
+    let (near, near_url) = start_status_mock(0).await;
+    let temp = TempDir::new().expect("temp dir");
+    let db_path = temp.path().join("shed-paid.db").to_string_lossy().to_string();
+    let state = coordinator_with(&near_url, &db_path).await;
+
+    let now = chrono::Utc::now();
+    const FLOOD: usize = 240;
+    for i in 0..FLOOD {
+        let order = order_at(
+            &format!("t1ShedFodder{i:08}"),
+            now - chrono::Duration::hours(2) - chrono::Duration::seconds(i as i64),
+            now + chrono::Duration::hours(4),
+        );
+        state.db.insert_order(&order).await.expect("insert");
+    }
+
+    // The oldest row in the whole set, so it is first in line to be shed, and
+    // 1Click has its ZEC.
+    let paid = order_at(
+        "t1OldestAndPaid",
+        now - chrono::Duration::hours(5),
+        now + chrono::Duration::hours(1),
+    );
+    let paid_id = paid.id;
+    near.answer("t1OldestAndPaid", "PROCESSING");
+    state.db.insert_order(&paid).await.expect("insert");
+
+    tick_capped_at(&state, 1000).await;
+
+    let after = state.db.get_order(paid_id).await.expect("get").expect("order");
+    assert_ne!(
+        after.stage,
+        Stage::Failed,
+        "U3-2: the shedding retired an order 1Click reports as PROCESSING. \
+         The sender's ZEC is at the bridge and the page says {:?}",
+        after.error
+    );
+}

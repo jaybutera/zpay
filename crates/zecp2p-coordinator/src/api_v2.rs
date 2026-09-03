@@ -31,17 +31,34 @@ use crate::{
 };
 
 /// Take a token for this caller, or refuse before anything upstream is called.
+fn source_for(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    peer: Option<Extension<ConnectInfo<std::net::SocketAddr>>>,
+) -> std::net::IpAddr {
+    crate::ratelimit::source_of(
+        headers,
+        peer.map(|Extension(ConnectInfo(addr))| addr),
+        state.config.server.behind_trusted_proxy,
+    )
+}
+
 async fn limit(
     state: &Arc<AppState>,
     limiter: &crate::ratelimit::RateLimiter,
     headers: &HeaderMap,
     peer: Option<Extension<ConnectInfo<std::net::SocketAddr>>>,
 ) -> Result<(), AppError> {
-    let source = crate::ratelimit::source_of(
-        headers,
-        peer.map(|Extension(ConnectInfo(addr))| addr),
-        state.config.server.behind_trusted_proxy,
-    );
+    limit_source(limiter, source_for(state, headers, peer)).await
+}
+
+/// The same check for a caller that already knows its own source, so the open
+/// path can limit and then count the backlog against one address rather than
+/// deriving it twice (U3-2).
+async fn limit_source(
+    limiter: &crate::ratelimit::RateLimiter,
+    source: std::net::IpAddr,
+) -> Result<(), AppError> {
     limiter
         .check(source)
         .await
@@ -126,7 +143,10 @@ pub async fn quote_v2(
     // dollars. A sender paying a dinner bill thinks in dollars, so this is the
     // unit the main route defaults to showing.
     let zatoshi = match amount {
-        Amount::Zec { zatoshi } => zatoshi,
+        // A ZEC amount is not sized from a rate, so there is no rate to name a
+        // dollar floor with; the page falls back to the zatoshi figure, which is
+        // the unit that caller asked in anyway.
+        Amount::Zec { zatoshi } => (zatoshi, None),
         Amount::Usd { cents } => {
             let (zatoshi, units_per_zec) = zatoshi_for_cents(&state, cents).await?;
             // U2-3. The dollar amount is refused here, in dollars, by the same
@@ -142,12 +162,28 @@ pub async fn quote_v2(
                     cents: first_quotable_cents(floor, units_per_zec),
                 });
             }
-            zatoshi
+            (zatoshi, Some(units_per_zec))
         }
     };
+    let (zatoshi, units_per_zec) = zatoshi;
 
     let min_rate = crate::api::parse_min_rate_pub(query.min_rate.as_deref())?;
-    let quote = build_live_quote(&state, backend, zatoshi, min_rate).await?;
+    let quote = build_live_quote(&state, backend, zatoshi, min_rate)
+        .await
+        // U3-3. The local floor check above uses `observed_floor()`, which is
+        // the last floor 1Click named in a rejection and is a guess until the
+        // first rejection of the process. On a cold start the guess is low, the
+        // sizing passes the local check, and 1Click refuses the real quote; the
+        // refusal came back as `BelowFloor { cents: None }` and the page, having
+        // asked in dollars, rendered a ZEC amount under a dollar sign. It
+        // happened once per process, and the process is restarted to deploy, so
+        // the first dollar sender after every deploy got it.
+        //
+        // The rate is already in hand from the sizing probe, and it is the same
+        // number `first_quotable_cents` would be given a moment later on the
+        // retry, so the cents are filled here rather than left for the sender to
+        // discover by reloading.
+        .map_err(|e| fill_in_the_dollar_floor(e, units_per_zec))?;
 
     // The id is now a thing the coordinator issued, not a string the caller can
     // invent, and opening against it spends it. Because the signature's scope
@@ -254,6 +290,24 @@ fn first_quotable_cents(floor_zatoshi: u64, units_per_zec: u64) -> Option<u64> {
         cents = cents.checked_add(1)?;
     }
     None
+}
+
+/// Put the dollar floor back into a below-the-floor refusal that lost it.
+///
+/// U3-3. `from_quote_error` turns 1Click's rejection into `BelowFloor` with the
+/// zatoshi figure it named and `cents: None`, because at the point it runs
+/// nothing knows what a dollar is worth. A caller who asked in dollars has
+/// already paid for a rate probe, so the answer is in hand here; anything that
+/// is not a below-the-floor refusal, and any caller who asked in ZEC, passes
+/// through untouched.
+fn fill_in_the_dollar_floor(err: AppError, units_per_zec: Option<u64>) -> AppError {
+    match (err, units_per_zec) {
+        (AppError::BelowFloor { zatoshi, cents: None }, Some(rate)) => AppError::BelowFloor {
+            zatoshi,
+            cents: first_quotable_cents(zatoshi, rate),
+        },
+        (other, _) => other,
+    }
 }
 
 /// Take a live 1Click quote and turn it into the net price the sender reads.
@@ -401,7 +455,11 @@ pub async fn open_order(
     headers: HeaderMap,
     Json(body): Json<OpenRequest>,
 ) -> Result<Json<Opened>, AppError> {
-    limit(&state, &state.open_limiter, &headers, peer).await?;
+    // Derived once: the limiter buckets on it and the backlog cap counts on it,
+    // and the two must agree about who is calling or the cap is bounding a
+    // different caller from the one the limiter slowed (U3-2).
+    let source = source_for(&state, &headers, peer);
+    limit_source(&state.open_limiter, source).await?;
 
     let destination = zecp2p_types::settlement::PayoutDestination::new(
         body.destination.rail,
@@ -449,7 +507,7 @@ pub async fn open_order(
     //
     // Both are checked before the quote is spent, so hitting one costs the
     // caller their price and nothing else.
-    check_the_unfunded_backlog(&state, &body.session_pubkey).await?;
+    check_the_unfunded_backlog(&state, &body.session_pubkey, source).await?;
 
     // U2-4. The checks that cost no 1Click round trip run *before* the quote is
     // spent. The curator is the one that a sender realistically fails: a
@@ -558,7 +616,7 @@ pub async fn open_order(
 
     state
         .db
-        .insert_order(&order)
+        .insert_order_from_source(&order, Some(&source.to_string()))
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
@@ -581,22 +639,67 @@ pub async fn open_order(
 /// flaky wallet. Four is nobody, so the cap sits there.
 const MAX_UNFUNDED_PER_KEY: i64 = 4;
 
+/// How many unfunded orders one source address may hold open at once.
+///
+/// U3-2. This is the cap that actually bounds a flood. The per-key cap above
+/// bounds nobody, because session keys are free and the page mints a new one on
+/// every submit, so two hundred rows from one script look like two hundred
+/// senders to it. The source address is the first thing in the request that
+/// costs anything to vary.
+///
+/// Eight, against a global cap of 400, means one address can hold two per cent
+/// of the queue and it takes fifty distinct addresses to fill it. It is loose
+/// enough for the shape a real sender produces even sharing an address: a
+/// household, an office, a mobile carrier NAT. Reaching it is answered as a
+/// queue, not as a scolding, because behind a NAT the person refused may well
+/// not be the person who filled it.
+pub const MAX_UNFUNDED_PER_SOURCE: i64 = 8;
+
 /// How many unfunded orders the coordinator will hold across every caller.
 ///
-/// Session keys are free, so the per-key cap bounds one caller and not the
-/// sweep. This is the number the sweep's budget is sized against: at 1Click's
-/// measured status latency of about 0.2 s, a five-second budget covers roughly
-/// twenty-five orders, so a cap of 200 puts the worst case at eight ticks, or
-/// two minutes at the default fifteen-second interval, before any order is
-/// polled again. Raising it lengthens that; lowering it starts refusing real
-/// senders sooner in a queue.
-const MAX_UNFUNDED_TOTAL: i64 = 200;
+/// The number the sweep's budget is sized against: at 1Click's measured status
+/// latency of about 0.2 s, a five-second budget covers roughly twenty-five
+/// orders, so 400 puts the worst case at sixteen ticks, or four minutes at the
+/// default fifteen-second interval, before any order is polled again.
+///
+/// U3-2. It was 200, and it was the only bound that bit, which made it a
+/// lockout: two hundred free-key opens, about five minutes of requests from
+/// seven addresses, refused every new sender for the six hours it took the
+/// backlog to time out. Three things changed together. The per-source cap above
+/// is what a flood now runs into first. `MAX_UNFUNDED_SHED_ABOVE` makes the
+/// queue shed its stalest rows instead of sitting full. And this number is a
+/// last resort rather than the first one, so it is set where the sweep still
+/// keeps its promise rather than where a flood is cheap.
+pub const MAX_UNFUNDED_TOTAL: i64 = 400;
+
+/// The level above which the sweep starts retiring the stalest unfunded orders
+/// early, instead of waiting for each one's own six-hour window.
+///
+/// U3-2. Half the cap. Below it nothing is shed and every order gets its full
+/// window; above it the queue drains from the oldest end, so a flood ages out
+/// in minutes rather than hours and the global cap is reached only by a rush of
+/// orders that are all genuinely recent. The shedding still asks 1Click about
+/// every order before retiring it (U3-1), so an order somebody has actually
+/// paid is never shed.
+pub const MAX_UNFUNDED_SHED_ABOVE: i64 = 200;
+
+/// How long an unfunded order is safe from early shedding, however full the
+/// queue is.
+///
+/// The page promises a payment inside twenty minutes and 1Click's deposit
+/// windows are longer than that, so an order younger than this is a sender who
+/// may still be opening their wallet. Nothing younger is shed, at any depth of
+/// queue; a flood large enough to fill 400 rows with orders under an hour old
+/// has to keep 400 opens in flight against the per-source cap of eight, which
+/// takes fifty addresses sustained rather than seven for five minutes.
+pub const SHED_NOTHING_YOUNGER_THAN: chrono::Duration = chrono::Duration::hours(1);
 
 /// Refuse an open that would push the unfunded backlog past what the keeper can
-/// sweep in bounded time (U2-1).
+/// sweep in bounded time (U2-1, U3-2).
 async fn check_the_unfunded_backlog(
     state: &Arc<AppState>,
     session_pubkey: &str,
+    source: std::net::IpAddr,
 ) -> Result<(), AppError> {
     let mine = state
         .db
@@ -610,17 +713,34 @@ async fn check_the_unfunded_backlog(
         )));
     }
 
+    // U3-2. Per source, and before the global count, so a flood is refused at
+    // the address making it rather than at whoever asks next.
+    let from_here = state
+        .db
+        .count_unfunded_orders_from_source(&source.to_string())
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    if from_here >= MAX_UNFUNDED_PER_SOURCE {
+        tracing::warn!(
+            unfunded = from_here,
+            "one source is holding its whole share of the unfunded backlog"
+        );
+        return Err(AppError::QueueFull {
+            retry_after_seconds: 60,
+        });
+    }
+
     let all = state
         .db
         .count_unfunded_orders()
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
     if all >= MAX_UNFUNDED_TOTAL {
-        // Not the caller's fault, so it reads as a queue rather than as a
-        // refusal, and it is the one condition here worth a log line: reaching
-        // it means either a real rush or the flooding this cap exists for.
+        // Reaching this now takes fifty addresses holding eight orders each,
+        // all under an hour old, and it says so as a queue rather than as an
+        // accusation: the caller refused here has usually opened nothing.
         tracing::warn!(unfunded = all, "the unfunded backlog is full; refusing new orders");
-        return Err(AppError::TooManyRequests {
+        return Err(AppError::QueueFull {
             retry_after_seconds: 60,
         });
     }
