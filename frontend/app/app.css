@@ -1,12 +1,13 @@
 /* zpay app: the front door's stylesheet, plus the card.
 
-   site.css is loaded first, so the palette, the fonts, the nav, the hero, the
-   labels, the buttons, the strip, the step cards, the flow panel and the
-   footer are the ones on zpay.cash by construction, not by copy. What lives
-   here is the app card (fields, quote, address, ladder, refund) and the few
-   places the app page differs from the front door: the card sits next to the
-   headline and the status dot stays visible on a phone. The advanced route
-   keeps its own terminal styling on purpose. */
+   site.css is loaded first, so the palette, the fonts, the nav, the labels,
+   the buttons and the footer are the ones on zpay.cash by construction, not
+   by copy. What lives here is the app card (fields, quote, address, ladder,
+   refund) and the few places the app page differs from the front door: the
+   card sits alone in the middle of the page, the footer is one row, and the
+   status dot stays visible on a phone. The pitch, the steps, the diagram and
+   the terms are the front door's; this page links to them and does not
+   repeat them. The advanced route keeps its own terminal styling on purpose. */
 
 :root {
   --zec:      #d7b34a;
@@ -34,35 +35,34 @@ main { flex: 1; }
 }
 @media (max-width: 720px) { .nav-status span:last-child { display: none; } }
 
-/* ---------- hero: headline, card, lede ----------
-   The headline and the card share the fold. On a wide screen the copy stacks
-   under the headline in the left column; on a phone the card comes right
-   after the headline and the lede follows it. The four-cell strip and the
-   two-variant flow diagram are site.css's; the front door draws the same. */
+/* ---------- the page: one column, the card in the middle ----------
+   site.css's .hero brings the dot grid and the two-column grid; the app page
+   keeps the grid texture and collapses the grid to one centered column just
+   wide enough for the card. */
 
-.hero { padding: 72px 0 36px; }
-.hero .wrap {
-  grid-template-columns: minmax(0, 1.15fr) minmax(320px, .85fr);
-  grid-template-areas: "head card" "copy card";
-  grid-template-rows: auto 1fr;
-  row-gap: 0;
+.hero.app-hero { padding: 56px 0 48px; }
+.app-hero .wrap {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0;
+  max-width: 480px;
 }
-.hero-head { grid-area: head; }
-.hero-copy { grid-area: copy; }
-.app-card  { grid-area: card; }
-.hero .hero-head h1 { margin-bottom: 20px; }
-.hero .hero-cta { margin-top: 26px; }
+.app-title { text-align: center; margin-bottom: 22px; }
+.app-title h1 {
+  font-size: 22px;
+  font-weight: 700;
+  line-height: 1.25;
+  letter-spacing: -.02em;
+  color: #fff;
+  margin: 0 0 8px;
+}
+.app-title p { font-size: 14px; color: var(--text-dim); margin: 0; text-wrap: balance; }
+.app-title p a { color: var(--blue-lit); white-space: nowrap; }
 @media (max-width: 860px) {
-  .hero { padding: 40px 0 28px; }
-  .hero .wrap { grid-template-columns: minmax(0, 1fr); grid-template-areas: "head" "card" "copy"; gap: 0; }
-  .hero .hero-head h1 { margin-bottom: 24px; }
-  .hero-copy { margin-top: 28px; }
-  .hero .hero-cta { display: none; }
+  .hero.app-hero { padding: 28px 0 32px; }
+  .app-title { margin-bottom: 16px; }
+  .app-title h1 { font-size: 20px; }
 }
-
-/* ---------- strip: sits right under the card ---------- */
-
-.strip { padding: 0 0 8px; }
 
 /* ---------- the card ---------- */
 
@@ -286,10 +286,17 @@ main { flex: 1; }
 .kv dt { color: var(--text-mute); font-family: var(--mono); }
 .kv dd { margin: 0; font-family: var(--mono); word-break: break-all; color: var(--text-dim); }
 
-/* ---------- footer: the site's, with the key sentence as the fine print ---------- */
+/* ---------- footer: the site's, in one row ---------- */
 
-footer { margin-top: 0; }
-footer .fine { max-width: 34ch; }
+footer.app-foot { margin-top: 0; padding: 28px 0 36px; }
+footer.app-foot .wrap {
+  display: flex; justify-content: space-between; align-items: flex-start;
+  gap: 28px; flex-wrap: wrap;
+}
+footer.app-foot .fine { max-width: 40ch; }
+footer.app-foot .foot-links { display: flex; flex-wrap: wrap; gap: 6px 18px; padding-top: 4px; }
+footer.app-foot .foot-links a { margin: 0; }
+@media (max-width: 560px) { footer.app-foot .wrap { flex-direction: column; gap: 18px; } }
 
 @media (max-width: 480px) {
   .app-card { padding: 16px; }

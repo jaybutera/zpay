@@ -17,11 +17,9 @@
   <div class="wrap">
     <a class="wordmark" href="../">zpay<span class="tick">_</span></a>
     <nav class="nav-links">
-      <a href="#how">How it works</a>
-      <a href="../#trust">Custody</a>
+      <a href="../#how">How it works</a>
       <a href="../#fees">Fees</a>
       <a href="../#limits">Limits</a>
-      <a href="../takers/">Run a taker</a>
     </nav>
     <div class="spacer"></div>
     <span class="net-tag" id="net-tag" hidden></span>
@@ -30,33 +28,13 @@
 </header>
 
 <main>
-<!-- ============ HERO: the headline, the card, then the lede ============ -->
-<section class="hero">
+<!-- The app page is the tool. The pitch, the steps, the diagram and the terms
+     live on the front door (../); this page is the card and nothing else. -->
+<section class="hero app-hero">
   <div class="wrap">
-
-    <div class="hero-head">
-      <span class="label blue">Zcash &rarr; escrow on Zcash &rarr; Venmo</span>
-      <h1>Send ZEC.<br>They get Venmo <span class="blue">dollars.</span></h1>
-    </div>
-
-    <div class="hero-copy">
-      <p class="lede">
-        Type their Venmo handle and send ZEC to one address. Your coins sit in a
-        <b>Zcash escrow that only you can refund</b> until a payer sends the
-        dollars and proves it. They never touch crypto. Nothing leaves Zcash
-        until the proof is in.
-      </p>
-
-      <div class="facts">
-        <span>escrow on Zcash, not on Base</span>
-        <span><span data-fee>0.15%</span> fee</span>
-        <span>refund needs nobody</span>
-        <span>open source</span>
-      </div>
-
-      <div class="hero-cta">
-        <a class="btn" href="#how">See how it settles</a>
-      </div>
+    <div class="app-title">
+      <h1>Pay a Venmo handle with ZEC</h1>
+      <p>Your coins sit in an escrow on Zcash that only you can refund. <a href="../#how">How it works</a></p>
     </div>
 
     <div class="card app-card" id="card">
@@ -181,183 +159,23 @@
     </div>
   </div>
 </section>
-  </div>
-</section>
-
-<!-- ============ STRIP: what holds, and for how long ============ -->
-<section class="strip" aria-label="the terms in numbers">
-  <div class="wrap">
-    <div class="grid four">
-      <div class="cell"><span class="k label">escrow</span><span class="v blue">Zcash</span><span class="sub">one t3 address, your key and the payer's</span></div>
-      <div class="cell"><span class="k label">fee</span><span class="v" data-fee>0.15%</span><span class="sub">taken on release, nothing added after you send</span></div>
-      <div class="cell"><span class="k label">refund</span><span class="v">24 h</span><span class="sub">your key alone, nobody else needed</span></div>
-      <div class="cell"><span class="k label">release</span><span class="v">on proof</span><span class="sub">the enclave attests the Venmo payment</span></div>
-    </div>
-  </div>
-</section>
-
-<!-- ============ HOW IT WORKS ============ -->
-<section class="block" id="how">
-  <div class="wrap">
-    <span class="label blue">how it works</span>
-    <h2>One address, one proof, one key</h2>
-    <p class="intro">
-      A payer sees the locked ZEC, sends the Venmo, and proves it through the
-      same enclave zk-p2p uses. That proof is the only thing that can release
-      the escrow. If nobody pays within a day, your own key alone takes the
-      coins back.
-    </p>
-
-    <div class="steps">
-      <div class="step">
-        <span class="n">01</span>
-        <h3>Type their handle, get an address</h3>
-        <p>Enter their Venmo username and an amount. Your key is made in this page and never sent anywhere. The address it derives is an escrow whose refund branch only that key can spend, and the page checks that before it shows you anything.</p>
-        <div class="rail"><span class="tok">@handle</span><span class="arr">&rarr;</span><span class="tok">your key</span><span class="arr">&rarr;</span><span class="tok zec">t3 address</span></div>
-      </div>
-      <div class="step">
-        <span class="n">02</span>
-        <h3>Send ZEC from any wallet</h3>
-        <p>One transaction, exactly the amount shown. Once it confirms, this page signs the release under one condition: a proof that the dollars reached the handle you typed. Nothing leaves Zcash until then.</p>
-        <div class="rail"><span class="tok zec">ZEC</span><span class="arr">&rarr;</span><span class="tok">escrow locks</span><span class="arr">&rarr;</span><span class="tok">waiting for a payer</span></div>
-      </div>
-      <div class="step">
-        <span class="n">03</span>
-        <h3>Released on the proof, or refunded by you</h3>
-        <p>A payer sends the Venmo and asks the enclave to attest it. That attestation completes the release and the payer collects the ZEC. If nobody pays within a day, your key alone signs the refund; no one has to approve it.</p>
-        <div class="rail"><span class="tok venmo">Venmo</span><span class="arr">&rarr;</span><span class="tok">enclave attestation</span><span class="arr">&rarr;</span><span class="tok zec">release</span></div>
-      </div>
-    </div>
-
-    <div class="flow" aria-label="settlement diagram">
-      <svg class="flow-wide" viewBox="0 0 1000 250" role="img" aria-labelledby="flow-title">
-        <title id="flow-title">ZEC goes from your wallet into a Zcash escrow at one t3 address, which your key and the payer's key can spend together, or your key alone after 24 hours. A payer sends the Venmo and proves it; the proof releases the escrow to the payer. If nobody pays, the escrow refunds to you.</title>
-        <!-- you -->
-        <rect class="box zec" x="20" y="60" width="150" height="70" rx="4"/>
-        <text x="95" y="90" text-anchor="middle" font-size="14" font-weight="700">you</text>
-        <text class="t-dim" x="95" y="112" text-anchor="middle" font-size="11">any Zcash wallet</text>
-
-        <!-- escrow -->
-        <rect class="box blue" x="330" y="50" width="250" height="90" rx="4"/>
-        <text class="t-blue" x="455" y="76" text-anchor="middle" font-size="14" font-weight="700">escrow on Zcash</text>
-        <text class="t-dim" x="455" y="96" text-anchor="middle" font-size="11">one t3 address</text>
-        <text class="t-dim" x="455" y="112" text-anchor="middle" font-size="11">your key + payer key, or</text>
-        <text class="t-dim" x="455" y="128" text-anchor="middle" font-size="11">your key alone after 24 h</text>
-
-        <!-- their venmo -->
-        <rect class="box blue" x="800" y="60" width="170" height="70" rx="4"/>
-        <text class="t-blue" x="885" y="90" text-anchor="middle" font-size="14" font-weight="700">their Venmo</text>
-        <text class="t-dim" x="885" y="112" text-anchor="middle" font-size="11">dollars arrive here</text>
-
-        <!-- payer -->
-        <rect class="box" x="500" y="170" width="170" height="60" rx="4"/>
-        <text x="585" y="196" text-anchor="middle" font-size="14" font-weight="700">payer</text>
-        <text class="t-dim" x="585" y="216" text-anchor="middle" font-size="11">sends Venmo, proves it</text>
-
-        <!-- you -> escrow -->
-        <path class="line" d="M170 95 H322"/>
-        <path class="arrow" d="M322 90 L330 95 L322 100 Z"/>
-        <text class="t-dim" x="250" y="84" text-anchor="middle" font-size="10">ZEC</text>
-
-        <!-- escrow -> payer: release -->
-        <path class="line" d="M580 95 H655 V162"/>
-        <path class="arrow" d="M650 162 L655 170 L660 162 Z"/>
-        <text class="t-dim" x="588" y="87" font-size="10">release</text>
-
-        <!-- payer -> escrow: proof -->
-        <path class="line blue" d="M540 170 V148"/>
-        <path class="arrow blue" d="M535 148 L540 140 L545 148 Z"/>
-        <text class="t-blue" x="548" y="158" font-size="10">proof of payment</text>
-
-        <!-- payer -> venmo -->
-        <path class="line blue" d="M670 200 H885 V138"/>
-        <path class="arrow blue" d="M880 138 L885 130 L890 138 Z"/>
-        <text class="t-blue" x="895" y="170" font-size="10">$</text>
-
-        <!-- refund, dashed, escrow -> you -->
-        <path class="line dashed" d="M455 140 V215 H95 V138"/>
-        <path class="arrow" d="M90 138 L95 130 L100 138 Z"/>
-        <text class="t-dim" x="275" y="230" text-anchor="middle" font-size="10">nobody paid? refund after 24 h, your key alone</text>
-      </svg>
-
-      <svg class="flow-tall" viewBox="0 0 380 500" role="img" aria-labelledby="flow-title-tall">
-        <title id="flow-title-tall">ZEC goes from your wallet into a Zcash escrow at one t3 address, which your key and the payer's key can spend together, or your key alone after 24 hours. A payer sends the Venmo and proves it; the proof releases the escrow to the payer. If nobody pays, the escrow refunds to you.</title>
-        <!-- you -->
-        <rect class="box zec" x="50" y="20" width="150" height="60" rx="4"/>
-        <text x="125" y="45" text-anchor="middle" font-size="14" font-weight="700">you</text>
-        <text class="t-dim" x="125" y="65" text-anchor="middle" font-size="11">any Zcash wallet</text>
-
-        <!-- escrow -->
-        <rect class="box blue" x="50" y="140" width="200" height="90" rx="4"/>
-        <text class="t-blue" x="150" y="166" text-anchor="middle" font-size="14" font-weight="700">escrow on Zcash</text>
-        <text class="t-dim" x="150" y="186" text-anchor="middle" font-size="11">one t3 address</text>
-        <text class="t-dim" x="150" y="202" text-anchor="middle" font-size="11">your key + payer key, or</text>
-        <text class="t-dim" x="150" y="218" text-anchor="middle" font-size="11">your key alone after 24 h</text>
-
-        <!-- payer -->
-        <rect class="box" x="210" y="290" width="150" height="60" rx="4"/>
-        <text x="285" y="315" text-anchor="middle" font-size="14" font-weight="700">payer</text>
-        <text class="t-dim" x="285" y="335" text-anchor="middle" font-size="11">sends Venmo, proves it</text>
-
-        <!-- their venmo -->
-        <rect class="box blue" x="210" y="420" width="150" height="60" rx="4"/>
-        <text class="t-blue" x="285" y="445" text-anchor="middle" font-size="14" font-weight="700">their Venmo</text>
-        <text class="t-dim" x="285" y="465" text-anchor="middle" font-size="11">dollars arrive here</text>
-
-        <!-- you -> escrow -->
-        <path class="line" d="M125 80 V132"/>
-        <path class="arrow" d="M120 132 L125 140 L130 132 Z"/>
-        <text class="t-dim" x="133" y="114" font-size="10">ZEC</text>
-
-        <!-- escrow -> payer: release -->
-        <path class="line" d="M250 175 H300 V282"/>
-        <path class="arrow" d="M295 282 L300 290 L305 282 Z"/>
-        <text class="t-dim" x="256" y="168" font-size="10">release</text>
-
-        <!-- payer -> escrow: proof -->
-        <path class="line blue" d="M240 290 V238"/>
-        <path class="arrow blue" d="M235 238 L240 230 L245 238 Z"/>
-        <text class="t-blue" x="232" y="262" text-anchor="end" font-size="10">proof of payment</text>
-
-        <!-- payer -> venmo -->
-        <path class="line blue" d="M285 350 V412"/>
-        <path class="arrow blue" d="M280 412 L285 420 L290 412 Z"/>
-        <text class="t-blue" x="293" y="390" font-size="10">$</text>
-
-        <!-- refund, dashed, escrow -> you -->
-        <path class="line dashed" d="M100 230 V370 H20 V50 H42"/>
-        <path class="arrow" d="M42 45 L50 50 L42 55 Z"/>
-        <text class="t-dim" x="50" y="392" font-size="10">nobody paid? refund</text>
-        <text class="t-dim" x="50" y="406" font-size="10">after 24 h, your key alone</text>
-      </svg>
-    </div>
-  </div>
-</section>
 </main>
 
-<footer>
+<footer class="app-foot">
   <div class="wrap">
     <div class="col">
       <a class="wordmark" href="../">zpay<span class="tick">_</span></a>
       <p class="fine"><span data-fee>0.15%</span> fee &middot; escrow on Zcash &middot; refund needs nobody</p>
       <p class="fine">Your key is made in this page and never sent anywhere. Only the order leaves it.</p>
     </div>
-    <div class="col">
-      <h4>product</h4>
+    <nav class="col foot-links">
       <a href="../">About zpay</a>
-      <a href="#how">How it works</a>
+      <a href="../#how">How it works</a>
       <a href="../#fees">Fees</a>
       <a href="../#limits">Limits</a>
-    </div>
-    <div class="col">
-      <h4>takers</h4>
-      <a href="../takers/">Run a taker</a>
-    </div>
-    <div class="col">
-      <h4>routes</h4>
-      <a href="./">Escrow on Zcash</a>
       <a href="advanced/">Advanced route</a>
-    </div>
+      <a href="../takers/">Run a taker</a>
+    </nav>
   </div>
 </footer>
 
