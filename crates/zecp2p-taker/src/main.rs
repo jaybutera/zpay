@@ -26,6 +26,7 @@ use zecp2p_taker::{
         journal::{FillRecord, FillState, Journal},
         money::payment_cents,
         pipeline::Gate,
+        rail::WorkId,
         watch::{GlueDeposit, WatchConfig, Watcher},
     },
     abi::IEscrowTaker,
@@ -459,11 +460,15 @@ async fn main() -> Result<()> {
         }
 
         Commands::Run { dry_run, recipient } => {
-            let mode = if dry_run {
-                SendMode::DryRun
-            } else {
-                SendMode::Live
-            };
+            // R5-2: `TakerAgent` pays through the browser with no journal read
+            // and no journal write, so it cannot see the coordinator's claim and
+            // the coordinator cannot see its. `--dry-run` still works: it drives
+            // the page and stops at the irreversible step.
+            if !dry_run {
+                return refuse_ungated_live_payment("run", "auto");
+            }
+            // Only reachable with `--dry-run`, by the refusal above.
+            let mode = SendMode::DryRun;
             tracing::info!(taker = %taker, dry_run, "starting taker agent");
             let agent =
                 TakerAgent::with_recipient(config, provider.clone(), taker, mode, recipient);
@@ -582,6 +587,64 @@ fn print_terms(terms: &IntentTerms) {
 /// The selectors in `venmo.rs` are guesses at Venmo's markup until something
 /// runs them against the page, and `PaymentStep::Fill` sets a React-controlled
 /// input, which is the failure that silently does nothing. This runs the live
+/// Records that an intent was left on chain because the cancel failed.
+///
+/// R10-2: the fact has to outlive the line. A displaced fill whose cancel fails
+/// may have its line closed by the winner's forced writes moments later, and
+/// then nothing anywhere says a maker's USDC is locked behind an intent that
+/// will sit there until it expires. The marker goes in the note, which
+/// `Journal::uncancelled_intents` finds whether the line is open or closed.
+///
+/// Best-effort by design: it runs on a path that has already failed, and a
+/// second failure here must not replace the first in the operator's view.
+fn note_uncancelled_intent(
+    journal: &Journal,
+    record: &FillRecord,
+    intent_hash: alloy::primitives::B256,
+    why: &str,
+) {
+    let mut stuck = record.clone();
+    stuck.state = FillState::NeedsOperator;
+    stuck.note = Some(format!(
+        "{} {why} intent {intent_hash} is still on chain and will expire on its own; \
+         this instance sent no payment",
+        zecp2p_taker::auto::journal::UNCANCELLED_INTENT
+    ));
+    if let Err(e) = zecp2p_taker::auto::journal::record_outcome(journal, record, &stuck) {
+        tracing::error!(
+            error = %e,
+            %intent_hash,
+            "could not record an uncancelled intent; it is only in this log now"
+        );
+    }
+}
+
+/// Refuses a live payment from a path that does not take the payment slot.
+///
+/// R5-2: two subcommands drove the browser with no journal read and no journal
+/// write - `run`, whose whole purpose is to claim and pay, and `test-pay
+/// --send-for-real`. The slot is what stops this taker and
+/// `zecp2p-v2coordinator` paying the same Venmo account at the same time, and
+/// the config comments told operators the two programs were bound. For these
+/// paths that was false.
+///
+/// Rather than thread a journal through the agent - which would be a second
+/// implementation of a gate that already exists in `handle_one` - these paths
+/// refuse in `Live` mode and name the one that is gated. A payer that cannot
+/// take the slot must not send money.
+fn refuse_ungated_live_payment(command: &str, gated: &str) -> Result<()> {
+    bail!(
+        "`{command}` sends money without taking the payment slot, and this build \
+         shares that slot with zecp2p-v2coordinator through the fill journal \
+         (taker.journal_path). A payer that does not read the journal can pay the \
+         same Venmo account while the other daemon is paying it, and two identical \
+         entries in the feed cannot be told apart afterwards.\n\n\
+         Use `{gated}`, which reads the slot, claims it before the click, and \
+         records what happened. `{command} --dry-run` still drives the page \
+         without sending."
+    )
+}
+
 /// sequence with the irreversible step removed, so both failures surface here.
 async fn run_test_pay(
     config: &TakerConfig,
@@ -595,6 +658,11 @@ async fn run_test_pay(
         bail!("{amount:?} is not an amount Venmo's field would accept");
     }
     let claimed = zecp2p_taker::payee::validate_username_shape(recipient)?.to_string();
+
+    // R5-2. Refused before the browser opens, so the refusal costs nothing.
+    if send_for_real {
+        return refuse_ungated_live_payment("test-pay --send-for-real", "auto");
+    }
 
     let browser = VenmoBrowser::new(config.venmo.cdp_url.clone(), config.venmo.timeout_seconds);
     let tab = browser
@@ -854,10 +922,10 @@ fn compare_attestations(fresh: &AttestationFile, reference_path: &str) -> Result
 async fn run_rails(config: &TakerConfig, check_chain: bool) -> Result<()> {
     use zecp2p_taker::auto::rail::Rail;
 
-    let journal = Journal::open(&config.taker.journal_path)?;
+    let journal = Journal::open(config.taker.journal_path())?;
     let records = journal.latest()?;
 
-    println!("journal : {}", config.taker.journal_path);
+    println!("journal : {}", config.taker.journal_path());
     println!();
 
     for rail in Rail::all() {
@@ -906,6 +974,19 @@ async fn run_rails(config: &TakerConfig, check_chain: bool) -> Result<()> {
             record.state
         ),
         None => println!("the in-flight slot is free; either rail may start work"),
+    }
+
+    // R9: every open fill, not only the ones that may have moved money. `Seen`,
+    // `Signalling` and `Signalled` all hold the slot, and a daemon restarting
+    // behind one starts cleanly and then skips every deposit - in silence,
+    // until somebody prints this.
+    let open = journal.open_fills()?;
+    if open.len() > 1 {
+        println!();
+        println!("{} open fill(s) in the journal:", open.len());
+        for record in &open {
+            println!("  {} is {:?}", record.describe(), record.state);
+        }
     }
 
     let stuck = journal.needs_operator()?;
@@ -1225,7 +1306,7 @@ async fn run_auto<P: alloy::providers::Provider + Clone>(
     once: bool,
     auto_yes: bool,
 ) -> Result<()> {
-    let journal = Journal::open(&config.taker.journal_path)?;
+    let journal = Journal::open(config.taker.journal_path())?;
 
     // A fill whose fiat may have left is not something to reason around. It is
     // read by a human before anything else moves.
@@ -1245,6 +1326,67 @@ async fn run_auto<P: alloy::providers::Provider + Clone>(
             "check the Venmo feed for these before restarting. The journal is \
              written before the send button, so a Paying record may or may not \
              have gone out."
+        );
+    }
+
+    // R10-1: clear this rail's own pre-payment leftovers before starting.
+    //
+    // A crash between reserving and the next write leaves a line that only
+    // displacement clears, and displacement only happens when the same deposit
+    // reaches `open_fill` again. A taker never gets there for a deposit that is
+    // now exhausted - which a `Signalled` orphan's own intent can make it, by
+    // taking the whole deposit. So the line sits there holding the global slot,
+    // and `zecp2p-v2coordinator` waits behind it too, for as long as nobody
+    // looks.
+    //
+    // Only this rail's own lines, and only the pre-payment states: anything at
+    // `Paying` or past it is caught by the check above and is a human's to
+    // resolve. Nothing here was ever sent.
+    let orphans = zecp2p_taker::auto::journal::own_pre_payment_orphans(
+        &journal.latest()?,
+        zecp2p_taker::auto::rail::Rail::Base,
+    );
+    let sweeper = Claimer::new(
+        provider.clone(),
+        config.contracts.zkp2p_orchestrator,
+        config.contracts.zkp2p_escrow,
+        config.contracts.stake_vault,
+        config.contracts.usdc,
+        taker,
+    );
+    for orphan in &orphans {
+        println!(
+            "clearing a leftover reservation: deposit {} is {:?} from a previous run",
+            orphan.deposit_id, orphan.state
+        );
+
+        // A `Signalled` orphan has an intent on chain. It has to come back, or
+        // the maker's USDC stays locked until it expires.
+        if let (FillState::Signalled, Some(intent_hash)) = (orphan.state, orphan.intent_hash) {
+            match sweeper.cancel_intent(intent_hash).await {
+                Ok(tx) => println!("  cancelled its intent {intent_hash} in {tx}"),
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        %intent_hash,
+                        "could not cancel a leftover intent; it will expire on its own"
+                    );
+                    note_uncancelled_intent(
+                        &journal,
+                        orphan,
+                        intent_hash,
+                        &format!("cleared a leftover reservation and the cancel failed ({e:#});"),
+                    );
+                    continue;
+                }
+            }
+        }
+
+        zecp2p_taker::auto::journal::release_if_still_ours(
+            &journal,
+            orphan,
+            FillState::Cancelled,
+            "a leftover reservation from a previous run; nothing was sent",
         );
     }
 
@@ -1285,6 +1427,19 @@ async fn run_auto<P: alloy::providers::Provider + Clone>(
             if deposits.is_empty() {
                 tracing::debug!(from_block, head, "no zpay deposits in range");
             }
+            // R4-a: a deposit that was refused for a reason that will pass
+            // later - the payment slot is held, the session is not usable -
+            // used to be dropped for the life of the process, because the
+            // cursor moved past it whatever happened. Now the cursor rewinds to
+            // the earliest such deposit, so the next poll sees it again.
+            //
+            // The slot being held is no longer a rare case: it covers the whole
+            // of a coordinator trade, attestation included, which is minutes.
+            let mut retry_from: Option<u64> = None;
+            let mut remember = |block: u64| {
+                retry_from = Some(retry_from.map_or(block, |b: u64| b.min(block)));
+            };
+
             for deposit in deposits {
                 match handle_one(
                     provider,
@@ -1300,11 +1455,43 @@ async fn run_auto<P: alloy::providers::Provider + Clone>(
                 )
                 .await
                 {
-                    Ok(outcome) => println!("deposit {}: {outcome:?}", deposit.deposit_id),
-                    Err(e) => println!("deposit {}: stopped: {e:#}", deposit.deposit_id),
+                    Ok(outcome) => {
+                        // `Skipped` and `Blocked` both mean "not now", and both
+                        // can become "yes" without anything about the deposit
+                        // changing. `Declined` is a human saying no, and
+                        // `Paid`/`Fulfilled` are done.
+                        if matches!(outcome, Outcome::Skipped { .. } | Outcome::Blocked { .. }) {
+                            remember(deposit.block_number);
+                        }
+                        println!("deposit {}: {outcome:?}", deposit.deposit_id);
+                    }
+                    Err(e) => {
+                        // An error before anything was spent is also worth
+                        // another look: an RPC that failed once may not fail
+                        // twice. A fill that got as far as paying has a journal
+                        // record, and `handle_one` refuses to re-enter it:
+                        // `slot_verdict` at the top and `open_fill` under the
+                        // lock, both of which stop on any own-work state past
+                        // `Seen`. R6-2: that refusal did not exist when this
+                        // comment was first written, and the cursor rewind added
+                        // here is exactly what made its absence reachable.
+                        remember(deposit.block_number);
+                        println!("deposit {}: stopped: {e:#}", deposit.deposit_id);
+                    }
                 }
             }
-            from_block = head + 1;
+
+            from_block = match retry_from {
+                Some(block) => {
+                    tracing::info!(
+                        block,
+                        "rewinding the scan cursor: a deposit was refused for a reason that \
+                         may pass"
+                    );
+                    block
+                }
+                None => head + 1,
+            };
         }
 
         if once {
@@ -1485,6 +1672,21 @@ async fn handle_one<P: alloy::providers::Provider + Clone>(
     auto_yes: bool,
     session_health: Option<&SessionHealth>,
 ) -> Result<Outcome> {
+    // The one payment slot, read per fill and not just at startup.
+    //
+    // The startup check in `run_auto` is a check on the state the daemon
+    // inherited. It says nothing about what happens later, and "later" now
+    // includes another process: `zecp2p-v2coordinator` pays from the same Venmo
+    // account and writes the same journal. Without this, a running taker starts
+    // a fill while the coordinator is mid-payment, and the feed ends up with two
+    // entries of the same amount to the same handle - which is precisely what
+    // `locate_payment` refuses to resolve, once both have left.
+    //
+    // This read is cheap and early; the one that decides is inside `open_fill`
+    // below, which asks the same question under the journal's lock. A fill
+    // refused here leaves no trace and is retried on the next poll.
+    let mine = WorkId::base(deposit.deposit_id);
+
     // Everything free comes first. The cookie check is here rather than before
     // the attestation because a dead cookie found after the payment means the
     // fiat is gone and only cancelIntent recovers the stake.
@@ -1570,18 +1772,46 @@ async fn handle_one<P: alloy::providers::Provider + Clone>(
         taker,
     };
 
-    let mut record = FillRecord::new(
-        deposit.deposit_id,
-        deposit.session_id,
-        amount,
-        rate,
-        plan.recipient.clone(),
-    );
-    journal.record(&record)?;
+    // R5-1: this `Seen` line used to be an unconditional append, three chain
+    // calls and a curator round-trip after the gate read at the top of this
+    // function. If the coordinator took the slot inside that window, both ended
+    // up holding a reservation - and then neither could proceed: the
+    // coordinator saw this line and waited, while this fill signalled an
+    // intent, lost at its own claim, and left a `Signalled` line open forever.
+    // A stall that only an operator could clear.
+    //
+    // The reservation now goes through `claim_if`, which holds the journal's
+    // lock across the read and the write, so exactly one side gets it.
+    let mut record = match zecp2p_taker::auto::journal::open_fill(
+        journal,
+        &mine,
+        &format!("deposit {}", deposit.deposit_id),
+        || {
+            FillRecord::new(
+                deposit.deposit_id,
+                deposit.session_id,
+                amount,
+                rate,
+                plan.recipient.clone(),
+            )
+        },
+    )? {
+        Ok(record) => record,
+        // Nothing has been signalled or spent yet, so there is nothing to undo.
+        Err(why) => return Ok(Outcome::Skipped { why }),
+    };
 
     if dry_run {
         println!("\n{}", plan.signal_prompt());
         println!("\n(dry run: stopping here, nothing signalled)");
+        // R6-b: the reservation goes back. A dry run has spent nothing, and on
+        // a journal shared with `zecp2p-v2coordinator` a `Seen` line left behind
+        // blocks that coordinator from paying anything at all - so a rehearsal
+        // would stall live trades until an operator noticed.
+        // R7-1: compare-and-set, like every other give-back. Writing blind
+        // would cancel whatever line is latest, which on a shared journal can
+        // be another daemon's claim.
+        zecp2p_taker::auto::journal::release_if_still_ours(journal, &record, FillState::Cancelled, "dry run: nothing was signalled");
         return Ok(Outcome::Blocked {
             why: "dry run".into(),
         });
@@ -1599,13 +1829,16 @@ async fn handle_one<P: alloy::providers::Provider + Clone>(
 
     // Gate one. Gas and a 14-day stake lock.
     if !confirm.confirm(Gate::Signal, &plan.signal_prompt())? {
-        record.state = FillState::Cancelled;
-        record.note = Some("operator declined at the signal gate".into());
-        journal.record(&record)?;
+        zecp2p_taker::auto::journal::release_if_still_ours(
+            journal,
+            &record,
+            FillState::Cancelled,
+            "operator declined at the signal gate",
+        );
         return Ok(Outcome::Declined { gate: Gate::Signal });
     }
 
-    run_fill(
+    let outcome = run_fill(
         provider,
         config,
         journal,
@@ -1614,7 +1847,30 @@ async fn handle_one<P: alloy::providers::Provider + Clone>(
         taker,
         confirm.as_ref(),
     )
-    .await
+    .await;
+
+    // R6-b: an error before anything was signalled leaves the reservation open,
+    // and on a shared journal that blocks the coordinator rather than only this
+    // taker. The states past `Seen` are somebody's business to resolve - a
+    // `Signalled` intent has to be cancelled, a `Paying` line needs a human -
+    // but a fill still sitting at `Seen` has done nothing and can simply give
+    // the slot back.
+    //
+    // The same applies when the deposit turns out to be exhausted on a retry:
+    // `run_fill` returns `Skipped` with the reservation still standing.
+    let untouched = matches!(record.state, FillState::Seen);
+    match &outcome {
+        Ok(Outcome::Skipped { .. }) | Ok(Outcome::Blocked { .. }) | Err(_) if untouched => {
+            let why = match &outcome {
+                Err(e) => format!("nothing was signalled: {e:#}"),
+                _ => "nothing was signalled".into(),
+            };
+            zecp2p_taker::auto::journal::release_if_still_ours(journal, &record, FillState::Cancelled, &why);
+        }
+        _ => {}
+    }
+
+    outcome
 }
 
 /// Everything after the signal gate: stake, signal, pay, attest, fulfil.
@@ -1685,8 +1941,26 @@ async fn run_fill<P: alloy::providers::Provider + Clone>(
         .await
         .context("could not stake for this intent")?;
 
-    record.state = FillState::Signalling;
-    journal.record(record)?;
+    // R8-1: a compare-and-set, not a blind write. This line used to land over
+    // whatever was latest - including another instance's open `Paying` line,
+    // which it then buried: `latest` keeps the last line per work item, so the
+    // first payment disappeared from every reader including `needs_operator`.
+    // The second fill then passed its own claim and paid.
+    //
+    // Nothing has been signalled or spent at this point, so a refusal here is
+    // free: no intent, no stake, nothing to undo.
+    match zecp2p_taker::auto::journal::advance_if_still_ours(
+        journal,
+        record,
+        FillState::Signalling,
+    )? {
+        Ok(written) => *record = written,
+        Err(verdict) => {
+            return Ok(Outcome::Skipped {
+                why: verdict.why(&format!("deposit {}", record.deposit_id)),
+            })
+        }
+    }
 
     let intent = claimer
         .signal_intent(
@@ -1700,9 +1974,33 @@ async fn run_fill<P: alloy::providers::Provider + Clone>(
         .await
         .context("signalIntent failed")?;
 
-    record.state = FillState::Signalled;
-    record.intent_hash = Some(intent.intent_hash);
-    journal.record(record)?;
+    let mut signalled = record.clone();
+    signalled.state = FillState::Signalled;
+    signalled.intent_hash = Some(intent.intent_hash);
+    match zecp2p_taker::auto::journal::advance_to_if_still_ours(journal, record, &signalled)? {
+        Ok(written) => *record = written,
+        Err(verdict) => {
+            // An intent is on chain and the slot went to somebody else while it
+            // was being signalled. It has to come back, or the maker's USDC and
+            // this taker's stake sit locked until it expires.
+            let why = verdict.why(&format!("deposit {}", record.deposit_id));
+            tracing::warn!(%why, "lost the payment slot while signalling; cancelling the intent");
+            if let Err(e) = claimer.cancel_intent(intent.intent_hash).await {
+                tracing::error!(
+                    error = %e,
+                    intent = %intent.intent_hash,
+                    "the intent could not be cancelled and will expire on its own"
+                );
+                note_uncancelled_intent(
+                    journal,
+                    record,
+                    intent.intent_hash,
+                    &format!("lost the slot and the cancel failed ({e:#});"),
+                );
+            }
+            return Ok(Outcome::Skipped { why });
+        }
+    }
     println!("signalled intent {}", intent.intent_hash);
 
     // The attestation is bound to the intent's on-chain signal time, and a
@@ -1716,24 +2014,67 @@ async fn run_fill<P: alloy::providers::Provider + Clone>(
     .terms(intent.intent_hash, 50_000)
     .await
     .context("could not read back the intent we just signalled")?;
-    record.signalled_at_ms = Some(terms.timestamp_ms());
+    let mut timed = record.clone();
+    timed.signalled_at_ms = Some(terms.timestamp_ms());
     // The cut for finding this payment in the feed later. The payment cannot
     // predate the intent it pays for, so the signal time is a sound lower bound;
     // a minute of slack absorbs clock skew between the chain and Venmo.
     let signalled_at = chrono::DateTime::from_timestamp_millis(terms.timestamp_ms() as i64)
         .unwrap_or_else(chrono::Utc::now)
         - chrono::Duration::minutes(1);
-    journal.record(record)?;
+    match zecp2p_taker::auto::journal::advance_to_if_still_ours(journal, record, &timed)? {
+        Ok(written) => *record = written,
+        Err(verdict) => {
+            let why = verdict.why(&format!("deposit {}", record.deposit_id));
+            tracing::warn!(%why, "lost the payment slot; cancelling the intent");
+            if let Err(e) = claimer.cancel_intent(intent.intent_hash).await {
+                tracing::error!(
+                    error = %e,
+                    intent = %intent.intent_hash,
+                    "the intent could not be cancelled and will expire on its own"
+                );
+                note_uncancelled_intent(
+                    journal,
+                    record,
+                    intent.intent_hash,
+                    &format!("lost the slot and the cancel failed ({e:#});"),
+                );
+            }
+            return Ok(Outcome::Skipped { why });
+        }
+    }
 
     // Gate two. Real dollars, and nothing recalls them.
     if !confirm.confirm(Gate::Pay, &plan.pay_prompt(intent.intent_hash))? {
-        record.state = FillState::Cancelled;
-        record.note = Some("operator declined at the payment gate".into());
-        journal.record(record)?;
-        // Give the claim back so the maker's USDC is not stranded and the stake
-        // unlocks, rather than leaving it to expire.
-        if let Err(e) = claimer.cancel_intent(intent.intent_hash).await {
-            tracing::error!(error = %e, "declined at the pay gate but cancelIntent also failed; the intent will expire");
+        // R8-b: the intent goes back *first*, and the slot only afterwards.
+        // The other order freed the slot while the intent was still standing,
+        // so the next fill could start against a deposit whose USDC was locked
+        // by this one - and if that fill signalled, the deposit had two intents
+        // and two stakes against one payment.
+        match claimer.cancel_intent(intent.intent_hash).await {
+            Ok(_) => {
+                zecp2p_taker::auto::journal::release_if_still_ours(
+                    journal,
+                    record,
+                    FillState::Cancelled,
+                    "operator declined at the payment gate",
+                );
+            }
+            Err(e) => {
+                // The intent stands, so the slot stays held: a fill nobody can
+                // start is better than a second intent on a locked deposit.
+                tracing::error!(
+                    error = %e,
+                    "declined at the pay gate and cancelIntent also failed; holding the \
+                     slot until an operator looks, because the intent is still on chain"
+                );
+                note_uncancelled_intent(
+                    journal,
+                    record,
+                    intent.intent_hash,
+                    &format!("declined at the payment gate and the cancel failed ({e:#});"),
+                );
+            }
         }
         return Ok(Outcome::Declined { gate: Gate::Pay });
     }
@@ -1741,9 +2082,82 @@ async fn run_fill<P: alloy::providers::Provider + Clone>(
     // Written before the click, never after. A record in this state means the
     // money may or may not have left, and only a human reading the Venmo feed
     // can tell which.
-    record.state = FillState::Paying;
-    record.paid = Some(plan.payment.to_venmo_string());
-    journal.record(record)?;
+    //
+    // R4-3: the slot is read again here, under the journal's own file lock, and
+    // the `Paying` line is written in the same critical section. The check in
+    // `handle_one` happened before four network calls, and `zecp2p-v2coordinator`
+    // pays from this same Venmo account - so between that check and this write
+    // the coordinator could have taken the slot. `claim_if` makes the last
+    // decision before money moves and the record of it one indivisible step.
+    let mut lost_the_slot = None;
+    let claimed = journal.claim_if(|existing| {
+        // R7-2: the same `slot_verdict` the coordinator uses, and the same one
+        // `open_fill` used to reserve. This closure used to skip its own work id
+        // in *every* state, so two taker instances on one journal both passed
+        // `open_fill` (an own `Seen` is allowed, because that is what a retry
+        // looks like), both signalled, and both wrote `Paying`. Two payments.
+        // The coordinator closed that in round 5; this never did, because the
+        // rule lived in two places.
+        if let Err(verdict) = zecp2p_taker::auto::journal::may_continue(existing, record) {
+            lost_the_slot = Some(verdict.why(&format!("deposit {}", record.deposit_id)));
+            return None;
+        }
+        let mut claim = record.clone();
+        claim.state = FillState::Paying;
+        claim.paid = Some(plan.payment.to_venmo_string());
+        Some(claim)
+    })?;
+    if let Some(why) = lost_the_slot {
+        // R5-1: an intent is already signalled by this point, and it holds the
+        // maker's USDC and this taker's stake. Walking away without cancelling
+        // leaves both locked until the intent expires, and leaves an open
+        // `Signalled` line that holds the slot against every later fill - a
+        // stall only an operator could clear.
+        //
+        // Nothing has been paid, so cancelling is free and correct.
+        tracing::warn!(%why, "lost the payment slot after signalling; cancelling the intent");
+        match record.intent_hash {
+            Some(intent_hash) => match claimer.cancel_intent(intent_hash).await {
+                Ok(tx) => {
+                    zecp2p_taker::auto::journal::release_if_still_ours(
+                        journal,
+                        record,
+                        FillState::Cancelled,
+                        &format!("{why}; intent cancelled in {tx}"),
+                    );
+                }
+                Err(e) => {
+                    // The cancel failed, so the intent stands. That needs a
+                    // human, and the record must not be left saying the slot is
+                    // free while an intent is outstanding.
+                    tracing::error!(error = %e, "cancel failed; the intent will expire on its own");
+                    // Not a give-back: this holds the slot deliberately, and
+                    // it must land even if the line has moved, because an
+                    // outstanding intent is a fact somebody has to see.
+                    // R8-a: "this instance paid nothing", not "nothing was
+                    // paid". In the two-instance case the line this replaces
+                    // may be another fill's `Paying`, and an operator reading
+                    // "nothing was paid" while a payment is in flight is
+                    // exactly the wrong conclusion. `record_outcome` names what
+                    // it wrote over.
+                    note_uncancelled_intent(
+                        journal,
+                        record,
+                        intent_hash,
+                        &format!("{why} the cancel failed ({e:#});"),
+                    );
+                }
+            },
+            None => {
+                // Never signalled: give the reservation back so the next fill
+                // is not blocked by a line that means nothing.
+                zecp2p_taker::auto::journal::release_if_still_ours(journal, record, FillState::Cancelled, &why);
+            }
+        }
+        return Ok(Outcome::Skipped { why });
+    }
+    *record = claimed
+        .ok_or_else(|| anyhow::anyhow!("the payment slot could not be claimed"))?;
 
     let browser = VenmoBrowser::new(config.venmo.cdp_url.clone(), config.venmo.timeout_seconds);
     let tab = browser
@@ -1768,15 +2182,19 @@ async fn run_fill<P: alloy::providers::Provider + Clone>(
              intent {}; if not, cancel that intent.",
             request.amount, request.recipient, intent.intent_hash
         ));
-        journal.record(record)?;
+        let needs_operator = record.clone();
+        *record = zecp2p_taker::auto::journal::record_outcome(journal, record, &needs_operator)?;
         return Err(e.context(
             "the Venmo payment step failed; this fill now needs an operator to \
              read the feed before anything else moves",
         ));
     }
 
-    record.state = FillState::Paid;
-    journal.record(record)?;
+    // R8-1: the dollars are gone, so this fact must land - but if another line
+    // is standing here, that one is named rather than silently buried.
+    let mut paid = record.clone();
+    paid.state = FillState::Paid;
+    *record = zecp2p_taker::auto::journal::record_outcome(journal, record, &paid)?;
     println!("paid ${} to @{}", request.amount, request.recipient);
 
     // From here the fiat is gone and the only thing that recovers it is the
@@ -1850,8 +2268,9 @@ async fn run_fill<P: alloy::providers::Provider + Clone>(
         .await
         .context("fulfillIntent failed after the payment was made")?;
 
-    record.state = FillState::Fulfilled;
-    journal.record(record)?;
+    let mut done = record.clone();
+    done.state = FillState::Fulfilled;
+    *record = zecp2p_taker::auto::journal::record_outcome(journal, record, &done)?;
     println!("fulfilled, tx {tx}");
 
     Ok(Outcome::Fulfilled)
@@ -1893,4 +2312,23 @@ async fn run_find_payment(
     println!("an outgoing ${amount} to @{recipient} is at feed index {index}");
     println!("(the enclave would be given PAYMENT_INDEX={index})");
     Ok(())
+}
+
+#[cfg(test)]
+mod bypass_is_unreachable {
+    //! R7-b: `Journal::append_unchecked` writes a journal line with the
+    //! payment-slot gate skipped, and one of those is how an escrow gets paid
+    //! twice. It is behind the `journal-fixtures` feature, which no binary
+    //! turns on.
+    //!
+    //! What that buys, precisely: **a `cargo build` of this binary cannot
+    //! compile a call to it.** Verified by adding one and watching
+    //! `cargo build -p zecp2p-taker` fail with "no method named
+    //! `append_unchecked`". That is the build that ships.
+    //!
+    //! What it does not buy: under `cargo test`, the dev-dependency turns the
+    //! feature on for the whole crate, so a call written here would compile in
+    //! a test build. A cfg assertion in this module would therefore fail, and
+    //! asserting the opposite would be asserting something untrue. The
+    //! enforcement is the release build, and it is real.
 }

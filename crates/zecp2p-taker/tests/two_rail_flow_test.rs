@@ -281,7 +281,9 @@ fn one_journal_holds_a_live_trade_on_each_rail() {
     );
     base.state = FillState::Signalled;
     base.intent_hash = Some(B256::repeat_byte(0xbb));
-    journal.record(&base).unwrap();
+    // `append_unchecked`: this is staging a journal state, not opening a fill.
+    // Opening goes through `open_fill`, which decides under the lock.
+    journal.append_unchecked(&base).unwrap();
 
     // The escrow fill, further along.
     let leg = mainnet_escrow().fiat_leg(10_000).unwrap();
@@ -294,7 +296,7 @@ fn one_journal_holds_a_live_trade_on_each_rail() {
     zec.state = FillState::Paid;
     zec.intent_hash = Some(leg.intent_hash);
     zec.paid = Some(leg.payment.to_venmo_string());
-    journal.record(&zec).unwrap();
+    journal.append_unchecked(&zec).unwrap();
 
     let latest = journal.latest().unwrap();
     assert_eq!(latest.len(), 2, "both rails must survive in one journal");

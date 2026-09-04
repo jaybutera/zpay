@@ -38,7 +38,24 @@ lookback_blocks = 5000
 max_payment_cents = 2500
 # Written before each irreversible step, so a restart can tell which fills may
 # have moved money.
-journal_path = "taker-fills.jsonl"
+#
+# It is also the payment slot, and the slot is global: one Venmo balance, and
+# two identical payments in the feed that the enclave's payment_index cannot
+# tell apart. So if zecp2p-v2coordinator runs against the same Venmo account,
+# BOTH must name this same file - it sets server.journal_path for exactly this
+# reason. Two journals mean two slots, and each daemon will pay while the other
+# is paying.
+#
+# Both daemons read this file before every fill, not just at startup, and both
+# take an exclusive flock(2) across the read and the claim - so the decision and
+# the record of it are one indivisible step, and neither can start a payment in
+# the window the other is using. Appends are a single write syscall, so two
+# writers cannot split a line.
+#
+# The lock is advisory: it binds these two programs because both take it.
+#
+# A leading ~/ expands on both sides.
+journal_path = "/home/YOU/.zecp2p/fills.jsonl"
 
 [session]
 # Venmo session material the enclave replays: the account.venmo.com Cookie
