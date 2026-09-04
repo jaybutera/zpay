@@ -289,8 +289,15 @@ pub fn fulfilled(
     );
     record.state = FillState::Fulfilled;
     record.note = Some(format!("released in {release_txid}"));
-    journal
-        .record(&record)
+
+    // A terminal outcome: the release is on chain, so this fact lands whatever
+    // else is in the file - and `record_outcome` names anything it wrote over
+    // rather than burying it. The `held` copy is the `Paid` line this follows,
+    // which is what the compare-and-set matches against when nothing has gone
+    // wrong.
+    let mut held = record.clone();
+    held.state = FillState::Paid;
+    zecp2p_taker::auto::journal::record_outcome(journal, &held, &record)
         .map(|_| ())
         .context("could not record the fill as fulfilled; the slot will stay held")
 }
@@ -407,12 +414,25 @@ mod tests {
     }
 
     #[test]
-    fn a_seen_record_for_this_order_does_not_block_it() {
-        // `Seen` is written before anything is attempted. It must not lock an
-        // order out of its own first payment.
+    fn a_standing_seen_record_blocks_a_second_reservation() {
+        // R8-1: a second `Seen` used to be allowed here on the reasoning that a
+        // retry looks like one. But the journal keeps the last line per work
+        // item, so a second reservation *displaces* the first - and the fill
+        // holding that one can no longer advance, while the newcomer walks the
+        // sequence and pays. A retry after a real crash is not blocked: the
+        // attempt that ended wrote `Cancelled`, and a closed line holds nothing.
         let (_d, j) = journal();
         let work = zec_work(1);
         write(&j, &work, FillState::Seen);
+        assert!(take(&j, &work, 700_000, "alice").unwrap().is_err());
+    }
+
+    #[test]
+    fn a_cancelled_record_lets_the_order_try_again() {
+        let (_d, j) = journal();
+        let work = zec_work(1);
+        write(&j, &work, FillState::Seen);
+        write(&j, &work, FillState::Cancelled);
         assert!(take(&j, &work, 700_000, "alice").unwrap().is_ok());
     }
 

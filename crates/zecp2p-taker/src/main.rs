@@ -1835,8 +1835,26 @@ async fn run_fill<P: alloy::providers::Provider + Clone>(
         .await
         .context("could not stake for this intent")?;
 
-    record.state = FillState::Signalling;
-    *record = journal.record(record)?;
+    // R8-1: a compare-and-set, not a blind write. This line used to land over
+    // whatever was latest - including another instance's open `Paying` line,
+    // which it then buried: `latest` keeps the last line per work item, so the
+    // first payment disappeared from every reader including `needs_operator`.
+    // The second fill then passed its own claim and paid.
+    //
+    // Nothing has been signalled or spent at this point, so a refusal here is
+    // free: no intent, no stake, nothing to undo.
+    match zecp2p_taker::auto::journal::advance_if_still_ours(
+        journal,
+        record,
+        FillState::Signalling,
+    )? {
+        Ok(written) => *record = written,
+        Err(verdict) => {
+            return Ok(Outcome::Skipped {
+                why: verdict.why(&format!("deposit {}", record.deposit_id)),
+            })
+        }
+    }
 
     let intent = claimer
         .signal_intent(
@@ -1850,9 +1868,27 @@ async fn run_fill<P: alloy::providers::Provider + Clone>(
         .await
         .context("signalIntent failed")?;
 
-    record.state = FillState::Signalled;
-    record.intent_hash = Some(intent.intent_hash);
-    *record = journal.record(record)?;
+    let mut signalled = record.clone();
+    signalled.state = FillState::Signalled;
+    signalled.intent_hash = Some(intent.intent_hash);
+    match zecp2p_taker::auto::journal::advance_to_if_still_ours(journal, record, &signalled)? {
+        Ok(written) => *record = written,
+        Err(verdict) => {
+            // An intent is on chain and the slot went to somebody else while it
+            // was being signalled. It has to come back, or the maker's USDC and
+            // this taker's stake sit locked until it expires.
+            let why = verdict.why(&format!("deposit {}", record.deposit_id));
+            tracing::warn!(%why, "lost the payment slot while signalling; cancelling the intent");
+            if let Err(e) = claimer.cancel_intent(intent.intent_hash).await {
+                tracing::error!(
+                    error = %e,
+                    intent = %intent.intent_hash,
+                    "the intent could not be cancelled and will expire on its own"
+                );
+            }
+            return Ok(Outcome::Skipped { why });
+        }
+    }
     println!("signalled intent {}", intent.intent_hash);
 
     // The attestation is bound to the intent's on-chain signal time, and a
@@ -1866,27 +1902,65 @@ async fn run_fill<P: alloy::providers::Provider + Clone>(
     .terms(intent.intent_hash, 50_000)
     .await
     .context("could not read back the intent we just signalled")?;
-    record.signalled_at_ms = Some(terms.timestamp_ms());
+    let mut timed = record.clone();
+    timed.signalled_at_ms = Some(terms.timestamp_ms());
     // The cut for finding this payment in the feed later. The payment cannot
     // predate the intent it pays for, so the signal time is a sound lower bound;
     // a minute of slack absorbs clock skew between the chain and Venmo.
     let signalled_at = chrono::DateTime::from_timestamp_millis(terms.timestamp_ms() as i64)
         .unwrap_or_else(chrono::Utc::now)
         - chrono::Duration::minutes(1);
-    *record = journal.record(record)?;
+    match zecp2p_taker::auto::journal::advance_to_if_still_ours(journal, record, &timed)? {
+        Ok(written) => *record = written,
+        Err(verdict) => {
+            let why = verdict.why(&format!("deposit {}", record.deposit_id));
+            tracing::warn!(%why, "lost the payment slot; cancelling the intent");
+            if let Err(e) = claimer.cancel_intent(intent.intent_hash).await {
+                tracing::error!(
+                    error = %e,
+                    intent = %intent.intent_hash,
+                    "the intent could not be cancelled and will expire on its own"
+                );
+            }
+            return Ok(Outcome::Skipped { why });
+        }
+    }
 
     // Gate two. Real dollars, and nothing recalls them.
     if !confirm.confirm(Gate::Pay, &plan.pay_prompt(intent.intent_hash))? {
-        zecp2p_taker::auto::journal::release_if_still_ours(
-            journal,
-            record,
-            FillState::Cancelled,
-            "operator declined at the payment gate",
-        );
-        // Give the claim back so the maker's USDC is not stranded and the stake
-        // unlocks, rather than leaving it to expire.
-        if let Err(e) = claimer.cancel_intent(intent.intent_hash).await {
-            tracing::error!(error = %e, "declined at the pay gate but cancelIntent also failed; the intent will expire");
+        // R8-b: the intent goes back *first*, and the slot only afterwards.
+        // The other order freed the slot while the intent was still standing,
+        // so the next fill could start against a deposit whose USDC was locked
+        // by this one - and if that fill signalled, the deposit had two intents
+        // and two stakes against one payment.
+        match claimer.cancel_intent(intent.intent_hash).await {
+            Ok(_) => {
+                zecp2p_taker::auto::journal::release_if_still_ours(
+                    journal,
+                    record,
+                    FillState::Cancelled,
+                    "operator declined at the payment gate",
+                );
+            }
+            Err(e) => {
+                // The intent stands, so the slot stays held: a fill nobody can
+                // start is better than a second intent on a locked deposit.
+                tracing::error!(
+                    error = %e,
+                    "declined at the pay gate and cancelIntent also failed; holding the \
+                     slot until an operator looks, because the intent is still on chain"
+                );
+                let mut stuck = record.clone();
+                stuck.state = FillState::NeedsOperator;
+                stuck.note = Some(format!(
+                    "declined at the payment gate, and the intent could not be cancelled \
+                     ({e:#}). It will expire on its own. This instance sent no payment."
+                ));
+                match zecp2p_taker::auto::journal::record_outcome(journal, record, &stuck) {
+                    Ok(written) => *record = written,
+                    Err(e) => tracing::error!(error = %e, "could not record the stuck intent"),
+                }
+            }
         }
         return Ok(Outcome::Declined { gate: Gate::Pay });
     }
@@ -1946,16 +2020,25 @@ async fn run_fill<P: alloy::providers::Provider + Clone>(
                     // Not a give-back: this holds the slot deliberately, and
                     // it must land even if the line has moved, because an
                     // outstanding intent is a fact somebody has to see.
-                    record.state = FillState::NeedsOperator;
-                    record.note = Some(format!(
+                    // R8-a: "this instance paid nothing", not "nothing was
+                    // paid". In the two-instance case the line this replaces
+                    // may be another fill's `Paying`, and an operator reading
+                    // "nothing was paid" while a payment is in flight is
+                    // exactly the wrong conclusion. `record_outcome` names what
+                    // it wrote over.
+                    let mut stuck = record.clone();
+                    stuck.state = FillState::NeedsOperator;
+                    stuck.note = Some(format!(
                         "{why}; the intent could not be cancelled ({e:#}) and will expire. \
-                         Nothing was paid."
+                         This instance sent no payment - check the feed before concluding \
+                         that nobody did."
                     ));
-                    if let Err(e) = journal.record(record) {
-                        tracing::error!(
+                    match zecp2p_taker::auto::journal::record_outcome(journal, record, &stuck) {
+                        Ok(written) => *record = written,
+                        Err(e) => tracing::error!(
                             error = %e,
                             "could not record an uncancelled intent; it will expire on its own"
-                        );
+                        ),
                     }
                 }
             },
@@ -1993,15 +2076,19 @@ async fn run_fill<P: alloy::providers::Provider + Clone>(
              intent {}; if not, cancel that intent.",
             request.amount, request.recipient, intent.intent_hash
         ));
-        *record = journal.record(record)?;
+        let needs_operator = record.clone();
+        *record = zecp2p_taker::auto::journal::record_outcome(journal, record, &needs_operator)?;
         return Err(e.context(
             "the Venmo payment step failed; this fill now needs an operator to \
              read the feed before anything else moves",
         ));
     }
 
-    record.state = FillState::Paid;
-    *record = journal.record(record)?;
+    // R8-1: the dollars are gone, so this fact must land - but if another line
+    // is standing here, that one is named rather than silently buried.
+    let mut paid = record.clone();
+    paid.state = FillState::Paid;
+    *record = zecp2p_taker::auto::journal::record_outcome(journal, record, &paid)?;
     println!("paid ${} to @{}", request.amount, request.recipient);
 
     // From here the fiat is gone and the only thing that recovers it is the
@@ -2075,8 +2162,9 @@ async fn run_fill<P: alloy::providers::Provider + Clone>(
         .await
         .context("fulfillIntent failed after the payment was made")?;
 
-    record.state = FillState::Fulfilled;
-    *record = journal.record(record)?;
+    let mut done = record.clone();
+    done.state = FillState::Fulfilled;
+    *record = zecp2p_taker::auto::journal::record_outcome(journal, record, &done)?;
     println!("fulfilled, tx {tx}");
 
     Ok(Outcome::Fulfilled)

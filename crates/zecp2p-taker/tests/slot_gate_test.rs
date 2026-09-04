@@ -178,12 +178,37 @@ fn the_gate_refuses_a_deposit_this_taker_may_already_have_paid() {
 }
 
 #[test]
-fn a_deposits_own_seen_line_does_not_stop_it() {
-    // `Seen` is a reservation, written before any network call. It must not
-    // lock a deposit out of its own first payment - only the states past it do.
+fn a_standing_seen_line_stops_a_second_reservation() {
+    // R8-1. A second `Seen` used to be allowed, on the reasoning that a retry
+    // looks like one. But the journal keeps the last line per work item, so
+    // writing it *displaces* the reservation already there - and the fill
+    // holding that one can then no longer advance, while the newcomer walks the
+    // whole sequence and pays. Same burying, one step earlier than the one the
+    // reviewer reproduced.
     let mine = WorkId::base(U256::from(4499));
     let journal = vec![base_record(4499, FillState::Seen)];
-    assert!(slot_verdict(&journal, &mine).is_free());
+    assert!(
+        matches!(
+            slot_verdict(&journal, &mine),
+            SlotVerdict::OwnPaymentUnderway(_)
+        ),
+        "a standing reservation was displaced by a second one"
+    );
+}
+
+#[test]
+fn a_closed_line_does_not_stop_a_retry() {
+    // The other half: a fill that ended - crashed and was cancelled, or
+    // declined - must not lock its deposit out forever. Only an *open* line
+    // holds the slot.
+    let mine = WorkId::base(U256::from(4499));
+    for state in [FillState::Cancelled, FillState::Fulfilled] {
+        let journal = vec![base_record(4499, state)];
+        assert!(
+            slot_verdict(&journal, &mine).is_free(),
+            "{state:?} is finished and must not block a retry"
+        );
+    }
 }
 
 #[test]
@@ -460,7 +485,7 @@ fn a_dry_run_gives_the_slot_back() {
     let dir = tempfile::tempdir().unwrap();
     let journal = Journal::open(dir.path().join("fills.jsonl")).unwrap();
 
-    let mut record = open_fill(
+    let record = open_fill(
         &journal,
         &WorkId::base(U256::from(4499)),
         "deposit 4499",
@@ -478,10 +503,16 @@ fn a_dry_run_gives_the_slot_back() {
         "the reservation should hold the slot while it stands"
     );
 
-    // The dry run ends the way `handle_one` ends it.
-    record.state = FillState::Cancelled;
-    record.note = Some("dry run: nothing was signalled".into());
-    journal.record(&record).unwrap();
+    // The dry run ends the way `handle_one` ends it: through the shared
+    // compare-and-set, not a direct write. R8-c: this test used to call
+    // `record` with a comment claiming it matched the call site, which stopped
+    // being true when every give-back moved to `release_if_still_ours`.
+    zecp2p_taker::auto::journal::release_if_still_ours(
+        &journal,
+        &record,
+        FillState::Cancelled,
+        "dry run: nothing was signalled",
+    );
 
     assert!(
         journal
@@ -569,43 +600,101 @@ fn a_give_back_does_release_a_line_that_is_still_ours() {
 }
 
 #[test]
-fn two_taker_instances_do_not_both_claim_paying() {
-    // R7-2. The taker's `Paying` claim skipped its own work id in every state,
-    // so two instances on one journal both passed `open_fill` - an own `Seen`
-    // is allowed, because that is what a retry looks like - both signalled, and
-    // both claimed. Two payments for one deposit.
+fn two_taker_instances_do_not_both_pay_one_deposit() {
+    // R8-1, the reviewer's reproduction, driven through the real sequence.
+    //
+    // The earlier version of this test jumped instance B from a stale `Seen`
+    // straight to the `Paying` claim, which the pipeline never does - so it
+    // never exercised the write that actually caused the double payment. The
+    // real order is: reserve, `Signalling`, sign the intent, `Signalled`, read
+    // it back, then claim `Paying`. The damage was at `Signalling`, four steps
+    // before the guard.
+    //
+    // A takes the deposit and gets as far as `Paying` - it is in the browser.
+    // B, which reserved earlier while A was staking, then walks its own
+    // sequence. Before the fix, B's `Signalling` landed *over* A's open
+    // `Paying` line and buried it: `latest` keeps the last line per work item,
+    // so A's payment vanished from every reader including `needs_operator`. B
+    // then reached its claim, found the latest line was its own, and paid.
     let dir = tempfile::tempdir().unwrap();
     let journal = Journal::open(dir.path().join("fills.jsonl")).unwrap();
     let work = WorkId::base(U256::from(4499));
 
-    // Instance A reserves and gets as far as `Signalled`.
-    let mut a = open_fill(&journal, &work, "deposit 4499", || {
+    // Both instances reserve. An own `Seen` is allowed through, because that is
+    // what a retry looks like, so this is the state the real race starts from.
+    let a = open_fill(&journal, &work, "deposit 4499", || {
         base_record(4499, FillState::Seen)
     })
     .unwrap()
-    .expect("the slot is free");
-    a.state = FillState::Signalled;
-    // The write stamps a fresh `updated_at`, and the caller carries that back:
-    // `may_continue` recognises its own line by state and timestamp, so a copy
-    // from before the write would never match.
-    a = journal.record(&a).unwrap();
+    .expect("A takes the free slot");
+    // B cannot even reserve now: A's `Seen` is standing, and a second one would
+    // displace it. That is the earliest possible refusal, and it is the right
+    // one - B has done nothing to undo.
+    let b_refused = open_fill(&journal, &work, "deposit 4499", || {
+        base_record(4499, FillState::Seen)
+    })
+    .unwrap()
+    .expect_err("a second instance must not displace A's reservation");
+    assert!(b_refused.contains("pay twice"), "{b_refused}");
 
-    // Instance B holds a stale reservation from before that.
+    // To reach the write that caused the reported double payment, B has to be
+    // holding a reservation from *before* A took one - the real interleaving,
+    // where B reserved, went slow in gating and staking, and A got there first.
     let mut b = base_record(4499, FillState::Seen);
     b.updated_at = chrono::Utc::now() - chrono::Duration::seconds(30);
 
-    // A may continue: the latest line is still its own.
+    // A runs its sequence to the click.
+    let a = zecp2p_taker::auto::journal::advance_if_still_ours(
+        &journal,
+        &a,
+        FillState::Signalling,
+    )
+    .unwrap()
+    .expect("A may signal");
+    let a = zecp2p_taker::auto::journal::advance_if_still_ours(
+        &journal,
+        &a,
+        FillState::Signalled,
+    )
+    .unwrap()
+    .expect("A's intent is on chain");
+    let a = zecp2p_taker::auto::journal::advance_if_still_ours(&journal, &a, FillState::Paying)
+        .unwrap()
+        .expect("A claims and is now in the browser");
+
+    // B now walks the same sequence. Its very first step must refuse: A's
+    // `Paying` line is standing where B's `Signalling` would land.
+    let refused = zecp2p_taker::auto::journal::advance_if_still_ours(
+        &journal,
+        &b,
+        FillState::Signalling,
+    )
+    .unwrap()
+    .expect_err("B must not write over A's claim");
     assert!(
-        zecp2p_taker::auto::journal::may_continue(&journal.latest().unwrap(), &a).is_ok(),
-        "a fill must be able to continue its own progress"
+        matches!(refused, SlotVerdict::OwnPaymentUnderway(_)),
+        "B was told the wrong thing: {refused:?}"
     );
 
-    // B may not: the fill has moved on without it.
-    let verdict = zecp2p_taker::auto::journal::may_continue(&journal.latest().unwrap(), &b)
-        .expect_err("a second instance must not claim over the first");
+    // Nothing was signalled and nothing spent, so there is nothing to undo -
+    // which is the point of refusing at the first write rather than the last.
+    let lines: Vec<_> = journal.latest().unwrap();
+    assert_eq!(lines.len(), 1, "one line per work item");
+    assert_eq!(
+        lines[0].state,
+        FillState::Paying,
+        "A's claim was buried, so the next reader sees a deposit nobody is paying"
+    );
+    assert_eq!(
+        lines[0].updated_at, a.updated_at,
+        "the surviving line is not A's"
+    );
+
+    // And the startup check can still see A's payment, which is what burying it
+    // destroyed.
     assert!(
-        matches!(verdict, SlotVerdict::OwnPaymentUnderway(_)),
-        "{verdict:?}"
+        !journal.needs_operator().unwrap().is_empty(),
+        "A's in-flight payment is invisible to the check that exists to catch it"
     );
 }
 

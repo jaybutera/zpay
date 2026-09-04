@@ -320,8 +320,21 @@ impl SlotVerdict {
 /// already paid for this" and "somebody else is paying" call for different
 /// answers, and the first is the more expensive mistake.
 pub fn slot_verdict(latest: &[FillRecord], mine: &WorkId) -> SlotVerdict {
-    if let Some(own) = own_payment_underway(latest, mine) {
-        return SlotVerdict::OwnPaymentUnderway(own);
+    // R8-1: *any* open line for this work stops a new fill, not only the states
+    // past reservation. A second `Seen` used to be allowed on the reasoning
+    // that a retry looks like one - but the journal keeps the last line per
+    // work item, so writing it displaces the reservation already there, and the
+    // fill holding that one can no longer advance. That is the same burying
+    // that let two instances pay, one step earlier.
+    //
+    // A retry after a genuine crash is not blocked by this: whatever ended that
+    // attempt wrote `Cancelled`, or an operator did, and a closed line does not
+    // hold the slot. A `Seen` still standing means somebody is mid-decision.
+    if let Some(own) = latest
+        .iter()
+        .find(|r| &r.work_id() == mine && r.state.is_open())
+    {
+        return SlotVerdict::OwnPaymentUnderway(own.clone());
     }
     if let Some(holder) = holder_among(latest, mine) {
         return SlotVerdict::HeldByAnother(holder);
@@ -412,6 +425,119 @@ pub fn may_continue(latest: &[FillRecord], held: &FillRecord) -> Result<(), Slot
         Some(other) => Err(SlotVerdict::OwnPaymentUnderway(other.clone())),
         // Gone entirely, which should not happen: the journal is append-only.
         None => Err(SlotVerdict::OwnPaymentUnderway(held.clone())),
+    }
+}
+
+/// Moves a fill to its next state, and only if it is still ours to move.
+///
+/// R8-1: the root of the double-pay class, and the reason it survived three
+/// rounds of fixing one arm at a time. Only the `Paying` claim asked whose line
+/// was latest; every write between `Seen` and `Paying` was blind. So two takers
+/// on one deposit both passed `open_fill` - an own `Seen` is allowed, because
+/// that is what a retry looks like - and then the second one's `Signalling`
+/// landed *over* the first one's open `Paying` line. That buried it: `latest`
+/// keeps the last line per work item, so the first payment vanished from every
+/// reader, including `needs_operator`. The second fill then reached its own
+/// claim, found the latest line was its own, passed, and paid. Two payments,
+/// one deposit, and no record that the first ever happened.
+///
+/// So the rule is not "check before the claim". It is that **no write may bury
+/// a line somebody else is standing on**, and that has to hold for every state
+/// change, which is what this is for.
+///
+/// The check is the same one [`may_continue`] makes, taken under the journal's
+/// lock together with the write, so nothing can land in between. `Err` carries
+/// what stopped it, ready to show an operator.
+#[allow(clippy::result_large_err)]
+pub fn advance_if_still_ours(
+    journal: &Journal,
+    held: &FillRecord,
+    to: FillState,
+) -> Result<Result<FillRecord, SlotVerdict>> {
+    let mut refused = None;
+    let written = journal.claim_if(|existing| match may_continue(existing, held) {
+        Ok(()) => {
+            let mut next = held.clone();
+            next.state = to;
+            Some(next)
+        }
+        Err(verdict) => {
+            refused = Some(verdict);
+            None
+        }
+    })?;
+
+    match (written, refused) {
+        (Some(record), _) => Ok(Ok(record)),
+        (None, Some(verdict)) => Ok(Err(verdict)),
+        (None, None) => anyhow::bail!("the fill could not be advanced"),
+    }
+}
+
+/// The same, keeping the caller's other field changes.
+///
+/// `advance_if_still_ours` writes the state and nothing else; several steps
+/// also set `intent_hash`, `paid` or a note in the same breath. This takes the
+/// record the caller has already filled in, and checks it against the line it
+/// replaced.
+#[allow(clippy::result_large_err)]
+pub fn advance_to_if_still_ours(
+    journal: &Journal,
+    was: &FillRecord,
+    now: &FillRecord,
+) -> Result<Result<FillRecord, SlotVerdict>> {
+    let mut refused = None;
+    let written = journal.claim_if(|existing| match may_continue(existing, was) {
+        Ok(()) => Some(now.clone()),
+        Err(verdict) => {
+            refused = Some(verdict);
+            None
+        }
+    })?;
+
+    match (written, refused) {
+        (Some(record), _) => Ok(Ok(record)),
+        (None, Some(verdict)) => Ok(Err(verdict)),
+        (None, None) => anyhow::bail!("the fill could not be advanced"),
+    }
+}
+
+/// Records a state that must land, whether or not the line is still ours.
+///
+/// For the writes *after* money has moved. `Paid`, `Fulfilled` and the
+/// `NeedsOperator` that follows a failed browser step are facts about spent
+/// dollars, and a compare-and-set that declined would lose them - which is
+/// worse than the burying it protects against, because nobody would know a
+/// payment had happened at all.
+///
+/// So it tries the compare-and-set first, and on a refusal writes anyway *and
+/// says what it wrote over*, in the note and in the log. An operator reading
+/// the journal then sees both facts rather than one.
+pub fn record_outcome(journal: &Journal, held: &FillRecord, now: &FillRecord) -> Result<FillRecord> {
+    match advance_to_if_still_ours(journal, held, now)? {
+        Ok(written) => Ok(written),
+        Err(verdict) => {
+            let buried = match &verdict {
+                SlotVerdict::OwnPaymentUnderway(r) | SlotVerdict::HeldByAnother(r) => {
+                    format!("{} as {:?}", r.describe(), r.state)
+                }
+                SlotVerdict::Free => "nothing".into(),
+            };
+            tracing::error!(
+                work = %now.work_id(),
+                buried = %buried,
+                "recording {:?} over a line this fill did not write. Money has already \
+                 moved for this fill, so the fact has to land - but another line was \
+                 standing here, and it is named in the note.",
+                now.state
+            );
+            let mut forced = now.clone();
+            forced.note = Some(match &forced.note {
+                Some(n) => format!("{n} [written over {buried}]"),
+                None => format!("[written over {buried}]"),
+            });
+            journal.record(&forced)
+        }
     }
 }
 

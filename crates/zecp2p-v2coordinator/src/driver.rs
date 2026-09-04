@@ -592,12 +592,19 @@ async fn settle(state: &Arc<AppState>, order: Order) -> Result<()> {
             // The payment may still have gone out: the browser is driven and
             // the failure could be anywhere in it. The journal already says
             // `Paying`, which is the ambiguous state a human resolves.
-            record.state = zecp2p_taker::auto::journal::FillState::NeedsOperator;
-            record.note = Some(format!("the Venmo leg failed: {e}"));
-            // R7-d: not discarded. This is the line that says money may have
-            // left, and it is also what holds the slot; losing it silently
-            // means the next order pays into an unreconciled feed.
-            if let Err(write_err) = state.journal.record(&record) {
+            // R8-1: post-payment, so this must land - `record_outcome` tries
+            // the compare-and-set first and, if another line is standing here,
+            // writes anyway and names what it wrote over. Losing this line
+            // silently means the next order pays into an unreconciled feed.
+            let mut stuck = record.clone();
+            stuck.state = zecp2p_taker::auto::journal::FillState::NeedsOperator;
+            stuck.note = Some(format!(
+                "the Venmo leg failed: {e}. This coordinator's payment may or may not \
+                 have left; read the feed."
+            ));
+            if let Err(write_err) =
+                zecp2p_taker::auto::journal::record_outcome(&state.journal, &record, &stuck)
+            {
                 tracing::error!(
                     order = %order.order_id,
                     error = %format!("{write_err:#}"),
@@ -659,9 +666,13 @@ async fn settle(state: &Arc<AppState>, order: Order) -> Result<()> {
         );
     }
 
-    record.state = zecp2p_taker::auto::journal::FillState::Paid;
-    record.paid = Some(leg.payment.to_venmo_string());
-    if let Err(e) = state.journal.record(&record) {
+    let mut paid_line = record.clone();
+    paid_line.state = zecp2p_taker::auto::journal::FillState::Paid;
+    paid_line.paid = Some(leg.payment.to_venmo_string());
+    if let Err(e) =
+        zecp2p_taker::auto::journal::record_outcome(&state.journal, &record, &paid_line)
+            .map(|written| record = written)
+    {
         tracing::error!(
             order = %order.order_id,
             error = %format!("{e:#}"),

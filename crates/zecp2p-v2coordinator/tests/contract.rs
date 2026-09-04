@@ -2171,9 +2171,18 @@ async fn a_losing_instance_does_not_cancel_the_winners_claim() {
     // own-work `Seen` is allowed through, because that is what a retry looks
     // like - and wins the claim. Its dollars are now in flight.
     tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-    let theirs = zecp2p_v2coordinator::slot::take(&state.journal, &work, 700_000, "alice")
+
+    // The intruder is a second coordinator that reserved *before* this one -
+    // R8-1 stops it reserving now, which is the earlier and better refusal, so
+    // reaching the claim arm means holding a reservation from before. It claims
+    // over its own line and is now in the browser.
+    let theirs = state
+        .journal
+        .latest()
         .unwrap()
-        .expect("an own-work Seen does not block a second instance");
+        .into_iter()
+        .find(|r| r.work_id() == work)
+        .expect("this order holds a reservation");
     zecp2p_v2coordinator::slot::claim(
         &state.journal,
         theirs,
