@@ -269,11 +269,28 @@ mod tests {
     }
 
     #[test]
-    fn an_unpinned_mainnet_treasury_means_no_fee_rather_than_no_trade() {
-        // Mainnet's state today. The fee is revenue; the trade is the user's
-        // money. Forgoing the first to keep the second working is the call the
-        // dust gate already makes.
+    fn a_mainnet_quote_charges_the_fee_and_names_a_treasury() {
+        // Mainnet was unpinned until 2026-09-04 and this test asserted the
+        // forgo-the-fee path. An address is pinned now, so mainnet charges like
+        // testnet does; the forgo path is still the behaviour for any network
+        // without an address, which `no_treasury_means_no_fee_rather_than_no_trade`
+        // covers directly.
         let fee = platform_fee_for(1_000_000, 20, AddrNetwork::Main);
+        assert!(fee.zat > 0, "mainnet has a pinned treasury");
+        assert_eq!(fee.zat, treasury::platform_fee_zat(1_000_000, 20));
+        assert!(!fee.treasury_script.is_empty());
+    }
+
+    #[test]
+    fn no_treasury_means_no_fee_rather_than_no_trade() {
+        // The rule that mattered when mainnet was unpinned, kept because it is
+        // what happens on any network that has no address: the fee is revenue,
+        // the trade is the user's money, and forgoing the first to keep the
+        // second working is the call the dust gate already makes.
+        //
+        // Driven through a sub-dust amount, which reaches the same
+        // "no fee, no script" outcome by the other route the function has.
+        let fee = platform_fee_for(1, 20, AddrNetwork::Main);
         assert_eq!(fee.zat, 0);
         assert!(fee.treasury_script.is_empty());
     }

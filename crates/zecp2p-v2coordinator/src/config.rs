@@ -86,8 +86,21 @@ pub struct ZecConfig {
     pub rpc_password: Option<String>,
     #[serde(default)]
     pub rpc_api_key_header: Option<String>,
+    /// The provider's API key, for a hosted endpoint that keys on a header.
+    ///
+    /// Prefer `rpc_api_key_env` over putting the key here. This config file is
+    /// world-readable on the hub (644), and a key in it is a key every local
+    /// account can read; the LP scalar is kept out of it for the same reason.
     #[serde(default)]
     pub rpc_api_key: Option<String>,
+    /// Name of an environment variable holding the API key.
+    ///
+    /// Read in preference to `rpc_api_key`, so the key reaches the process
+    /// through a 600 EnvironmentFile rather than through the config. Set but
+    /// empty is treated as unset: an env file that failed to render should look
+    /// like no key, not like a key that is the empty string.
+    #[serde(default)]
+    pub rpc_api_key_env: Option<String>,
     /// `main` or `test`. Never defaulted: a coordinator that guessed its
     /// network would quote mainnet prices against a testnet chain.
     pub network: String,
@@ -413,10 +426,32 @@ impl CoordinatorConfig {
             (Some(u), Some(p)) => RpcConfig::local(self.zec.rpc_url.clone(), u, p, network),
             _ => RpcConfig::hosted(self.zec.rpc_url.clone(), network),
         };
-        if let (Some(header), Some(key)) = (&self.zec.rpc_api_key_header, &self.zec.rpc_api_key) {
-            rpc.api_key_header = Some((header.clone(), key.clone()));
+        if let (Some(header), Some(key)) = (&self.zec.rpc_api_key_header, self.rpc_api_key()) {
+            rpc.api_key_header = Some((header.clone(), key));
         }
         Ok(rpc)
+    }
+
+    /// The RPC API key, from the environment when a variable is named for it.
+    ///
+    /// `rpc_api_key_env` wins over the inline `rpc_api_key` so a deployment can
+    /// keep the key out of a world-readable config without having to delete the
+    /// inline field first. An empty or whitespace-only value counts as unset.
+    pub fn rpc_api_key(&self) -> Option<String> {
+        if let Some(var) = &self.zec.rpc_api_key_env {
+            if let Ok(v) = std::env::var(var) {
+                let v = v.trim();
+                if !v.is_empty() {
+                    return Some(v.to_string());
+                }
+            }
+        }
+        self.zec
+            .rpc_api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
     }
 
     pub fn state_dir(&self) -> PathBuf {
@@ -576,6 +611,73 @@ pub fn expand_home(path: &str) -> PathBuf {
 mod tests {
     use super::*;
 
+    /// A unique env var per test: these run in one process on many threads, and
+    /// a shared name makes the set/unset pairs race each other.
+    fn env_name(tag: &str) -> String {
+        format!("ZECP2P_TEST_RPC_KEY_{tag}")
+    }
+
+    #[test]
+    fn the_key_comes_from_the_environment_when_a_variable_is_named() {
+        let mut c = base();
+        let var = env_name("FROM_ENV");
+        std::env::set_var(&var, "sk-live-from-env");
+        c.zec.rpc_api_key_env = Some(var.clone());
+        c.zec.rpc_api_key_header = Some("x-api-key".into());
+
+        assert_eq!(c.rpc_api_key().as_deref(), Some("sk-live-from-env"));
+        let rpc = c.rpc_config().expect("rpc config");
+        assert_eq!(
+            rpc.api_key_header,
+            Some(("x-api-key".to_string(), "sk-live-from-env".to_string()))
+        );
+        std::env::remove_var(&var);
+    }
+
+    #[test]
+    fn the_environment_wins_over_a_key_written_into_the_config() {
+        // The point of the env var is keeping the key out of a world-readable
+        // file. If a stale inline key could win, that would silently keep using
+        // the one in the file.
+        let mut c = base();
+        let var = env_name("WINS");
+        std::env::set_var(&var, "the-env-one");
+        c.zec.rpc_api_key_env = Some(var.clone());
+        c.zec.rpc_api_key = Some("the-config-one".into());
+        assert_eq!(c.rpc_api_key().as_deref(), Some("the-env-one"));
+        std::env::remove_var(&var);
+    }
+
+    #[test]
+    fn an_empty_environment_value_reads_as_no_key_at_all() {
+        // An env file that failed to render leaves the variable set and empty.
+        // That must look like no key, not like a key that is the empty string:
+        // an empty `x-api-key` header is a request the provider rejects, and
+        // the failure would look like a bad key rather than a missing one.
+        let mut c = base();
+        let var = env_name("EMPTY");
+        std::env::set_var(&var, "   ");
+        c.zec.rpc_api_key_env = Some(var.clone());
+        c.zec.rpc_api_key = None;
+        assert_eq!(c.rpc_api_key(), None);
+
+        let rpc = c.rpc_config().expect("rpc config");
+        assert_eq!(rpc.api_key_header, None, "no header rather than an empty one");
+        std::env::remove_var(&var);
+    }
+
+    #[test]
+    fn a_header_without_a_key_sends_no_header() {
+        // Both halves or neither: a header name with nothing behind it would
+        // send `x-api-key:` empty on every call.
+        let mut c = base();
+        c.zec.rpc_api_key_header = Some("x-api-key".into());
+        c.zec.rpc_api_key = None;
+        c.zec.rpc_api_key_env = None;
+        let rpc = c.rpc_config().expect("rpc config");
+        assert_eq!(rpc.api_key_header, None);
+    }
+
     fn base() -> CoordinatorConfig {
         CoordinatorConfig {
             server: ServerConfig {
@@ -591,6 +693,7 @@ mod tests {
                 rpc_password: None,
                 rpc_api_key_header: None,
                 rpc_api_key: None,
+                rpc_api_key_env: None,
                 network: "test".into(),
                 refund_hours: 24,
                 block_seconds: 75,

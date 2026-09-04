@@ -34,7 +34,9 @@ allowed_origins = []
 [zec]
 rpc_url = "http://127.0.0.1:8232"
 # rpc_user / rpc_password for a local zcashd or zebrad.
-# rpc_api_key_header / rpc_api_key for a hosted provider that keys on a header.
+# rpc_api_key_header plus rpc_api_key_env for a hosted provider that keys on a
+# header. Prefer rpc_api_key_env over the inline rpc_api_key: the deployed config
+# is world-readable, and a key in it is readable by every local account.
 network = "test"
 refund_hours = 24
 block_seconds = 75

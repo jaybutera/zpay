@@ -41,23 +41,47 @@
 //! because `fees::release_fee_zat` shows the release input dominates through
 //! three outputs, so the escrow has a spare one in hand.
 //!
-//! # Why the constant is empty
+//! # The mainnet constant, and the check it still owes
 //!
-//! No treasury address has been funded or spent from yet. The design that
-//! specified this feature names the failure mode directly: a pinned script
-//! whose key is lost does not break trades and does not risk user funds, but it
-//! burns every fee it collects, silently, forever. So the rule is that an
-//! address ships only after a live-fire check - fund it, spend from it, record
-//! the txid - and until then every path that would need one refuses. An empty
-//! constant that fails closed is the honest encoding of "not yet".
+//! This constant was empty until 2026-09-04, and the reason is worth keeping:
+//! the design that specified this feature names the failure mode directly. A
+//! pinned script whose key is lost does not break trades and does not risk user
+//! funds, but it burns every fee it collects, silently, forever. So the rule was
+//! that an address ships only after a live-fire check - fund it, spend from it,
+//! record the txid - and until then every path that would need one refuses.
+//!
+//! A mainnet address is pinned now, ahead of that check, on Casper's
+//! instruction: the alternative was serving mainnet with the fee silently
+//! disabled, which is its own kind of dishonest. The lost-key risk is answered
+//! by a backup rather than by the live-fire run - the key is in
+//! `~/.zecp2p/mainnet-v2coord/` at 0600 and copied to `~/.zecp2p-backups/` with
+//! restore steps. **The first spend from it is still owed.** Until that happens
+//! nobody has demonstrated the key can move what the address receives, which is
+//! the one thing the live-fire check exists to demonstrate.
+//!
+//! The fail-closed rule itself is unchanged and still enforced, by
+//! `address_or_unpinned` rather than by the constant happening to be empty.
 
 use crate::address::{script_pubkey_for, AddrNetwork, AddressError};
 
 /// The mainnet treasury address, base58 `t1...` or `t3...`.
 ///
-/// Empty until an address has been funded and spent from on mainnet. See the
-/// module note.
-pub const MAINNET_TREASURY_ADDRESS: &str = "";
+/// Minted 2026-09-04 by `examples/payout_addrs` under `ZECP2P_RPC_NETWORK=main`,
+/// which encodes the address and then decodes it again through
+/// `address::script_pubkey_for` and asserts the resulting script pays the key's
+/// own hash160 - so this string is one the spending code accepts, not one this
+/// file merely spelled correctly. Its key is in the keystore
+/// `~/.zecp2p/mainnet-v2coord/v2coord-treasury-payout.key` (0600), backed up off
+/// that directory at `~/.zecp2p-backups/` with restore steps in `RESTORE.md`.
+///
+/// The module note above says an address ships only after a live-fire check -
+/// fund it, spend from it, record the txid - and that has NOT happened for this
+/// one. It is pinned ahead of that check deliberately, on Casper's instruction,
+/// because the alternative was serving mainnet with the fee silently disabled.
+/// What the note is guarding against is a lost key burning every fee collected,
+/// and the backup above is what answers that; the first spend from this address
+/// is still owed, and until it happens the risk is real rather than retired.
+pub const MAINNET_TREASURY_ADDRESS: &str = "t1J5pHAy423fRpkWDEP5Lu7iMtmsJ7SsTnz";
 
 /// The testnet/regtest treasury address, base58 `tm...`.
 ///
@@ -142,6 +166,18 @@ pub fn treasury_address(network: AddrNetwork) -> Result<&'static str, TreasuryEr
         AddrNetwork::Main => MAINNET_TREASURY_ADDRESS,
         AddrNetwork::Test => TESTNET_TREASURY_ADDRESS,
     };
+    address_or_unpinned(addr, network)
+}
+
+/// The emptiness rule on its own: an unpinned network refuses.
+///
+/// Split out from [`treasury_address`] so the fail-closed behaviour can be
+/// tested without depending on a constant being empty - both are pinned now,
+/// and a rule that only holds while nobody has filled it in is not a rule.
+fn address_or_unpinned(
+    addr: &'static str,
+    network: AddrNetwork,
+) -> Result<&'static str, TreasuryError> {
     if addr.is_empty() {
         return Err(TreasuryError::Unpinned { network });
     }
@@ -190,16 +226,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_unpinned_mainnet_treasury_refuses_rather_than_paying_somewhere() {
-        // Fail-closed is the point: an unset constant must never decode to a
-        // zero hash, which is an address nobody can spend from. Mainnet stays
-        // unset until an address has been funded and spent from.
+    fn an_empty_constant_still_refuses_rather_than_paying_somewhere() {
+        // Fail-closed is the rule the module is built on: an unset constant must
+        // never decode to a zero hash, which is an address nobody can spend
+        // from. Mainnet is pinned now, so the rule is exercised through the
+        // function that enforces it rather than through the constant.
         assert_eq!(
-            treasury_script(AddrNetwork::Main),
+            address_or_unpinned("", AddrNetwork::Main),
             Err(TreasuryError::Unpinned {
                 network: AddrNetwork::Main
             })
         );
+    }
+
+    #[test]
+    fn the_mainnet_treasury_decodes_to_the_key_it_documents() {
+        // Same check the testnet constant gets: the pinned mainnet address must
+        // decode, under mainnet, to a P2PKH script over its own key's hash160.
+        // A constant that decodes to anything else pays a script nobody holds a
+        // key for, and every fee it collects is burnt.
+        let spk = treasury_script(AddrNetwork::Main).expect("the mainnet treasury is pinned");
+        let mut expected = vec![0x76, 0xa9, 20];
+        expected.extend_from_slice(
+            &hex::decode("024f3c8fdcd5bae27df45b8dee80a5c079d0d4d4").unwrap(),
+        );
+        expected.extend_from_slice(&[0x88, 0xac]);
+        assert_eq!(spk, expected);
+    }
+
+    #[test]
+    fn the_mainnet_treasury_cannot_become_a_testnet_destination() {
+        // The mirror of the testnet guard below. A mainnet t1 under a testnet
+        // run must be refused outright rather than decoded to a hash that
+        // testnet would happily pay.
+        assert!(matches!(
+            script_pubkey_for(MAINNET_TREASURY_ADDRESS, AddrNetwork::Test),
+            Err(_)
+        ));
     }
 
     #[test]
