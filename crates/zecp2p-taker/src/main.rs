@@ -26,6 +26,7 @@ use zecp2p_taker::{
         journal::{FillRecord, FillState, Journal},
         money::payment_cents,
         pipeline::Gate,
+        rail::WorkId,
         watch::{GlueDeposit, WatchConfig, Watcher},
     },
     abi::IEscrowTaker,
@@ -854,10 +855,10 @@ fn compare_attestations(fresh: &AttestationFile, reference_path: &str) -> Result
 async fn run_rails(config: &TakerConfig, check_chain: bool) -> Result<()> {
     use zecp2p_taker::auto::rail::Rail;
 
-    let journal = Journal::open(&config.taker.journal_path)?;
+    let journal = Journal::open(config.taker.journal_path())?;
     let records = journal.latest()?;
 
-    println!("journal : {}", config.taker.journal_path);
+    println!("journal : {}", config.taker.journal_path());
     println!();
 
     for rail in Rail::all() {
@@ -1225,7 +1226,7 @@ async fn run_auto<P: alloy::providers::Provider + Clone>(
     once: bool,
     auto_yes: bool,
 ) -> Result<()> {
-    let journal = Journal::open(&config.taker.journal_path)?;
+    let journal = Journal::open(config.taker.journal_path())?;
 
     // A fill whose fiat may have left is not something to reason around. It is
     // read by a human before anything else moves.
@@ -1485,6 +1486,32 @@ async fn handle_one<P: alloy::providers::Provider + Clone>(
     auto_yes: bool,
     session_health: Option<&SessionHealth>,
 ) -> Result<Outcome> {
+    // The one payment slot, read per fill and not just at startup.
+    //
+    // The startup check in `run_auto` is a check on the state the daemon
+    // inherited. It says nothing about what happens later, and "later" now
+    // includes another process: `zecp2p-v2coordinator` pays from the same Venmo
+    // account and writes the same journal. Without this, a running taker starts
+    // a fill while the coordinator is mid-payment, and the feed ends up with two
+    // entries of the same amount to the same handle - which is precisely what
+    // `locate_payment` refuses to resolve, once both have left.
+    //
+    // The read is before the `Seen` write below, so a fill that cannot have the
+    // slot leaves no trace and is retried on the next poll.
+    if let Some(holder) = journal.in_flight()? {
+        if holder.work_id() != WorkId::base(deposit.deposit_id) {
+            return Ok(Outcome::Skipped {
+                why: format!(
+                    "{} holds the one payment slot ({:?}). One payment at a time: there is \
+                     one Venmo balance, and two entries of the same amount to the same \
+                     handle cannot be told apart in the feed.",
+                    holder.describe(),
+                    holder.state
+                ),
+            });
+        }
+    }
+
     // Everything free comes first. The cookie check is here rather than before
     // the attestation because a dead cookie found after the payment means the
     // fiat is gone and only cancelIntent recovers the stake.

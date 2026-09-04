@@ -120,6 +120,22 @@ impl OrderStore {
             .count()
     }
 
+    /// Orders this coordinator is still working on, across every handle.
+    ///
+    /// What the global bound counts. R3-5: it used to count every open order,
+    /// and `Refundable` is open forever - the page must keep being able to
+    /// offer the refund - so abandoned, never-funded orders accumulated toward
+    /// the ceiling and nothing ever brought them back down. Same reasoning as
+    /// [`Self::awaiting_for_handle`], applied to the global limit.
+    pub fn awaiting_count(&self) -> usize {
+        self.orders
+            .lock()
+            .expect("order store lock")
+            .values()
+            .filter(|o| o.stage.is_open() && o.stage != Stage::Refundable)
+            .count()
+    }
+
     /// Open orders for one Venmo handle.
     ///
     /// The per-caller bound. A handle is the only thing an order names that a

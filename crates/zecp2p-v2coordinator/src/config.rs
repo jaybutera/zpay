@@ -58,6 +58,11 @@ pub struct ServerConfig {
     ///
     /// Left unset it defaults under `state_dir`, which is correct only for a
     /// coordinator running alone.
+    ///
+    /// A leading `~/` is expanded, the way the taker expands its own
+    /// `journal_path` - R3-6: documenting the difference was not enough, since
+    /// a tilde in one file and a tilde in the other would have been two
+    /// journals and two slots.
     #[serde(default)]
     pub journal_path: Option<String>,
 }

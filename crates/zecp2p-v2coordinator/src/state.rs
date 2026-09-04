@@ -125,9 +125,18 @@ impl AppState {
         self.paying.clone().lock_owned().await
     }
 
-    /// Whether a payment is under way right now, without waiting for it.
+    /// Takes the payment lock if it is free, without waiting.
     ///
-    /// For a caller that wants to skip rather than queue.
+    /// One operation rather than a check and then an acquire: a caller that
+    /// asked `is it free` and then awaited the lock would have a window between
+    /// the two, and skipping on contention is the whole point - the sweep comes
+    /// back in seconds, and queueing would pin this task for as long as a
+    /// browser drive.
+    pub fn try_pay_lock(&self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        self.paying.clone().try_lock_owned().ok()
+    }
+
+    /// Whether a payment is under way right now. For tests and status.
     pub fn payment_in_progress(&self) -> bool {
         self.paying.try_lock().is_err()
     }

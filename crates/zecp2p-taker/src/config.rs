@@ -236,8 +236,23 @@ pub struct TakerSettings {
     ///
     /// Written before each irreversible step, so a restart can tell an operator
     /// which fills may have moved money. See `auto::journal`.
+    ///
+    /// It is also the payment slot, and the slot is global: one Venmo balance,
+    /// and two identical entries in the feed that the enclave's `payment_index`
+    /// cannot tell apart. So when `zecp2p-v2coordinator` serves the same
+    /// account, both must name the same file. Read it through
+    /// [`TakerSettings::journal_path`] rather than directly, so a leading `~/`
+    /// expands - the coordinator expands its own, and a tilde that expanded on
+    /// one side and not the other would be two journals and two slots.
     #[serde(default = "default_journal_path")]
     pub journal_path: String,
+}
+
+impl TakerSettings {
+    /// The journal path with a leading `~/` expanded.
+    pub fn journal_path(&self) -> String {
+        shellexpand_home(&self.journal_path)
+    }
 }
 
 /// $25.00. Deliberately small: a daemon serving $5 orders should have to be

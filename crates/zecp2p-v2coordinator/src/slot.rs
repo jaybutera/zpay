@@ -177,6 +177,60 @@ pub fn fiat_may_have_left(journal: &Journal, work: &WorkId) -> Result<bool> {
         .any(|r| &r.work_id() == work && may_already_have_paid(r.state)))
 }
 
+/// Takes the slot before anything slow happens.
+///
+/// R3-3: the read and the `Paying` write used to be separated by a chain
+/// round-trip and the rail's preflight. Inside one process the global mutex
+/// covers that, but the journal is meant to be the slot *between* daemons, and
+/// a second daemon reading the file during that window sees it free. So the
+/// claim goes down immediately after the read, while the mutex is still held,
+/// and the file says "taken" from that moment on.
+///
+/// The state is `Seen`, not `Paying`, and the difference matters. `Seen` holds
+/// the slot against every other work item, because [`holds_the_slot`] counts
+/// every open record - but it does not assert that money may have moved, so
+/// this order can still [`retract`] it when the chain check or the preflight
+/// refuses. `Paying` is written later, by [`claim`], and is never retracted:
+/// past that point a crash means a human reads the Venmo feed.
+pub fn reserve(
+    journal: &Journal,
+    work: &WorkId,
+    usd_amount_6dec: u64,
+    recipient: &str,
+) -> Result<FillRecord> {
+    let mut record = FillRecord::new_zec(
+        work.local.clone(),
+        alloy::primitives::U256::from(usd_amount_6dec),
+        alloy::primitives::U256::from(zecp2p_escrow::payment_details::IDENTITY_RATE_18DEC),
+        recipient.to_string(),
+    );
+    record.state = FillState::Seen;
+    journal
+        .record(&record)
+        .context("could not reserve the payment slot")?;
+    Ok(record)
+}
+
+/// Gives the slot back, having reserved it and then decided not to pay.
+///
+/// Only ever called on a [`reserve`] that has not become a [`claim`]: the chain
+/// said no, the rail cannot start, the deadline passed. Nothing has been sent,
+/// so `Cancelled` is the truth and it frees the slot for the next order.
+///
+/// A failure here leaves the slot held by a `Seen` line, which blocks payments
+/// until an operator looks - the safe direction, and the reason this is
+/// best-effort rather than fatal.
+pub fn retract(journal: &Journal, mut record: FillRecord, why: &str) {
+    record.state = FillState::Cancelled;
+    record.note = Some(format!("not paid: {why}"));
+    if let Err(e) = journal.record(&record) {
+        tracing::error!(
+            error = %e,
+            "could not release the payment slot after deciding not to pay; it stays held"
+        );
+    }
+}
+
 /// Writes the claim that must precede a payment.
 ///
 /// Separate from [`may_claim`] so the sequence at the call site reads in the
@@ -185,18 +239,11 @@ pub fn fiat_may_have_left(journal: &Journal, work: &WorkId) -> Result<bool> {
 /// recorded as "may have paid" rather than as nothing at all.
 pub fn claim(
     journal: &Journal,
-    work: &WorkId,
-    usd_amount_6dec: u64,
-    recipient: &str,
+    reserved: FillRecord,
     intent_hash: alloy::primitives::B256,
     intent_timestamp_ms: u64,
 ) -> Result<FillRecord> {
-    let mut record = FillRecord::new_zec(
-        work.local.clone(),
-        alloy::primitives::U256::from(usd_amount_6dec),
-        alloy::primitives::U256::from(zecp2p_escrow::payment_details::IDENTITY_RATE_18DEC),
-        recipient.to_string(),
-    );
+    let mut record = reserved;
     record.state = FillState::Paying;
     record.intent_hash = Some(intent_hash);
     record.signalled_at_ms = Some(intent_timestamp_ms);
@@ -204,6 +251,61 @@ pub fn claim(
         .record(&record)
         .context("could not write the journal entry that must precede a payment")?;
     Ok(record)
+}
+
+/// Releases the slot: the trade is finished and settled.
+///
+/// R3-1: nothing wrote this, so a `Paid` line stayed open forever and one
+/// completed trade blocked every later one. Worse across daemons: the taker
+/// refuses to start at all while an open record says the fiat may have left,
+/// so a finished coordinator trade would keep the taker from restarting.
+///
+/// `Fulfilled` is the right state rather than a new one: it is what the taker
+/// writes when `fulfillIntent` confirms, and here the release landing on chain
+/// is the same fact - the escrow has paid out against the payment, and there is
+/// nothing left for anybody to reconcile.
+///
+/// Best-effort by design. It runs after the release is on chain, so a failure
+/// to write it cannot lose money; it can only leave the slot held, which the
+/// next operator sees as a stuck fill rather than as a double payment.
+pub fn fulfilled(
+    journal: &Journal,
+    work: &WorkId,
+    usd_amount_6dec: u64,
+    recipient: &str,
+    release_txid: &str,
+) -> Result<()> {
+    let mut record = FillRecord::new_zec(
+        work.local.clone(),
+        alloy::primitives::U256::from(usd_amount_6dec),
+        alloy::primitives::U256::from(zecp2p_escrow::payment_details::IDENTITY_RATE_18DEC),
+        recipient.to_string(),
+    );
+    record.state = FillState::Fulfilled;
+    record.note = Some(format!("released in {release_txid}"));
+    journal
+        .record(&record)
+        .context("could not record the fill as fulfilled; the slot will stay held")
+}
+
+/// Whether the journal says this escrow's fiat leg **definitely** completed.
+///
+/// R3-4: a `Paid` line with an order still at `Locked` is the post-payment
+/// store write having failed. The dollars are gone and the order does not say
+/// so; failing that order abandons the release the LP has already paid for, so
+/// the right move is to finish it.
+///
+/// `Paid` only, and deliberately not `Paying`. The two are not the same claim:
+/// `Paying` is written *before* the click and means nobody knows whether money
+/// moved, so releasing on it would hand the escrow to the LP for a payment that
+/// may never have happened - the user loses their ZEC and got no dollars. That
+/// case stays a refusal for a human, which is what `NeedsOperator` and the
+/// `Failed` order are for.
+pub fn definitely_paid(journal: &Journal, work: &WorkId) -> Result<bool> {
+    let latest = journal.latest().context("could not read the journal back")?;
+    Ok(latest
+        .into_iter()
+        .any(|r| &r.work_id() == work && r.state == FillState::Paid))
 }
 
 #[cfg(test)]
@@ -312,7 +414,8 @@ mod tests {
         let work = zec_work(7);
         {
             let j = Journal::open(&path).unwrap();
-            claim(&j, &work, 700_000, "alice", B256::repeat_byte(0x11), 1_700_000_000_000).unwrap();
+            let reserved = reserve(&j, &work, 700_000, "alice").unwrap();
+            claim(&j, reserved, B256::repeat_byte(0x11), 1_700_000_000_000).unwrap();
         }
         let reopened = Journal::open(&path).unwrap();
         let refusal = may_claim(&reopened, &work).unwrap().expect_err("must refuse");

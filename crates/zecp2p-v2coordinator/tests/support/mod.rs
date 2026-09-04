@@ -630,6 +630,62 @@ impl FiatRail for SlowFiat {
     }
 }
 
+/// A rail that pays, and destroys the journal while doing it.
+///
+/// R3-2: the earlier version of this test broke the journal from a timer, and
+/// the timer won the race against `slot::claim` - so the claim failed, no
+/// payment left, and the only assertion sat behind `if payments > 0`. Breaking
+/// it from *inside* `pay` puts the failure exactly where it belongs: after the
+/// dollars are gone and before the `Paid` line is written.
+pub struct PayThenBreakJournal {
+    journal: std::path::PathBuf,
+    payments: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl PayThenBreakJournal {
+    pub fn new(journal: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            journal: journal.into(),
+            payments: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    pub fn payments(&self) -> usize {
+        self.payments.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl FiatRail for PayThenBreakJournal {
+    async fn pay(&self, leg: &zecp2p_taker::auto::rail::FiatLeg) -> anyhow::Result<PaidFiat> {
+        // The dollars leave.
+        self.payments
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // And then the journal becomes unwritable, so the `Paid` line that
+        // follows this call cannot be appended. A directory in place of the
+        // file is the cheapest real IO error.
+        let _ = std::fs::remove_file(&self.journal);
+        let _ = std::fs::create_dir(&self.journal);
+        Ok(PaidFiat {
+            cents: u64::try_from(leg.payment.cents())?,
+            fiat_left: true,
+        })
+    }
+
+    async fn attest(
+        &self,
+        leg: &zecp2p_taker::auto::rail::FiatLeg,
+    ) -> anyhow::Result<zecp2p_escrow::lp_client::WireAttestation> {
+        Ok(zecp2p_escrow::lp_client::WireAttestation {
+            intent_hash: hex::encode(leg.intent_hash.0),
+            release_amount: leg.intent_amount_6dec.to_string(),
+            data_hash: hex::encode([0u8; 32]),
+            signature: hex::encode([0u8; 65]),
+            encoded_payment_details: hex::encode(vec![0u8; 448]),
+        })
+    }
+}
+
 /// A curator stub, so no test reaches the live zk-p2p API.
 pub struct FakeCurator {
     pub url: String,

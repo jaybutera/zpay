@@ -46,11 +46,13 @@ max_payment_cents = 2500
 # reason. Two journals mean two slots, and each daemon will pay while the other
 # is paying.
 #
-# An absolute path, not `~/...`: the taker opens this string as given and does
-# not expand a tilde, so `~/.zecp2p/fills.jsonl` would create a directory
-# literally named `~` and the two daemons would quietly stop sharing a slot.
-# The coordinator does expand `~`, which makes the mismatch easy to write and
-# impossible to see.
+# Both daemons now read this file before every fill, not just at startup, and
+# both write their claim before the click. There is no file lock, so two
+# processes reading at the very same instant can still both see it free; the
+# windows are small and getting smaller, but this is not a mutex. Do not run
+# two payers against one account and rely on it alone.
+#
+# A leading ~/ expands on both sides.
 journal_path = "/home/YOU/.zecp2p/fills.jsonl"
 
 [session]

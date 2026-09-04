@@ -231,7 +231,7 @@ async fn open_order(
     // Orders cannot be evicted, so the bound is applied here. A caller in a
     // loop would otherwise leave this process scanning an unbounded number of
     // addresses on every sweep, and each of those scans is a node call.
-    if state.store.open_count() >= state.config.quote.max_open_orders {
+    if state.store.awaiting_count() >= state.config.quote.max_open_orders {
         return Err(ApiError::unavailable(
             "zpay has as many escrows open as it will watch at once. Try again in a \
              few minutes.",

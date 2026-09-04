@@ -378,14 +378,18 @@ async fn settle(state: &Arc<AppState>, order: Order) -> Result<()> {
     // Skipped rather than queued: an order that waited would hold this task
     // for as long as a browser drive takes, and the sweep will come back for
     // it in seconds anyway.
-    if state.payment_in_progress() {
+    // R3-7: one operation, not a check followed by an acquire. `try_lock` both
+    // asks and takes, so there is no window between them in which a third task
+    // could slip in - and skipping rather than queueing keeps this task from
+    // being held for as long as a browser drive takes, since the sweep returns
+    // in seconds.
+    let Some(_paying) = state.try_pay_lock() else {
         tracing::info!(
             order = %order.order_id,
             "waiting for the payment slot: another order is paying"
         );
         return Ok(());
-    }
-    let _paying = state.pay_lock().await;
+    };
 
     // Re-read the order under the lock. Whoever held it before may have moved
     // this very order on - the presign task and the sweep both arrive here -
@@ -422,6 +426,29 @@ async fn settle(state: &Arc<AppState>, order: Order) -> Result<()> {
                 // retry that automatically: the second payment is money the
                 // escrow cannot repay, because it releases once.
                 crate::slot::SlotRefusal::ThisOrderMayHavePaid { .. } => {
+                    // R3-4: `Paid` here is not an error, it is the post-payment
+                    // store write having failed. The dollars are gone and the
+                    // release is the only thing that recovers them, so the
+                    // order is finished rather than failed - failing it would
+                    // abandon a release the LP has already paid for.
+                    if crate::slot::definitely_paid(&state.journal, &work).unwrap_or(false) {
+                        tracing::warn!(
+                            order = %order.order_id,
+                            "the journal says this escrow was PAID and the order does not, \
+                             which is the post-payment store write having failed. Recording \
+                             the payment and going on to the release: abandoning it would \
+                             leave the LP having paid for an escrow that refunds to the user."
+                        );
+                        order.payment = Some(crate::order::Payment {
+                            sent_at: chrono::Utc::now(),
+                            cents: order.quote.net_cents,
+                        });
+                        order.stage = Stage::Paid;
+                        order.touch();
+                        state.store.put(&order)?;
+                        drop(_paying);
+                        return finish_payment(state, order).await;
+                    }
                     tracing::error!(order = %order.order_id, reason = %refusal, "refusing to pay twice");
                     order.fail(refusal.to_string());
                     state.store.put(&order)?;
@@ -430,6 +457,20 @@ async fn settle(state: &Arc<AppState>, order: Order) -> Result<()> {
             }
         }
     }
+
+    // The slot is taken *now*, before anything slow, and written to the file
+    // the other daemon reads. R3-3: the mutex above serialises this process,
+    // but the journal is the cross-daemon slot and the window between the read
+    // and the `Paying` write spanned a chain call and the rail's preflight - so
+    // a taker reading the file in that window saw it free. `Seen` holds the
+    // slot without claiming money may have moved, so it can still be given back
+    // below if the chain or the rail says no.
+    let reserved = crate::slot::reserve(
+        &state.journal,
+        &work,
+        order.quote.usd_amount_6dec,
+        &order.handle,
+    )?;
 
     let watched = watched_escrow(state, &order)?;
 
@@ -470,12 +511,22 @@ async fn settle(state: &Arc<AppState>, order: Order) -> Result<()> {
 
     if let Err(e) = payable {
         tracing::info!(order = %order.order_id, reason = %format!("{e:#}"), "not payable yet");
+        crate::slot::retract(&state.journal, reserved, "the chain says not yet");
+        // R3-8: off the pay lock before a chain read. `check_deadlines` talks
+        // to the node, and holding the one global payment lock across it makes
+        // every other order wait on a call that has nothing to do with paying.
+        drop(_paying);
         return check_deadlines(state, order).await;
     }
 
-    let leg = watched
-        .fiat_leg(state.config.quote.max_payment_cents)
-        .context("this escrow agreed a payment this coordinator will not send")?;
+    let leg = match watched.fiat_leg(state.config.quote.max_payment_cents) {
+        Ok(leg) => leg,
+        Err(e) => {
+            crate::slot::retract(&state.journal, reserved, "the payment is over the cap");
+            return Err(e)
+                .context("this escrow agreed a payment this coordinator will not send");
+        }
+    };
 
     // Can this rail pay at all? Asked before the journal entry, because a rail
     // that cannot start has provably sent nothing, and an escrow whose LP never
@@ -488,6 +539,9 @@ async fn settle(state: &Arc<AppState>, order: Order) -> Result<()> {
             error = %format!("{e:#}"),
             "the fiat rail cannot pay right now; nothing was sent and the escrow stays refundable"
         );
+        crate::slot::retract(&state.journal, reserved, "the fiat rail cannot start");
+        // Off the lock before the chain read in `check_deadlines`. See R3-8.
+        drop(_paying);
         return check_deadlines(state, order).await;
     }
 
@@ -498,9 +552,7 @@ async fn settle(state: &Arc<AppState>, order: Order) -> Result<()> {
     // recorded first, and a human resolves it from the feed.
     let mut record = crate::slot::claim(
         &state.journal,
-        &work,
-        order.quote.usd_amount_6dec,
-        &order.handle,
+        reserved,
         leg.intent_hash,
         leg.intent_timestamp_ms,
     )?;
@@ -524,11 +576,14 @@ async fn settle(state: &Arc<AppState>, order: Order) -> Result<()> {
     };
 
     if !paid.fiat_left {
-        // A dry run. The escrow is untouched and the user refunds at T.
+        // A dry run. The escrow is untouched and the user refunds at T, so the
+        // slot goes back: nothing was sent, and holding it would stall every
+        // other order behind a rail that never intends to pay.
         tracing::warn!(
             order = %order.order_id,
             "the fiat rail did not send: serve.live_payments is false"
         );
+        crate::slot::retract(&state.journal, record, "the rail was in dry-run mode");
         return Ok(());
     }
 
@@ -595,10 +650,14 @@ async fn finish_payment(state: &Arc<AppState>, mut order: Order) -> Result<()> {
     let Some(fiat) = state.fiat.clone() else {
         return Ok(());
     };
-    if order.release_txid.is_some() {
+    if let Some(txid) = order.release_txid.clone() {
+        // A restart on an order that already released. The slot may still be
+        // held by a `Paid` line from before the crash, and nothing else will
+        // ever free it.
         order.stage = Stage::Released;
         order.touch();
         state.store.put(&order)?;
+        release_slot(state, &order, &txid);
         return Ok(());
     }
 
@@ -715,15 +774,22 @@ async fn broadcast_release(
 
     match txid {
         Ok(txid) => {
-            order.release_txid = Some(zecp2p_escrow::rpc::txid_to_display(&txid));
+            // Not named `display`: that shadows `tracing::field::display`,
+            // which the macro below resolves through `%`.
+            let release_txid = zecp2p_escrow::rpc::txid_to_display(&txid);
+            order.release_txid = Some(release_txid.clone());
             order.stage = Stage::Released;
             order.touch();
             state.store.put(&order)?;
-            tracing::info!(
-                order = %order.order_id,
-                txid = %zecp2p_escrow::rpc::txid_to_display(&txid),
-                "released"
-            );
+
+            // The slot is released here and nowhere else. Until this line the
+            // journal still says `Paid`, which holds the slot - correctly, since
+            // a payment without a release is exactly the state a human needs to
+            // see. Now the escrow has paid out against it and there is nothing
+            // left to reconcile.
+            release_slot(state, &order, &release_txid);
+
+            tracing::info!(order = %order.order_id, txid = %release_txid, "released");
             Ok(())
         }
         Err(e) => {
@@ -738,6 +804,32 @@ async fn broadcast_release(
             state.store.put(&order)?;
             Err(e)
         }
+    }
+}
+
+/// Marks the fill fulfilled, which is what frees the payment slot.
+///
+/// Best-effort: it runs after the release is on chain, so failing to write it
+/// cannot lose money. It can only leave the slot held, which surfaces as a
+/// stuck fill an operator clears rather than as a second payment.
+fn release_slot(state: &AppState, order: &Order, release_txid: &str) {
+    let Some(funding) = order.funding else {
+        return;
+    };
+    let work = crate::slot::work_id_for(&funding.txid, funding.vout);
+    if let Err(e) = crate::slot::fulfilled(
+        &state.journal,
+        &work,
+        order.quote.usd_amount_6dec,
+        &order.handle,
+        release_txid,
+    ) {
+        tracing::error!(
+            order = %order.order_id,
+            error = %format!("{e:#}"),
+            "the release landed but the fill could not be marked fulfilled. The payment \
+             slot stays held, so no further order will be paid until this is cleared."
+        );
     }
 }
 
