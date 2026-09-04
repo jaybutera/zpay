@@ -81,13 +81,15 @@ pub const TESTNET_TREASURY_ADDRESS: &str = "tmCMbzCuRX3BW95a2GZWDSHvM4THqu5ziTA"
 
 /// The platform cut, in basis points of the escrow amount.
 ///
-/// 20 bps is the rate the superseded Base-rail spec charged and the rate the v2
-/// design carries forward. It is expressed against `amount_zat` rather than
+/// 15 bps, the 0.15% the coordinator's quote breakdown and the launch page
+/// already state. The superseded Base-rail spec charged 20 bps, and this crate
+/// shipped at that rate until 2026-09-03; the v2 design's open question 6
+/// records the change. The rate is expressed against `amount_zat` rather than
 /// against the USD leg because `rate_18dec` must be exactly
 /// `payment_details::IDENTITY_RATE_18DEC` - the enclave's `releaseAmount` only
 /// means dollars at the identity rate - so the fee cannot be a rate adjustment
 /// and has to be a zatoshi subtraction.
-pub const PLATFORM_FEE_BPS: u64 = 20;
+pub const PLATFORM_FEE_BPS: u64 = 15;
 
 /// The smallest treasury output the escrow will write.
 ///
@@ -228,30 +230,33 @@ mod tests {
 
     #[test]
     fn the_fee_rounds_down() {
-        // 20 bps of 200000 is 400 exactly.
-        assert_eq!(platform_fee_zat(200_000, 20), 400);
-        // 20 bps of 200001 is 400.002, which rounds to 400 and not to 401: the
+        // 15 bps of 200000 is 300 exactly.
+        assert_eq!(platform_fee_zat(200_000, 15), 300);
+        // 15 bps of 200001 is 300.0015, which rounds to 300 and not to 301: the
         // platform never takes more than its published rate.
-        assert_eq!(platform_fee_zat(200_001, 20), 400);
+        assert_eq!(platform_fee_zat(200_001, 15), 300);
+        // And the constant is the rate these figures were computed at.
+        assert_eq!(PLATFORM_FEE_BPS, 15);
     }
 
     #[test]
     fn a_sub_dust_fee_becomes_no_fee_at_all() {
-        // At 20 bps the dust boundary falls at 27,000 zat of escrow: 20 bps of
-        // 26,999 is 53 zat, one below the threshold, and 20 bps of 27,000 is
-        // exactly 54. A 53 zat output would make the release non-standard,
-        // which breaks the trade; forgoing the fee does not.
-        assert_eq!(platform_fee_zat(26_999, PLATFORM_FEE_BPS), 0);
-        assert_eq!(platform_fee_zat(27_000, PLATFORM_FEE_BPS), 54);
+        // At 15 bps the dust boundary falls at 36,000 zat of escrow: 15 bps of
+        // 35,999 is 53.9985, which rounds down to 53, one below the threshold,
+        // and 15 bps of 36,000 is exactly 54. A 53 zat output would make the
+        // release non-standard, which breaks the trade; forgoing the fee does
+        // not.
+        assert_eq!(platform_fee_zat(35_999, PLATFORM_FEE_BPS), 0);
+        assert_eq!(platform_fee_zat(36_000, PLATFORM_FEE_BPS), 54);
 
         // Worth stating plainly: at this rate the gate never fires on an escrow
         // the protocol will actually accept. `client::MINIMUM_ESCROW_ZAT` is
-        // 120,000 zat, more than four times the boundary, so every quotable
+        // 120,000 zat, more than three times the boundary, so every quotable
         // escrow yields a fee above dust. The gate is here for a lower rate or a
         // smaller minimum, either of which is a config change away.
         // A const assertion, so a change to either constant is a build error
         // and not a test that quietly stops meaning anything.
-        const _: () = assert!(crate::client::MINIMUM_ESCROW_ZAT > 27_000);
+        const _: () = assert!(crate::client::MINIMUM_ESCROW_ZAT > 36_000);
         assert!(platform_fee_zat(crate::client::MINIMUM_ESCROW_ZAT, PLATFORM_FEE_BPS) > 0);
 
         // A 1 bp rate is one such config change, and there the gate does fire.

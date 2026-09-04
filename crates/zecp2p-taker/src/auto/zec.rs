@@ -331,7 +331,7 @@ mod tests {
             1_000_000_000_000_000_000,
             [0x85; 32],
             1_756_000_000_000,
-            400,
+            300,
             vec![0x76, 0xa9, 20, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb,
                  0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0x88, 0xac],
         )
@@ -528,7 +528,7 @@ mod tests {
             0x76, 0xa9, 20, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
             0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0x88, 0xac,
         ];
-        let err = canonical_terms(&terms, 1_500_000, 1, [0x85; 32], 1, 400, Vec::new())
+        let err = canonical_terms(&terms, 1_500_000, 1, [0x85; 32], 1, 300, Vec::new())
             .expect_err("a fee with no destination must be refused");
         assert!(err.to_string().contains("both be set or both be empty"));
         let err = canonical_terms(&terms, 1_500_000, 1, [0x85; 32], 1, 0, treasury.clone())
@@ -536,7 +536,7 @@ mod tests {
         assert!(err.to_string().contains("both be set or both be empty"));
 
         // And the honest pairing builds.
-        canonical_terms(&terms, 1_500_000, 1, [0x85; 32], 1, 400, treasury)
+        canonical_terms(&terms, 1_500_000, 1, [0x85; 32], 1, 300, treasury)
             .expect("a complete fee must build");
         assert!(canonical_terms(&terms, 1_500_000, 0, [0x85; 32], 1, 0, Vec::new()).is_err());
         let err = canonical_terms(&terms, 1_500_000, 1, [0u8; 32], 1, 0, Vec::new()).expect_err("must refuse");

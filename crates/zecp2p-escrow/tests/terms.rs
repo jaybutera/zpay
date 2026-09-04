@@ -18,8 +18,8 @@ fn base() -> CanonicalTerms {
         rate_18dec: 990_881_148_896_019_200,
         payee_hash: [0x85; 32],
         lock_confirmed_ms: 1_788_315_013_000,
-        // 20 bps of 5_000_000 zat, the rate `treasury::PLATFORM_FEE_BPS` sets.
-        platform_fee_zat: 10_000,
+        // 15 bps of 5_000_000 zat, the rate `treasury::PLATFORM_FEE_BPS` sets.
+        platform_fee_zat: 7_500,
         treasury_script: TREASURY.to_vec(),
     }
 }
@@ -124,7 +124,7 @@ fn the_canonical_json_is_a_fixed_vector() {
             "\"l_pub\":\"030303030303030303030303030303030303030303030303030303030303030303\",",
             "\"lock_confirmed_ms\":\"1788315013000\",",
             "\"payee_hash\":\"8585858585858585858585858585858585858585858585858585858585858585\",",
-            "\"platform_fee_zat\":\"10000\",",
+            "\"platform_fee_zat\":\"7500\",",
             "\"rate_18dec\":\"990881148896019200\",",
             "\"refund_height\":\"3500000\",",
             "\"treasury_script\":\"76a914c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d388ac\",",
