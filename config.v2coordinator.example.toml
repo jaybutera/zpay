@@ -8,6 +8,20 @@
 host = "127.0.0.1"
 port = 3000
 state_dir = "~/.zecp2p/v2coordinator"
+# The fill journal, which is also the payment slot.
+#
+# THIS MUST BE THE SAME FILE zecp2p-taker WRITES (taker.journal_path) on any
+# machine where both run. There is one Venmo balance and one feed, and two
+# identical payments in that feed cannot be told apart by the enclave's
+# payment_index. Two daemons with two journals hold two slots, so each will
+# pay while the other is paying - and the protection looks like it is working
+# because each process is internally consistent.
+#
+# config.taker.example.toml sets taker.journal_path to this same path. Write it
+# absolute in both: the taker opens its journal_path as given and does not
+# expand `~`, while this one does, so a tilde here and a tilde there are two
+# different files.
+journal_path = "/home/YOU/.zecp2p/fills.jsonl"
 # Origins allowed to call the API from a browser. Empty means same-origin only,
 # which is what a deployment serving the page itself wants.
 allowed_origins = []

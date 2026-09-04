@@ -47,6 +47,19 @@ pub struct ServerConfig {
     /// only, which is what a deployment serving the page itself wants.
     #[serde(default)]
     pub allowed_origins: Vec<String>,
+    /// The fill journal, which is also the payment slot.
+    ///
+    /// **This must be the same file the taker writes** (`taker.journal_path`)
+    /// on any machine where both run. The slot exists because there is one
+    /// Venmo balance and one feed; two daemons holding two journals hold two
+    /// slots, and each will happily pay while the other is paying. That was
+    /// R2-6: the defaults were `taker-fills.jsonl` and `fills.jsonl`, so the
+    /// protection was real within each process and absent between them.
+    ///
+    /// Left unset it defaults under `state_dir`, which is correct only for a
+    /// coordinator running alone.
+    #[serde(default)]
+    pub journal_path: Option<String>,
 }
 
 fn default_host() -> String {
@@ -405,6 +418,14 @@ impl CoordinatorConfig {
         expand_home(&self.server.state_dir)
     }
 
+    /// Where the fill journal lives. See [`ServerConfig::journal_path`].
+    pub fn journal_path(&self) -> PathBuf {
+        match &self.server.journal_path {
+            Some(p) => expand_home(p),
+            None => self.state_dir().join("fills.jsonl"),
+        }
+    }
+
     /// Everything that must be true before the first order is taken.
     pub fn validate(&self) -> Result<()> {
         let network = self.network()?;
@@ -557,6 +578,7 @@ mod tests {
                 port: default_port(),
                 state_dir: "/tmp/v2coord-test".into(),
                 allowed_origins: vec![],
+                journal_path: None,
             },
             zec: ZecConfig {
                 rpc_url: "http://127.0.0.1:18232".into(),
@@ -704,6 +726,28 @@ mod tests {
                 "{bad} is not loopback and must be refused"
             );
         }
+    }
+
+    #[test]
+    fn the_journal_path_is_configurable_so_it_can_be_shared_with_the_taker() {
+        // R2-6: the slot is only a slot if both daemons write one file. The
+        // coordinator defaulted to `<state_dir>/fills.jsonl` and the taker to
+        // `taker-fills.jsonl`, so the protection was real inside each process
+        // and absent between them.
+        let mut c = base();
+        c.server.state_dir = "/tmp/v2coord-test".into();
+        assert_eq!(
+            c.journal_path(),
+            std::path::PathBuf::from("/tmp/v2coord-test/fills.jsonl"),
+            "the default lives under state_dir"
+        );
+
+        c.server.journal_path = Some("/var/lib/zecp2p/fills.jsonl".into());
+        assert_eq!(
+            c.journal_path(),
+            std::path::PathBuf::from("/var/lib/zecp2p/fills.jsonl"),
+            "an explicit path is used as given, so it can name the taker's file"
+        );
     }
 
     #[test]

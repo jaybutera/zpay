@@ -347,7 +347,7 @@ pub fn verify_pre_signature(state: &AppState, order: &Order, pre_signature_hex: 
 }
 
 /// The paid path: check, pay, attest, release.
-async fn settle(state: &Arc<AppState>, mut order: Order) -> Result<()> {
+async fn settle(state: &Arc<AppState>, order: Order) -> Result<()> {
     let Some(fiat) = state.fiat.clone() else {
         tracing::debug!(
             order = %order.order_id,
@@ -360,6 +360,48 @@ async fn settle(state: &Arc<AppState>, mut order: Order) -> Result<()> {
         .funding
         .ok_or_else(|| anyhow::anyhow!("settling an order with no funding outpoint"))?;
     let work = crate::slot::work_id_for(&funding.txid, funding.vout);
+
+    // **The critical section starts here.**
+    //
+    // R2-1: the slot check below is a read of the journal, and the matching
+    // write is three `await` points away - a chain round-trip and the rail's
+    // preflight sit between them. The per-order lock does not help, because the
+    // two racing tasks are two *different* orders. So two of them read an empty
+    // journal, both passed, both wrote `Paying`, and both paid; the reviewer
+    // reproduced exactly that, two payments with an overlap of two.
+    //
+    // A read-then-write on a shared resource has to happen inside one lock.
+    // This is that lock, it is global, and it is held until the payment's
+    // outcome is on disk. Another order arriving meanwhile waits here rather
+    // than observing the gap.
+    //
+    // Skipped rather than queued: an order that waited would hold this task
+    // for as long as a browser drive takes, and the sweep will come back for
+    // it in seconds anyway.
+    if state.payment_in_progress() {
+        tracing::info!(
+            order = %order.order_id,
+            "waiting for the payment slot: another order is paying"
+        );
+        return Ok(());
+    }
+    let _paying = state.pay_lock().await;
+
+    // Re-read the order under the lock. Whoever held it before may have moved
+    // this very order on - the presign task and the sweep both arrive here -
+    // and the copy read before the wait is stale.
+    let Some(order_now) = state.store.get(&order.order_id) else {
+        return Ok(());
+    };
+    if order_now.stage != Stage::Locked {
+        tracing::debug!(
+            order = %order.order_id,
+            stage = order_now.stage.as_str(),
+            "no longer waiting to be paid"
+        );
+        return Ok(());
+    }
+    let mut order = order_now;
 
     // The one payment slot, read back from the journal rather than from the
     // order store. R1-1 and R1-2: the store says `Locked` for an order that is
@@ -490,18 +532,56 @@ async fn settle(state: &Arc<AppState>, mut order: Order) -> Result<()> {
         return Ok(());
     }
 
-    record.state = zecp2p_taker::auto::journal::FillState::Paid;
-    record.paid = Some(leg.payment.to_venmo_string());
-    state.journal.record(&record)?;
-
+    // The dollars are gone. From here nothing may abort the release: it is the
+    // only thing that recovers the payment, and the escrow's timeout branch is
+    // running against it.
+    //
+    // R2-3: this used to write the journal first with `?`, so a failed journal
+    // write - a full disk, a permissions change - bailed with the store still
+    // at `Locked`. The next sweep then read `Paying`, correctly refused to pay
+    // twice, and failed the order: dollars gone, release never attempted, and
+    // the LP's own escrow left to the user's refund. Two changes:
+    //
+    // The **order store goes first**, because it is what `finish_payment` reads
+    // to know a payment happened, and it is what a restart reads. Then the
+    // journal, which is the operator's record and the slot.
+    //
+    // And **neither write can stop the release.** A write that fails is logged
+    // at error and the release is attempted anyway. That is the right trade:
+    // the worst case of proceeding is a release whose bookkeeping is missing,
+    // which a human can reconcile from the chain; the worst case of stopping is
+    // an escrow that refunds to the user after the LP has paid them.
     order.payment = Some(crate::order::Payment {
         sent_at: chrono::Utc::now(),
         cents: paid.cents,
     });
     order.stage = Stage::Paid;
     order.touch();
-    state.store.put(&order)?;
+    if let Err(e) = state.store.put(&order) {
+        tracing::error!(
+            order = %order.order_id,
+            error = %format!("{e:#}"),
+            "the dollars have gone and this order could not be written to disk.              Continuing to the release anyway: the payment is unrecoverable without it.              A restart before the release lands will not know this order was paid."
+        );
+    }
+
+    record.state = zecp2p_taker::auto::journal::FillState::Paid;
+    record.paid = Some(leg.payment.to_venmo_string());
+    if let Err(e) = state.journal.record(&record) {
+        tracing::error!(
+            order = %order.order_id,
+            error = %format!("{e:#}"),
+            "the dollars have gone and the journal could not be updated. The slot stays              held by the Paying line, which is the safe direction; continuing to the release."
+        );
+    }
     tracing::info!(order = %order.order_id, cents = paid.cents, "the dollars have gone");
+
+    // The payment slot is released here, by dropping the guard, and not before:
+    // the order is `Paid` on disk and the journal line is written, so any other
+    // order arriving now reads a slot that is properly held by a `Paid` record.
+    // `finish_payment` does not need the lock - it pays nothing - and holding it
+    // through an attestation would stall every other trade for minutes.
+    drop(_paying);
 
     finish_payment(state, order).await
 }

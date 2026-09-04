@@ -85,6 +85,24 @@ pub struct AppState {
     /// pay - or both broadcast. The lock is per order rather than global so a
     /// slow browser on one trade does not stall the sweep on every other.
     advancing: Arc<tokio::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// One payment at a time, across every order.
+    ///
+    /// R2-1: the per-order lock above serialises an order with itself and
+    /// nothing else, and the slot check was a *read* of the journal followed by
+    /// two `await` points - a chain round-trip and the rail's preflight -
+    /// before the matching write. Two orders advancing together both read an
+    /// empty journal, both passed, both wrote `Paying`, and both paid. The
+    /// reviewer reproduced it: two payments, maximum overlap two.
+    ///
+    /// A read-then-write on a shared resource needs the read and the write
+    /// inside one critical section. This is that section, and it is held from
+    /// before the journal is read until the payment's outcome is recorded, so
+    /// no second order can observe the gap.
+    ///
+    /// It is a `Mutex` rather than a semaphore because the invariant is exactly
+    /// one: one Venmo balance, and one feed in which two identical payments
+    /// cannot be told apart.
+    paying: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -97,6 +115,23 @@ impl std::fmt::Debug for AppState {
 }
 
 impl AppState {
+    /// The global payment lock.
+    ///
+    /// Held across the whole read-decide-claim-pay-record sequence in
+    /// `driver::settle`. Callers must not hold it while doing anything that
+    /// does not need to be serialised against other payments: everything under
+    /// it is one trade's worth of latency for every other trade.
+    pub async fn pay_lock(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.paying.clone().lock_owned().await
+    }
+
+    /// Whether a payment is under way right now, without waiting for it.
+    ///
+    /// For a caller that wants to skip rather than queue.
+    pub fn payment_in_progress(&self) -> bool {
+        self.paying.try_lock().is_err()
+    }
+
     /// The lock for one order, created on first use.
     pub async fn order_lock(&self, order_id: &str) -> Arc<tokio::sync::Mutex<()>> {
         let mut map = self.advancing.lock().await;
@@ -262,9 +297,24 @@ impl AppStateBuilder {
             "funding discovery strategy"
         );
 
-        let journal_path = config.state_dir().join("fills.jsonl");
+        let journal_path = config.journal_path();
         let journal = zecp2p_taker::auto::journal::Journal::open(&journal_path)
             .with_context(|| format!("could not open the journal at {}", journal_path.display()))?;
+
+        // Where the slot lives, on the record. A deployment that also runs the
+        // taker must point both at one file, and the only way an operator finds
+        // out otherwise is by paying twice.
+        if config.server.journal_path.is_none() {
+            tracing::warn!(
+                journal = %journal_path.display(),
+                "server.journal_path is unset, so the payment slot is this process's own \
+                 journal. If zecp2p-taker also runs against this Venmo account, point \
+                 both at the same file (taker.journal_path) or each will pay while the \
+                 other is paying."
+            );
+        } else {
+            tracing::info!(journal = %journal_path.display(), "payment slot journal");
+        }
 
         Ok(Arc::new(AppState {
             config,
@@ -282,6 +332,7 @@ impl AppStateBuilder {
             journal: Arc::new(journal),
             secp,
             advancing: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            paying: Arc::new(tokio::sync::Mutex::new(())),
         }))
     }
 }

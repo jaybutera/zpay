@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 
-use crate::order::Order;
+use crate::order::{Order, Stage};
 
 /// Every order this coordinator knows about.
 #[derive(Debug, Clone)]
@@ -130,6 +130,31 @@ impl OrderStore {
             .expect("order store lock")
             .values()
             .filter(|o| o.stage.is_open() && o.handle.eq_ignore_ascii_case(handle))
+            .count()
+    }
+
+    /// Orders for one handle that this coordinator is still working on.
+    ///
+    /// The per-handle bound counts these rather than every open order. R2-5:
+    /// `Refundable` is open - the user may still refund, and the order must
+    /// stay readable so the page can offer that - but it needs nothing further
+    /// from this coordinator. Counting it meant five abandoned, never-funded
+    /// orders locked a served handle out permanently, at no cost to whoever
+    /// opened them.
+    ///
+    /// The distinction is "is this coordinator going to do something about it",
+    /// not "is this order finished". A refundable escrow is the user's to
+    /// resolve, from a page that already holds the key.
+    pub fn awaiting_for_handle(&self, handle: &str) -> usize {
+        self.orders
+            .lock()
+            .expect("order store lock")
+            .values()
+            .filter(|o| {
+                o.handle.eq_ignore_ascii_case(handle)
+                    && o.stage.is_open()
+                    && o.stage != Stage::Refundable
+            })
             .count()
     }
 

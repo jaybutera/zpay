@@ -237,7 +237,7 @@ async fn open_order(
              few minutes.",
         ));
     }
-    if state.store.open_for_handle(&handle) >= state.config.quote.max_open_per_handle {
+    if state.store.awaiting_for_handle(&handle) >= state.config.quote.max_open_per_handle {
         return Err(ApiError::bad_request(
             "there are already several escrows open for that Venmo account. Finish or \
              let those refund before opening another.",
@@ -516,6 +516,31 @@ async fn refund(
             "the dollars for this order have already been sent, so zpay will not help \
              broadcast a refund that would race its release",
         ));
+    }
+
+    // And the journal, which knows things the stage does not. R2-4: `order.fail`
+    // leaves the stage `Failed`, and the failure whose message is "a payment may
+    // have left" produced exactly that stage - which the gate above accepts. The
+    // journal line is written before the click, so it is the only record that
+    // can distinguish a failed order nobody paid for from a failed order that
+    // may have been paid.
+    //
+    // The refusal is deliberately not the end of the road for the user: the page
+    // holds the signed bytes and any node will take them after `T`. What this
+    // will not do is put the coordinator's own node behind a transaction that
+    // may be racing a release for money already sent.
+    if let Some(funding) = order.funding {
+        let work = crate::slot::work_id_for(&funding.txid, funding.vout);
+        let may_have_paid = crate::slot::fiat_may_have_left(&state.journal, &work)
+            .map_err(|e| ApiError::unavailable(format!("zpay could not check its own records: {e}")))?;
+        if may_have_paid {
+            return Err(ApiError::bad_request(
+                "zpay's records say a payment for this escrow may already have been sent, \
+                 so it will not broadcast a refund that could race the release. The signed \
+                 transaction is on your screen and any Zcash node will accept it once the \
+                 refund height passes.",
+            ));
+        }
     }
 
     // A refund is only due once the escrow is past `T` and unsettled. Outside

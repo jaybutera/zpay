@@ -38,6 +38,39 @@ use anyhow::{Context, Result};
 use zecp2p_taker::auto::journal::{FillRecord, FillState, Journal};
 use zecp2p_taker::auto::rail::WorkId;
 
+/// Whether an open journal record must hold the payment slot.
+///
+/// R2-2: this used to be `fiat_may_have_left() || state == Paying`, which let
+/// `NeedsOperator` through. That is the state `settle` writes when `fiat::pay`
+/// fails - the case whose whole meaning is "a payment may have left and a human
+/// has to look" - so the slot was freed by exactly the outcome that most needs
+/// it held. The next order for the same handle then paid, into a feed that
+/// already had an entry nobody had reconciled.
+///
+/// The rule is the taker's: **every open record holds the slot.** `is_open` is
+/// false only for `Fulfilled` and `Cancelled`, both of which are somebody
+/// having decided the fill is over. Anything else - `Seen`, `Signalling`,
+/// `Signalled`, `Paying`, `Paid`, `NeedsOperator` - is unfinished work against
+/// one Venmo balance, and `Journal::in_flight` treats all of it the same way.
+fn holds_the_slot(state: FillState) -> bool {
+    state.is_open()
+}
+
+/// Whether an open record for *this* work item means a payment may already
+/// have gone out for it.
+///
+/// Narrower than [`holds_the_slot`], because the two answers differ: a `Seen`
+/// line for this order is its own claim on the slot and must not lock the order
+/// out of its first payment, whereas a `Seen` line for a *different* order
+/// still occupies the one balance.
+fn may_already_have_paid(state: FillState) -> bool {
+    state.fiat_may_have_left()
+        || matches!(
+            state,
+            FillState::Paying | FillState::NeedsOperator | FillState::Signalling
+        )
+}
+
 /// Why a payment may not start.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlotRefusal {
@@ -91,16 +124,17 @@ pub fn may_claim(journal: &Journal, work: &WorkId) -> Result<Result<(), SlotRefu
         .context("could not read the journal back; refusing to pay without it")?;
 
     for record in latest {
-        if !record.state.is_open() {
+        if !holds_the_slot(record.state) {
             continue;
         }
         let holder = record.work_id();
 
         if &holder == work {
-            // Our own record. `Seen` is a claim that has not reached the
-            // browser and may be retried; anything from `Paying` on means a
-            // payment for this escrow may already have left.
-            if record.state.fiat_may_have_left() || record.state == FillState::Paying {
+            // Our own record. `Seen` is a claim that never reached the browser
+            // and may be retried; anything from `Signalling` on means a payment
+            // for this escrow may already have left, and `NeedsOperator` says
+            // so outright.
+            if may_already_have_paid(record.state) {
                 return Ok(Err(SlotRefusal::ThisOrderMayHavePaid {
                     work: holder.to_string(),
                     state: record.state,
@@ -109,18 +143,38 @@ pub fn may_claim(journal: &Journal, work: &WorkId) -> Result<Result<(), SlotRefu
             continue;
         }
 
-        // Somebody else's open fill. `Paid` counts: that order is waiting on an
-        // attestation for a payment already in the feed, and a second payment
-        // of the same amount to the same handle would make both unprovable.
-        if record.state.fiat_may_have_left() || record.state == FillState::Paying {
-            return Ok(Err(SlotRefusal::HeldByAnother {
-                work: holder.to_string(),
-                state: record.state,
-            }));
-        }
+        // Somebody else's open fill. All of it counts, including `Paid` (that
+        // order is waiting on an attestation for a payment already in the feed)
+        // and `NeedsOperator` (a human has not yet said what happened to a
+        // payment that may have gone out). A second payment of the same amount
+        // to the same handle would make both unprovable.
+        return Ok(Err(SlotRefusal::HeldByAnother {
+            work: holder.to_string(),
+            state: record.state,
+        }));
     }
 
     Ok(Ok(()))
+}
+
+/// Whether the journal says a payment for this escrow may have gone out.
+///
+/// For a caller that is about to do something a payment would make unsafe -
+/// broadcasting a refund, above all. R2-4: the refund endpoint gated on the
+/// order's *stage*, and `order.fail` leaves the stage `Failed`, which that
+/// endpoint accepted. So the one path whose message is "a payment may have
+/// left" produced a stage the refund endpoint would broadcast against, and the
+/// refund would race a release for money already paid.
+///
+/// The journal is the authority here for the same reason it is the slot: it is
+/// written before the click, so it knows things the stage cannot.
+pub fn fiat_may_have_left(journal: &Journal, work: &WorkId) -> Result<bool> {
+    let latest = journal
+        .latest()
+        .context("could not read the journal back")?;
+    Ok(latest
+        .into_iter()
+        .any(|r| &r.work_id() == work && may_already_have_paid(r.state)))
 }
 
 /// Writes the claim that must precede a payment.

@@ -869,6 +869,135 @@ async fn a_second_order_cannot_pay_while_the_first_is_mid_payment() {
 }
 
 #[tokio::test]
+async fn two_orders_advancing_together_never_overlap_a_payment() {
+    // R2-1, the reviewer's reproduction. The slot check was a journal *read*
+    // with two `await` points before the matching write, and the per-order lock
+    // serialises an order only with itself - so two orders advancing
+    // concurrently both read an empty journal, both passed, both wrote
+    // `Paying`, and both paid. The reviewer measured payments=2, overlap=2.
+    //
+    // The rail here is slow inside `preflight` and inside `pay`, which is what
+    // makes the window certain rather than lucky, and it records the maximum
+    // number of payments in flight at once. That number is the invariant: one
+    // Venmo balance, and two identical entries in the feed that
+    // `locate_payment` cannot tell apart.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+    // The rail starts closed, so `presign`'s own settlement task cannot pay
+    // either order while the other is still being set up. Without this the
+    // first order is already `released` by the time the second exists, and
+    // there is nothing left to race - which is how the earlier version of this
+    // test passed against the broken code.
+    let fiat = Arc::new(SlowFiat::closed(150));
+    let state = coordinator_with_fiat(dir.path(), scanner.clone(), &node, &attestor, fiat.clone());
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+
+    // Two orders, both locked, neither paid.
+    let user_a = TestUser::new();
+    let (order_a, _) = locked_order(&app, &state, &node, &scanner, &attestor, &user_a).await;
+    let user_b = TestUser::new();
+    let (order_b, _) = locked_order(&app, &state, &node, &scanner, &attestor, &user_b).await;
+
+    // And the sweep, which now spawns each order on its own task, arriving on
+    // both at the same moment.
+    for id in [&order_a, &order_b] {
+        assert_eq!(
+            state.store.get(id).unwrap().stage,
+            Stage::Locked,
+            "both orders must be waiting to be paid before the race starts"
+        );
+    }
+
+    // Now both become payable at once, and the sweep arrives on both.
+    fiat.open_for_business();
+    let (sa, sb) = (state.clone(), state.clone());
+    let (ia, ib) = (order_a.clone(), order_b.clone());
+    let (ra, rb) = tokio::join!(
+        tokio::spawn(async move { zecp2p_v2coordinator::driver::advance(&sa, &ia).await }),
+        tokio::spawn(async move { zecp2p_v2coordinator::driver::advance(&sb, &ib).await }),
+    );
+    let _ = (ra, rb);
+
+    // Let anything still in flight finish.
+    for _ in 0..60 {
+        if !state.payment_in_progress() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    assert!(
+        fiat.max_overlap() <= 1,
+        "two payments were in flight at once (overlap {}), which is the bug the reviewer \
+         reproduced",
+        fiat.max_overlap()
+    );
+    assert!(
+        fiat.payments() <= 1,
+        "{} payments left for two orders sharing one Venmo balance",
+        fiat.payments()
+    );
+
+    // Exactly one order got the slot; the other is untouched and will be paid
+    // on a later sweep.
+    let with_payment = [&order_a, &order_b]
+        .iter()
+        .filter(|id| state.store.get(id).unwrap().payment.is_some())
+        .count();
+    assert!(
+        with_payment <= 1,
+        "{with_payment} orders recorded a payment"
+    );
+}
+
+#[tokio::test]
+async fn a_needs_operator_line_keeps_holding_the_slot() {
+    // R2-2. When `fiat::pay` failed, `settle` overwrote the `Paying` line with
+    // `NeedsOperator` - the state whose entire meaning is "a payment may have
+    // left and a human must look" - and the slot check blocked only on `Paying`
+    // and `Paid`. So the failure that most needs the slot held was the one that
+    // freed it, and the next order for the same handle paid into a feed with an
+    // unreconciled entry in it.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+    let fiat = Arc::new(CountingFiat::new());
+    let state = coordinator_with_fiat(dir.path(), scanner.clone(), &node, &attestor, fiat.clone());
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+
+    // Another work item failed mid-payment and is waiting for a human.
+    let stranded = zecp2p_v2coordinator::slot::work_id_for(&[0xf1u8; 32], 0);
+    let mut record = zecp2p_taker::auto::journal::FillRecord::new_zec(
+        stranded.local.clone(),
+        alloy::primitives::U256::from(700_000u64),
+        alloy::primitives::U256::from(1_000_000_000_000_000_000u128),
+        "alice".into(),
+    );
+    record.state = zecp2p_taker::auto::journal::FillState::NeedsOperator;
+    record.note = Some("the Venmo leg failed".into());
+    state.journal.record(&record).unwrap();
+
+    let user = TestUser::new();
+    let (order_id, _) = locked_order(&app, &state, &node, &scanner, &attestor, &user).await;
+    let paid_before = fiat.payments();
+
+    zecp2p_v2coordinator::driver::advance(&state, &order_id)
+        .await
+        .expect("waiting for the slot is not an error");
+
+    assert_eq!(
+        fiat.payments(),
+        paid_before,
+        "an order paid while a stranded payment was still unreconciled"
+    );
+    // And this order is not failed: it waits for the operator, then pays.
+    assert_eq!(state.store.get(&order_id).unwrap().stage, Stage::Locked);
+}
+
+#[tokio::test]
 async fn one_order_at_a_time_even_when_the_sweep_runs_them_together() {
     // The same finding from the other direction: two orders both eligible, one
     // sweep. Exactly one may pay.
@@ -1241,4 +1370,192 @@ async fn open_orders_are_bounded_per_handle() {
         .unwrap()
         .contains("already several escrows open"));
     assert_eq!(state.store.open_count(), 2);
+}
+
+#[tokio::test]
+async fn the_refund_endpoint_asks_the_journal_not_the_stage() {
+    // R2-4. The guard read `order.stage.fiat_may_have_left()`, and `order.fail`
+    // leaves the stage `Failed` - which the endpoint's own stage gate accepts.
+    // So the failure whose message is "a payment may have left" produced the
+    // one stage that would let a refund through, and the refund would race a
+    // release for money already sent.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+    let state = coordinator_with_everything(dir.path(), scanner.clone(), &node, &attestor);
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+    let user = TestUser::new();
+
+    let (order_id, funding_txid) =
+        locked_order(&app, &state, &node, &scanner, &attestor, &user).await;
+
+    // Exactly what `settle` leaves behind when the Venmo leg fails after the
+    // journal claim: a `NeedsOperator` line, and a `Failed` order.
+    let work = zecp2p_v2coordinator::slot::work_id_for(&funding_txid, 0);
+    let mut record = zecp2p_taker::auto::journal::FillRecord::new_zec(
+        work.local.clone(),
+        alloy::primitives::U256::from(700_000u64),
+        alloy::primitives::U256::from(1_000_000_000_000_000_000u128),
+        "alice".into(),
+    );
+    record.state = zecp2p_taker::auto::journal::FillState::NeedsOperator;
+    state.journal.record(&record).unwrap();
+
+    let mut failed = state.store.get(&order_id).unwrap();
+    failed.fail("the payment could not be completed. Check the Venmo feed.");
+    state.store.put(&failed).unwrap();
+    // The stage gate alone would let this through.
+    assert!(!failed.stage.fiat_may_have_left());
+
+    let raw = user.sign_refund(&failed, &funding_txid, 0);
+    let (status, body) = post(
+        &app,
+        &format!("/escrow/orders/{order_id}/refund"),
+        serde_json::json!({ "raw_tx": hex::encode(&raw) }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("may already have been sent"),
+        "the refusal must name the reason: {body}"
+    );
+    assert!(node.broadcasts().await.is_empty());
+    // And the user is still told they can broadcast it themselves.
+    assert!(body["error"].as_str().unwrap().contains("any Zcash node"));
+}
+
+#[tokio::test]
+async fn a_refundable_order_stops_counting_against_the_handle_limit() {
+    // R2-5. `Refundable` is open - the page must still be able to offer the
+    // refund - but it needs nothing further from this coordinator. Counting it
+    // meant a handful of abandoned, never-funded orders locked a served handle
+    // out permanently, at no cost to whoever opened them.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let mut config = test_config(dir.path());
+    config.quote.max_open_per_handle = 2;
+    let state = coordinator_from_config(config, Arc::new(FakeScanner::new()), &node, None);
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        let user = TestUser::new();
+        let (_, q) = get(&app, "/escrow/quote?amount=0.05&unit=zec").await;
+        let (status, order) = post(
+            &app,
+            "/escrow/orders",
+            serde_json::json!({
+                "quote_id": q["quote_id"],
+                "u_pub": hex::encode(user.u_pub),
+                "destination": { "rail": "venmo", "handle": "alice" },
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        ids.push(order["order_id"].as_str().unwrap().to_string());
+    }
+
+    // Full up.
+    let user = TestUser::new();
+    let (_, q) = get(&app, "/escrow/quote?amount=0.05&unit=zec").await;
+    let (status, _) = post(
+        &app,
+        "/escrow/orders",
+        serde_json::json!({
+            "quote_id": q["quote_id"],
+            "u_pub": hex::encode(user.u_pub),
+            "destination": { "rail": "venmo", "handle": "alice" },
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Both abandoned escrows reach T. Nobody funded them and nothing was paid.
+    for id in &ids {
+        let mut o = state.store.get(id).unwrap();
+        o.stage = Stage::Refundable;
+        state.store.put(&o).unwrap();
+    }
+
+    // The handle is served again.
+    let user = TestUser::new();
+    let (_, q) = get(&app, "/escrow/quote?amount=0.05&unit=zec").await;
+    let (status, body) = post(
+        &app,
+        "/escrow/orders",
+        serde_json::json!({
+            "quote_id": q["quote_id"],
+            "u_pub": hex::encode(user.u_pub),
+            "destination": { "rail": "venmo", "handle": "alice" },
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "abandoned orders locked the handle out: {body}"
+    );
+    // And the refundable orders are still readable, so the page can offer the
+    // refund. They are never evicted.
+    for id in &ids {
+        let (status, _) = get(&app, &format!("/escrow/orders/{id}")).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+}
+
+#[tokio::test]
+async fn the_release_still_happens_when_the_journal_cannot_be_written() {
+    // R2-3. The `Paid` journal write used `?`, so a failure after `fiat::pay`
+    // succeeded bailed with the store still at `Locked`. The next sweep read
+    // `Paying`, correctly refused to pay twice, and failed the order: the
+    // dollars were gone and the release was never attempted, leaving the LP's
+    // own escrow to the user's refund.
+    //
+    // The journal is made unwritable by replacing it with a directory, which is
+    // the cheapest way to get a real IO error out of an append.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+    let fiat = Arc::new(SlowFiat::closed(10));
+    let state = coordinator_with_fiat(dir.path(), scanner.clone(), &node, &attestor, fiat.clone());
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+    let user = TestUser::new();
+
+    let (order_id, _) = locked_order(&app, &state, &node, &scanner, &attestor, &user).await;
+    assert_eq!(state.store.get(&order_id).unwrap().stage, Stage::Locked);
+
+    // The journal claim is written first and must succeed, so the file is
+    // broken only after that. `slot::claim` appends, then the directory swap
+    // makes the *next* append fail - which is the `Paid` line.
+    let journal = dir.path().join("fills.jsonl");
+    fiat.open_for_business();
+
+    // Drive the payment, then break the journal mid-flight from another task.
+    let breaker = tokio::spawn({
+        let journal = journal.clone();
+        async move {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            let _ = std::fs::remove_file(&journal);
+            let _ = std::fs::create_dir(&journal);
+        }
+    });
+
+    let result = zecp2p_v2coordinator::driver::advance(&state, &order_id).await;
+    let _ = breaker.await;
+
+    // Whatever happened to the bookkeeping, the release must have been tried.
+    // Either it landed, or the order records the payment so a later sweep
+    // finishes it. What must never happen is `Locked` with the dollars gone.
+    let after = state.store.get(&order_id).unwrap();
+    if fiat.payments() > 0 {
+        assert!(
+            after.stage == Stage::Released
+                || after.stage == Stage::Paid
+                || after.payment.is_some(),
+            "the dollars left and the order is {} with no payment recorded: {result:?}",
+            after.stage.as_str()
+        );
+    }
 }

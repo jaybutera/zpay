@@ -539,6 +539,97 @@ pub fn coordinator_with_fiat(
     build(dir, scanner, node, Some(attestor), Some(fiat))
 }
 
+/// A rail that is slow to start and records how many payments overlap.
+///
+/// The reviewer's reproduction. `CountingFiat` returns instantly, so two racing
+/// tasks interleave only by luck; a rail that takes real time inside
+/// `preflight` and `pay` makes the window certain. What it measures is the
+/// thing that must never exceed one: the number of payments in flight at the
+/// same moment.
+pub struct SlowFiat {
+    delay: std::time::Duration,
+    in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    max_overlap: Arc<std::sync::atomic::AtomicUsize>,
+    payments: Arc<std::sync::atomic::AtomicUsize>,
+    /// While closed, `preflight` refuses, so an order can be walked to `locked`
+    /// without the settlement task that `presign` spawns paying it first. Open
+    /// it and every locked order becomes payable at the same instant, which is
+    /// the state the race needs.
+    open: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl SlowFiat {
+    pub fn new(delay_ms: u64) -> Self {
+        Self {
+            delay: std::time::Duration::from_millis(delay_ms),
+            in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            max_overlap: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            payments: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            open: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        }
+    }
+
+    /// Starts closed: nothing pays until [`Self::open_for_business`].
+    pub fn closed(delay_ms: u64) -> Self {
+        let s = Self::new(delay_ms);
+        s.open.store(false, std::sync::atomic::Ordering::SeqCst);
+        s
+    }
+
+    pub fn open_for_business(&self) {
+        self.open.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The most payments that were ever in flight together.
+    pub fn max_overlap(&self) -> usize {
+        self.max_overlap.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn payments(&self) -> usize {
+        self.payments.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl FiatRail for SlowFiat {
+    /// Slow on purpose: this is the `await` the slot read used to be separated
+    /// from its own write by.
+    async fn preflight(&self) -> anyhow::Result<()> {
+        if !self.open.load(std::sync::atomic::Ordering::SeqCst) {
+            anyhow::bail!("this rail is closed for now");
+        }
+        tokio::time::sleep(self.delay).await;
+        Ok(())
+    }
+
+    async fn pay(&self, leg: &zecp2p_taker::auto::rail::FiatLeg) -> anyhow::Result<PaidFiat> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let now = self.in_flight.fetch_add(1, SeqCst) + 1;
+        self.max_overlap.fetch_max(now, SeqCst);
+        // The browser drive, which is where the real one spends two minutes.
+        tokio::time::sleep(self.delay).await;
+        self.payments.fetch_add(1, SeqCst);
+        self.in_flight.fetch_sub(1, SeqCst);
+        Ok(PaidFiat {
+            cents: u64::try_from(leg.payment.cents())?,
+            fiat_left: true,
+        })
+    }
+
+    async fn attest(
+        &self,
+        leg: &zecp2p_taker::auto::rail::FiatLeg,
+    ) -> anyhow::Result<zecp2p_escrow::lp_client::WireAttestation> {
+        Ok(zecp2p_escrow::lp_client::WireAttestation {
+            intent_hash: hex::encode(leg.intent_hash.0),
+            release_amount: leg.intent_amount_6dec.to_string(),
+            data_hash: hex::encode([0u8; 32]),
+            signature: hex::encode([0u8; 65]),
+            encoded_payment_details: hex::encode(vec![0u8; 448]),
+        })
+    }
+}
+
 /// A curator stub, so no test reaches the live zk-p2p API.
 pub struct FakeCurator {
     pub url: String,
