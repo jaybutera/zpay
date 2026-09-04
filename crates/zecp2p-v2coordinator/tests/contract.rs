@@ -782,13 +782,14 @@ async fn a_crash_between_the_journal_and_the_store_does_not_pay_twice() {
     // The crash: a `Paying` line exists and the store still says `Locked`.
     let work = zecp2p_v2coordinator::slot::work_id_for(&funding_txid, 0);
     {
-        let reserved = zecp2p_v2coordinator::slot::reserve(
+        let reserved = zecp2p_v2coordinator::slot::take(
             &state.journal,
             &work,
             700_000,
             "alice",
         )
-        .unwrap();
+        .unwrap()
+        .expect("the slot is free");
         zecp2p_v2coordinator::slot::claim(
             &state.journal,
             reserved,
@@ -850,13 +851,14 @@ async fn a_second_order_cannot_pay_while_the_first_is_mid_payment() {
     // `Locked`, so nothing in the order store says a payment is under way.
     let work_a = zecp2p_v2coordinator::slot::work_id_for(&[0xa1u8; 32], 0);
     {
-        let reserved = zecp2p_v2coordinator::slot::reserve(
+        let reserved = zecp2p_v2coordinator::slot::take(
             &state.journal,
             &work_a,
             700_000,
             "alice",
         )
-        .unwrap();
+        .unwrap()
+        .expect("the slot is free");
         zecp2p_v2coordinator::slot::claim(
             &state.journal,
             reserved,
@@ -1772,7 +1774,9 @@ async fn a_paying_line_still_needs_a_human_rather_than_a_release() {
 
     let work = zecp2p_v2coordinator::slot::work_id_for(&funding_txid, 0);
     let reserved =
-        zecp2p_v2coordinator::slot::reserve(&state.journal, &work, 700_000, "alice").unwrap();
+        zecp2p_v2coordinator::slot::take(&state.journal, &work, 700_000, "alice")
+            .unwrap()
+            .expect("the slot is free");
     zecp2p_v2coordinator::slot::claim(
         &state.journal,
         reserved,
@@ -1857,4 +1861,91 @@ async fn a_refundable_order_stops_counting_against_the_global_limit() {
         StatusCode::OK,
         "abandoned refundable orders filled the global ceiling for good: {body}"
     );
+}
+
+#[tokio::test]
+async fn a_taker_fill_in_the_shared_journal_stops_the_coordinator_paying() {
+    // The other direction of the cross-daemon slot, through the file the two
+    // daemons actually share. A Base-rail record is what the taker writes.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+    let fiat = Arc::new(CountingFiat::new());
+    let state = coordinator_with_fiat(dir.path(), scanner.clone(), &node, &attestor, fiat.clone());
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+
+    // The taker is mid-fill on its own rail.
+    let mut takers = zecp2p_taker::auto::journal::FillRecord::new(
+        alloy::primitives::U256::from(4499),
+        alloy::primitives::B256::repeat_byte(0xaa),
+        alloy::primitives::U256::from(4_875_437u64),
+        alloy::primitives::U256::from(990_881_148_896_019_200u128),
+        "alice".into(),
+    );
+    takers.state = zecp2p_taker::auto::journal::FillState::Paying;
+    state.journal.record(&takers).unwrap();
+
+    let user = TestUser::new();
+    let (order_id, _) = locked_order(&app, &state, &node, &scanner, &attestor, &user).await;
+    let paid_before = fiat.payments();
+
+    zecp2p_v2coordinator::driver::advance(&state, &order_id)
+        .await
+        .expect("waiting for the slot is not an error");
+
+    assert_eq!(
+        fiat.payments(),
+        paid_before,
+        "the coordinator paid while the taker had a payment in flight, into the same \
+         Venmo account"
+    );
+    // Waiting, not failed: it pays once the taker finishes.
+    assert_eq!(state.store.get(&order_id).unwrap().stage, Stage::Locked);
+}
+
+#[tokio::test]
+async fn the_slot_claim_and_the_check_are_one_step() {
+    // R4-3. The check and the claim used to be separate journal calls with the
+    // decision between them, so another process could take the slot in the gap.
+    // `slot::take` does both under one `flock`, so a caller that succeeds has
+    // the slot and one that fails never wrote anything.
+    let dir = tempfile::tempdir().unwrap();
+    let journal = std::sync::Arc::new(
+        zecp2p_taker::auto::journal::Journal::open(dir.path().join("fills.jsonl")).unwrap(),
+    );
+
+    // Many claimants for one slot, each a different escrow.
+    let mut threads = Vec::new();
+    let winners = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    for t in 0..8u8 {
+        let journal = journal.clone();
+        let winners = winners.clone();
+        threads.push(std::thread::spawn(move || {
+            let work = zecp2p_v2coordinator::slot::work_id_for(&[t; 32], 0);
+            if zecp2p_v2coordinator::slot::take(&journal, &work, 700_000, "alice")
+                .unwrap()
+                .is_ok()
+            {
+                winners.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }));
+    }
+    for t in threads {
+        t.join().unwrap();
+    }
+
+    assert_eq!(
+        winners.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "more than one escrow took the one payment slot"
+    );
+    // And exactly one open record exists, so the file agrees.
+    let open = journal
+        .latest()
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.state.is_open())
+        .count();
+    assert_eq!(open, 1, "{open} open records for one slot");
 }

@@ -1286,6 +1286,19 @@ async fn run_auto<P: alloy::providers::Provider + Clone>(
             if deposits.is_empty() {
                 tracing::debug!(from_block, head, "no zpay deposits in range");
             }
+            // R4-a: a deposit that was refused for a reason that will pass
+            // later - the payment slot is held, the session is not usable -
+            // used to be dropped for the life of the process, because the
+            // cursor moved past it whatever happened. Now the cursor rewinds to
+            // the earliest such deposit, so the next poll sees it again.
+            //
+            // The slot being held is no longer a rare case: it covers the whole
+            // of a coordinator trade, attestation included, which is minutes.
+            let mut retry_from: Option<u64> = None;
+            let mut remember = |block: u64| {
+                retry_from = Some(retry_from.map_or(block, |b: u64| b.min(block)));
+            };
+
             for deposit in deposits {
                 match handle_one(
                     provider,
@@ -1301,11 +1314,38 @@ async fn run_auto<P: alloy::providers::Provider + Clone>(
                 )
                 .await
                 {
-                    Ok(outcome) => println!("deposit {}: {outcome:?}", deposit.deposit_id),
-                    Err(e) => println!("deposit {}: stopped: {e:#}", deposit.deposit_id),
+                    Ok(outcome) => {
+                        // `Skipped` and `Blocked` both mean "not now", and both
+                        // can become "yes" without anything about the deposit
+                        // changing. `Declined` is a human saying no, and
+                        // `Paid`/`Fulfilled` are done.
+                        if matches!(outcome, Outcome::Skipped { .. } | Outcome::Blocked { .. }) {
+                            remember(deposit.block_number);
+                        }
+                        println!("deposit {}: {outcome:?}", deposit.deposit_id);
+                    }
+                    Err(e) => {
+                        // An error before anything was spent is also worth
+                        // another look: an RPC that failed once may not fail
+                        // twice. A fill that got as far as paying has a journal
+                        // record, and `handle_one` refuses to re-enter it.
+                        remember(deposit.block_number);
+                        println!("deposit {}: stopped: {e:#}", deposit.deposit_id);
+                    }
                 }
             }
-            from_block = head + 1;
+
+            from_block = match retry_from {
+                Some(block) => {
+                    tracing::info!(
+                        block,
+                        "rewinding the scan cursor: a deposit was refused for a reason that \
+                         may pass"
+                    );
+                    block
+                }
+                None => head + 1,
+            };
         }
 
         if once {
@@ -1498,18 +1538,17 @@ async fn handle_one<P: alloy::providers::Provider + Clone>(
     //
     // The read is before the `Seen` write below, so a fill that cannot have the
     // slot leaves no trace and is retried on the next poll.
-    if let Some(holder) = journal.in_flight()? {
-        if holder.work_id() != WorkId::base(deposit.deposit_id) {
-            return Ok(Outcome::Skipped {
-                why: format!(
-                    "{} holds the one payment slot ({:?}). One payment at a time: there is \
-                     one Venmo balance, and two entries of the same amount to the same \
-                     handle cannot be told apart in the feed.",
-                    holder.describe(),
-                    holder.state
-                ),
-            });
-        }
+    let mine = WorkId::base(deposit.deposit_id);
+    if let Some(holder) = journal.holder_against(&mine)? {
+        return Ok(Outcome::Skipped {
+            why: format!(
+                "{} holds the one payment slot ({:?}). One payment at a time: there is \
+                 one Venmo balance, and two entries of the same amount to the same \
+                 handle cannot be told apart in the feed.",
+                holder.describe(),
+                holder.state
+            ),
+        });
     }
 
     // Everything free comes first. The cookie check is here rather than before
@@ -1768,9 +1807,37 @@ async fn run_fill<P: alloy::providers::Provider + Clone>(
     // Written before the click, never after. A record in this state means the
     // money may or may not have left, and only a human reading the Venmo feed
     // can tell which.
-    record.state = FillState::Paying;
-    record.paid = Some(plan.payment.to_venmo_string());
-    journal.record(record)?;
+    //
+    // R4-3: the slot is read again here, under the journal's own file lock, and
+    // the `Paying` line is written in the same critical section. The check in
+    // `handle_one` happened before four network calls, and `zecp2p-v2coordinator`
+    // pays from this same Venmo account - so between that check and this write
+    // the coordinator could have taken the slot. `claim_if` makes the last
+    // decision before money moves and the record of it one indivisible step.
+    let mine = record.work_id();
+    let mut lost_the_slot = None;
+    let claimed = journal.claim_if(|existing| {
+        for other in existing {
+            if !other.state.is_open() || other.work_id() == mine {
+                continue;
+            }
+            lost_the_slot = Some(format!(
+                "{} took the one payment slot ({:?}) while this fill was being prepared",
+                other.describe(),
+                other.state
+            ));
+            return None;
+        }
+        let mut claim = record.clone();
+        claim.state = FillState::Paying;
+        claim.paid = Some(plan.payment.to_venmo_string());
+        Some(claim)
+    })?;
+    if let Some(why) = lost_the_slot {
+        return Ok(Outcome::Skipped { why });
+    }
+    *record = claimed
+        .ok_or_else(|| anyhow::anyhow!("the payment slot could not be claimed"))?;
 
     let browser = VenmoBrowser::new(config.venmo.cdp_url.clone(), config.venmo.timeout_seconds);
     let tab = browser

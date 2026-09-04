@@ -24,6 +24,8 @@ dotenvy = { workspace = true }
 chrono = { workspace = true }
 hmac = { workspace = true }
 sha1 = { workspace = true }
+# flock(2) around the fill journal, which is the cross-daemon payment slot.
+libc = "0.2"
 tokio-tungstenite = "0.26"
 futures-util = "0.3"
 

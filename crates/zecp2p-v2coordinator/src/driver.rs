@@ -407,70 +407,54 @@ async fn settle(state: &Arc<AppState>, order: Order) -> Result<()> {
     }
     let mut order = order_now;
 
-    // The one payment slot, read back from the journal rather than from the
-    // order store. R1-1 and R1-2: the store says `Locked` for an order that is
-    // mid-browser and for an order whose process died mid-browser, and those
-    // are the two cases that must not pay. Only the journal line, written
-    // before the click, tells them apart from an order that has not started.
-    match crate::slot::may_claim(&state.journal, &work)? {
-        Ok(()) => {}
-        Err(refusal) => {
-            match &refusal {
-                // Another order holds the slot: wait, and try again on the next
-                // sweep. Nothing is wrong with this order.
-                crate::slot::SlotRefusal::HeldByAnother { .. } => {
-                    tracing::info!(order = %order.order_id, reason = %refusal, "waiting for the payment slot");
-                    return Ok(());
-                }
-                // A payment for *this* escrow may already have gone out. Never
-                // retry that automatically: the second payment is money the
-                // escrow cannot repay, because it releases once.
-                crate::slot::SlotRefusal::ThisOrderMayHavePaid { .. } => {
-                    // R3-4: `Paid` here is not an error, it is the post-payment
-                    // store write having failed. The dollars are gone and the
-                    // release is the only thing that recovers them, so the
-                    // order is finished rather than failed - failing it would
-                    // abandon a release the LP has already paid for.
-                    if crate::slot::definitely_paid(&state.journal, &work).unwrap_or(false) {
-                        tracing::warn!(
-                            order = %order.order_id,
-                            "the journal says this escrow was PAID and the order does not, \
-                             which is the post-payment store write having failed. Recording \
-                             the payment and going on to the release: abandoning it would \
-                             leave the LP having paid for an escrow that refunds to the user."
-                        );
-                        order.payment = Some(crate::order::Payment {
-                            sent_at: chrono::Utc::now(),
-                            cents: order.quote.net_cents,
-                        });
-                        order.stage = Stage::Paid;
-                        order.touch();
-                        state.store.put(&order)?;
-                        drop(_paying);
-                        return finish_payment(state, order).await;
-                    }
-                    tracing::error!(order = %order.order_id, reason = %refusal, "refusing to pay twice");
-                    order.fail(refusal.to_string());
-                    state.store.put(&order)?;
-                    return Ok(());
-                }
-            }
-        }
-    }
-
-    // The slot is taken *now*, before anything slow, and written to the file
-    // the other daemon reads. R3-3: the mutex above serialises this process,
-    // but the journal is the cross-daemon slot and the window between the read
-    // and the `Paying` write spanned a chain call and the rail's preflight - so
-    // a taker reading the file in that window saw it free. `Seen` holds the
-    // slot without claiming money may have moved, so it can still be given back
-    // below if the chain or the rail says no.
-    let reserved = crate::slot::reserve(
+    // The one payment slot: read and claimed under one file lock, so the
+    // window a second daemon could read through does not exist. `take` writes a
+    // `Seen` line, which holds the slot without asserting money may have moved
+    // - so it can still be given back below if the chain or the rail says no.
+    let reserved = match crate::slot::take(
         &state.journal,
         &work,
         order.quote.usd_amount_6dec,
         &order.handle,
-    )?;
+    )? {
+        Ok(record) => record,
+        Err(refusal) => match &refusal {
+            // Somebody else holds it: wait, and try again on the next sweep.
+            // Nothing is wrong with this order.
+            crate::slot::SlotRefusal::HeldByAnother { .. } => {
+                tracing::info!(order = %order.order_id, reason = %refusal, "waiting for the payment slot");
+                return Ok(());
+            }
+            crate::slot::SlotRefusal::ThisOrderMayHavePaid { .. } => {
+                // R3-4: `Paid` here is not an error, it is the post-payment
+                // store write having failed. The dollars are gone and the
+                // release is the only thing that recovers them, so the order is
+                // finished rather than failed.
+                if crate::slot::definitely_paid(&state.journal, &work).unwrap_or(false) {
+                    tracing::warn!(
+                        order = %order.order_id,
+                        "the journal says this escrow was PAID and the order does not, which \
+                         is the post-payment store write having failed. Recording the \
+                         payment and going on to the release: abandoning it would leave the \
+                         LP having paid for an escrow that refunds to the user."
+                    );
+                    order.payment = Some(crate::order::Payment {
+                        sent_at: chrono::Utc::now(),
+                        cents: order.quote.net_cents,
+                    });
+                    order.stage = Stage::Paid;
+                    order.touch();
+                    state.store.put(&order)?;
+                    drop(_paying);
+                    return finish_payment(state, order).await;
+                }
+                tracing::error!(order = %order.order_id, reason = %refusal, "refusing to pay twice");
+                order.fail(refusal.to_string());
+                state.store.put(&order)?;
+                return Ok(());
+            }
+        },
+    };
 
     let watched = watched_escrow(state, &order)?;
 
@@ -780,7 +764,28 @@ async fn broadcast_release(
             order.release_txid = Some(release_txid.clone());
             order.stage = Stage::Released;
             order.touch();
-            state.store.put(&order)?;
+
+            // R4-d: this used to be `put(&order)?`, which bailed after the
+            // release was already on chain - leaving the store at `Paid` with
+            // no txid, so the next sweep re-attested and re-broadcast. The
+            // second broadcast is harmless on its own (the node answers
+            // "already in the chain", which `is_already_accepted` maps to
+            // success) but the second `/attest` is not free: the attestor signs
+            // one outcome per event, and burning the call on a retry costs the
+            // one thing that can complete a release.
+            //
+            // So a failure here is loud and not fatal, and the slot is released
+            // regardless: the trade is finished on chain whatever this file
+            // says.
+            if let Err(e) = state.store.put(&order) {
+                tracing::error!(
+                    order = %order.order_id,
+                    txid = %release_txid,
+                    error = %format!("{e:#}"),
+                    "the release is on chain and this order could not be written to disk. \
+                     Reconcile from the txid: the escrow has paid out."
+                );
+            }
 
             // The slot is released here and nowhere else. Until this line the
             // journal still says `Paid`, which holds the slot - correctly, since

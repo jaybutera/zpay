@@ -113,53 +113,9 @@ pub fn work_id_for(funding_txid: &[u8; 32], vout: u32) -> WorkId {
     WorkId::zec(&zecp2p_escrow::rpc::txid_to_display(funding_txid), vout)
 }
 
-/// May a payment for `work` start right now?
-///
-/// Reads the journal from disk every time. That is the point: the in-memory
-/// view of who is paying is exactly what a crash destroys, and this question is
-/// only worth asking against something durable.
-pub fn may_claim(journal: &Journal, work: &WorkId) -> Result<Result<(), SlotRefusal>> {
-    let latest = journal
-        .latest()
-        .context("could not read the journal back; refusing to pay without it")?;
-
-    for record in latest {
-        if !holds_the_slot(record.state) {
-            continue;
-        }
-        let holder = record.work_id();
-
-        if &holder == work {
-            // Our own record. `Seen` is a claim that never reached the browser
-            // and may be retried; anything from `Signalling` on means a payment
-            // for this escrow may already have left, and `NeedsOperator` says
-            // so outright.
-            if may_already_have_paid(record.state) {
-                return Ok(Err(SlotRefusal::ThisOrderMayHavePaid {
-                    work: holder.to_string(),
-                    state: record.state,
-                }));
-            }
-            continue;
-        }
-
-        // Somebody else's open fill. All of it counts, including `Paid` (that
-        // order is waiting on an attestation for a payment already in the feed)
-        // and `NeedsOperator` (a human has not yet said what happened to a
-        // payment that may have gone out). A second payment of the same amount
-        // to the same handle would make both unprovable.
-        return Ok(Err(SlotRefusal::HeldByAnother {
-            work: holder.to_string(),
-            state: record.state,
-        }));
-    }
-
-    Ok(Ok(()))
-}
-
 /// Whether the journal says a payment for this escrow may have gone out.
 ///
-/// For a caller that is about to do something a payment would make unsafe -
+/// For a caller about to do something a payment would make unsafe -
 /// broadcasting a refund, above all. R2-4: the refund endpoint gated on the
 /// order's *stage*, and `order.fail` leaves the stage `Failed`, which that
 /// endpoint accepted. So the one path whose message is "a payment may have
@@ -177,38 +133,70 @@ pub fn fiat_may_have_left(journal: &Journal, work: &WorkId) -> Result<bool> {
         .any(|r| &r.work_id() == work && may_already_have_paid(r.state)))
 }
 
-/// Takes the slot before anything slow happens.
+/// Takes the slot, deciding and claiming under one file lock.
 ///
-/// R3-3: the read and the `Paying` write used to be separated by a chain
-/// round-trip and the rail's preflight. Inside one process the global mutex
-/// covers that, but the journal is meant to be the slot *between* daemons, and
-/// a second daemon reading the file during that window sees it free. So the
-/// claim goes down immediately after the read, while the mutex is still held,
-/// and the file says "taken" from that moment on.
+/// R4-3: the read and the write used to be separate calls with the decision
+/// between them. Within one process the global mutex covered that; between the
+/// two daemons nothing did, and they share one Venmo account. `claim_if` holds
+/// `flock` across both, so no other process can observe the gap.
 ///
-/// The state is `Seen`, not `Paying`, and the difference matters. `Seen` holds
-/// the slot against every other work item, because [`holds_the_slot`] counts
-/// every open record - but it does not assert that money may have moved, so
-/// this order can still [`retract`] it when the chain check or the preflight
-/// refuses. `Paying` is written later, by [`claim`], and is never retracted:
-/// past that point a crash means a human reads the Venmo feed.
-pub fn reserve(
+/// The state written is `Seen`, not `Paying`, and the difference matters.
+/// `Seen` holds the slot against every other work item, because
+/// [`holds_the_slot`] counts every open record - but it does not assert that
+/// money may have moved, so this order can still [`retract`] it when the chain
+/// check or the preflight refuses. `Paying` comes later, from [`claim`], and is
+/// never retracted: past that point a crash means a human reads the feed.
+///
+/// Returns the refusal when somebody else holds the slot, so the caller can
+/// tell "wait" from "this escrow may already have been paid".
+pub fn take(
     journal: &Journal,
     work: &WorkId,
     usd_amount_6dec: u64,
     recipient: &str,
-) -> Result<FillRecord> {
-    let mut record = FillRecord::new_zec(
-        work.local.clone(),
-        alloy::primitives::U256::from(usd_amount_6dec),
-        alloy::primitives::U256::from(zecp2p_escrow::payment_details::IDENTITY_RATE_18DEC),
-        recipient.to_string(),
-    );
-    record.state = FillState::Seen;
-    journal
-        .record(&record)
-        .context("could not reserve the payment slot")?;
-    Ok(record)
+) -> Result<Result<FillRecord, SlotRefusal>> {
+    let mut refusal = None;
+    let claimed = journal.claim_if(|existing| {
+        for record in existing {
+            if !holds_the_slot(record.state) {
+                continue;
+            }
+            let holder = record.work_id();
+            if &holder == work {
+                if may_already_have_paid(record.state) {
+                    refusal = Some(SlotRefusal::ThisOrderMayHavePaid {
+                        work: holder.to_string(),
+                        state: record.state,
+                    });
+                    return None;
+                }
+                // Our own `Seen` from an earlier attempt. Claim over it.
+                continue;
+            }
+            refusal = Some(SlotRefusal::HeldByAnother {
+                work: holder.to_string(),
+                state: record.state,
+            });
+            return None;
+        }
+
+        let mut record = FillRecord::new_zec(
+            work.local.clone(),
+            alloy::primitives::U256::from(usd_amount_6dec),
+            alloy::primitives::U256::from(zecp2p_escrow::payment_details::IDENTITY_RATE_18DEC),
+            recipient.to_string(),
+        );
+        record.state = FillState::Seen;
+        Some(record)
+    })?;
+
+    match claimed {
+        Some(record) => Ok(Ok(record)),
+        None => Ok(Err(refusal.unwrap_or(SlotRefusal::HeldByAnother {
+            work: "another fill".into(),
+            state: FillState::Seen,
+        }))),
+    }
 }
 
 /// Gives the slot back, having reserved it and then decided not to pay.
@@ -233,8 +221,8 @@ pub fn retract(journal: &Journal, mut record: FillRecord, why: &str) {
 
 /// Writes the claim that must precede a payment.
 ///
-/// Separate from [`may_claim`] so the sequence at the call site reads in the
-/// order it happens: check, claim, pay. The claim is `Paying`, which is the
+/// Separate from [`take`] so the sequence at the call site reads in the order
+/// it happens: take the slot, decide, claim, pay. The claim is `Paying`, the
 /// ambiguous state - written before the click precisely so that a crash is
 /// recorded as "may have paid" rather than as nothing at all.
 pub fn claim(
@@ -243,14 +231,41 @@ pub fn claim(
     intent_hash: alloy::primitives::B256,
     intent_timestamp_ms: u64,
 ) -> Result<FillRecord> {
-    let mut record = reserved;
-    record.state = FillState::Paying;
-    record.intent_hash = Some(intent_hash);
-    record.signalled_at_ms = Some(intent_timestamp_ms);
-    journal
-        .record(&record)
-        .context("could not write the journal entry that must precede a payment")?;
-    Ok(record)
+    let work = reserved.work_id();
+
+    // R4-3: the slot is read again, under the lock, immediately before the
+    // `Paying` line goes down. The reservation above closed most of the window,
+    // but "most" is not the standard for the last write before money moves:
+    // between the reservation and here sit a chain round-trip and the rail's
+    // preflight, and a second daemon that had already reserved could have
+    // become the holder in that time.
+    let mut lost = None;
+    let written = journal.claim_if(|existing| {
+        for record in existing {
+            if !holds_the_slot(record.state) {
+                continue;
+            }
+            let holder = record.work_id();
+            if holder == work {
+                continue;
+            }
+            lost = Some(SlotRefusal::HeldByAnother {
+                work: holder.to_string(),
+                state: record.state,
+            });
+            return None;
+        }
+        let mut record = reserved.clone();
+        record.state = FillState::Paying;
+        record.intent_hash = Some(intent_hash);
+        record.signalled_at_ms = Some(intent_timestamp_ms);
+        Some(record)
+    })?;
+
+    if let Some(refusal) = lost {
+        anyhow::bail!("{refusal}");
+    }
+    written.ok_or_else(|| anyhow::anyhow!("the payment slot could not be claimed"))
 }
 
 /// Releases the slot: the trade is finished and settled.
@@ -337,7 +352,7 @@ mod tests {
     #[test]
     fn an_empty_journal_lets_a_payment_start() {
         let (_d, j) = journal();
-        assert_eq!(may_claim(&j, &zec_work(1)).unwrap(), Ok(()));
+        assert!(take(&j, &zec_work(1), 700_000, "alice").unwrap().is_ok());
     }
 
     #[test]
@@ -348,7 +363,9 @@ mod tests {
         let work = zec_work(1);
         write(&j, &work, FillState::Paying);
 
-        let refusal = may_claim(&j, &work).unwrap().expect_err("must refuse");
+        let refusal = take(&j, &work, 700_000, "alice")
+            .unwrap()
+            .expect_err("must refuse");
         assert!(matches!(refusal, SlotRefusal::ThisOrderMayHavePaid { .. }));
         assert!(
             refusal.to_string().contains("check the Venmo feed"),
@@ -361,7 +378,7 @@ mod tests {
         let (_d, j) = journal();
         let work = zec_work(1);
         write(&j, &work, FillState::Paid);
-        assert!(may_claim(&j, &work).unwrap().is_err());
+        assert!(take(&j, &work, 700_000, "alice").unwrap().is_err());
     }
 
     #[test]
@@ -371,7 +388,9 @@ mod tests {
         let (_d, j) = journal();
         write(&j, &zec_work(0xaa), FillState::Paying);
 
-        let refusal = may_claim(&j, &zec_work(0xbb)).unwrap().expect_err("must refuse");
+        let refusal = take(&j, &zec_work(0xbb), 700_000, "alice")
+            .unwrap()
+            .expect_err("must refuse");
         assert!(matches!(refusal, SlotRefusal::HeldByAnother { .. }));
         assert!(refusal.to_string().contains("One payment at a time"));
     }
@@ -382,7 +401,7 @@ mod tests {
         // feed. A second identical payment makes both unprovable.
         let (_d, j) = journal();
         write(&j, &zec_work(0xaa), FillState::Paid);
-        assert!(may_claim(&j, &zec_work(0xbb)).unwrap().is_err());
+        assert!(take(&j, &zec_work(0xbb), 700_000, "alice").unwrap().is_err());
     }
 
     #[test]
@@ -392,7 +411,7 @@ mod tests {
         write(&j, &other, FillState::Paying);
         write(&j, &other, FillState::Fulfilled);
         // Last line per work item wins, so the slot is free again.
-        assert_eq!(may_claim(&j, &zec_work(0xbb)).unwrap(), Ok(()));
+        assert!(take(&j, &zec_work(0xbb), 700_000, "alice").unwrap().is_ok());
     }
 
     #[test]
@@ -402,7 +421,7 @@ mod tests {
         let (_d, j) = journal();
         let work = zec_work(1);
         write(&j, &work, FillState::Seen);
-        assert_eq!(may_claim(&j, &work).unwrap(), Ok(()));
+        assert!(take(&j, &work, 700_000, "alice").unwrap().is_ok());
     }
 
     #[test]
@@ -414,11 +433,13 @@ mod tests {
         let work = zec_work(7);
         {
             let j = Journal::open(&path).unwrap();
-            let reserved = reserve(&j, &work, 700_000, "alice").unwrap();
+            let reserved = take(&j, &work, 700_000, "alice").unwrap().unwrap();
             claim(&j, reserved, B256::repeat_byte(0x11), 1_700_000_000_000).unwrap();
         }
         let reopened = Journal::open(&path).unwrap();
-        let refusal = may_claim(&reopened, &work).unwrap().expect_err("must refuse");
+        let refusal = take(&reopened, &work, 700_000, "alice")
+            .unwrap()
+            .expect_err("must refuse");
         assert!(matches!(refusal, SlotRefusal::ThisOrderMayHavePaid { .. }));
     }
 
@@ -437,6 +458,6 @@ mod tests {
         base.state = FillState::Paying;
         j.record(&base).unwrap();
 
-        assert!(may_claim(&j, &zec_work(0xbb)).unwrap().is_err());
+        assert!(take(&j, &zec_work(0xbb), 700_000, "alice").unwrap().is_err());
     }
 }

@@ -46,11 +46,13 @@ max_payment_cents = 2500
 # reason. Two journals mean two slots, and each daemon will pay while the other
 # is paying.
 #
-# Both daemons now read this file before every fill, not just at startup, and
-# both write their claim before the click. There is no file lock, so two
-# processes reading at the very same instant can still both see it free; the
-# windows are small and getting smaller, but this is not a mutex. Do not run
-# two payers against one account and rely on it alone.
+# Both daemons read this file before every fill, not just at startup, and both
+# take an exclusive flock(2) across the read and the claim - so the decision and
+# the record of it are one indivisible step, and neither can start a payment in
+# the window the other is using. Appends are a single write syscall, so two
+# writers cannot split a line.
+#
+# The lock is advisory: it binds these two programs because both take it.
 #
 # A leading ~/ expands on both sides.
 journal_path = "/home/YOU/.zecp2p/fills.jsonl"

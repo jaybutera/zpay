@@ -212,6 +212,74 @@ impl FillRecord {
     }
 }
 
+/// Which record holds the payment slot against `mine`, if any.
+///
+/// The gate both daemons use, as a pure function over the journal's latest
+/// states so it can be tested without a chain, a browser or a process.
+///
+/// R4-1: the rule is "any open record that is not mine", and it has to be a
+/// scan rather than a first-match against `in_flight`, because `latest` is
+/// ordered by `WorkId` and `Rail::Base` sorts before `Rail::Zec`. A taker that
+/// matched only the first record was told its own open Base deposit was the
+/// holder and carried on, never seeing the coordinator's `Paying` line behind
+/// it.
+pub fn holder_among(latest: &[FillRecord], mine: &WorkId) -> Option<FillRecord> {
+    latest
+        .iter()
+        .find(|r| r.state.is_open() && &r.work_id() != mine)
+        .cloned()
+}
+
+/// An advisory exclusive lock held for the life of the value.
+///
+/// `flock(2)`, which is per open file description and released when the handle
+/// closes - including if the process dies, which matters here: a daemon killed
+/// mid-append must not leave the journal locked against its own restart.
+///
+/// Advisory and cooperative: it binds the two daemons in this repository
+/// because both take it, and it is not a defence against a third writer that
+/// does not. That is the right tool for the job - both writers are ours.
+struct FileLock {
+    /// The descriptor, not a borrow of the handle: the caller still needs
+    /// `&mut File` to write while the lock is held.
+    #[cfg(unix)]
+    fd: std::os::unix::io::RawFd,
+}
+
+impl FileLock {
+    fn exclusive(file: &std::fs::File, path: &Path) -> Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = file.as_raw_fd();
+            // Blocking: the critical section is one small append, and waiting
+            // for it is always better than writing over somebody's line.
+            let rc = unsafe { libc::flock(fd, libc::LOCK_EX) };
+            if rc != 0 {
+                return Err(std::io::Error::last_os_error()).with_context(|| {
+                    format!("could not lock the journal at {}", path.display())
+                });
+            }
+            Ok(Self { fd })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (file, path);
+            Ok(Self {})
+        }
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            // Best-effort: closing the handle releases it anyway.
+            unsafe { libc::flock(self.fd, libc::LOCK_UN) };
+        }
+    }
+}
+
 /// A newline-delimited JSON log, one line per state change.
 ///
 /// Append-only on purpose. A journal that rewrites entries can lose the
@@ -237,8 +305,6 @@ impl Journal {
     /// Append a state change. Flushed before returning, because the caller's
     /// next act is the one this record exists to describe.
     pub fn record(&self, record: &FillRecord) -> Result<()> {
-        use std::io::Write;
-
         let mut record = record.clone();
         record.updated_at = chrono::Utc::now();
         let line = serde_json::to_string(&record).context("could not serialise a fill record")?;
@@ -248,9 +314,78 @@ impl Journal {
             .append(true)
             .open(&self.path)
             .with_context(|| format!("could not open the journal at {}", self.path.display()))?;
-        writeln!(file, "{line}").context("could not write to the journal")?;
-        file.flush().context("could not flush the journal")?;
+
+        // Exclusive for the duration of the append, so a reader in another
+        // process never sees a half-written line and two writers never
+        // interleave. See `write_line` for why one syscall is not enough on its
+        // own.
+        let _lock = FileLock::exclusive(&file, &self.path)?;
+        Self::write_line(&mut file, &line, &self.path)
+    }
+
+    /// Appends one line in a single `write` syscall.
+    ///
+    /// R4-2: this used to be `writeln!(file, "{line}")` on an unbuffered
+    /// `File`, which is **two** syscalls - the JSON, then a bare newline
+    /// (confirmed with strace). Two processes appending at the same instant
+    /// could therefore produce `AB\n\n`: one malformed line that `latest`
+    /// skips with a warning, so *both* records disappear - including a
+    /// `Paying` line, which is the one record whose absence lets the same
+    /// escrow be paid twice.
+    ///
+    /// The newline goes into the buffer and one `write_all` issues it. On an
+    /// `O_APPEND` file a single write under `PIPE_BUF` is atomic on Linux, so
+    /// even without the lock above two appends can no longer split each other.
+    /// Both together are deliberate: the lock also covers the read side.
+    fn write_line(file: &mut std::fs::File, line: &str, path: &Path) -> Result<()> {
+        use std::io::Write;
+
+        let mut buf = String::with_capacity(line.len() + 1);
+        buf.push_str(line);
+        buf.push('\n');
+        file.write_all(buf.as_bytes())
+            .with_context(|| format!("could not write to the journal at {}", path.display()))?;
+        file.flush()
+            .with_context(|| format!("could not flush the journal at {}", path.display()))?;
         Ok(())
+    }
+
+    /// Reads the journal, decides, and appends - all under one lock.
+    ///
+    /// R4-3: the daemons' slot check was a read, then some work, then a write,
+    /// with nothing holding the file in between. Each narrowed its own window,
+    /// but between two *processes* the exposure was as wide as whatever ran
+    /// between them - four network calls on the taker's side - and they share
+    /// one Venmo account. This closes it: the decision and the claim happen
+    /// with the lock held, so no other process can observe the gap.
+    ///
+    /// `decide` is handed every record's latest state. Returning `None` means
+    /// "do not claim", and nothing is written.
+    pub fn claim_if(
+        &self,
+        decide: impl FnOnce(&[FillRecord]) -> Option<FillRecord>,
+    ) -> Result<Option<FillRecord>> {
+        // Opened for append *and* read: the same handle carries the lock, so
+        // there is no moment between deciding and appending.
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .read(true)
+            .open(&self.path)
+            .with_context(|| format!("could not open the journal at {}", self.path.display()))?;
+        let _lock = FileLock::exclusive(&file, &self.path)?;
+
+        let existing = Self::parse(&std::fs::read_to_string(&self.path).with_context(|| {
+            format!("could not read the journal at {}", self.path.display())
+        })?);
+
+        let Some(mut record) = decide(&existing) else {
+            return Ok(None);
+        };
+        record.updated_at = chrono::Utc::now();
+        let line = serde_json::to_string(&record).context("could not serialise a fill record")?;
+        Self::write_line(&mut file, &line, &self.path)?;
+        Ok(Some(record))
     }
 
     /// Every deposit's latest state.
@@ -263,9 +398,16 @@ impl Journal {
             }
         };
 
-        // Last line per deposit wins. A malformed line is skipped rather than
-        // fatal: a truncated final write must not make the whole journal
-        // unreadable, which is precisely when it is needed most.
+        Ok(Self::parse(&contents))
+    }
+
+    /// Last line per work item wins.
+    ///
+    /// A malformed line is skipped rather than fatal: a truncated final write
+    /// must not make the whole journal unreadable, which is precisely when it
+    /// is needed most. `write_line` and the lock exist so that a *concurrent*
+    /// write cannot produce one of these in the first place.
+    fn parse(contents: &str) -> Vec<FillRecord> {
         let mut by_deposit: std::collections::BTreeMap<WorkId, FillRecord> = Default::default();
         for (n, line) in contents.lines().enumerate() {
             if line.trim().is_empty() {
@@ -278,7 +420,7 @@ impl Journal {
                 Err(e) => tracing::warn!(line = n + 1, error = %e, "skipping unreadable journal line"),
             }
         }
-        Ok(by_deposit.into_values().collect())
+        by_deposit.into_values().collect()
     }
 
     /// The fill currently holding the daemon's one slot, if any.
@@ -287,6 +429,22 @@ impl Journal {
     /// is about the shared Venmo account, not about either chain.
     pub fn in_flight(&self) -> Result<Option<FillRecord>> {
         Ok(self.latest()?.into_iter().find(|r| r.state.is_open()))
+    }
+
+    /// The open fill holding the slot against `mine`, if any.
+    ///
+    /// R4-1: [`Self::in_flight`] returns the *first* open record, and `latest`
+    /// is ordered by `WorkId`, where `Rail::Base` sorts before `Rail::Zec`. So
+    /// a caller that compared `in_flight()` to its own work id was told "that
+    /// is you, carry on" whenever its own Base record happened to be open -
+    /// and never saw the coordinator's `Paying` line on the Zec rail behind it.
+    /// The taker re-enters its own deposits routinely after a restart, because
+    /// `start_block` rescans `lookback_blocks`, so this was reachable rather
+    /// than theoretical.
+    ///
+    /// Every open record that is not `mine` counts.
+    pub fn holder_against(&self, mine: &WorkId) -> Result<Option<FillRecord>> {
+        Ok(holder_among(&self.latest()?, mine))
     }
 
     /// The open fill on one rail specifically, if any.
@@ -540,5 +698,191 @@ mod tests {
         let back = &j.latest().unwrap()[0];
         assert_eq!(back.conversion_rate, U256::from(990_881_148_896_019_200u128));
         assert_eq!(back.signalled_at_ms, Some(1_756_000_000_000));
+    }
+}
+
+#[cfg(test)]
+mod concurrency_tests {
+    use super::*;
+    use alloy::primitives::{B256, U256};
+
+    fn zec(byte: u8, state: FillState) -> FillRecord {
+        let mut r = FillRecord::new_zec(
+            format!("{}:0", hex::encode([byte; 32])),
+            U256::from(700_000u64),
+            U256::from(1_000_000_000_000_000_000u128),
+            "alice".into(),
+        );
+        r.state = state;
+        r
+    }
+
+    fn base(id: u64, state: FillState) -> FillRecord {
+        let mut r = FillRecord::new(
+            U256::from(id),
+            B256::repeat_byte(0xaa),
+            U256::from(4_875_437u64),
+            U256::from(990_881_148_896_019_200u128),
+            "alice".into(),
+        );
+        r.state = state;
+        r
+    }
+
+    #[test]
+    fn a_zec_record_holds_the_slot_against_the_takers_own_base_deposit() {
+        // R4-1. `in_flight` returns the *first* open record, and `latest` is
+        // ordered by `WorkId` with `Rail::Base` before `Rail::Zec`. So a taker
+        // comparing `in_flight()` to its own work id was told "that is you,
+        // carry on" whenever its own Base record was open, and never saw the
+        // coordinator's `Paying` line behind it. The taker re-enters its own
+        // deposits after a restart, because `start_block` rescans
+        // `lookback_blocks`, so this was reachable.
+        let dir = tempfile::tempdir().unwrap();
+        let j = Journal::open(dir.path().join("fills.jsonl")).unwrap();
+
+        // The taker's own deposit, open, on the rail that sorts first.
+        j.record(&base(4499, FillState::Signalled)).unwrap();
+        // And the coordinator, mid-payment, on the rail that sorts second.
+        j.record(&zec(0xcc, FillState::Paying)).unwrap();
+
+        let mine = WorkId::base(U256::from(4499));
+
+        // The old check: the first open record is the taker's own, so it reads
+        // as "nobody else holds the slot".
+        let first = j.in_flight().unwrap().unwrap();
+        assert_eq!(first.work_id(), mine, "Base really does sort first");
+
+        // The fixed check sees the coordinator.
+        let holder = j
+            .holder_against(&mine)
+            .unwrap()
+            .expect("the coordinator's Paying line must hold the slot");
+        assert_eq!(holder.rail, Rail::Zec);
+        assert_eq!(holder.state, FillState::Paying);
+    }
+
+    #[test]
+    fn a_work_items_own_record_does_not_hold_the_slot_against_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = Journal::open(dir.path().join("fills.jsonl")).unwrap();
+        j.record(&base(4499, FillState::Signalled)).unwrap();
+        assert!(j
+            .holder_against(&WorkId::base(U256::from(4499)))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn an_append_is_one_write_so_two_writers_cannot_split_a_line() {
+        // R4-2. `writeln!` on an unbuffered `File` is two syscalls - the JSON,
+        // then a bare newline - so two processes appending at the same instant
+        // could produce one malformed line, which `parse` skips: both records
+        // vanish, including a `Paying` line, which is the one whose absence
+        // lets an escrow be paid twice.
+        //
+        // Threads rather than processes, because the failure is in the write
+        // pattern rather than in the process boundary, and `flock` is per open
+        // file description so each `record` call takes its own.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fills.jsonl");
+        let j = std::sync::Arc::new(Journal::open(&path).unwrap());
+
+        let mut threads = Vec::new();
+        for t in 0..8u8 {
+            let j = j.clone();
+            threads.push(std::thread::spawn(move || {
+                for i in 0..25u8 {
+                    // Distinct work ids, so every record must survive.
+                    j.record(&zec(t * 25 + i, FillState::Paying)).unwrap();
+                }
+            }));
+        }
+        for t in threads {
+            t.join().unwrap();
+        }
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<_> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(lines.len(), 200, "lines were lost or split");
+        for (n, line) in lines.iter().enumerate() {
+            serde_json::from_str::<FillRecord>(line)
+                .unwrap_or_else(|e| panic!("line {} is not a record: {e}\n{line}", n + 1));
+        }
+        // And every distinct work item is still readable.
+        assert_eq!(Journal::open(&path).unwrap().latest().unwrap().len(), 200);
+    }
+
+    #[test]
+    fn claim_if_decides_and_appends_under_one_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = Journal::open(dir.path().join("fills.jsonl")).unwrap();
+
+        // Nothing there: the claim goes down.
+        let claimed = j
+            .claim_if(|existing| {
+                assert!(existing.is_empty());
+                Some(zec(0x01, FillState::Seen))
+            })
+            .unwrap();
+        assert!(claimed.is_some());
+
+        // Now the decision sees it, and declining writes nothing.
+        let before = std::fs::read_to_string(dir.path().join("fills.jsonl")).unwrap();
+        let declined = j
+            .claim_if(|existing| {
+                assert_eq!(existing.len(), 1);
+                None
+            })
+            .unwrap();
+        assert!(declined.is_none());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("fills.jsonl")).unwrap(),
+            before,
+            "declining must not write"
+        );
+    }
+
+    #[test]
+    fn only_one_of_many_racing_claimants_takes_the_slot() {
+        // What `claim_if` is for: the read and the write are one critical
+        // section, so exactly one of a crowd wins.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fills.jsonl");
+        let j = std::sync::Arc::new(Journal::open(&path).unwrap());
+        let winners = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let mut threads = Vec::new();
+        for t in 0..8u8 {
+            let j = j.clone();
+            let winners = winners.clone();
+            threads.push(std::thread::spawn(move || {
+                let got = j
+                    .claim_if(|existing| {
+                        if existing.iter().any(|r| r.state.is_open()) {
+                            return None;
+                        }
+                        // The decision takes time, the way a real one does: the
+                        // coordinator reads the chain and the taker makes four
+                        // network calls between its read and its claim. If the
+                        // lock does not span the decision, every thread sees an
+                        // empty journal here and every one of them claims.
+                        std::thread::sleep(std::time::Duration::from_millis(40));
+                        Some(zec(t, FillState::Paying))
+                    })
+                    .unwrap();
+                if got.is_some() {
+                    winners.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }));
+        }
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(
+            winners.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "more than one claimant took the one slot"
+        );
     }
 }

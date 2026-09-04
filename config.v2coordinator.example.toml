@@ -17,14 +17,13 @@ state_dir = "~/.zecp2p/v2coordinator"
 # while the other is paying - and it looks like it is working, because each
 # process is internally consistent.
 #
-# What sharing the file does and does not give you, as of this build: both
-# daemons read it before they pay, and both write their claim before the click,
-# so a fill started while the other is paying is refused. What there is not is a file
-# lock, so two processes that read at the very same instant can both see it
-# free. Each narrows its own window as far as it can - this one takes its claim
-# before any network call - but the guarantee is "much harder to hit", not
-# "impossible". Do not run two payers against one Venmo account and rely on
-# this alone.
+# Both daemons take an exclusive flock(2) on this file and make the decision
+# and the claim in one locked step, so the read-then-act window between the two
+# processes is closed rather than merely narrow. Each append is a single write
+# syscall, so a concurrent writer cannot split a line either.
+#
+# The lock is advisory and cooperative: it binds these two programs because both
+# take it. A third writer that does not take it is not stopped by it.
 #
 # A leading ~/ expands on both sides. An absolute path is still clearer.
 journal_path = "/home/YOU/.zecp2p/fills.jsonl"
