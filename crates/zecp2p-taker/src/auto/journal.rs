@@ -340,6 +340,25 @@ impl Journal {
     fn write_line(file: &mut std::fs::File, line: &str, path: &Path) -> Result<()> {
         use std::io::Write;
 
+        // R5-e: a `write_all` that dies partway - a full disk is the realistic
+        // way - leaves a line with no terminating newline, and the next append
+        // glues onto it. That makes *two* records into one unparseable line
+        // rather than one, and `parse` skips it, so a `Paying` line can vanish
+        // along with whatever followed it.
+        //
+        // Under the same lock as the append, so no reader sees the gap: if the
+        // file does not end in a newline, end it before writing.
+        if Self::needs_terminator(file, path)? {
+            tracing::warn!(
+                journal = %path.display(),
+                "the journal did not end in a newline, which means an earlier append was \
+                 cut short. Terminating it so this record does not glue onto the remains."
+            );
+            file.write_all(b"\n").with_context(|| {
+                format!("could not terminate the journal at {}", path.display())
+            })?;
+        }
+
         let mut buf = String::with_capacity(line.len() + 1);
         buf.push_str(line);
         buf.push('\n');
@@ -348,6 +367,35 @@ impl Journal {
         file.flush()
             .with_context(|| format!("could not flush the journal at {}", path.display()))?;
         Ok(())
+    }
+
+    /// Whether the file's last byte is something other than a newline.
+    ///
+    /// An empty file needs no terminator. Anything else that does not end in
+    /// `\n` is the remains of an append that did not finish.
+    fn needs_terminator(file: &std::fs::File, path: &Path) -> Result<bool> {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let len = file
+            .metadata()
+            .with_context(|| format!("could not stat the journal at {}", path.display()))?
+            .len();
+        if len == 0 {
+            return Ok(false);
+        }
+
+        // Read the last byte through a separate handle: this one is `O_APPEND`,
+        // and seeking it would not move where a write lands anyway.
+        let mut reader = std::fs::File::open(path)
+            .with_context(|| format!("could not read the journal at {}", path.display()))?;
+        reader
+            .seek(SeekFrom::End(-1))
+            .with_context(|| format!("could not seek the journal at {}", path.display()))?;
+        let mut last = [0u8; 1];
+        reader
+            .read_exact(&mut last)
+            .with_context(|| format!("could not read the journal at {}", path.display()))?;
+        Ok(last[0] != b'\n')
     }
 
     /// Reads the journal, decides, and appends - all under one lock.
@@ -784,6 +832,12 @@ mod concurrency_tests {
         // Threads rather than processes, because the failure is in the write
         // pattern rather than in the process boundary, and `flock` is per open
         // file description so each `record` call takes its own.
+        //
+        // Verifying this by reverting: restoring `writeln!` alone leaves this
+        // passing, because the lock in `record` keeps two appenders apart on
+        // its own. Revert the lock as well to see the split. The two are
+        // deliberate belt and braces - the lock is advisory and binds only
+        // programs that take it, while the single write holds against anything.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("fills.jsonl");
         let j = std::sync::Arc::new(Journal::open(&path).unwrap());
@@ -811,6 +865,42 @@ mod concurrency_tests {
         }
         // And every distinct work item is still readable.
         assert_eq!(Journal::open(&path).unwrap().latest().unwrap().len(), 200);
+    }
+
+    #[test]
+    fn a_torn_last_line_is_terminated_before_the_next_append() {
+        // R5-e. A `write_all` cut short by a full disk leaves a line with no
+        // newline; the next append glues onto it and makes both records
+        // unparseable, so `parse` drops them - including, potentially, a
+        // `Paying` line and whatever followed it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fills.jsonl");
+        let j = Journal::open(&path).unwrap();
+
+        j.record(&zec(0x01, FillState::Paying)).unwrap();
+
+        // The disk fills up partway through the second append.
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(b"{\"rail\":\"zec\",\"deposit_i").unwrap();
+        }
+        assert!(!std::fs::read_to_string(&path).unwrap().ends_with('\n'));
+
+        // The next append must not glue onto the fragment.
+        j.record(&zec(0x02, FillState::Seen)).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<_> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(lines.len(), 3, "the fragment and the new record were merged");
+        // The first and last parse; only the fragment is lost, which is the
+        // most that can be saved.
+        serde_json::from_str::<FillRecord>(lines[0]).expect("the first record survived");
+        serde_json::from_str::<FillRecord>(lines[2]).expect("the new record is readable");
+
+        // And both readable records come back.
+        let latest = j.latest().unwrap();
+        assert_eq!(latest.len(), 2, "a readable record was lost: {latest:?}");
     }
 
     #[test]

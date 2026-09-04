@@ -163,6 +163,11 @@ pub fn take(
             }
             let holder = record.work_id();
             if &holder == work {
+                // R5-a: an own-work record that says a payment may have moved
+                // stops us, and that check has to be here rather than only in
+                // the caller - two coordinators sharing a state directory both
+                // reach this point for the same order, and each would otherwise
+                // treat the other's line as its own and claim over it.
                 if may_already_have_paid(record.state) {
                     refusal = Some(SlotRefusal::ThisOrderMayHavePaid {
                         work: holder.to_string(),
@@ -170,7 +175,10 @@ pub fn take(
                     });
                     return None;
                 }
-                // Our own `Seen` from an earlier attempt. Claim over it.
+                // A `Seen` for this order and nothing further: our own earlier
+                // attempt, or another instance still deciding. Claiming over it
+                // is safe because neither has paid, and the `Paying` claim below
+                // re-reads under the lock before anything is sent.
                 continue;
             }
             refusal = Some(SlotRefusal::HeldByAnother {
@@ -247,6 +255,17 @@ pub fn claim(
             }
             let holder = record.work_id();
             if holder == work {
+                // R5-a: our own work id, but a state past reservation means
+                // somebody is already paying this order - a second coordinator
+                // on the same state directory, or this one re-entered. Writing
+                // a second `Paying` line here is how one order gets paid twice.
+                if may_already_have_paid(record.state) {
+                    lost = Some(SlotRefusal::ThisOrderMayHavePaid {
+                        work: holder.to_string(),
+                        state: record.state,
+                    });
+                    return None;
+                }
                 continue;
             }
             lost = Some(SlotRefusal::HeldByAnother {

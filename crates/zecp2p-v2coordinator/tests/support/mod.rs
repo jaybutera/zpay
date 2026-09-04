@@ -95,6 +95,11 @@ impl FakeNode {
         self.inner.broadcasts.lock().await.clone()
     }
 
+    /// Moves the chain tip, which is how a test reaches `T`.
+    pub async fn set_height(&self, height: u32) {
+        *self.inner.height.lock().await = height;
+    }
+
     /// A network upgrade, which is what changes the ZIP 244 sighash.
     pub async fn set_branch_id(&self, branch_id: u32) {
         *self.inner.branch_id.lock().await = branch_id;

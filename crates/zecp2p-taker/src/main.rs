@@ -460,11 +460,15 @@ async fn main() -> Result<()> {
         }
 
         Commands::Run { dry_run, recipient } => {
-            let mode = if dry_run {
-                SendMode::DryRun
-            } else {
-                SendMode::Live
-            };
+            // R5-2: `TakerAgent` pays through the browser with no journal read
+            // and no journal write, so it cannot see the coordinator's claim and
+            // the coordinator cannot see its. `--dry-run` still works: it drives
+            // the page and stops at the irreversible step.
+            if !dry_run {
+                return refuse_ungated_live_payment("run", "auto");
+            }
+            // Only reachable with `--dry-run`, by the refusal above.
+            let mode = SendMode::DryRun;
             tracing::info!(taker = %taker, dry_run, "starting taker agent");
             let agent =
                 TakerAgent::with_recipient(config, provider.clone(), taker, mode, recipient);
@@ -583,6 +587,32 @@ fn print_terms(terms: &IntentTerms) {
 /// The selectors in `venmo.rs` are guesses at Venmo's markup until something
 /// runs them against the page, and `PaymentStep::Fill` sets a React-controlled
 /// input, which is the failure that silently does nothing. This runs the live
+/// Refuses a live payment from a path that does not take the payment slot.
+///
+/// R5-2: two subcommands drove the browser with no journal read and no journal
+/// write - `run`, whose whole purpose is to claim and pay, and `test-pay
+/// --send-for-real`. The slot is what stops this taker and
+/// `zecp2p-v2coordinator` paying the same Venmo account at the same time, and
+/// the config comments told operators the two programs were bound. For these
+/// paths that was false.
+///
+/// Rather than thread a journal through the agent - which would be a second
+/// implementation of a gate that already exists in `handle_one` - these paths
+/// refuse in `Live` mode and name the one that is gated. A payer that cannot
+/// take the slot must not send money.
+fn refuse_ungated_live_payment(command: &str, gated: &str) -> Result<()> {
+    bail!(
+        "`{command}` sends money without taking the payment slot, and this build \
+         shares that slot with zecp2p-v2coordinator through the fill journal \
+         (taker.journal_path). A payer that does not read the journal can pay the \
+         same Venmo account while the other daemon is paying it, and two identical \
+         entries in the feed cannot be told apart afterwards.\n\n\
+         Use `{gated}`, which reads the slot, claims it before the click, and \
+         records what happened. `{command} --dry-run` still drives the page \
+         without sending."
+    )
+}
+
 /// sequence with the irreversible step removed, so both failures surface here.
 async fn run_test_pay(
     config: &TakerConfig,
@@ -596,6 +626,11 @@ async fn run_test_pay(
         bail!("{amount:?} is not an amount Venmo's field would accept");
     }
     let claimed = zecp2p_taker::payee::validate_username_shape(recipient)?.to_string();
+
+    // R5-2. Refused before the browser opens, so the refusal costs nothing.
+    if send_for_real {
+        return refuse_ungated_live_payment("test-pay --send-for-real", "auto");
+    }
 
     let browser = VenmoBrowser::new(config.venmo.cdp_url.clone(), config.venmo.timeout_seconds);
     let tab = browser
@@ -1636,14 +1671,40 @@ async fn handle_one<P: alloy::providers::Provider + Clone>(
         taker,
     };
 
-    let mut record = FillRecord::new(
-        deposit.deposit_id,
-        deposit.session_id,
-        amount,
-        rate,
-        plan.recipient.clone(),
-    );
-    journal.record(&record)?;
+    // R5-1: this `Seen` line used to be an unconditional append, three chain
+    // calls and a curator round-trip after the gate read at the top of this
+    // function. If the coordinator took the slot inside that window, both ended
+    // up holding a reservation - and then neither could proceed: the
+    // coordinator saw this line and waited, while this fill signalled an
+    // intent, lost at its own claim, and left a `Signalled` line open forever.
+    // A stall that only an operator could clear.
+    //
+    // The reservation now goes through `claim_if`, which holds the journal's
+    // lock across the read and the write, so exactly one side gets it.
+    let mut lost_the_slot = None;
+    let claimed_slot = journal.claim_if(|existing| {
+        if let Some(holder) = zecp2p_taker::auto::journal::holder_among(existing, &mine) {
+            lost_the_slot = Some(format!(
+                "{} took the one payment slot ({:?}) while this fill was being priced",
+                holder.describe(),
+                holder.state
+            ));
+            return None;
+        }
+        Some(FillRecord::new(
+            deposit.deposit_id,
+            deposit.session_id,
+            amount,
+            rate,
+            plan.recipient.clone(),
+        ))
+    })?;
+    if let Some(why) = lost_the_slot {
+        // Nothing has been signalled or spent yet, so there is nothing to undo.
+        return Ok(Outcome::Skipped { why });
+    }
+    let mut record = claimed_slot
+        .ok_or_else(|| anyhow::anyhow!("the payment slot could not be reserved"))?;
 
     if dry_run {
         println!("\n{}", plan.signal_prompt());
@@ -1834,6 +1895,42 @@ async fn run_fill<P: alloy::providers::Provider + Clone>(
         Some(claim)
     })?;
     if let Some(why) = lost_the_slot {
+        // R5-1: an intent is already signalled by this point, and it holds the
+        // maker's USDC and this taker's stake. Walking away without cancelling
+        // leaves both locked until the intent expires, and leaves an open
+        // `Signalled` line that holds the slot against every later fill - a
+        // stall only an operator could clear.
+        //
+        // Nothing has been paid, so cancelling is free and correct.
+        tracing::warn!(%why, "lost the payment slot after signalling; cancelling the intent");
+        match record.intent_hash {
+            Some(intent_hash) => match claimer.cancel_intent(intent_hash).await {
+                Ok(tx) => {
+                    record.state = FillState::Cancelled;
+                    record.note = Some(format!("{why}; intent cancelled in {tx}"));
+                    journal.record(record)?;
+                }
+                Err(e) => {
+                    // The cancel failed, so the intent stands. That needs a
+                    // human, and the record must not be left saying the slot is
+                    // free while an intent is outstanding.
+                    tracing::error!(error = %e, "cancel failed; the intent will expire on its own");
+                    record.state = FillState::NeedsOperator;
+                    record.note = Some(format!(
+                        "{why}; the intent could not be cancelled ({e:#}) and will expire. \
+                         Nothing was paid."
+                    ));
+                    journal.record(record)?;
+                }
+            },
+            None => {
+                // Never signalled: give the reservation back so the next fill
+                // is not blocked by a line that means nothing.
+                record.state = FillState::Cancelled;
+                record.note = Some(why.clone());
+                journal.record(record)?;
+            }
+        }
         return Ok(Outcome::Skipped { why });
     }
     *record = claimed

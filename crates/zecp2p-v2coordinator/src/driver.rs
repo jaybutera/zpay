@@ -422,8 +422,13 @@ async fn settle(state: &Arc<AppState>, order: Order) -> Result<()> {
             // Somebody else holds it: wait, and try again on the next sweep.
             // Nothing is wrong with this order.
             crate::slot::SlotRefusal::HeldByAnother { .. } => {
+                // R5-d: the deadline check runs even while the slot is held.
+                // Returning early left an order past `T` sitting at `locked`
+                // for as long as another trade took, so the page never offered
+                // the refund the user was entitled to.
                 tracing::info!(order = %order.order_id, reason = %refusal, "waiting for the payment slot");
-                return Ok(());
+                drop(_paying);
+                return check_deadlines(state, order).await;
             }
             crate::slot::SlotRefusal::ThisOrderMayHavePaid { .. } => {
                 // R3-4: `Paid` here is not an error, it is the post-payment
@@ -534,12 +539,28 @@ async fn settle(state: &Arc<AppState>, order: Order) -> Result<()> {
     // writes nothing itself, and a crash between here and Venmo cannot be told
     // from a completed payment - so the expensive reading of that ambiguity is
     // recorded first, and a human resolves it from the feed.
-    let mut record = crate::slot::claim(
+    let mut record = match crate::slot::claim(
         &state.journal,
-        reserved,
+        reserved.clone(),
         leg.intent_hash,
         leg.intent_timestamp_ms,
-    )?;
+    ) {
+        Ok(record) => record,
+        Err(e) => {
+            // R5-1: the claim lost the slot between the reservation and here.
+            // The reservation must go back, or this order's own `Seen` line
+            // holds the slot against every other order - including the one that
+            // won - and nothing but an operator clears it.
+            tracing::info!(
+                order = %order.order_id,
+                reason = %format!("{e:#}"),
+                "lost the payment slot before the click; giving the reservation back"
+            );
+            crate::slot::retract(&state.journal, reserved, "lost the slot before paying");
+            drop(_paying);
+            return check_deadlines(state, order).await;
+        }
+    };
 
     let paid = match fiat.pay(&leg).await {
         Ok(p) => p,

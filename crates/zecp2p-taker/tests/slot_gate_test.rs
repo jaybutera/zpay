@@ -125,3 +125,92 @@ fn the_gate_reads_what_the_other_daemon_actually_wrote() {
         .unwrap()
         .is_none());
 }
+
+#[test]
+fn a_reservation_written_under_the_lock_cannot_double_up() {
+    // R5-1, the taker's half of the mutual stall. Its `Seen` line used to be an
+    // unconditional append, three chain calls and a curator round-trip after the
+    // gate read - so if the coordinator took the slot inside that window, both
+    // held a reservation, and neither could then proceed. Routing the write
+    // through `claim_if` means exactly one side gets it.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fills.jsonl");
+    let journal = std::sync::Arc::new(Journal::open(&path).unwrap());
+
+    // The coordinator is already reserving.
+    journal.record(&zec_record(0xcc, FillState::Seen)).unwrap();
+
+    // The taker tries to reserve for its own deposit, the way `handle_one`
+    // does now: the gate and the write in one locked step.
+    let mine = WorkId::base(U256::from(4499));
+    let mut lost = None;
+    let claimed = journal
+        .claim_if(|existing| {
+            if let Some(holder) = holder_among(existing, &mine) {
+                lost = Some(holder);
+                return None;
+            }
+            Some(base_record(4499, FillState::Seen))
+        })
+        .unwrap();
+
+    assert!(claimed.is_none(), "the taker reserved on top of the coordinator");
+    assert!(lost.is_some(), "the taker did not see the coordinator's reservation");
+
+    // One reservation in the file, not two.
+    let open = journal
+        .latest()
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.state.is_open())
+        .count();
+    assert_eq!(open, 1, "{open} daemons hold a reservation for one Venmo balance");
+}
+
+#[test]
+fn racing_reservations_leave_exactly_one_holder() {
+    // The same thing under real contention, with a decision that takes time -
+    // which is what the taker's does: three chain calls and an HTTP round-trip.
+    let dir = tempfile::tempdir().unwrap();
+    let journal = std::sync::Arc::new(Journal::open(dir.path().join("fills.jsonl")).unwrap());
+    let winners = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    let mut threads = Vec::new();
+    for t in 0..6u8 {
+        let journal = journal.clone();
+        let winners = winners.clone();
+        threads.push(std::thread::spawn(move || {
+            // Half the threads are takers, half are coordinators.
+            let (mine, record) = if t % 2 == 0 {
+                (
+                    WorkId::base(U256::from(4000 + t as u64)),
+                    base_record(4000 + t as u64, FillState::Seen),
+                )
+            } else {
+                let r = zec_record(t, FillState::Seen);
+                (r.work_id(), r)
+            };
+            let got = journal
+                .claim_if(|existing| {
+                    if holder_among(existing, &mine).is_some() {
+                        return None;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                    Some(record.clone())
+                })
+                .unwrap();
+            if got.is_some() {
+                winners.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }));
+    }
+    for t in threads {
+        t.join().unwrap();
+    }
+
+    assert_eq!(
+        winners.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "more than one daemon reserved the one payment slot"
+    );
+}

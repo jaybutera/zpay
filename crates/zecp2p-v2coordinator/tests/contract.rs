@@ -1949,3 +1949,162 @@ async fn the_slot_claim_and_the_check_are_one_step() {
         .count();
     assert_eq!(open, 1, "{open} open records for one slot");
 }
+
+#[tokio::test]
+async fn losing_the_slot_before_the_click_gives_the_reservation_back() {
+    // R5-1, the coordinator's half of the mutual stall. `take` writes a `Seen`
+    // line, then the chain call and the preflight run, then `claim` re-reads
+    // and can find somebody else holding the slot. That reservation has to go
+    // back: left behind, this order's own `Seen` blocks every other order -
+    // including the one that won - and nothing but an operator clears it.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+    // Slow preflight, so there is a window to take the slot inside.
+    let fiat = Arc::new(SlowFiat::new(300));
+    let state = coordinator_with_fiat(dir.path(), scanner.clone(), &node, &attestor, fiat.clone());
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+    let user = TestUser::new();
+
+    let (order_id, _) = locked_order(&app, &state, &node, &scanner, &attestor, &user).await;
+
+    // The order starts paying, and a competing daemon takes the slot while it
+    // is inside preflight.
+    let driving = {
+        let s = state.clone();
+        let id = order_id.clone();
+        tokio::spawn(async move { zecp2p_v2coordinator::driver::advance(&s, &id).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    let mut intruder = zecp2p_taker::auto::journal::FillRecord::new(
+        alloy::primitives::U256::from(4499),
+        alloy::primitives::B256::repeat_byte(0xaa),
+        alloy::primitives::U256::from(4_875_437u64),
+        alloy::primitives::U256::from(990_881_148_896_019_200u128),
+        "alice".into(),
+    );
+    intruder.state = zecp2p_taker::auto::journal::FillState::Paying;
+    state.journal.record(&intruder).unwrap();
+
+    let _ = driving.await;
+
+    // The intruder still holds the slot, and this order left nothing behind.
+    let ours = zecp2p_v2coordinator::slot::work_id_for(
+        &state.store.get(&order_id).unwrap().funding.unwrap().txid,
+        0,
+    );
+    let open_for_us: Vec<_> = state
+        .journal
+        .latest()
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.work_id() == ours && r.state.is_open())
+        .collect();
+    assert!(
+        open_for_us.is_empty(),
+        "the reservation was left behind and now blocks every order: {open_for_us:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_order_past_t_becomes_refundable_even_while_the_slot_is_held() {
+    // R5-d. The `HeldByAnother` branch returned before the deadline check, so
+    // an order past `T` sat at `locked` for as long as another trade took, and
+    // the page never offered the refund the user was entitled to.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+    let fiat = Arc::new(CountingFiat::new());
+    let state = coordinator_with_fiat(dir.path(), scanner.clone(), &node, &attestor, fiat.clone());
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+    let user = TestUser::new();
+
+    let (order_id, _) = locked_order(&app, &state, &node, &scanner, &attestor, &user).await;
+    let mut relocked = state.store.get(&order_id).unwrap();
+    relocked.stage = Stage::Locked;
+    relocked.payment = None;
+    relocked.release_txid = None;
+    state.store.put(&relocked).unwrap();
+
+    // Somebody else holds the slot, and the chain passes T.
+    let mut other = zecp2p_taker::auto::journal::FillRecord::new(
+        alloy::primitives::U256::from(4499),
+        alloy::primitives::B256::repeat_byte(0xaa),
+        alloy::primitives::U256::from(4_875_437u64),
+        alloy::primitives::U256::from(990_881_148_896_019_200u128),
+        "alice".into(),
+    );
+    other.state = zecp2p_taker::auto::journal::FillState::Paying;
+    state.journal.record(&other).unwrap();
+    node.set_height(u32::try_from(relocked.refund_height).unwrap() + 1).await;
+
+    zecp2p_v2coordinator::driver::advance(&state, &order_id)
+        .await
+        .expect("waiting for the slot is not an error");
+
+    assert_eq!(
+        state.store.get(&order_id).unwrap().stage,
+        Stage::Refundable,
+        "the user could not be offered their refund because another trade was paying"
+    );
+    assert_eq!(fiat.payments(), 0, "it paid while the slot was held");
+}
+
+#[tokio::test]
+async fn a_second_coordinator_cannot_pay_the_same_order() {
+    // R5-a. `take` and `claim` skip records for their own work id, which is
+    // right for a retry and wrong for a second process on the same state
+    // directory: both would treat the other's line as their own and both would
+    // write `Paying` for one order.
+    let dir = tempfile::tempdir().unwrap();
+    let journal =
+        zecp2p_taker::auto::journal::Journal::open(dir.path().join("fills.jsonl")).unwrap();
+    let work = zecp2p_v2coordinator::slot::work_id_for(&[0x5c; 32], 0);
+
+    // The first instance reserves and claims.
+    let reserved = zecp2p_v2coordinator::slot::take(&journal, &work, 700_000, "alice")
+        .unwrap()
+        .expect("the slot is free");
+    zecp2p_v2coordinator::slot::claim(
+        &journal,
+        reserved,
+        alloy::primitives::B256::repeat_byte(0x11),
+        1_700_000_000_000,
+    )
+    .expect("the first claim succeeds");
+
+    // A second instance, same order, same journal.
+    let second = zecp2p_v2coordinator::slot::take(&journal, &work, 700_000, "alice").unwrap();
+    assert!(
+        second.is_err(),
+        "a second coordinator claimed an order already being paid"
+    );
+
+    // And even holding a stale reservation, its claim is refused.
+    let stale = zecp2p_taker::auto::journal::FillRecord::new_zec(
+        work.local.clone(),
+        alloy::primitives::U256::from(700_000u64),
+        alloy::primitives::U256::from(1_000_000_000_000_000_000u128),
+        "alice".into(),
+    );
+    let refused = zecp2p_v2coordinator::slot::claim(
+        &journal,
+        stale,
+        alloy::primitives::B256::repeat_byte(0x22),
+        1_700_000_000_000,
+    );
+    assert!(
+        refused.is_err(),
+        "a second coordinator wrote a second Paying line for one order"
+    );
+
+    // One Paying line, not two.
+    let paying = std::fs::read_to_string(dir.path().join("fills.jsonl"))
+        .unwrap()
+        .lines()
+        .filter(|l| l.contains("\"paying\""))
+        .count();
+    assert_eq!(paying, 1, "{paying} Paying lines for one order");
+}
