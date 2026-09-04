@@ -12,6 +12,8 @@
 //! is why `decide` below is a pure function of the request and the pinned
 //! constants, with no manual override and no path that skips the enclave check.
 
+pub mod db;
+pub mod service;
 pub mod store;
 
 use secp256k1_zkp::{PublicKey, Secp256k1, SecretKey};
@@ -82,6 +84,8 @@ pub enum AttestorError {
     EscrowNotFound,
     #[error("chain error: {0}")]
     Chain(String),
+    #[error("the attestor could not answer: {0}")]
+    Unavailable(String),
 }
 
 /// The confirmation depth table of spec section 7, applied by the attestor
@@ -390,12 +394,11 @@ pub(crate) fn handle_attest_with_signer(
     rate: &RatePolicy,
     trusted_signer: &[u8; 20],
 ) -> Result<SecretKey, AttestorError> {
-    // An event already signed returns what it published rather than signing
-    // again. The scalar is public the moment the release is broadcast, so this
-    // is idempotent, not a leak.
-    if let Some(existing) = store.signed_outcome(event_id) {
-        return SecretKey::from_slice(&existing)
-            .map_err(|e| AttestorError::Dlc(DlcError::Secp(e.to_string())));
+    // Criterion 8. Note this is the in-memory path, which refuses a repeat
+    // outright; the SQLite path that the service actually runs replays an exact
+    // repeat per spec 19.1. `store.rs` records why they differ (R8-9).
+    if store.signed_outcome(event_id).is_some() {
+        return Err(AttestorError::AlreadySigned);
     }
 
     let event = store.get(event_id).ok_or(AttestorError::UnknownEvent)?.clone();
@@ -447,14 +450,17 @@ pub(crate) fn handle_attest_with_signer(
     Ok(s)
 }
 
-fn map_store_error(e: store::StoreError) -> AttestorError {
+pub(crate) fn map_store_error(e: store::StoreError) -> AttestorError {
     match e {
         store::StoreError::UnknownEvent => AttestorError::UnknownEvent,
         store::StoreError::AlreadySigned => AttestorError::AlreadySigned,
         store::StoreError::PaymentAlreadyConsumed => AttestorError::PaymentAlreadyConsumed,
-        store::StoreError::DuplicateEvent | store::StoreError::DuplicateFundingTx => {
-            AttestorError::DuplicateAnnouncement
-        }
+        store::StoreError::DuplicateEvent
+        | store::StoreError::DuplicateFundingTx
+        | store::StoreError::DuplicateNoncePoint => AttestorError::DuplicateAnnouncement,
+        // Not a decision: the store could not answer. The LP must retry rather
+        // than read this as a refusal (R5-1).
+        store::StoreError::Unavailable(m) => AttestorError::Unavailable(m),
     }
 }
 
@@ -495,11 +501,42 @@ impl Clock for FixedClock {
 
 /// The `/announce` handler, spec 5.1.
 ///
-/// Stamps `announced_at_ms` from the handler's own clock, refuses a zero stamp,
-/// and checks that the requested `event_id` is the one this outpoint actually
+/// Draws the nonce itself from the OS RNG (round 4 finding 1), stamps
+/// `announced_at_ms` from the handler's own clock, refuses a zero stamp, and
+/// checks that the requested `event_id` is the one this outpoint actually
 /// produces - so a caller cannot announce under an id belonging to a different
 /// escrow and have the store's later checks compare against the wrong row.
+///
+/// `k` is never a parameter. Spec section 6 requires it be generated per event
+/// from the OS RNG and never derived from `d`; a caller-supplied nonce is a
+/// caller-supplied opportunity to repeat one, and two signatures under one
+/// nonce publish `d`.
 pub fn handle_announce(
+    store: &mut store::EventStore,
+    secp: &Secp256k1<secp256k1_zkp::All>,
+    clock: &impl Clock,
+    event_id: &[u8; 32],
+    terms: &CanonicalTerms,
+) -> Result<PublicKey, AttestorError> {
+    let k = SecretKey::new(&mut secp256k1_zkp::rand::thread_rng());
+    announce_with_nonce(store, secp, clock, event_id, terms, &k)
+}
+
+/// As [`handle_announce`], with the nonce supplied. Test-only: a production
+/// announcement draws its own.
+#[cfg(feature = "test-signer")]
+pub fn handle_announce_with_nonce(
+    store: &mut store::EventStore,
+    secp: &Secp256k1<secp256k1_zkp::All>,
+    clock: &impl Clock,
+    event_id: &[u8; 32],
+    terms: &CanonicalTerms,
+    k: &SecretKey,
+) -> Result<PublicKey, AttestorError> {
+    announce_with_nonce(store, secp, clock, event_id, terms, k)
+}
+
+fn announce_with_nonce(
     store: &mut store::EventStore,
     secp: &Secp256k1<secp256k1_zkp::All>,
     clock: &impl Clock,
@@ -558,6 +595,173 @@ pub fn observe_escrow(
     })
 }
 
+/// Phase one of `/attest`: everything that needs the store *before* the chain
+/// is consulted.
+///
+/// R6-6: the service held the store lock across the `gettxout` round trip, so
+/// one stalled node call blocked every other announce and attest for as long as
+/// the RPC timeout - 45 s in the daemon. Splitting the sequence lets the lock be
+/// released around the network call.
+///
+/// Correctness does not depend on the lock spanning the gap. The signing
+/// transaction's `UPDATE ... WHERE s IS NULL` and the UNIQUE
+/// `payment_nullifier` are what make check-then-sign atomic; a racing request
+/// that slips in between loses at the commit, with its nonce intact.
+pub fn attest_prepare(
+    db: &db::SqliteEventStore,
+    event_id: &[u8; 32],
+) -> Result<store::Event, AttestorError> {
+    db.get(event_id)
+        .map_err(|e| AttestorError::Unavailable(e.to_string()))?
+        .ok_or(AttestorError::UnknownEvent)
+}
+
+/// Phase three of `/attest`: decide and sign, with the chain already read.
+///
+/// Takes the observation rather than a `ChainClient`, so the caller can hold the
+/// store lock for exactly this call and not for the network round trip (R6-6).
+#[allow(clippy::too_many_arguments)]
+pub fn attest_decide_and_sign(
+    db: &mut db::SqliteEventStore,
+    secp: &Secp256k1<secp256k1_zkp::All>,
+    d: &SecretKey,
+    clock: &impl Clock,
+    event_id: &[u8; 32],
+    terms: &CanonicalTerms,
+    attestation: &PaymentAttestation,
+    signature: &[u8],
+    encoded_payment_details: &[u8],
+    observation: &ChainObservation,
+    rate: &RatePolicy,
+) -> Result<SecretKey, AttestorError> {
+    decide_and_sign_with_signer(
+        db,
+        secp,
+        d,
+        clock,
+        event_id,
+        terms,
+        attestation,
+        signature,
+        encoded_payment_details,
+        observation,
+        rate,
+        &ENCLAVE_SIGNER,
+    )
+}
+
+/// As [`attest_decide_and_sign`], against a caller-supplied enclave key.
+/// Test builds only.
+#[cfg(feature = "test-signer")]
+#[allow(clippy::too_many_arguments)]
+pub fn attest_decide_and_sign_against_signer(
+    db: &mut db::SqliteEventStore,
+    secp: &Secp256k1<secp256k1_zkp::All>,
+    d: &SecretKey,
+    clock: &impl Clock,
+    event_id: &[u8; 32],
+    terms: &CanonicalTerms,
+    attestation: &PaymentAttestation,
+    signature: &[u8],
+    encoded_payment_details: &[u8],
+    observation: &ChainObservation,
+    rate: &RatePolicy,
+    trusted_signer: &[u8; 20],
+) -> Result<SecretKey, AttestorError> {
+    decide_and_sign_with_signer(
+        db, secp, d, clock, event_id, terms, attestation, signature,
+        encoded_payment_details, observation, rate, trusted_signer,
+    )
+}
+
+/// The shared body of the signing phase. `attest_over_db_with_signer` reads the
+/// chain itself and then calls this; the service reads the chain between two
+/// lock acquisitions and calls it directly.
+#[allow(clippy::too_many_arguments)]
+fn decide_and_sign_with_signer(
+    db: &mut db::SqliteEventStore,
+    secp: &Secp256k1<secp256k1_zkp::All>,
+    d: &SecretKey,
+    clock: &impl Clock,
+    event_id: &[u8; 32],
+    terms: &CanonicalTerms,
+    attestation: &PaymentAttestation,
+    signature: &[u8],
+    encoded_payment_details: &[u8],
+    observation: &ChainObservation,
+    rate: &RatePolicy,
+    trusted_signer: &[u8; 20],
+) -> Result<SecretKey, AttestorError> {
+    // Re-read under the lock: between the chain call and here, another request
+    // may have signed this event.
+    let event = db
+        .get(event_id)
+        .map_err(|e| AttestorError::Unavailable(e.to_string()))?
+        .ok_or(AttestorError::UnknownEvent)?;
+    let already_signed = event.signed_s;
+
+    // R7-7: `attest_decide_and_sign` is public and takes a `ChainObservation`,
+    // so a caller could hand back a recency bound of its own choosing - the
+    // round 2 finding 2 shape. Narrow it here, where the row is already in
+    // hand, so no caller can widen it whatever it passes.
+    let observation = &ChainObservation {
+        earliest_acceptable_payment_ms: observation
+            .earliest_acceptable_payment_ms
+            .max(event.announced_at_ms),
+        ..observation.clone()
+    };
+
+    let details = PaymentDetails::decode(encoded_payment_details)?;
+    let nullifier = payment_nullifier(&details);
+    let already_consumed = db
+        .payment_is_consumed(&nullifier)
+        .map_err(|e| AttestorError::Unavailable(e.to_string()))?;
+
+    let is_replay_of_this_event = already_signed.is_some()
+        && event.payment_nullifier == Some(nullifier)
+        && event.terms_hash == terms.terms_hash();
+
+    decide_inner(
+        &event.terms_hash,
+        event.signed_s.is_some() && !is_replay_of_this_event,
+        terms,
+        attestation,
+        signature,
+        encoded_payment_details,
+        observation,
+        trusted_signer,
+        rate,
+        already_consumed && !is_replay_of_this_event,
+    )?;
+
+    if let Some(existing) = already_signed {
+        if is_replay_of_this_event {
+            return SecretKey::from_slice(&existing)
+                .map_err(|e| AttestorError::Dlc(DlcError::Secp(e.to_string())));
+        }
+        return Err(AttestorError::AlreadySigned);
+    }
+
+    let signed_at_ms = clock.now_ms();
+    let terms_hash = event.terms_hash;
+    let s_bytes = db
+        .sign_and_record(event_id, nullifier, signed_at_ms, |k| {
+            // R6-8: these were mapped to `AlreadySigned`, so a signing failure
+            // would have been reported as 409 "already signed" - wrong on its
+            // face, and misleading to an operator. Neither can happen with a
+            // valid `k`, and if one does it is the store being unusable.
+            let k = SecretKey::from_slice(k)
+                .map_err(|e| store::StoreError::Unavailable(format!("stored nonce: {e}")))?;
+            let s = sign_outcome(secp, &k, d, event_id, &terms_hash)
+                .map_err(|e| store::StoreError::Unavailable(format!("outcome signing: {e}")))?;
+            Ok(s.secret_bytes())
+        })
+        .map_err(map_store_error)?;
+
+    SecretKey::from_slice(&s_bytes)
+        .map_err(|e| AttestorError::Dlc(DlcError::Secp(e.to_string())))
+}
+
 /// The `/attest` handler that reads the chain itself.
 ///
 /// This is the shape a service should call: the only chain facts it uses come
@@ -590,5 +794,135 @@ pub fn handle_attest_with_chain(
         encoded_payment_details,
         &observation,
         &RatePolicy::production(),
+    )
+}
+
+/// The `/attest` sequence over the persistent store.
+///
+/// Same ordering as [`handle_attest`], with the store's own transaction doing
+/// the work that the in-memory version does under a `&mut` borrow: the nonce is
+/// taken, the outcome signed and the payment consumed in one SQLite
+/// transaction, so a crash cannot leave a usable nonce beside a published
+/// scalar.
+///
+/// Every chain fact comes from `chain`, and the recency bound from the store's
+/// own `announced_at_ms`. Nothing here is a caller's word for anything.
+#[allow(clippy::too_many_arguments)]
+pub fn attest_over_db(
+    db: &mut db::SqliteEventStore,
+    chain: &impl ChainClient,
+    secp: &Secp256k1<secp256k1_zkp::All>,
+    d: &SecretKey,
+    clock: &impl Clock,
+    event_id: &[u8; 32],
+    terms: &CanonicalTerms,
+    attestation: &PaymentAttestation,
+    signature: &[u8],
+    encoded_payment_details: &[u8],
+    rate: &RatePolicy,
+) -> Result<SecretKey, AttestorError> {
+    attest_over_db_with_signer(
+        db,
+        chain,
+        secp,
+        d,
+        clock,
+        event_id,
+        terms,
+        attestation,
+        signature,
+        encoded_payment_details,
+        rate,
+        &ENCLAVE_SIGNER,
+    )
+}
+
+/// As [`attest_over_db`], against a caller-supplied enclave signer.
+///
+/// Round 5 noted that `attest_over_db` had never returned `Ok` in any test:
+/// the pinned enclave key cannot sign for terms a test invents, so every
+/// `/attest` in the suite stopped at the signer check before it reached the
+/// chain call or the SQLite write. R5-4 lived in exactly that gap. This is the
+/// same gated affordance the in-memory path already had, so the success path
+/// can be driven end to end without adding a production path.
+#[cfg(feature = "test-signer")]
+#[allow(clippy::too_many_arguments)]
+pub fn attest_over_db_against_signer(
+    db: &mut db::SqliteEventStore,
+    chain: &impl ChainClient,
+    secp: &Secp256k1<secp256k1_zkp::All>,
+    d: &SecretKey,
+    clock: &impl Clock,
+    event_id: &[u8; 32],
+    terms: &CanonicalTerms,
+    attestation: &PaymentAttestation,
+    signature: &[u8],
+    encoded_payment_details: &[u8],
+    rate: &RatePolicy,
+    trusted_signer: &[u8; 20],
+) -> Result<SecretKey, AttestorError> {
+    attest_over_db_with_signer(
+        db,
+        chain,
+        secp,
+        d,
+        clock,
+        event_id,
+        terms,
+        attestation,
+        signature,
+        encoded_payment_details,
+        rate,
+        trusted_signer,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn attest_over_db_with_signer(
+    db: &mut db::SqliteEventStore,
+    chain: &impl ChainClient,
+    secp: &Secp256k1<secp256k1_zkp::All>,
+    d: &SecretKey,
+    clock: &impl Clock,
+    event_id: &[u8; 32],
+    terms: &CanonicalTerms,
+    attestation: &PaymentAttestation,
+    signature: &[u8],
+    encoded_payment_details: &[u8],
+    rate: &RatePolicy,
+    trusted_signer: &[u8; 20],
+) -> Result<SecretKey, AttestorError> {
+    // Criterion 8, and the recovery path R6-2 found missing.
+    //
+    // R5-3 was right that returning the stored scalar *before checking the
+    // request* is wrong: a bearer-token holder could read `s` for an event whose
+    // release was not yet broadcast by sending a zero signature and a zero blob.
+    // But refusing outright, which is what that fix did, left the LP with no way
+    // back from a lost response - and the comment claiming it could read `s` off
+    // the chain was wrong, because no release reaches the chain without `s`.
+    //
+    // So the repeat is idempotent only on an exact match: the same terms as the
+    // announcement, and the same payment. That is checked below, after the
+    // request has been validated, not before. See spec 19.1.
+    let event = db
+        .get(event_id)
+        .map_err(|e| AttestorError::Unavailable(e.to_string()))?
+        .ok_or(AttestorError::UnknownEvent)?;
+
+    let observation = observe_escrow(chain, terms, event.announced_at_ms)?;
+
+    decide_and_sign_with_signer(
+        db,
+        secp,
+        d,
+        clock,
+        event_id,
+        terms,
+        attestation,
+        signature,
+        encoded_payment_details,
+        &observation,
+        rate,
+        trusted_signer,
     )
 }

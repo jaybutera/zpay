@@ -56,14 +56,15 @@ fn poc1_the_client_refuses_lp_authored_fiat_terms() {
     };
 
     // What the user actually accepted: 100 USD, to its own Venmo.
-    let accepted = AcceptedQuote {
-        usd_amount_6dec: 100_000_000,
-        payee_hash: USER_VENMO_HASH,
-        rate_18dec: IDENTITY_RATE_18DEC,
-        refund_height: REFUND_HEIGHT,
-        l_pub: tx_terms.l_pub,
-        amount_zat: 5_000_000,
-    };
+    let accepted = AcceptedQuote::without_platform_fee(
+        100_000_000,
+        USER_VENMO_HASH,
+        IDENTITY_RATE_18DEC,
+        REFUND_HEIGHT,
+        tx_terms.l_pub,
+        5_000_000,
+    )
+    .expect("the fixture quote must build");
 
     // What the LP returns in step 1c: chain fields honest, fiat fields its own.
     let lp_terms = CanonicalTerms {
@@ -77,6 +78,8 @@ fn poc1_the_client_refuses_lp_authored_fiat_terms() {
         rate_18dec: IDENTITY_RATE_18DEC,
         payee_hash: LP_VENMO_HASH,
         lock_confirmed_ms: 1_788_315_013_000,
+        platform_fee_zat: 0,
+        treasury_script: Vec::new(),
     };
 
     let ann = Announcement {
@@ -196,14 +199,15 @@ fn poc1b_a_rate_the_user_did_not_accept_is_refused() {
         refund_height: REFUND_HEIGHT,
         consensus_branch_id: NU6_3,
     };
-    let accepted = AcceptedQuote {
-        usd_amount_6dec: 100_000_000,
-        payee_hash: USER_VENMO_HASH,
-        rate_18dec: IDENTITY_RATE_18DEC,
-        refund_height: REFUND_HEIGHT,
-        l_pub: tx_terms.l_pub,
-        amount_zat: 5_000_000,
-    };
+    let accepted = AcceptedQuote::without_platform_fee(
+        100_000_000,
+        USER_VENMO_HASH,
+        IDENTITY_RATE_18DEC,
+        REFUND_HEIGHT,
+        tx_terms.l_pub,
+        5_000_000,
+    )
+    .expect("the fixture quote must build");
     let bent = CanonicalTerms {
         funding_txid: VICTIM_TXID,
         vout: 0,
@@ -215,6 +219,8 @@ fn poc1b_a_rate_the_user_did_not_accept_is_refused() {
         rate_18dec: 990_881_148_896_019_200,
         payee_hash: USER_VENMO_HASH,
         lock_confirmed_ms: 1_788_315_013_000,
+        platform_fee_zat: 0,
+        treasury_script: Vec::new(),
     };
 
     let mut store = MemoryRecordStore::default();

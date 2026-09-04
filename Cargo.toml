@@ -58,6 +58,12 @@ dotenvy = "0.15"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 
+# TOTP (RFC 6238) for the taker's unattended Venmo re-login. HMAC-SHA1 and a
+# base32 decoder are the whole of it, so the algorithm is implemented in
+# `auto::login` against the RFC's own vectors rather than pulled from a crate.
+hmac = "0.12"
+sha1 = "0.10"
+
 # Testing
 tempfile = "3"
 rand = "0.8"

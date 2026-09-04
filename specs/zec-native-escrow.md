@@ -440,8 +440,9 @@ Paid path:
    at least 1000000.
 5. The attestor returns `s` with `s*G == Y` for the announced `R`.
 6. The release tx confirms with scriptSig `OP_0 <sig_u> <sig_l> OP_1
-   <redeemScript>`, both signatures low-S, and pays `amount_zat - 10000` to
-   the LP output. `recover(sig_u, pre_sig, Y)` reproduces `s`.
+   <redeemScript>`, both signatures low-S, and pays `amount_zat - 15000` to
+   the LP output. (12.3 corrected the fee from 10000; a regtest zebra has since
+   refused the same release at 10000 and accepted it at 15000.) `recover(sig_u, pre_sig, Y)` reproduces `s`.
 7. The release confirms before `BROADCAST_DEADLINE`.
 8. A second `/attest` for the same `event_id` is refused.
 
@@ -616,11 +617,11 @@ Updated 2026-09-02. Phase numbering follows section 9.
 | Phase | State | Where |
 |---|---|---|
 | 0 Recon | Done | Section 12; `crates/zecp2p-escrow/tests/phase0_librustzcash.rs`, `attestation_vectors.rs` |
-| 1 Transactions | Code done, testnet gate not met | `crates/zecp2p-escrow/src/{script,tx,fees}.rs` |
-| 2 Attestor core | Decision path done, HTTP surface not built | `crates/zecp2p-attestor/src/{lib,store}.rs` |
+| 1 Transactions | Done, mempool gate met on testnet | `crates/zecp2p-escrow/src/{script,tx,fees}.rs` |
+| 2 Attestor core | Done: decision path, HTTP surface, SQLite | `crates/zecp2p-attestor/src/{lib,store,db,service}.rs` |
 | 3 Adaptor | Done | `crates/zecp2p-escrow/src/dlc.rs` |
-| 4 Client handshake | Logic done against a node trait; no RPC adapter | `crates/zecp2p-escrow/src/{client,lp,chain,deadlines}.rs` |
-| 5 Testnet end to end | Blocked, see below | |
+| 4 Client handshake | Done; RPC adapter live against testnet | `crates/zecp2p-escrow/src/{client,lp,chain,rpc,funding,deadlines}.rs` |
+| 5 Testnet end to end | Blocked on funded testnet coin | `crates/zecp2p-escrow/examples/escrow_e2e.rs` |
 | 6 Mainnet $1 | Blocked on 5 | |
 | 7 Nitro attestor | Not started | |
 
@@ -690,15 +691,13 @@ two signatures under one nonce expose `d`.
 
 ### 13.3 Still not built
 
-- Any RPC adapter. Phase 1's mempool gate and criterion 12's mempool rejection
-  remain unmet, and the script-level evidence is not a substitute for a node
-  accepting or refusing a transaction.
+- The shielded refund output of 4.4, which is why the runner pays a transparent
+  one and uses the transparent fee.
 - The funding transaction of 4.2: a shielded spend needs a wallet, note
   management and the Orchard proving path. `tx.rs` builds only the two
   transactions that spend the escrow.
-- The attestor's HTTP surface: `/identity`, `/announce`, `/attest`, the bearer
-  token, the SQLite table behind `EventStore`, and rate limiting. The decision
-  logic those endpoints would call is written and tested.
+- Rate limiting on `/announce`. The endpoints themselves, the bearer token and
+  the SQLite table are built; see section 19.
 - The BIP340 `announce_sig` of 5.1. The user verifies the attestor's key
   against a pin; it does not yet verify a signature over the announcement.
 - Phase 7 in full.
@@ -735,14 +734,24 @@ live chain.
 Two limits, both real:
 
 - **5 requests per minute.** Enough for a gate, not for a polling daemon.
-- **`sendrawtransaction` is blocked at the provider's WAF**, returning
-  Cloudflare `403 error code: 1010` for a two-character payload as readily as a
-  real one. It is the method that is blocked, not the size.
+- `sendrawtransaction` **works**. An earlier run of this document said it was
+  blocked at the provider's WAF; that was a transient Cloudflare episode and the
+  conclusion was wrong. Re-probed 2026-09-02 at payload sizes from 64 to 730 hex
+  characters, every one reached the node.
 
-The second means **Phase 1's mempool gate and criterion 12's mempool rejection
-remain unmet.** `crates/zecp2p-escrow/tests/mempool_gate.rs` is written and runs
-unchanged against a real node; the `dump_release` example prints the same bytes
-for submitting by other means.
+**Phase 1's mempool gate is met.** A live Zcash testnet node returned, for the
+real signed transactions this repo builds:
+
+- release: `could not find transparent input UTXO in the best chain or mempool`
+- refund: `transaction is locked until after block height 4320000`
+
+Both are consensus rejections of a *fully parsed* transaction - the node read
+the v5 header, the NU5 version group id, the NU6.3 branch id, the P2SH scriptSig
+and the nLockTime, and objected only to the fictional outpoint and to our own
+timelock. A malformed transaction never reaches those errors; it stops at
+`parse error: bad tx header`, which is what an all-zero payload of identical
+length receives. What remains for criterion 12 is the same rejection against a
+*funded* escrow, which needs a funded testnet outpoint.
 
 ## 15. Review round 1: what was found and what changed
 
@@ -1049,3 +1058,117 @@ announcement, before the user pre-signs, so no field can change afterwards.
 `lock_confirmed_ms` is fixed at announcement time and is the LP's estimate; it
 does not bound recency (16.2) and survives only as the value
 `INTENT_TIMESTAMP_MS` must equal.
+
+## 18. Where the live test stands
+
+Updated 2026-09-02.
+
+### 18.1 Done since round 4
+
+- **Phase 1's mempool gate is met.** Section 14 has the verdicts. The earlier
+  claim that the hosted endpoint blocked `sendrawtransaction` was wrong: it was
+  a transient Cloudflare episode, and the method works at every payload size.
+- The attestor has its HTTP surface and its SQLite table. Every uniqueness rule
+  is a schema constraint, so it survives a restart, and a test opens the file in
+  a fresh process to check.
+- The nonce is drawn inside the attestor from the OS RNG, and a repeated `R` is
+  refused by a UNIQUE index.
+- `AcceptedQuote::new` refuses a zero amount, an escrow below the 0.001 ZEC
+  floor, a non-identity rate, an unusable timeout, and an `l_pub` that is not a
+  curve point.
+- `escrow_e2e` computes a fundable address from live chain state and can sweep
+  the escrow back with the user key alone.
+
+### 18.2 The blocker: a funded testnet coin
+
+Everything that does not require coin is built. What remains needs an output at
+an escrow address, and this host has none:
+
+- no reachable Zcash testnet faucet (three tried, all down or unroutable);
+- the hosted RPC has no wallet, so it cannot create one;
+- there is no funded testnet key on this machine.
+
+**What unblocks it.** Any of:
+
+1. **Testnet TAZ** sent to an address `escrow_e2e plan` prints. About 0.002 TAZ
+   covers an escrow plus fees. This is the smallest ask and unblocks the whole
+   testnet run: lock, refund-at-`T`, and criterion 12's mempool rejection
+   against a *funded* escrow.
+2. **A lightwalletd endpoint**, which additionally unblocks the shielded funding
+   leg of 4.2 through `zcash_client_backend` - the note discovery and witness
+   path that plain RPC cannot provide.
+3. **A zebrad with a wallet**, which covers both and is what production needs
+   anyway.
+
+For the mainnet $1 run, additionally: a funded mainnet key, the LP's Venmo
+session for the existing prover, and the attestor deployed with its bearer
+token.
+
+### 18.3 What a broadcast-capable endpoint needs
+
+For the record, since an earlier version of this document said no such endpoint
+existed. The requirement is small:
+
+- `getblockchaininfo` for the height and the consensus branch id;
+- `gettxout` for the escrow output's script, value and depth;
+- `sendrawtransaction`.
+
+`https://api.tatum.io/v3/blockchain/node/zcash-{testnet,mainnet}` serves all
+three keyless, at 5 requests a minute. It does **not** serve `z_gettreestate`,
+which is why the shielded funding leg needs something else.
+
+## 19. Review rounds 5 and 6: the service layer in practice
+
+## 19.1 Criterion 8, restated
+
+Criterion 8 says "a second `/attest` for the same `event_id` is refused". Two
+review rounds pulled it in opposite directions, and the resolution is worth
+recording because the criterion as written is ambiguous about *which* second
+request.
+
+Round 5 (R5-3) found the handler returning the stored scalar before it looked
+at the request at all. That let anyone holding the bearer token read `s` for an
+event whose release had not been broadcast, by sending a zero signature and a
+zero blob. Refusing outright fixed it.
+
+Round 6 (R6-2) found what refusing outright cost. The LP calls `/attest` after
+it has paid Venmo. If the response is lost - a client timeout shorter than the
+attestor's chain round trip is enough - the signing has already committed, the
+nonce is gone and the payment nullifier is recorded. The LP holds no `s`, and
+`s` is the only thing that completes the user's pre-signature. The comment in
+the code claimed the LP could read `s` off the chain instead; that was wrong,
+because no release reaches the chain without `s` in the first place. So the LP
+was out the fiat with no exit, and the user refunded at `T`.
+
+**The rule now: a repeat is answered with the stored scalar if and only if it is
+the same request.** Same terms as the announcement pinned, same payment
+nullifier, and every other check passed - the replay is decided *after* the
+request is validated, not before. Anything else is 409.
+
+Criterion 8 should be read as: **a second `/attest` under different terms or a
+different payment is refused.** That is what it is protecting. The properties
+the original wording was standing in for all hold:
+
+- No second signature is ever produced. The nonce is gone after the first, and
+  a replay returns the recorded value rather than signing.
+- Nothing new is published. The scalar handed back is one this same request
+  already produced.
+- The R5-3 attack fails: a zero signature and a zero blob hash to a different
+  payment, so they are not a replay, and the event is signed.
+- One payment still releases one escrow: the `payment_nullifier` UNIQUE
+  constraint is untouched, and a replay is not counted as a fresh consumption.
+
+`/announce` gets the same treatment for the same reason: a repeat carrying the
+terms the announcement pinned returns the existing `R`, and different terms over
+one outpoint stay a 409. Without it a lost announcement stranded an escrow the
+user may already have funded.
+
+## 19.2 The regtest node
+
+See `scripts/regtest/README.md`. The one thing that belongs here: a default
+Regtest node runs Canopy, where ZIP 225 v5 transactions do not exist, so it
+rejects every transaction this repo builds at parse. The node must activate NU5
+through NU6.3 at height 1, which puts it on branch `37a5165b` - the same as
+mainnet. The transaction builder is not the place to accommodate this; a v4
+fallback would mean the run exercised a different sighash from the one mainnet
+will see.

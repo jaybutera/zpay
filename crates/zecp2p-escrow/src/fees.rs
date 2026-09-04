@@ -91,10 +91,47 @@ pub fn conventional_fee_zat(
 
 /// The fee for a release paying a single transparent (t1) output.
 pub fn release_fee_to_transparent_zat(redeem_script_len: usize) -> u64 {
-    conventional_fee_zat(release_input_size(redeem_script_len), P2PKH_STANDARD_OUTPUT_SIZE, 0)
+    release_fee_zat(redeem_script_len, 1)
 }
 
 /// The fee for a refund paying a single shielded output.
 pub fn refund_fee_to_shielded_zat(redeem_script_len: usize) -> u64 {
     conventional_fee_zat(refund_input_size(redeem_script_len), 0, 2)
+}
+
+/// The fee for a refund paying a single transparent output.
+///
+/// R7-2: the runner used the shielded number on a transparent refund and
+/// overpaid by 10000 zat. A regtest node's floor for that shape is two logical
+/// actions. The shielded number becomes the right one when the refund of spec
+/// 4.4 actually pays a shielded output, which needs the wallet tooling
+/// `funding.rs` describes; until then paying it is paying for actions the
+/// transaction does not have.
+pub fn refund_fee_to_transparent_zat(redeem_script_len: usize) -> u64 {
+    conventional_fee_zat(
+        refund_input_size(redeem_script_len),
+        P2PKH_STANDARD_OUTPUT_SIZE,
+        0,
+    )
+}
+
+/// The fee for a release paying `n_outputs` transparent (t1) outputs.
+///
+/// The design's arithmetic, recomputed rather than asserted: the release input
+/// is 310 bytes of scriptSig plus framing, which ZIP 317 divides by its 150-byte
+/// nominal input to get 3 input actions. Outputs are 34 bytes each, so the
+/// output side contributes `n_outputs` actions and the logical count is the
+/// larger of the two. The input therefore dominates through three outputs, and
+/// the treasury output the platform fee needs is free. The fourth output is the
+/// first one that costs anything, and `tests/fees.rs` pins that cliff.
+///
+/// `n_outputs` of zero is not a transaction anyone can broadcast; it is priced
+/// at the grace floor rather than special-cased, because `tx::build_vout`
+/// refuses it before a fee is ever needed.
+pub fn release_fee_zat(redeem_script_len: usize, n_outputs: usize) -> u64 {
+    conventional_fee_zat(
+        release_input_size(redeem_script_len),
+        n_outputs * P2PKH_STANDARD_OUTPUT_SIZE,
+        0,
+    )
 }

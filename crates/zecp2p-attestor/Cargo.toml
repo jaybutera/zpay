@@ -5,6 +5,14 @@ edition.workspace = true
 license.workspace = true
 description = "Outcome attestor for the ZEC-native escrow: verifies a zk-p2p enclave payment attestation and signs the DLC outcome"
 
+[[bin]]
+name = "zecp2p-attestor"
+path = "src/main.rs"
+
+[lib]
+name = "zecp2p_attestor"
+path = "src/lib.rs"
+
 [features]
 # Exposes decide_against_signer. Tests only; see the escrow crate.
 test-signer = ["zecp2p-escrow/test-signer"]
@@ -13,7 +21,6 @@ test-signer = ["zecp2p-escrow/test-signer"]
 zecp2p-escrow = { path = "../zecp2p-escrow" }
 tokio = { workspace = true }
 axum = { workspace = true }
-sqlx = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
@@ -24,9 +31,14 @@ hex = { workspace = true }
 secp256k1 = { version = "0.30", features = ["rand", "global-context"] }
 secp256k1-zkp = { version = "0.11", features = ["rand", "rand-std", "std", "hashes", "global-context"] }
 sha2 = "0.10"
+libc = "0.2"
+rusqlite = { version = "0.32", features = ["bundled"] }
 rand = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true }
+tower = { workspace = true }
+http-body-util = "0.1"
 zecp2p-attestor = { path = ".", features = ["test-signer"] }
 sha3 = "0.10"
 tempfile = { workspace = true }

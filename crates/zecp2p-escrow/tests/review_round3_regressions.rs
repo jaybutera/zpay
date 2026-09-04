@@ -94,14 +94,25 @@ fn run_prepare(
         .public_key(&secp)
         .serialize();
 
-    let quote = AcceptedQuote {
-        usd_amount_6dec: 100_000_000,
-        payee_hash: [0x85; 32],
-        rate_18dec: IDENTITY_RATE_18DEC,
-        refund_height: quote_refund_height,
+    // Built at a height the constructor accepts, then set to the one under
+    // test. R3-2 exercises `prepare_escrow`'s cap, and several of its cases are
+    // heights `AcceptedQuote` itself refuses - so building the quote with them
+    // directly would panic in this helper before the test could assert
+    // anything, which is what happened between rounds 2 and 3.
+    //
+    // Overriding the field afterwards is the honest reproduction of the case:
+    // a caller holding a quote whose timeout is unusable, which `prepare_escrow`
+    // must refuse on its own rather than trusting the quote to have done it.
+    let mut quote = AcceptedQuote::without_platform_fee(
+        100_000_000,
+        [0x85; 32],
+        IDENTITY_RATE_18DEC,
+        REFUND_HEIGHT,
         l_pub,
-        amount_zat: 5_000_000,
-    };
+        5_000_000,
+    )
+    .expect("the fixture quote must build");
+    quote.refund_height = quote_refund_height;
     let lp_terms = CanonicalTerms {
         funding_txid: TXID,
         vout: 0,
@@ -113,6 +124,8 @@ fn run_prepare(
         rate_18dec: IDENTITY_RATE_18DEC,
         payee_hash: [0x85; 32],
         lock_confirmed_ms: 1_788_315_013_000,
+        platform_fee_zat: 0,
+        treasury_script: Vec::new(),
     };
     let ann = Announcement {
         p: d.public_key(&secp),
@@ -192,15 +205,18 @@ fn r3_1b_the_derived_escrow_always_refunds_to_the_user() {
         rate_18dec: IDENTITY_RATE_18DEC,
         payee_hash: [0x85; 32],
         lock_confirmed_ms: 1_788_315_013_000,
+        platform_fee_zat: 0,
+        treasury_script: Vec::new(),
     };
-    let quote = AcceptedQuote {
-        usd_amount_6dec: 100_000_000,
-        payee_hash: [0x85; 32],
-        rate_18dec: IDENTITY_RATE_18DEC,
-        refund_height: REFUND_HEIGHT,
+    let quote = AcceptedQuote::without_platform_fee(
+        100_000_000,
+        [0x85; 32],
+        IDENTITY_RATE_18DEC,
+        REFUND_HEIGHT,
         l_pub,
-        amount_zat: 5_000_000,
-    };
+        5_000_000,
+    )
+    .expect("the fixture quote must build");
     let d = SecretKey::from_slice(&[0xd1; 32]).unwrap();
     let k = SecretKey::from_slice(&[0x4b; 32]).unwrap();
     let ann = Announcement {

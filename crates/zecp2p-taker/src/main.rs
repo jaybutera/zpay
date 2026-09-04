@@ -95,6 +95,22 @@ enum Commands {
     /// Check that the browser has a usable, logged-in Venmo tab
     CheckVenmo,
 
+    /// Report the Venmo session's health and what the daemon could do about it.
+    ///
+    /// Runs one health check and prints the answer, plus whether an expiry
+    /// could be repaired without a human. Use it after filling in
+    /// `config/venmo.local.toml` to find out whether the daemon will actually
+    /// survive an expiry before trusting it to run overnight.
+    ///
+    /// With `--relogin` it drives the login form for real, which types the
+    /// configured password into Venmo's sign-in page. Without it, nothing is
+    /// typed and nothing is clicked.
+    VenmoHealth {
+        /// Actually attempt a sign-in if the session is dead.
+        #[arg(long)]
+        relogin: bool,
+    },
+
     /// Re-derive an attestation for an intent whose payment is already sent.
     ///
     /// The daemon's own attestation path, run against an intent that already
@@ -209,6 +225,87 @@ enum Commands {
         after: Option<String>,
     },
 
+    /// Report both settlement rails' status side by side, and stop.
+    ///
+    /// Reads only. It says which rail holds the daemon's one in-flight slot,
+    /// what each rail's journal has open, and whether the native escrow rail is
+    /// configured at all. Nothing is signalled, staked, paid or broadcast.
+    Rails {
+        /// Also read the configured Zcash node for each watched escrow's state.
+        ///
+        /// Without this the report is journal-only and touches no network.
+        #[arg(long)]
+        check_chain: bool,
+    },
+
+    /// Watch one native-escrow trade and report what the rail would do.
+    ///
+    /// The Zcash counterpart of `terms`: it reads the escrow off the chain,
+    /// asks `zecp2p-escrow`'s own state machine what state it is in, and prints
+    /// the fiat leg that would be paid. It sends no money and broadcasts
+    /// nothing, so it is the dry run for the second rail.
+    ZecWatch {
+        /// The funding transaction, in the order an explorer prints it.
+        #[arg(long)]
+        txid: String,
+        #[arg(long, default_value_t = 0)]
+        vout: u32,
+        /// The refund height `T` burned into the redeem script.
+        #[arg(long)]
+        refund_height: u64,
+        /// The escrow's value in zatoshi.
+        #[arg(long)]
+        amount_zat: u64,
+        /// The user's public key from the redeem script, 33 bytes of hex.
+        #[arg(long)]
+        u_pub: String,
+        /// The LP's public key from the redeem script, 33 bytes of hex.
+        #[arg(long)]
+        l_pub: String,
+        /// What the LP owes, in 6-decimal USD.
+        #[arg(long)]
+        usd_6dec: u64,
+        /// The quoted rate, scaled by 1e18.
+        #[arg(long, default_value_t = 1_000_000_000_000_000_000)]
+        rate_18dec: u128,
+        /// The curator's hashedOnchainId for the payee.
+        #[arg(long)]
+        payee_hash: String,
+        /// The Venmo handle behind that hash. Checked against the curator.
+        #[arg(long)]
+        recipient: String,
+        /// When the escrow reached its confirmation depth, in ms.
+        ///
+        /// The enclave's snapshot and the cut for the feed search. `paid_path`
+        /// prints it; passing a different value here produces a different
+        /// intent hash and an attestation that releases nothing.
+        #[arg(long)]
+        lock_confirmed_ms: u64,
+        /// The platform fee in zatoshis, to reproduce an escrow that was
+        /// announced under a different treasury from this build's.
+        ///
+        /// Normally omitted. The fee and the treasury script are *derived* from
+        /// the pinned constant in `zecp2p_escrow::treasury` and this rail's
+        /// configured network, exactly as the user's client derives them, so a
+        /// watch that supplies neither watches the escrow the client built.
+        /// Supplying them is for reproducing a recorded run - an escrow
+        /// announced before a treasury rotation, say - and both must be given
+        /// together, since a fee with no destination cannot be paid.
+        #[arg(long, requires = "treasury_script")]
+        platform_fee_zat: Option<u64>,
+        /// The treasury scriptPubKey, hex. Only with --platform-fee-zat.
+        #[arg(long, requires = "platform_fee_zat")]
+        treasury_script: Option<String>,
+        /// Treat the user's pre-signature as verified.
+        ///
+        /// The escrow crate refuses to reach `ReadyToPay` without it. This flag
+        /// exists so a watch can report the state a verified escrow would be
+        /// in; it does not verify anything, and the real run gets this from the
+        /// announce step's own record.
+        #[arg(long)]
+        assume_presigned: bool,
+    },
+
     /// Report an intent's terms as the daemon reads them, and stop.
     ///
     /// Touches no cookie and sends nothing. Useful for checking what the
@@ -248,6 +345,12 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // The session report needs no key: it reads the browser and, with
+    // --relogin, drives the login form. Neither sends a transaction.
+    if let Commands::VenmoHealth { relogin } = &cli.command {
+        return run_venmo_health(&config, *relogin).await;
+    }
+
     // Driving the payment page needs no key either: it stops before the click
     // and sends nothing on-chain.
     if let Commands::TestPay {
@@ -258,6 +361,17 @@ async fn main() -> Result<()> {
     {
         return run_test_pay(&config, recipient, amount, *send_for_real).await;
     }
+    // Both rail reports are read-only and need no key. `rails` reads the
+    // journal and, with --check-chain, the Zcash node; `zec-watch` reads the
+    // Zcash node and the curator. Neither sends a transaction on either chain
+    // and neither touches the Venmo cookie.
+    if let Commands::Rails { check_chain } = &cli.command {
+        return run_rails(&config, *check_chain).await;
+    }
+    if let Commands::ZecWatch { .. } = &cli.command {
+        return run_zec_watch(&config, &cli.command).await;
+    }
+
     if let Commands::FindPayment {
         recipient,
         amount,
@@ -335,7 +449,12 @@ async fn main() -> Result<()> {
     );
 
     match cli.command {
-        Commands::CheckVenmo | Commands::TestPay { .. } | Commands::FindPayment { .. } => {
+        Commands::CheckVenmo
+        | Commands::VenmoHealth { .. }
+        | Commands::TestPay { .. }
+        | Commands::FindPayment { .. }
+        | Commands::Rails { .. }
+        | Commands::ZecWatch { .. } => {
             unreachable!("handled above")
         }
 
@@ -726,6 +845,357 @@ fn compare_attestations(fresh: &AttestationFile, reference_path: &str) -> Result
 }
 
 /// The repository root, so the prover path resolves from anywhere.
+/// Report both settlement rails side by side.
+///
+/// The command an operator runs to answer "what is this daemon doing". Both
+/// systems are live at once, so a per-rail report is not enough on its own: the
+/// in-flight slot is global, because two open payments draw on one Venmo
+/// balance whichever chain settles them.
+async fn run_rails(config: &TakerConfig, check_chain: bool) -> Result<()> {
+    use zecp2p_taker::auto::rail::Rail;
+
+    let journal = Journal::open(&config.taker.journal_path)?;
+    let records = journal.latest()?;
+
+    println!("journal : {}", config.taker.journal_path);
+    println!();
+
+    for rail in Rail::all() {
+        let configured = match rail {
+            Rail::Base => true,
+            Rail::Zec => config.zec.is_some(),
+        };
+        println!("== {rail} ==");
+        if !configured {
+            // Silence in the config means off, and saying so is the point:
+            // a second settlement system that switched itself on because a
+            // section was missing would be watching a chain nobody set up.
+            println!("  not configured. Add a [zec] section to run this rail.");
+            println!();
+            continue;
+        }
+        println!("  locks   {}", rail.collateral());
+
+        let mine: Vec<_> = records.iter().filter(|r| r.rail == rail).collect();
+        if mine.is_empty() {
+            println!("  no fills recorded");
+        }
+        for record in &mine {
+            println!(
+                "  {:<34} {:?}{}",
+                record.describe(),
+                record.state,
+                match &record.paid {
+                    Some(amount) => format!("  paid ${amount} to @{}", record.recipient),
+                    None => String::new(),
+                }
+            );
+            if let Some(note) = &record.note {
+                println!("      note: {note}");
+            }
+        }
+        println!();
+    }
+
+    // The slot is global on purpose. A report that showed it per rail would
+    // suggest the two can run concurrently, and they cannot: one Venmo balance.
+    match journal.in_flight()? {
+        Some(record) => println!(
+            "the one in-flight slot is held by {} ({:?})",
+            record.describe(),
+            record.state
+        ),
+        None => println!("the in-flight slot is free; either rail may start work"),
+    }
+
+    let stuck = journal.needs_operator()?;
+    if !stuck.is_empty() {
+        println!();
+        println!("{} fill(s) need an operator before anything else moves:", stuck.len());
+        for record in &stuck {
+            println!(
+                "  {} is {:?}: ${} to @{}",
+                record.describe(),
+                record.state,
+                record.paid.clone().unwrap_or_else(|| "?".into()),
+                record.recipient
+            );
+        }
+        println!();
+        println!(
+            "the journal is written before the send button, so a Paying record may or \n\
+             may not have gone out. Check the Venmo feed."
+        );
+    }
+
+    if check_chain {
+        match &config.zec {
+            Some(zec) => {
+                println!();
+                // The escrow crate's chain client is blocking, by design: it is
+                // shared with `paid_path`, which is a synchronous tool. Calling
+                // it directly from this runtime panics the moment it blocks, so
+                // every use of it here goes through `spawn_blocking`.
+                let rpc = zec.rpc_config()?;
+                let (height, branch) = tokio::task::spawn_blocking(move || {
+                    let chain = zecp2p_escrow::rpc::RpcChainClient::new(rpc)?;
+                    let height = zecp2p_escrow::chain::ChainClient::height(&chain)?;
+                    let branch = zecp2p_escrow::chain::ChainClient::consensus_branch_id(&chain)?;
+                    Ok::<_, zecp2p_escrow::chain::ChainError>((height, branch))
+                })
+                .await
+                .context("the Zcash node read did not complete")?
+                .map_err(|e| anyhow::anyhow!("could not read the Zcash node: {e}"))?;
+                println!("zcash node: height {height}, consensus branch {branch:#x}");
+                let policy = zec.policy()?;
+                println!(
+                    "policy    : refund after {} blocks, no paying inside the last {}, \
+                     broadcast by {} before T",
+                    policy.refund_delay_blocks,
+                    policy.pay_deadline_blocks,
+                    policy.broadcast_deadline_blocks
+                );
+            }
+            None => println!("\n--check-chain: the zec rail is not configured, nothing to read"),
+        }
+    }
+
+    Ok(())
+}
+
+/// Read one native escrow off the chain and report what the rail would do.
+///
+/// The dry run for the second settlement system. It calls the escrow crate's
+/// own `evaluate` through `auto::zec`, so what it reports is what a live run
+/// would act on rather than a second opinion about it.
+async fn run_zec_watch(config: &TakerConfig, command: &Commands) -> Result<()> {
+    let Commands::ZecWatch {
+        txid,
+        vout,
+        refund_height,
+        amount_zat,
+        u_pub,
+        l_pub,
+        usd_6dec,
+        rate_18dec,
+        payee_hash,
+        recipient,
+        lock_confirmed_ms,
+        platform_fee_zat,
+        treasury_script,
+        assume_presigned,
+    } = command
+    else {
+        unreachable!("run_zec_watch is only called for ZecWatch")
+    };
+
+    let zec = config.zec.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "the native escrow rail is not configured. Add a [zec] section with \
+             rpc_url, network and attestor_url before watching an escrow."
+        )
+    })?;
+
+    let policy = zec.policy()?;
+
+    // The wire format keeps txids in internal order; an explorer prints the
+    // reverse. The operator pastes the explorer's, so it is converted here
+    // rather than expecting them to reverse it by hand.
+    let funding_txid = zecp2p_escrow::rpc::rpc_hex_to_txid(txid.trim())
+        .map_err(|e| anyhow::anyhow!("--txid is not a transaction id: {e}"))?;
+
+    let parse_key = |name: &str, text: &str| -> Result<[u8; 33]> {
+        let bytes = hex::decode(text.trim().strip_prefix("0x").unwrap_or(text.trim()))
+            .with_context(|| format!("{name} is not hex"))?;
+        <[u8; 33]>::try_from(bytes.as_slice())
+            .map_err(|_| anyhow::anyhow!("{name} must be a 33-byte compressed public key"))
+    };
+    let u_pub = parse_key("--u-pub", u_pub)?;
+    let l_pub = parse_key("--l-pub", l_pub)?;
+
+    let payee_bytes = hex::decode(
+        payee_hash
+            .trim()
+            .strip_prefix("0x")
+            .unwrap_or(payee_hash.trim()),
+    )
+    .context("--payee-hash is not hex")?;
+    let payee_bytes = <[u8; 32]>::try_from(payee_bytes.as_slice())
+        .map_err(|_| anyhow::anyhow!("--payee-hash must be 32 bytes"))?;
+
+    // The branch id is read from the node rather than assumed. A stale value
+    // produces a sighash nobody will accept, and the pre-signature was made
+    // against the branch in force when it was drawn.
+    //
+    // Blocking, like every other call into the escrow crate's chain client, so
+    // it runs off this runtime's reactor rather than panicking on it.
+    let rpc = zec.rpc_config()?;
+    let consensus_branch_id = tokio::task::spawn_blocking({
+        let rpc = rpc.clone();
+        move || {
+            let chain = zecp2p_escrow::rpc::RpcChainClient::new(rpc)?;
+            zecp2p_escrow::chain::ChainClient::consensus_branch_id(&chain)
+        }
+    })
+    .await
+    .context("the branch id read did not complete")?
+    .map_err(|e| anyhow::anyhow!("could not read the consensus branch id: {e}"))?;
+
+    let terms = zecp2p_escrow::tx::EscrowTerms {
+        funding_txid,
+        vout: *vout,
+        amount_zat: *amount_zat,
+        u_pub,
+        l_pub,
+        refund_height: *refund_height,
+        consensus_branch_id,
+    };
+
+    // The payee hash is checked against the curator before anything else, on
+    // the same principle the Base rail applies: the handle a human typed and
+    // the hash the terms committed to must be the same account, or the payment
+    // goes somewhere the attestation will not release for.
+    let claimed = zecp2p_taker::payee::validate_username_shape(recipient)?.to_string();
+    let resolved = zecp2p_taker::payee::curator_hash_for(
+        &reqwest::Client::new(),
+        &config.zkp2p.api_url,
+        &claimed,
+    )
+    .await
+    .context("could not check the username against the zk-p2p curator")?;
+    zecp2p_taker::payee::require_match(
+        &claimed,
+        resolved,
+        alloy::primitives::B256::from(payee_bytes),
+    )?;
+    println!("payee   : @{claimed} matches the terms' payee hash");
+
+    // Derived, not defaulted. `clap`'s `requires` makes the pair all-or-nothing,
+    // so the only two shapes that reach here are "both given" and "neither".
+    let (platform_fee_zat, treasury_script) = match (platform_fee_zat, treasury_script) {
+        (Some(fee), Some(script)) => {
+            println!(
+                "fee     : {fee} zat to a treasury supplied on the command line, \
+                 reproducing a recorded run"
+            );
+            (
+                *fee,
+                hex::decode(script.trim_start_matches("0x"))
+                    .context("--treasury-script is not hex")?,
+            )
+        }
+        _ => {
+            // The same policy site the user's client uses: the rate from
+            // `treasury::PLATFORM_FEE_BPS`, the address from the constant
+            // pinned for this network. If the two disagree the terms hash
+            // differs and the escrow this watch reports on is not the one the
+            // user funded, which is why nothing here guesses.
+            let quote = zecp2p_escrow::client::AcceptedQuote::at_identity_rate(
+                *usd_6dec,
+                payee_bytes,
+                terms.refund_height,
+                terms.l_pub,
+                terms.amount_zat,
+                match zec.network()? {
+                    zecp2p_escrow::rpc::Network::Main => {
+                        zecp2p_escrow::address::AddrNetwork::Main
+                    }
+                    zecp2p_escrow::rpc::Network::Test => {
+                        zecp2p_escrow::address::AddrNetwork::Test
+                    }
+                },
+            )
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "this escrow cannot be quoted, so its terms cannot be rebuilt: {e}. \
+                     If it was announced under a different treasury, pass \
+                     --platform-fee-zat and --treasury-script to reproduce it."
+                )
+            })?;
+            if quote.platform_fee_zat() > 0 {
+                println!(
+                    "fee     : {} zat to the pinned treasury",
+                    quote.platform_fee_zat()
+                );
+            }
+            (quote.platform_fee_zat(), quote.treasury_script().to_vec())
+        }
+    };
+
+    let canonical = zecp2p_taker::auto::zec::canonical_terms(
+        &terms,
+        *usd_6dec,
+        *rate_18dec,
+        payee_bytes,
+        *lock_confirmed_ms,
+        platform_fee_zat,
+        treasury_script,
+    )?;
+
+    let escrow = zecp2p_taker::auto::zec::WatchedEscrow {
+        terms,
+        canonical,
+        recipient: claimed,
+        pre_signature_verified: *assume_presigned,
+        venmo_paid: false,
+        outcome_secret_held: false,
+    };
+
+    println!("escrow  : {}", escrow.work_id());
+    println!("value   : {} zat", escrow.terms.amount_zat);
+    println!("T       : {}", escrow.terms.refund_height);
+    println!("branch  : {consensus_branch_id:#x}");
+    println!(
+        "intent  : 0x{}",
+        hex::encode(escrow.canonical.intent_hash())
+    );
+    if !assume_presigned {
+        println!(
+            "note    : --assume-presigned was not passed, so this reports the state of \n\
+             \x20         an escrow whose pre-signature has not verified. The escrow crate \n\
+             \x20         refuses to reach ReadyToPay without it."
+        );
+    }
+    println!();
+
+    let state = {
+        let escrow = escrow.clone();
+        let cap = config.taker.max_payment_cents;
+        tokio::task::spawn_blocking(move || {
+            let chain = zecp2p_escrow::rpc::RpcChainClient::new(rpc)
+                .map_err(|e| anyhow::anyhow!("could not reach the Zcash node: {e}"))?;
+            zecp2p_taker::auto::zec::state_of(&chain, &escrow, &policy, cap)
+        })
+        .await
+        .context("the escrow state read did not complete")??
+    };
+
+    use zecp2p_taker::auto::rail::RailState;
+    match &state {
+        RailState::Waiting { why } => println!("state   : waiting\n          {why}"),
+        RailState::ReadyToPay(leg) => {
+            println!("state   : READY TO PAY");
+            println!("          ${} to @{}", leg.payment, leg.recipient);
+            println!("          feed entries before {} are not this payment", leg.not_before);
+            println!();
+            println!("the prover environment this escrow needs:");
+            for (key, value) in zecp2p_taker::auto::fiat::prover_environment(leg) {
+                println!("  {key:<20} {value}");
+            }
+            println!();
+            println!("nothing was paid: this command is read-only.");
+        }
+        RailState::AwaitingSettlement(leg) => {
+            println!("state   : paid, awaiting settlement");
+            println!("          ${} to @{}", leg.payment, leg.recipient);
+        }
+        RailState::Settled { reference } => println!("state   : settled, {reference}"),
+        RailState::NeedsOperator { why } => println!("state   : NEEDS AN OPERATOR\n          {why}"),
+    }
+
+    Ok(())
+}
+
 fn repo_root() -> Result<std::path::PathBuf> {
     // The binary runs from wherever the operator invoked it, and the prover is
     // addressed relative to the repo. CARGO_MANIFEST_DIR is compiled in and
@@ -784,6 +1254,18 @@ async fn run_auto<P: alloy::providers::Provider + Clone>(
             config.session.user_agent.clone(),
         );
 
+    // The Venmo session supervisor, running on its own timer beside the fill
+    // loop rather than inside it.
+    //
+    // `once` gets no supervisor: a single scan that exits has no long-lived
+    // session to keep alive, and spawning a background task that outlives the
+    // work is how a `--once` run stops being once.
+    let session_health = if once {
+        None
+    } else {
+        Some(spawn_session_supervisor(config).await?)
+    };
+
     let mut from_block = watcher.start_block().await?;
     println!("watching glue {} from block {from_block}", config.contracts.glue_contract);
     if dry_run {
@@ -814,6 +1296,7 @@ async fn run_auto<P: alloy::providers::Provider + Clone>(
                     dry_run,
                     recipient_override.as_deref(),
                     auto_yes,
+                    session_health.as_ref(),
                 )
                 .await
                 {
@@ -834,6 +1317,160 @@ async fn run_auto<P: alloy::providers::Provider + Clone>(
     }
 }
 
+/// Report the session's health, and optionally repair it.
+///
+/// The one command an operator runs after filling in the credentials file, and
+/// the answer it gives is the one that matters: whether this daemon can survive
+/// an expiry on its own, or whether it will stop and wait for a person.
+async fn run_venmo_health(config: &TakerConfig, relogin: bool) -> Result<()> {
+    use zecp2p_taker::auto::health::{SessionDriver, Supervisor, Tick};
+
+    let credentials = config
+        .venmo_credentials()
+        .context("the Venmo credentials file is present but not usable")?;
+
+    match &config.venmo.credentials_path {
+        Some(path) if credentials.is_some() => println!("credentials : {path}"),
+        Some(path) => println!("credentials : {path} (not present)"),
+        None => println!("credentials : none configured"),
+    }
+
+    let browser = std::sync::Arc::new(VenmoBrowser::new(
+        config.venmo.cdp_url.clone(),
+        config.venmo.timeout_seconds,
+    ));
+
+    let state = browser.probe().await;
+    println!("session     : {}", state.summary());
+
+    // Readiness is reported from the credentials as configured, so the line
+    // says what the *daemon* would do rather than what this invocation will.
+    // Building it from the withheld set would tell an operator who has
+    // configured everything correctly that they have configured nothing.
+    println!(
+        "readiness   : {}",
+        Supervisor::new(
+            std::sync::Arc::new(VenmoBrowser::new(
+                config.venmo.cdp_url.clone(),
+                config.venmo.timeout_seconds,
+            )),
+            credentials.clone(),
+        )
+        .readiness()
+    );
+
+    // `--relogin` is what separates a report from an action, so the supervisor
+    // that actually runs only gets credentials when the operator asked for one.
+    // Without the flag this cannot type a password even if auto_relogin is set.
+    let mut supervisor = Supervisor::new(browser, if relogin { credentials } else { None });
+
+    if !relogin {
+        if !state.is_live() {
+            println!(
+                "\nThe session is not usable. Re-run with --relogin to have the \n\
+                 taker try to sign back in, or sign in by hand."
+            );
+        }
+        return Ok(());
+    }
+
+    let tick = supervisor.check_once().await;
+    println!("\nresult      : {tick:?}");
+    match tick {
+        Tick::Healthy => println!("The session was already fine; nothing was driven."),
+        Tick::Recovered => println!("Signed back in. The session is live."),
+        Tick::AwaitingHumanCode { what_to_do, .. } => {
+            println!("{what_to_do}");
+            std::process::exit(2);
+        }
+        other if other.needs_operator() => std::process::exit(1),
+        _ => std::process::exit(1),
+    }
+    Ok(())
+}
+
+/// The last thing the session supervisor reported, shared with the fill loop.
+///
+/// The fill loop reads this rather than probing the browser itself. That is the
+/// whole ordering the health check exists to establish: by the time a deposit
+/// arrives, whether the session is usable is already known, instead of being
+/// discovered with a trade in hand.
+type SessionHealth = std::sync::Arc<std::sync::Mutex<zecp2p_taker::auto::health::Tick>>;
+
+/// Start the session supervisor on its own task.
+///
+/// Returns the shared cell it publishes into. The task is detached and runs for
+/// the life of the process, which is the point: a check that only ran when a
+/// deposit arrived would be the thing this replaces.
+async fn spawn_session_supervisor(config: &TakerConfig) -> Result<SessionHealth> {
+    use zecp2p_taker::auto::health::{Supervisor, Tick};
+
+    // Loaded at startup, so a credentials file that exists but is unusable
+    // stops the daemon here rather than at the first expiry. A file that is
+    // simply absent is not an error: that is the daemon this repository had
+    // before, health-checking and reporting without repairing.
+    let credentials = config
+        .venmo_credentials()
+        .context("the Venmo credentials file is present but not usable")?;
+
+    let browser = std::sync::Arc::new(VenmoBrowser::new(
+        config.venmo.cdp_url.clone(),
+        config.venmo.timeout_seconds,
+    ));
+    let supervisor = Supervisor::new(browser, credentials);
+    println!("venmo session: {}", supervisor.readiness());
+
+    let shared: SessionHealth = std::sync::Arc::new(std::sync::Mutex::new(Tick::Healthy));
+    let publish = shared.clone();
+    tokio::spawn(async move {
+        supervisor
+            .run(move |tick| {
+                if let Ok(mut slot) = publish.lock() {
+                    *slot = tick.clone();
+                }
+            })
+            .await
+    });
+
+    Ok(shared)
+}
+
+/// Refuse to start a fill while the session is known to be dead.
+///
+/// Checked alongside the cookie check rather than instead of it: they are
+/// different credentials with different failure modes. The cookie is what the
+/// enclave replays after the payment; the browser session is what sends it.
+/// Either one dead means the fill cannot finish, and both are cheaper to find
+/// here than after the money has left.
+fn require_healthy_session(health: Option<&SessionHealth>) -> Result<()> {
+    use zecp2p_taker::auto::health::Tick;
+
+    let Some(health) = health else {
+        return Ok(());
+    };
+    let tick = health.lock().map(|t| t.clone()).unwrap_or(Tick::Healthy);
+    match &tick {
+        Tick::Healthy | Tick::Recovered => Ok(()),
+        // A first failed attempt is not a reason to refuse: the supervisor is
+        // still retrying and the session may well be back before this fill
+        // needs it. The states below are the ones that will not fix themselves.
+        Tick::ReloginFailed { .. } => Ok(()),
+        Tick::NeedsOperator { why, .. } => bail!(
+            "the Venmo session is not usable and will not repair itself: {why}\n\n\
+             Checked before signalling on purpose: failing here costs nothing."
+        ),
+        Tick::AwaitingHumanCode { what_to_do, .. } => bail!(
+            "the Venmo re-login is waiting for a human: {what_to_do}\n\n\
+             Nothing was signalled or paid."
+        ),
+        Tick::GaveUp { attempts } => bail!(
+            "the Venmo session is dead after {attempts} failed sign-in attempts, and \
+             the daemon has stopped trying to avoid locking the account. Sign in by \
+             hand and restart."
+        ),
+    }
+}
+
 /// Plan one deposit and take it as far as the gates allow.
 #[allow(clippy::too_many_arguments)]
 async fn handle_one<P: alloy::providers::Provider + Clone>(
@@ -846,10 +1483,16 @@ async fn handle_one<P: alloy::providers::Provider + Clone>(
     dry_run: bool,
     recipient_override: Option<&str>,
     auto_yes: bool,
+    session_health: Option<&SessionHealth>,
 ) -> Result<Outcome> {
     // Everything free comes first. The cookie check is here rather than before
     // the attestation because a dead cookie found after the payment means the
     // fiat is gone and only cancelIntent recovers the stake.
+    //
+    // The browser session is checked in the same breath and for the same
+    // reason. The supervisor already knows the answer, so this reads its last
+    // report rather than asking the browser again.
+    require_healthy_session(session_health)?;
     require_usable_session(store)?;
 
     let escrow = IEscrowTaker::new(config.contracts.zkp2p_escrow, provider);

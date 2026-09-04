@@ -6,7 +6,7 @@ use sha3::{Digest, Keccak256};
 
 use zecp2p_attestor::store::EventStore;
 use zecp2p_attestor::{
-    handle_announce, handle_attest_against_signer, handle_attest_with_chain, AttestorError,
+    handle_announce_with_nonce, handle_attest_against_signer, handle_attest_with_chain, AttestorError,
     ChainObservation, FixedClock,
 };
 use zecp2p_escrow::attestation::{eip712_digest, PaymentAttestation};
@@ -86,6 +86,8 @@ fn terms_for(txid: [u8; 32], lock_confirmed_ms: u64) -> CanonicalTerms {
         rate_18dec: IDENTITY_RATE_18DEC,
         payee_hash: [0x85; 32],
         lock_confirmed_ms,
+        platform_fee_zat: 0,
+        treasury_script: Vec::new(),
     }
 }
 
@@ -110,14 +112,14 @@ fn r3_3_announce_stamps_the_attestors_own_clock_and_refuses_zero() {
     // bounds nothing.
     let mut store = EventStore::new();
     assert_eq!(
-        handle_announce(&mut store, &secp, &FixedClock(0), &ev, &t, &k).unwrap_err(),
+        handle_announce_with_nonce(&mut store, &secp, &FixedClock(0), &ev, &t, &k).unwrap_err(),
         AttestorError::ZeroClock
     );
     assert!(store.get(&ev).is_none());
 
     // A real clock stamps the row, whatever the LP claims about the lock time.
     let mut store = EventStore::new();
-    handle_announce(&mut store, &secp, &FixedClock(NOW_MS), &ev, &t, &k).unwrap();
+    handle_announce_with_nonce(&mut store, &secp, &FixedClock(NOW_MS), &ev, &t, &k).unwrap();
     assert_eq!(store.get(&ev).unwrap().announced_at_ms, NOW_MS);
     assert_ne!(
         store.get(&ev).unwrap().announced_at_ms,
@@ -136,7 +138,7 @@ fn r3_3b_the_month_old_payment_is_refused_once_the_row_is_stamped() {
     let t = terms_for([0x7a; 32], NOW_MS - MONTH_MS);
     let ev = event_id(&t.funding_txid, 0);
     let mut store = EventStore::new();
-    handle_announce(&mut store, &secp, &FixedClock(NOW_MS), &ev, &t, &k).unwrap();
+    handle_announce_with_nonce(&mut store, &secp, &FixedClock(NOW_MS), &ev, &t, &k).unwrap();
 
     let blob = details(&t, 100_000_000, NOW_MS - MONTH_MS + 60_000, 77, IDENTITY_RATE_18DEC);
     let (att, sig) = attest_for(t.intent_hash(), 100_000_000, &blob);
@@ -182,7 +184,7 @@ fn r3_3c_announce_checks_the_event_id_against_the_outpoint() {
     let foreign = event_id(&[0xa7; 32], 0);
 
     let mut store = EventStore::new();
-    let err = handle_announce(&mut store, &secp, &FixedClock(NOW_MS), &foreign, &t, &k)
+    let err = handle_announce_with_nonce(&mut store, &secp, &FixedClock(NOW_MS), &foreign, &t, &k)
         .expect_err("an event id for another outpoint must be refused");
     assert!(matches!(err, AttestorError::EventIdMismatch { .. }), "got {err}");
 }
@@ -203,7 +205,7 @@ fn r3_4_a_rate_of_one_is_refused_by_the_only_constructible_policy() {
     let t = terms_for([0x7a; 32], NOW_MS);
     let ev = event_id(&t.funding_txid, 0);
     let mut store = EventStore::new();
-    handle_announce(&mut store, &secp, &FixedClock(NOW_MS), &ev, &t, &k).unwrap();
+    handle_announce_with_nonce(&mut store, &secp, &FixedClock(NOW_MS), &ev, &t, &k).unwrap();
 
     let blob = details(&t, 100_000_000, NOW_MS + 60_000, 77, 1);
     let (att, sig) = attest_for(t.intent_hash(), 100_000_000, &blob);
@@ -251,7 +253,7 @@ fn r3_5_one_payment_yields_exactly_one_scalar() {
         let t = terms_for(txid, NOW_MS);
         let k = SecretKey::from_slice(&[0x40 + i as u8; 32]).unwrap();
         let ev = event_id(&txid, 0);
-        handle_announce(&mut store, &secp, &FixedClock(NOW_MS), &ev, &t, &k).unwrap();
+        handle_announce_with_nonce(&mut store, &secp, &FixedClock(NOW_MS), &ev, &t, &k).unwrap();
         evs.push((t, ev));
     }
 
@@ -298,7 +300,7 @@ fn r3_5b_the_nonce_is_gone_after_one_signing() {
     let t = terms_for([0x7a; 32], NOW_MS);
     let ev = event_id(&t.funding_txid, 0);
     let mut store = EventStore::new();
-    handle_announce(&mut store, &secp, &FixedClock(NOW_MS), &ev, &t, &k).unwrap();
+    handle_announce_with_nonce(&mut store, &secp, &FixedClock(NOW_MS), &ev, &t, &k).unwrap();
 
     let blob = details(&t, 100_000_000, NOW_MS + 60_000, 484, IDENTITY_RATE_18DEC);
     let (att, sig) = attest_for(t.intent_hash(), 100_000_000, &blob);
@@ -330,7 +332,7 @@ fn the_handler_reads_the_escrow_from_its_own_node() {
     let t = terms_for([0x7a; 32], NOW_MS);
     let ev = event_id(&t.funding_txid, 0);
     let mut store = EventStore::new();
-    handle_announce(&mut store, &secp, &FixedClock(NOW_MS), &ev, &t, &k).unwrap();
+    handle_announce_with_nonce(&mut store, &secp, &FixedClock(NOW_MS), &ev, &t, &k).unwrap();
 
     let blob = details(&t, 100_000_000, NOW_MS + 60_000, 484, IDENTITY_RATE_18DEC);
     let (att, sig) = attest_for(t.intent_hash(), 100_000_000, &blob);

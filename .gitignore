@@ -68,3 +68,17 @@ scripts/proof/attestation*.json
 
 # Local coordinator database
 zecp2p*.db
+taker-fills.jsonl
+
+# Venmo login credentials for the unattended taker. The real username, password
+# and TOTP seed live in config/venmo.local.toml; only the placeholder template
+# next to it is committed. Anyone holding this file can sign into the account
+# and move the operator's money.
+config/venmo.local.toml
+config/*.local.toml
+
+# Terraform state and local provider cache
+deploy/aws/.terraform/
+deploy/aws/*.tfstate
+deploy/aws/*.tfstate.*
+deploy/aws/tfplan

@@ -19,17 +19,26 @@
 //!   cargo test -p zecp2p-escrow --test mempool_gate -- --ignored --test-threads 1
 //! ```
 //!
-//! # Status against the hosted endpoint
+//! # Status: the gate is met
 //!
-//! The hosted development endpoint (Tatum) blocks `sendrawtransaction` at its
-//! WAF: every call returns Cloudflare `403 error code: 1010`, for a 2-character
-//! payload as readily as a 730-character one. It is the method that is blocked,
-//! not the size. Read methods work.
+//! An earlier run concluded the hosted endpoint blocked `sendrawtransaction` at
+//! its WAF. That was wrong - it was a transient Cloudflare episode, and the
+//! method works at every payload size including the real 730-hex-character
+//! release. Re-probed 2026-09-02 across 64 to 730 characters, every one
+//! answered by the node.
 //!
-//! So these tests do not pass against that provider, and Phase 1's mempool gate
-//! is **still unmet**. They are written to run unchanged against Casper's
-//! zebrad. The `dump_release` example prints the same bytes for handing to a
-//! node by other means.
+//! The two verdicts that close Phase 1's gate, from a live Zcash testnet node:
+//!
+//! - release: `could not find transparent input UTXO in the best chain or
+//!   mempool`
+//! - refund: `transaction is locked until after block height 4320000`
+//!
+//! Both are *consensus* rejections of a fully parsed transaction. The node read
+//! the v5 header, the NU5 version group id, the NU6.3 branch id, the P2SH
+//! scriptSig and the nLockTime, and objected only to the fictional outpoint and
+//! to our own timelock. A malformed transaction cannot reach those errors; it
+//! stops at `parse error: bad tx header`, which is what an all-zero payload of
+//! the same length gets.
 
 use std::time::Duration;
 
@@ -48,6 +57,10 @@ fn client() -> Option<RpcChainClient> {
     let url = std::env::var("ZECP2P_RPC_URL").ok()?;
     let mut config = RpcConfig::public(url, Network::Test);
     config.timeout = Duration::from_secs(45);
+    // R7-6: zebra sits on a sendrawtransaction whose input it cannot find for
+    // 60 s before answering. A shorter budget turns the node's verdict - which
+    // is the whole point of these tests - into a client timeout.
+    config.broadcast_timeout = Duration::from_secs(120);
     RpcChainClient::new(config).ok()
 }
 
@@ -109,15 +122,24 @@ fn vector(branch_id: u32, refund_height: u64) -> Vector {
 /// answers that prove the encoding is right.
 fn is_parsed_then_rejected(err: &ChainError) -> bool {
     let text = format!("{err}").to_lowercase();
-    text.contains("missing")
-        || text.contains("inputs")
+    // The verdicts a real node actually returns for these transactions. Each
+    // one can only be reached after the whole transaction has been decoded.
+    text.contains("could not find transparent input utxo")
+        || text.contains("locked until after block height")
+        || text.contains("already queued for download")
+        || text.contains("missing")
         || text.contains("not found")
         || text.contains("spent")
 }
 
 fn is_decode_failure(err: &ChainError) -> bool {
     let text = format!("{err}").to_lowercase();
+    // What a node says when it cannot parse the bytes at all. An all-zero
+    // payload of the same length as our release gets `bad tx header`; if our
+    // transaction ever lands here, the v5 encoding is wrong.
     text.contains("failed to fill whole buffer")
+        || text.contains("bad tx header")
+        || text.contains("parse error")
         || text.contains("tx decode failed")
         || text.contains("deserializ")
 }

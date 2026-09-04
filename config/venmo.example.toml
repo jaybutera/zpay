@@ -1,0 +1,87 @@
+# Venmo login credentials for the unattended taker.
+#
+# Copy this file to config/venmo.local.toml and fill in the real values. The
+# local copy is gitignored; this template is not, so nothing here may ever be a
+# real credential.
+#
+#     cp config/venmo.example.toml config/venmo.local.toml
+#     chmod 600 config/venmo.local.toml
+#
+# The taker refuses to start a re-login if the file is still holding the
+# placeholders below, and it refuses to read a file that is group- or
+# world-readable. Both refusals are deliberate: a config that silently fell back
+# to "no credentials" would turn an unattended daemon into one that quietly
+# stops filling at the first expiry, which is the failure this file exists to
+# end.
+
+[venmo_login]
+# The email address or phone number the Venmo account signs in with.
+username = "PUT-YOUR-VENMO-EMAIL-HERE"
+
+# The account password.
+#
+# This file is the only place it lives. It is not read from the environment, not
+# logged, and not written to the journal; `Credentials` has a hand-written Debug
+# that prints the username and the length of the password rather than the
+# password.
+password = "PUT-YOUR-VENMO-PASSWORD-HERE"
+
+# ---------------------------------------------------------------------------
+# Two-factor authentication
+# ---------------------------------------------------------------------------
+#
+# Venmo requires a second factor on a new sign-in. Which one you get decides
+# whether this daemon can run unattended, and only one of the three can be
+# automated:
+#
+#   totp  - an authenticator app (RFC 6238). Fully automatic. The taker
+#           computes the six digits itself from the seed below. This is the
+#           only setting under which the daemon survives an expiry with nobody
+#           watching, and switching to it is a one-time change in Venmo's
+#           security settings.
+#   sms   - a texted code. NOT automatable here. The taker drives the form as
+#           far as the code box, then stops and says a human has to type it.
+#   email - a mailed code. Same: the form is driven to the code box and stopped.
+#
+# Set this to what the account is actually enrolled in. Claiming "totp" without
+# a working seed makes the re-login fail at the code box instead of at startup,
+# which is a worse place to find out.
+method = "sms"
+
+# The TOTP shared secret, base32, as the authenticator app was enrolled with.
+#
+# Only read when method = "totp". This is what Venmo shows as the "can't scan
+# the code?" text alongside the QR code during authenticator setup. Strip the
+# spaces; padding and case do not matter.
+#
+# Treat it as a second password: anyone holding it can generate the codes.
+# totp_secret = "PUT-YOUR-BASE32-TOTP-SEED-HERE"
+
+# ---------------------------------------------------------------------------
+# Health check and re-login policy
+# ---------------------------------------------------------------------------
+
+# Seconds between health checks. The check is one CDP round trip against the
+# already-open tab, so this can be frequent without costing anything; the
+# default looks about four times an hour.
+check_interval_seconds = 900
+
+# Whether the health check may drive the login form on its own.
+#
+# Off by default. A daemon that types a password into a page it discovered is a
+# meaningful step past one that only reads an open tab, and that step should be
+# taken on purpose. With this false the health check still runs and still
+# reports a logged-out session; it just refuses to fix it.
+auto_relogin = false
+
+# How many consecutive failed re-login attempts before the daemon stops trying.
+#
+# Venmo locks an account after repeated failures, so retrying forever turns a
+# recoverable expiry into a locked account. On reaching this count the health
+# loop stops attempting and keeps reporting, which leaves a human a live session
+# to repair rather than a lockout to appeal.
+max_attempts = 3
+
+# Seconds to wait after a failed attempt before the next one. Doubles each
+# time, up to an hour.
+retry_backoff_seconds = 300

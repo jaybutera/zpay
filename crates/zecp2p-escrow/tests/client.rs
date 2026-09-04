@@ -71,20 +71,27 @@ fn canonical(t: &EscrowTerms) -> CanonicalTerms {
         rate_18dec: 1_000_000_000_000_000_000,
         payee_hash: [0x85; 32],
         lock_confirmed_ms: 1_788_315_013_000,
+        platform_fee_zat: 0,
+        treasury_script: Vec::new(),
     }
 }
 
 /// What the user accepted before funding. Round 2 finding 1: the client must
 /// hold its own view of the fiat side, or the LP writes it.
 fn quote(c: &CanonicalTerms) -> AcceptedQuote {
-    AcceptedQuote {
-        usd_amount_6dec: c.usd_amount_6dec,
-        payee_hash: c.payee_hash,
-        rate_18dec: c.rate_18dec,
-        refund_height: c.refund_height,
-        l_pub: c.l_pub,
-        amount_zat: c.amount_zat,
-    }
+    // These fixtures carry no platform fee, so the quote must not either: the
+    // whole-structure comparison in `prepare_escrow` would otherwise reject
+    // terms the test means to accept.
+    assert_eq!(c.platform_fee_zat, 0, "this helper builds fee-free quotes");
+    AcceptedQuote::without_platform_fee(
+        c.usd_amount_6dec,
+        c.payee_hash,
+        c.rate_18dec,
+        c.refund_height,
+        c.l_pub,
+        c.amount_zat,
+    )
+    .expect("the fixture terms must be quotable")
 }
 
 fn p2pkh(hash: [u8; 20]) -> Vec<u8> {
