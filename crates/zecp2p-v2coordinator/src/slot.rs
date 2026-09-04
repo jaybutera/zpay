@@ -238,7 +238,7 @@ pub fn claim(
     reserved: FillRecord,
     intent_hash: alloy::primitives::B256,
     intent_timestamp_ms: u64,
-) -> Result<FillRecord> {
+) -> Result<Result<FillRecord, SlotRefusal>> {
     let work = reserved.work_id();
 
     // R4-3: the slot is read again, under the lock, immediately before the
@@ -282,9 +282,18 @@ pub fn claim(
     })?;
 
     if let Some(refusal) = lost {
-        anyhow::bail!("{refusal}");
+        // R6-1: a *typed* refusal, not a stringified one. The caller has to
+        // tell `HeldByAnother` from `ThisOrderMayHavePaid`, because the
+        // responses are opposites: give the reservation back for the first, and
+        // never touch the journal for the second. Collapsing both into an
+        // `anyhow` bail is what made `settle` retract over a `Paying` line
+        // somebody else had already written - cancelling the winner's claim
+        // while its dollars were in flight.
+        return Ok(Err(refusal));
     }
-    written.ok_or_else(|| anyhow::anyhow!("the payment slot could not be claimed"))
+    written
+        .map(Ok)
+        .ok_or_else(|| anyhow::anyhow!("the payment slot could not be claimed"))
 }
 
 /// Releases the slot: the trade is finished and settled.
@@ -365,7 +374,7 @@ mod tests {
             "alice".into(),
         );
         r.state = state;
-        journal.record(&r).unwrap();
+        journal.append_unchecked(&r).unwrap();
     }
 
     #[test]
@@ -453,7 +462,9 @@ mod tests {
         {
             let j = Journal::open(&path).unwrap();
             let reserved = take(&j, &work, 700_000, "alice").unwrap().unwrap();
-            claim(&j, reserved, B256::repeat_byte(0x11), 1_700_000_000_000).unwrap();
+            claim(&j, reserved, B256::repeat_byte(0x11), 1_700_000_000_000)
+                .unwrap()
+                .expect("the claim succeeds");
         }
         let reopened = Journal::open(&path).unwrap();
         let refusal = take(&reopened, &work, 700_000, "alice")
@@ -475,7 +486,7 @@ mod tests {
             "alice".into(),
         );
         base.state = FillState::Paying;
-        j.record(&base).unwrap();
+        j.append_unchecked(&base).unwrap();
 
         assert!(take(&j, &zec_work(0xbb), 700_000, "alice").unwrap().is_err());
     }

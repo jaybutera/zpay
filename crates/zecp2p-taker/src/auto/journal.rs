@@ -230,6 +230,130 @@ pub fn holder_among(latest: &[FillRecord], mine: &WorkId) -> Option<FillRecord> 
         .cloned()
 }
 
+/// Whether an open record means a payment for that work item may already have
+/// gone out.
+///
+/// The states past reservation. `Seen` is not one of them: it is written before
+/// any network call and means only that somebody intends to pay.
+///
+/// R6-2: both daemons need this against their *own* work id, not just against
+/// somebody else's. The taker re-enters its own deposits routinely - an error
+/// anywhere after the payment rewinds the scan cursor - and without this check
+/// it wrote a fresh `Seen` over its own `Paid` line, signalled a second intent
+/// and paid again. The `Paid` line also vanished from every later reader,
+/// including the startup check that exists to catch exactly this.
+pub fn may_already_have_paid(state: FillState) -> bool {
+    matches!(
+        state,
+        FillState::Signalling | FillState::Paying | FillState::Paid | FillState::NeedsOperator
+    )
+}
+
+/// The work item's own record, when it says a payment may already have gone.
+///
+/// Separate from [`holder_among`], which is about *other* work: this is the
+/// question "have I already paid for this one", and the two have different
+/// answers for `Seen`.
+pub fn own_payment_underway(latest: &[FillRecord], mine: &WorkId) -> Option<FillRecord> {
+    latest
+        .iter()
+        .find(|r| &r.work_id() == mine && r.state.is_open() && may_already_have_paid(r.state))
+        .cloned()
+}
+
+/// Why a fill may not start or continue.
+#[derive(Debug, Clone)]
+pub enum SlotVerdict {
+    /// Nothing in the journal stops this fill.
+    Free,
+    /// This work item already has a fill that may have moved money.
+    OwnPaymentUnderway(FillRecord),
+    /// Another work item holds the one slot.
+    HeldByAnother(FillRecord),
+}
+
+impl SlotVerdict {
+    pub fn is_free(&self) -> bool {
+        matches!(self, SlotVerdict::Free)
+    }
+
+    /// What to tell an operator, and what it means for their money.
+    pub fn why(&self, mine_describes: &str) -> String {
+        match self {
+            SlotVerdict::Free => String::new(),
+            SlotVerdict::OwnPaymentUnderway(r) => format!(
+                "{mine_describes} already has a fill recorded as {:?}. The journal is \
+                 written before the send button, so money may already have gone out for \
+                 it; re-entering would pay twice. Read the Venmo feed and finish or \
+                 cancel that fill before this one is filled again.",
+                r.state
+            ),
+            SlotVerdict::HeldByAnother(r) => format!(
+                "{} holds the one payment slot ({:?}). One payment at a time: there is \
+                 one Venmo balance, and two entries of the same amount to the same handle \
+                 cannot be told apart in the feed.",
+                r.describe(),
+                r.state
+            ),
+        }
+    }
+}
+
+/// The whole slot decision for one work item, in one place.
+///
+/// R6-a: both daemons and the tests call *this*, rather than each assembling
+/// the same two checks in the right order. A test that rebuilt the logic proved
+/// only that the test was self-consistent - reverting the real call site to an
+/// unconditional append left every such test green.
+///
+/// The order matters. The own-work question comes first, because "I may have
+/// already paid for this" and "somebody else is paying" call for different
+/// answers, and the first is the more expensive mistake.
+pub fn slot_verdict(latest: &[FillRecord], mine: &WorkId) -> SlotVerdict {
+    if let Some(own) = own_payment_underway(latest, mine) {
+        return SlotVerdict::OwnPaymentUnderway(own);
+    }
+    if let Some(holder) = holder_among(latest, mine) {
+        return SlotVerdict::HeldByAnother(holder);
+    }
+    SlotVerdict::Free
+}
+
+/// The gate a fill must pass before it touches a chain, and the reservation it
+/// takes if it does.
+///
+/// R6-a: this is the *call site*, not a helper beside it. A test that rebuilt
+/// the decision proved only that the test agreed with itself - the reviewer
+/// reverted `handle_one` to an unconditional append and every such test stayed
+/// green. `handle_one` now calls this and nothing else, so a test that calls it
+/// exercises the same code, and removing the call breaks the build rather than
+/// passing quietly.
+///
+/// Returns the reservation on success. `Err` carries why not, ready to be shown
+/// to an operator.
+pub fn open_fill(
+    journal: &Journal,
+    mine: &WorkId,
+    describes: &str,
+    make: impl FnOnce() -> FillRecord,
+) -> Result<Result<FillRecord, String>> {
+    let mut refused = None;
+    let claimed = journal.claim_if(|existing| {
+        let verdict = slot_verdict(existing, mine);
+        if !verdict.is_free() {
+            refused = Some(verdict.why(describes));
+            return None;
+        }
+        Some(make())
+    })?;
+
+    match (claimed, refused) {
+        (Some(record), _) => Ok(Ok(record)),
+        (None, Some(why)) => Ok(Err(why)),
+        (None, None) => anyhow::bail!("the payment slot could not be reserved"),
+    }
+}
+
 /// An advisory exclusive lock held for the life of the value.
 ///
 /// `flock(2)`, which is per open file description and released when the handle
@@ -312,6 +436,7 @@ impl Journal {
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
+            .read(true)
             .open(&self.path)
             .with_context(|| format!("could not open the journal at {}", self.path.display()))?;
 
@@ -319,6 +444,51 @@ impl Journal {
         // process never sees a half-written line and two writers never
         // interleave. See `write_line` for why one syscall is not enough on its
         // own.
+        let _lock = FileLock::exclusive(&file, &self.path)?;
+
+        // R6-a: this updates a fill; it does not open one. Opening goes through
+        // `open_fill`, which decides and claims under this same lock.
+        //
+        // The check is here rather than left to a reviewer's memory because the
+        // bypass is one line and the consequence is a second payment: a caller
+        // that appended a fresh record for unseen work would write straight over
+        // the gate, and the reviewer's reproduction of exactly that is what this
+        // refusal exists to make impossible. It costs one read of a file already
+        // open and already locked.
+        let existing = Self::parse(&std::fs::read_to_string(&self.path).with_context(|| {
+            format!("could not read the journal at {}", self.path.display())
+        })?);
+        let work = record.work_id();
+        if !existing.iter().any(|r| r.work_id() == work) {
+            anyhow::bail!(
+                "refusing to open a fill for {work} through `record`. A first line for a \
+                 work item is a claim on the one payment slot, and it has to be taken \
+                 through `open_fill`, which decides and writes under one lock. Appending \
+                 it directly is how the same escrow gets paid twice."
+            );
+        }
+
+        Self::write_line(&mut file, &line, &self.path)
+    }
+
+    /// Appends a line without the gate, for tests and for recovery tooling.
+    ///
+    /// The escape hatch `record` deliberately does not give: it opens a fill
+    /// without deciding anything. Callers are test fixtures staging a journal
+    /// state, and an operator following the recovery runbook, who has read the
+    /// Venmo feed and is the one making the decision.
+    ///
+    /// Production code takes `open_fill` instead. Nothing in either daemon
+    /// calls this.
+    pub fn append_unchecked(&self, record: &FillRecord) -> Result<()> {
+        let mut record = record.clone();
+        record.updated_at = chrono::Utc::now();
+        let line = serde_json::to_string(&record).context("could not serialise a fill record")?;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .with_context(|| format!("could not open the journal at {}", self.path.display()))?;
         let _lock = FileLock::exclusive(&file, &self.path)?;
         Self::write_line(&mut file, &line, &self.path)
     }
@@ -554,10 +724,10 @@ mod tests {
     fn the_latest_state_per_deposit_wins() {
         let (_dir, j) = journal();
         let mut r = record();
-        j.record(&r).unwrap();
+        j.append_unchecked(&r).unwrap();
         r.state = FillState::Signalled;
         r.intent_hash = Some(B256::repeat_byte(0xbb));
-        j.record(&r).unwrap();
+        j.append_unchecked(&r).unwrap();
 
         let latest = j.latest().unwrap();
         assert_eq!(latest.len(), 1);
@@ -569,10 +739,10 @@ mod tests {
     fn a_finished_fill_releases_the_slot() {
         let (_dir, j) = journal();
         let mut r = record();
-        j.record(&r).unwrap();
+        j.append_unchecked(&r).unwrap();
         assert!(j.in_flight().unwrap().is_some());
         r.state = FillState::Fulfilled;
-        j.record(&r).unwrap();
+        j.append_unchecked(&r).unwrap();
         assert!(j.in_flight().unwrap().is_none());
     }
 
@@ -583,7 +753,7 @@ mod tests {
         let (_dir, j) = journal();
         let mut r = record();
         r.state = FillState::Paying;
-        j.record(&r).unwrap();
+        j.append_unchecked(&r).unwrap();
 
         let stuck = j.needs_operator().unwrap();
         assert_eq!(stuck.len(), 1);
@@ -598,7 +768,7 @@ mod tests {
         let (_dir, j) = journal();
         let mut r = record();
         r.state = FillState::Signalled;
-        j.record(&r).unwrap();
+        j.append_unchecked(&r).unwrap();
         assert!(j.needs_operator().unwrap().is_empty());
         assert!(j.in_flight().unwrap().is_some());
     }
@@ -611,7 +781,7 @@ mod tests {
         let j = Journal::open(&path).unwrap();
         let mut r = record();
         r.state = FillState::Paid;
-        j.record(&r).unwrap();
+        j.append_unchecked(&r).unwrap();
 
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
@@ -631,7 +801,7 @@ mod tests {
 
         let mut base = record();
         base.state = FillState::Signalled;
-        j.record(&base).unwrap();
+        j.append_unchecked(&base).unwrap();
 
         let mut zec = FillRecord::new_zec(
             base.deposit_id.to_string(),
@@ -640,7 +810,7 @@ mod tests {
             "jay-butera".into(),
         );
         zec.state = FillState::Paid;
-        j.record(&zec).unwrap();
+        j.append_unchecked(&zec).unwrap();
 
         let latest = j.latest().unwrap();
         assert_eq!(latest.len(), 2, "one rail overwrote the other: {latest:#?}");
@@ -663,7 +833,7 @@ mod tests {
             U256::from(1_000_000_000_000_000_000u128),
             "jay-butera".into(),
         );
-        j.record(&zec).unwrap();
+        j.append_unchecked(&zec).unwrap();
 
         // A Base daemon asking whether it may start work must see the escrow.
         let held = j.in_flight().unwrap().expect("the slot is taken");
@@ -724,7 +894,7 @@ mod tests {
             "jay-butera".into(),
         );
         zec.state = FillState::Paying;
-        j.record(&zec).unwrap();
+        j.append_unchecked(&zec).unwrap();
 
         let stuck = j.needs_operator().unwrap();
         assert_eq!(stuck.len(), 1);
@@ -741,7 +911,7 @@ mod tests {
         let mut r = record();
         r.state = FillState::Paid;
         r.signalled_at_ms = Some(1_756_000_000_000);
-        j.record(&r).unwrap();
+        j.append_unchecked(&r).unwrap();
 
         let back = &j.latest().unwrap()[0];
         assert_eq!(back.conversion_rate, U256::from(990_881_148_896_019_200u128));
@@ -790,9 +960,9 @@ mod concurrency_tests {
         let j = Journal::open(dir.path().join("fills.jsonl")).unwrap();
 
         // The taker's own deposit, open, on the rail that sorts first.
-        j.record(&base(4499, FillState::Signalled)).unwrap();
+        j.append_unchecked(&base(4499, FillState::Signalled)).unwrap();
         // And the coordinator, mid-payment, on the rail that sorts second.
-        j.record(&zec(0xcc, FillState::Paying)).unwrap();
+        j.append_unchecked(&zec(0xcc, FillState::Paying)).unwrap();
 
         let mine = WorkId::base(U256::from(4499));
 
@@ -814,7 +984,7 @@ mod concurrency_tests {
     fn a_work_items_own_record_does_not_hold_the_slot_against_itself() {
         let dir = tempfile::tempdir().unwrap();
         let j = Journal::open(dir.path().join("fills.jsonl")).unwrap();
-        j.record(&base(4499, FillState::Signalled)).unwrap();
+        j.append_unchecked(&base(4499, FillState::Signalled)).unwrap();
         assert!(j
             .holder_against(&WorkId::base(U256::from(4499)))
             .unwrap()
@@ -848,7 +1018,7 @@ mod concurrency_tests {
             threads.push(std::thread::spawn(move || {
                 for i in 0..25u8 {
                     // Distinct work ids, so every record must survive.
-                    j.record(&zec(t * 25 + i, FillState::Paying)).unwrap();
+                    j.append_unchecked(&zec(t * 25 + i, FillState::Paying)).unwrap();
                 }
             }));
         }
@@ -877,7 +1047,7 @@ mod concurrency_tests {
         let path = dir.path().join("fills.jsonl");
         let j = Journal::open(&path).unwrap();
 
-        j.record(&zec(0x01, FillState::Paying)).unwrap();
+        j.append_unchecked(&zec(0x01, FillState::Paying)).unwrap();
 
         // The disk fills up partway through the second append.
         {
@@ -888,7 +1058,7 @@ mod concurrency_tests {
         assert!(!std::fs::read_to_string(&path).unwrap().ends_with('\n'));
 
         // The next append must not glue onto the fragment.
-        j.record(&zec(0x02, FillState::Seen)).unwrap();
+        j.append_unchecked(&zec(0x02, FillState::Seen)).unwrap();
 
         let text = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<_> = text.lines().filter(|l| !l.trim().is_empty()).collect();

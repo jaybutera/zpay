@@ -544,21 +544,45 @@ async fn settle(state: &Arc<AppState>, order: Order) -> Result<()> {
         reserved.clone(),
         leg.intent_hash,
         leg.intent_timestamp_ms,
-    ) {
+    )? {
         Ok(record) => record,
-        Err(e) => {
-            // R5-1: the claim lost the slot between the reservation and here.
-            // The reservation must go back, or this order's own `Seen` line
-            // holds the slot against every other order - including the one that
-            // won - and nothing but an operator clears it.
+
+        // R5-1: somebody else holds the slot. The reservation goes back, or
+        // this order's own `Seen` blocks every other order - including the one
+        // that won - until an operator clears it. Nothing was sent, so
+        // `Cancelled` is the truth.
+        Err(refusal @ crate::slot::SlotRefusal::HeldByAnother { .. }) => {
             tracing::info!(
                 order = %order.order_id,
-                reason = %format!("{e:#}"),
+                reason = %refusal,
                 "lost the payment slot before the click; giving the reservation back"
             );
             crate::slot::retract(&state.journal, reserved, "lost the slot before paying");
             drop(_paying);
             return check_deadlines(state, order).await;
+        }
+
+        // R6-1: a payment for *this* work item is already under way, which on
+        // one state directory means a second coordinator got here first, and on
+        // a restart means this order's own earlier attempt. Either way the
+        // journal's `Paying` line belongs to whoever is driving the browser
+        // right now.
+        //
+        // **Retracting here is the bug that was here.** It wrote `Cancelled`
+        // over the winner's claim while its dollars were in flight, so the next
+        // sweep read a free slot, re-took the order and paid a second time -
+        // undoing the single-instance guard entirely. The journal is not
+        // touched on this path.
+        Err(refusal) => {
+            tracing::error!(
+                order = %order.order_id,
+                reason = %refusal,
+                "another payment for this escrow is already under way; not retracting and \
+                 not paying"
+            );
+            order.fail(refusal.to_string());
+            state.store.put(&order)?;
+            return Ok(());
         }
     };
 

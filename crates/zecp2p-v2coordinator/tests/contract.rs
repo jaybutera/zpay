@@ -796,7 +796,8 @@ async fn a_crash_between_the_journal_and_the_store_does_not_pay_twice() {
             alloy::primitives::B256::repeat_byte(0x11),
             1_700_000_000_000,
         )
-        .unwrap();
+        .unwrap()
+        .expect("the claim succeeds");
     }
     let mut stalled = state.store.get(&order_id).unwrap();
     stalled.stage = Stage::Locked;
@@ -865,7 +866,8 @@ async fn a_second_order_cannot_pay_while_the_first_is_mid_payment() {
             alloy::primitives::B256::repeat_byte(0xaa),
             1_700_000_000_000,
         )
-        .unwrap();
+        .unwrap()
+        .expect("the claim succeeds");
     }
 
     // The sweep reaches B.
@@ -1004,7 +1006,7 @@ async fn a_needs_operator_line_keeps_holding_the_slot() {
     );
     record.state = zecp2p_taker::auto::journal::FillState::NeedsOperator;
     record.note = Some("the Venmo leg failed".into());
-    state.journal.record(&record).unwrap();
+    state.journal.append_unchecked(&record).unwrap();
 
     let user = TestUser::new();
     let (order_id, _) = locked_order(&app, &state, &node, &scanner, &attestor, &user).await;
@@ -1426,7 +1428,7 @@ async fn the_refund_endpoint_asks_the_journal_not_the_stage() {
         "alice".into(),
     );
     record.state = zecp2p_taker::auto::journal::FillState::NeedsOperator;
-    state.journal.record(&record).unwrap();
+    state.journal.append_unchecked(&record).unwrap();
 
     let mut failed = state.store.get(&order_id).unwrap();
     failed.fail("the payment could not be completed. Check the Venmo feed.");
@@ -1727,7 +1729,7 @@ async fn a_paid_journal_line_with_a_locked_order_finishes_the_release() {
     );
     record.state = zecp2p_taker::auto::journal::FillState::Paid;
     record.paid = Some("2.00".into());
-    state.journal.record(&record).unwrap();
+    state.journal.append_unchecked(&record).unwrap();
 
     let mut stalled = state.store.get(&order_id).unwrap();
     stalled.stage = Stage::Locked;
@@ -1783,7 +1785,8 @@ async fn a_paying_line_still_needs_a_human_rather_than_a_release() {
         alloy::primitives::B256::repeat_byte(0x11),
         1_700_000_000_000,
     )
-    .unwrap();
+    .unwrap()
+    .expect("the claim succeeds");
 
     let mut stalled = state.store.get(&order_id).unwrap();
     stalled.stage = Stage::Locked;
@@ -1884,7 +1887,7 @@ async fn a_taker_fill_in_the_shared_journal_stops_the_coordinator_paying() {
         "alice".into(),
     );
     takers.state = zecp2p_taker::auto::journal::FillState::Paying;
-    state.journal.record(&takers).unwrap();
+    state.journal.append_unchecked(&takers).unwrap();
 
     let user = TestUser::new();
     let (order_id, _) = locked_order(&app, &state, &node, &scanner, &attestor, &user).await;
@@ -1985,7 +1988,7 @@ async fn losing_the_slot_before_the_click_gives_the_reservation_back() {
         "alice".into(),
     );
     intruder.state = zecp2p_taker::auto::journal::FillState::Paying;
-    state.journal.record(&intruder).unwrap();
+    state.journal.append_unchecked(&intruder).unwrap();
 
     let _ = driving.await;
 
@@ -2037,7 +2040,7 @@ async fn an_order_past_t_becomes_refundable_even_while_the_slot_is_held() {
         "alice".into(),
     );
     other.state = zecp2p_taker::auto::journal::FillState::Paying;
-    state.journal.record(&other).unwrap();
+    state.journal.append_unchecked(&other).unwrap();
     node.set_height(u32::try_from(relocked.refund_height).unwrap() + 1).await;
 
     zecp2p_v2coordinator::driver::advance(&state, &order_id)
@@ -2073,6 +2076,7 @@ async fn a_second_coordinator_cannot_pay_the_same_order() {
         alloy::primitives::B256::repeat_byte(0x11),
         1_700_000_000_000,
     )
+    .expect("the journal is readable")
     .expect("the first claim succeeds");
 
     // A second instance, same order, same journal.
@@ -2094,10 +2098,18 @@ async fn a_second_coordinator_cannot_pay_the_same_order() {
         stale,
         alloy::primitives::B256::repeat_byte(0x22),
         1_700_000_000_000,
-    );
+    )
+    .expect("a refusal is a value, not an error");
+    // R6-1: the *kind* matters. `ThisOrderMayHavePaid` tells the caller not to
+    // touch the journal; `HeldByAnother` tells it to give its reservation back.
+    // Collapsing the two into a string is what let a losing instance cancel the
+    // winner's `Paying` line while its dollars were in flight.
     assert!(
-        refused.is_err(),
-        "a second coordinator wrote a second Paying line for one order"
+        matches!(
+            refused,
+            Err(zecp2p_v2coordinator::slot::SlotRefusal::ThisOrderMayHavePaid { .. })
+        ),
+        "a second coordinator was not told a payment for this order is under way: {refused:?}"
     );
 
     // One Paying line, not two.
@@ -2107,4 +2119,104 @@ async fn a_second_coordinator_cannot_pay_the_same_order() {
         .filter(|l| l.contains("\"paying\""))
         .count();
     assert_eq!(paying, 1, "{paying} Paying lines for one order");
+}
+
+#[tokio::test]
+async fn a_losing_instance_does_not_cancel_the_winners_claim() {
+    // R6-1, which the R5-1 retract introduced. `claim` bailed with a string, so
+    // `settle` retracted on *every* claim error - including the one that means
+    // "somebody is already paying this order". That wrote `Cancelled` over the
+    // winner's `Paying` line while its dollars were in flight, so the next sweep
+    // read a free slot, re-took the order and paid a second time. The
+    // single-instance guard from R5-a was undone by the retract from R5-1.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+    let fiat = Arc::new(CountingFiat::new());
+    let state = coordinator_with_fiat(dir.path(), scanner.clone(), &node, &attestor, fiat.clone());
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+    let user = TestUser::new();
+
+    let (order_id, funding_txid) =
+        locked_order(&app, &state, &node, &scanner, &attestor, &user).await;
+    let work = zecp2p_v2coordinator::slot::work_id_for(&funding_txid, 0);
+
+    // Two instances, in the order the reviewer reproduced. Both `take` the
+    // order - an own-work `Seen` is allowed through, because that is what a
+    // retry looks like - and then one of them claims.
+    //
+    // This instance reserves first, and holds that reservation across its chain
+    // call and preflight, which is where the real one sits.
+    let ours = zecp2p_v2coordinator::slot::take(&state.journal, &work, 700_000, "alice")
+        .unwrap()
+        .expect("the slot is free");
+
+    // The other instance takes the same order and wins the claim: it is now
+    // driving a browser, and its dollars are in flight.
+    let theirs = zecp2p_v2coordinator::slot::take(&state.journal, &work, 700_000, "alice")
+        .unwrap()
+        .expect("an own-work Seen does not block a retry");
+    zecp2p_v2coordinator::slot::claim(
+        &state.journal,
+        theirs,
+        alloy::primitives::B256::repeat_byte(0xaa),
+        1_700_000_000_000,
+    )
+    .unwrap()
+    .expect("the winner claims");
+
+    // Now this instance reaches its own claim, holding a stale reservation.
+    // What it must not do is retract - that writes `Cancelled` over the
+    // winner's `Paying` line while the dollars are gone.
+    let refusal = zecp2p_v2coordinator::slot::claim(
+        &state.journal,
+        ours.clone(),
+        alloy::primitives::B256::repeat_byte(0xbb),
+        1_700_000_000_000,
+    )
+    .unwrap()
+    .expect_err("the loser must be refused");
+    assert!(
+        matches!(
+            refusal,
+            zecp2p_v2coordinator::slot::SlotRefusal::ThisOrderMayHavePaid { .. }
+        ),
+        "the refusal must say a payment is under way, not merely that the slot is busy: \
+         {refusal:?}"
+    );
+
+    // And drive the real path to the same point, which is what must not retract.
+    let mut relocked2 = state.store.get(&order_id).unwrap();
+    relocked2.stage = Stage::Locked;
+    relocked2.payment = None;
+    relocked2.release_txid = None;
+    state.store.put(&relocked2).unwrap();
+
+    let paid_before = fiat.payments();
+    zecp2p_v2coordinator::driver::advance(&state, &order_id)
+        .await
+        .expect("refusing is not an error");
+    // The winner's claim must still stand. If it was cancelled, the next sweep
+    // pays again - which is the whole bug.
+    let latest: Vec<_> = state
+        .journal
+        .latest()
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.work_id() == work)
+        .collect();
+    assert_eq!(latest.len(), 1);
+    assert_eq!(
+        latest[0].state,
+        zecp2p_taker::auto::journal::FillState::Paying,
+        "the loser cancelled the winner's claim while its dollars were in flight"
+    );
+    assert_eq!(fiat.payments(), paid_before, "it paid over the top");
+
+    // And a following sweep still refuses, rather than reading a free slot.
+    zecp2p_v2coordinator::driver::advance(&state, &order_id)
+        .await
+        .expect("refusing is not an error");
+    assert_eq!(fiat.payments(), paid_before, "the next sweep paid a second time");
 }

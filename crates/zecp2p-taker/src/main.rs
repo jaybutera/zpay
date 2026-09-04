@@ -1363,7 +1363,11 @@ async fn run_auto<P: alloy::providers::Provider + Clone>(
                         // An error before anything was spent is also worth
                         // another look: an RPC that failed once may not fail
                         // twice. A fill that got as far as paying has a journal
-                        // record, and `handle_one` refuses to re-enter it.
+                        // record, and `handle_one` refuses to re-enter it -
+                        // `own_payment_underway`, checked at the top and again
+                        // under the lock. R6-2: that refusal did not exist when
+                        // this comment was first written, and the cursor rewind
+                        // added here is exactly what made its absence reachable.
                         remember(deposit.block_number);
                         println!("deposit {}: stopped: {e:#}", deposit.deposit_id);
                     }
@@ -1574,17 +1578,6 @@ async fn handle_one<P: alloy::providers::Provider + Clone>(
     // The read is before the `Seen` write below, so a fill that cannot have the
     // slot leaves no trace and is retried on the next poll.
     let mine = WorkId::base(deposit.deposit_id);
-    if let Some(holder) = journal.holder_against(&mine)? {
-        return Ok(Outcome::Skipped {
-            why: format!(
-                "{} holds the one payment slot ({:?}). One payment at a time: there is \
-                 one Venmo balance, and two entries of the same amount to the same \
-                 handle cannot be told apart in the feed.",
-                holder.describe(),
-                holder.state
-            ),
-        });
-    }
 
     // Everything free comes first. The cookie check is here rather than before
     // the attestation because a dead cookie found after the payment means the
@@ -1681,34 +1674,35 @@ async fn handle_one<P: alloy::providers::Provider + Clone>(
     //
     // The reservation now goes through `claim_if`, which holds the journal's
     // lock across the read and the write, so exactly one side gets it.
-    let mut lost_the_slot = None;
-    let claimed_slot = journal.claim_if(|existing| {
-        if let Some(holder) = zecp2p_taker::auto::journal::holder_among(existing, &mine) {
-            lost_the_slot = Some(format!(
-                "{} took the one payment slot ({:?}) while this fill was being priced",
-                holder.describe(),
-                holder.state
-            ));
-            return None;
-        }
-        Some(FillRecord::new(
-            deposit.deposit_id,
-            deposit.session_id,
-            amount,
-            rate,
-            plan.recipient.clone(),
-        ))
-    })?;
-    if let Some(why) = lost_the_slot {
+    let mut record = match zecp2p_taker::auto::journal::open_fill(
+        journal,
+        &mine,
+        &format!("deposit {}", deposit.deposit_id),
+        || {
+            FillRecord::new(
+                deposit.deposit_id,
+                deposit.session_id,
+                amount,
+                rate,
+                plan.recipient.clone(),
+            )
+        },
+    )? {
+        Ok(record) => record,
         // Nothing has been signalled or spent yet, so there is nothing to undo.
-        return Ok(Outcome::Skipped { why });
-    }
-    let mut record = claimed_slot
-        .ok_or_else(|| anyhow::anyhow!("the payment slot could not be reserved"))?;
+        Err(why) => return Ok(Outcome::Skipped { why }),
+    };
 
     if dry_run {
         println!("\n{}", plan.signal_prompt());
         println!("\n(dry run: stopping here, nothing signalled)");
+        // R6-b: the reservation goes back. A dry run has spent nothing, and on
+        // a journal shared with `zecp2p-v2coordinator` a `Seen` line left behind
+        // blocks that coordinator from paying anything at all - so a rehearsal
+        // would stall live trades until an operator noticed.
+        record.state = FillState::Cancelled;
+        record.note = Some("dry run: nothing was signalled".into());
+        journal.record(&record)?;
         return Ok(Outcome::Blocked {
             why: "dry run".into(),
         });
@@ -1732,7 +1726,7 @@ async fn handle_one<P: alloy::providers::Provider + Clone>(
         return Ok(Outcome::Declined { gate: Gate::Signal });
     }
 
-    run_fill(
+    let outcome = run_fill(
         provider,
         config,
         journal,
@@ -1741,7 +1735,37 @@ async fn handle_one<P: alloy::providers::Provider + Clone>(
         taker,
         confirm.as_ref(),
     )
-    .await
+    .await;
+
+    // R6-b: an error before anything was signalled leaves the reservation open,
+    // and on a shared journal that blocks the coordinator rather than only this
+    // taker. The states past `Seen` are somebody's business to resolve - a
+    // `Signalled` intent has to be cancelled, a `Paying` line needs a human -
+    // but a fill still sitting at `Seen` has done nothing and can simply give
+    // the slot back.
+    //
+    // The same applies when the deposit turns out to be exhausted on a retry:
+    // `run_fill` returns `Skipped` with the reservation still standing.
+    let untouched = matches!(record.state, FillState::Seen);
+    match &outcome {
+        Ok(Outcome::Skipped { .. }) | Ok(Outcome::Blocked { .. }) | Err(_) if untouched => {
+            record.state = FillState::Cancelled;
+            record.note = Some(match &outcome {
+                Err(e) => format!("nothing was signalled: {e:#}"),
+                _ => "nothing was signalled".into(),
+            });
+            if let Err(e) = journal.record(&record) {
+                tracing::error!(
+                    error = %e,
+                    "could not release the payment slot; it stays held until an operator \
+                     appends a cancelled line"
+                );
+            }
+        }
+        _ => {}
+    }
+
+    outcome
 }
 
 /// Everything after the signal gate: stake, signal, pay, attest, fulfil.
