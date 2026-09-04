@@ -242,6 +242,8 @@ mod tests {
             max_zat: 5_000_000_000,
             quote_seconds: 300,
             max_payment_cents: 2500,
+            max_open_orders: 200,
+            max_open_per_handle: 5,
         }
     }
 

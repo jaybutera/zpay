@@ -254,6 +254,13 @@ impl AppStateBuilder {
                 }
             }
         };
+        // Which strategy is in use, on the record. The scanner choice is a
+        // config value and the wrong one is invisible until an order sits at
+        // `awaiting_zec` forever, so it is logged rather than discovered.
+        tracing::info!(
+            scanner = ?config.zec.scanner,
+            "funding discovery strategy"
+        );
 
         let journal_path = config.state_dir().join("fills.jsonl");
         let journal = zecp2p_taker::auto::journal::Journal::open(&journal_path)

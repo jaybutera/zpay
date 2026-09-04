@@ -356,16 +356,37 @@ async fn settle(state: &Arc<AppState>, mut order: Order) -> Result<()> {
         return Ok(());
     };
 
-    // One payment in flight at a time. Two feed entries of the same amount to
-    // the same handle is a situation `locate_payment` refuses to resolve, and
-    // by then both payments have left.
-    if let Some(other) = state.store.another_payment_in_flight(&order.order_id) {
-        tracing::info!(
-            order = %order.order_id,
-            other = %other,
-            "waiting: another order has a payment in flight"
-        );
-        return Ok(());
+    let funding = order
+        .funding
+        .ok_or_else(|| anyhow::anyhow!("settling an order with no funding outpoint"))?;
+    let work = crate::slot::work_id_for(&funding.txid, funding.vout);
+
+    // The one payment slot, read back from the journal rather than from the
+    // order store. R1-1 and R1-2: the store says `Locked` for an order that is
+    // mid-browser and for an order whose process died mid-browser, and those
+    // are the two cases that must not pay. Only the journal line, written
+    // before the click, tells them apart from an order that has not started.
+    match crate::slot::may_claim(&state.journal, &work)? {
+        Ok(()) => {}
+        Err(refusal) => {
+            match &refusal {
+                // Another order holds the slot: wait, and try again on the next
+                // sweep. Nothing is wrong with this order.
+                crate::slot::SlotRefusal::HeldByAnother { .. } => {
+                    tracing::info!(order = %order.order_id, reason = %refusal, "waiting for the payment slot");
+                    return Ok(());
+                }
+                // A payment for *this* escrow may already have gone out. Never
+                // retry that automatically: the second payment is money the
+                // escrow cannot repay, because it releases once.
+                crate::slot::SlotRefusal::ThisOrderMayHavePaid { .. } => {
+                    tracing::error!(order = %order.order_id, reason = %refusal, "refusing to pay twice");
+                    order.fail(refusal.to_string());
+                    state.store.put(&order)?;
+                    return Ok(());
+                }
+            }
+        }
     }
 
     let watched = watched_escrow(state, &order)?;
@@ -373,16 +394,40 @@ async fn settle(state: &Arc<AppState>, mut order: Order) -> Result<()> {
     // Re-read the chain and re-ask whether paying is allowed. The state that
     // said this escrow was payable was computed on an earlier tick, and the
     // chain has moved since.
+    //
+    // Two questions, not one. `require_payable` asks the escrow crate whether
+    // the lock, the depth, the pre-signature and the deadlines allow a payment.
+    // It does **not** read the consensus branch id (R1-3): `lp::evaluate` never
+    // touches it, and this coordinator's own module docs claimed a check that
+    // was not being made. A network upgrade inside the 24-hour refund window
+    // changes the ZIP 244 sighash, so the pre-signature the user made stops
+    // authorising the transaction the LP will build - and the LP finds out
+    // after it has paid the dollars. The taker's rail asks first, and so does
+    // this.
     let policy = state.policy;
     let check = watched.clone();
+    let terms = watched.terms.clone();
     let payable = state
         .with_chain(move |chain| {
+            // The funding output, re-read. `lp::evaluate` below does this too,
+            // via `chain.utxo`, and refuses on a script or amount mismatch or
+            // insufficient depth - so a reorg that unwound the funding between
+            // the lock and the payment is caught there rather than here. This
+            // call is left to `evaluate` deliberately: a second, separate
+            // reading of the same outpoint could disagree with the one the
+            // decision is made on.
+            zecp2p_escrow::lp::check_branch(chain, &terms).map_err(|e| {
+                anyhow::anyhow!(
+                    "{e}. The pre-signature was made for another consensus branch, so the \
+                     release it authorises would not verify. Not paying this escrow."
+                )
+            })?;
             zecp2p_taker::auto::zec::require_payable(chain, &check, &policy)
         })
         .await;
 
     if let Err(e) = payable {
-        tracing::info!(order = %order.order_id, reason = %e, "not payable yet");
+        tracing::info!(order = %order.order_id, reason = %format!("{e:#}"), "not payable yet");
         return check_deadlines(state, order).await;
     }
 
@@ -404,32 +449,19 @@ async fn settle(state: &Arc<AppState>, mut order: Order) -> Result<()> {
         return check_deadlines(state, order).await;
     }
 
-    // The journal entry goes down before the click. `fiat::pay` deliberately
-    // writes nothing, and a crash between here and Venmo cannot be told from a
-    // completed payment - so the safe reading of the ambiguity is recorded
-    // first, and a human resolves it from the feed.
-    let mut record = zecp2p_taker::auto::journal::FillRecord::new_zec(
-        order
-            .funding
-            .map(|f| {
-                format!(
-                    "{}:{}",
-                    zecp2p_escrow::rpc::txid_to_display(&f.txid),
-                    f.vout
-                )
-            })
-            .unwrap_or_else(|| order.order_id.clone()),
-        alloy::primitives::U256::from(order.quote.usd_amount_6dec),
-        alloy::primitives::U256::from(zecp2p_escrow::payment_details::IDENTITY_RATE_18DEC),
-        order.handle.clone(),
-    );
-    record.state = zecp2p_taker::auto::journal::FillState::Paying;
-    record.intent_hash = Some(leg.intent_hash);
-    record.signalled_at_ms = Some(leg.intent_timestamp_ms);
-    state
-        .journal
-        .record(&record)
-        .context("could not write the journal entry that must precede a payment")?;
+    // The claim goes down before the click, and it is what the check above
+    // reads on the next tick or after a restart. `fiat::pay` deliberately
+    // writes nothing itself, and a crash between here and Venmo cannot be told
+    // from a completed payment - so the expensive reading of that ambiguity is
+    // recorded first, and a human resolves it from the feed.
+    let mut record = crate::slot::claim(
+        &state.journal,
+        &work,
+        order.quote.usd_amount_6dec,
+        &order.handle,
+        leg.intent_hash,
+        leg.intent_timestamp_ms,
+    )?;
 
     let paid = match fiat.pay(&leg).await {
         Ok(p) => p,
@@ -659,15 +691,33 @@ pub fn wire_terms(order: &Order) -> Option<WireTerms> {
 }
 
 /// Sweeps every open order on a timer.
+///
+/// Each order is advanced on its own task. The sweep used to `await` them in
+/// turn, which meant one order driving a browser for two minutes held up the
+/// funding scan for every other order behind it in the list - including orders
+/// approaching `T` whose users were waiting to be told they could refund.
+///
+/// Concurrency here is safe because it is not concurrency over the things that
+/// must be serialised: `advance` takes the per-order lock, so one order is
+/// never advanced twice at once, and the payment slot in `slot.rs` is global,
+/// so only one order can be paying whatever the sweep does.
 pub async fn run(state: Arc<AppState>, interval: std::time::Duration) {
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         ticker.tick().await;
+        let mut tasks = tokio::task::JoinSet::new();
         for order in state.store.open_orders() {
-            if let Err(e) = advance(&state, &order.order_id).await {
-                tracing::warn!(order = %order.order_id, error = %format!("{e:#}"), "could not advance");
-            }
+            let state = state.clone();
+            let id = order.order_id;
+            tasks.spawn(async move {
+                if let Err(e) = advance(&state, &id).await {
+                    tracing::warn!(order = %id, error = %format!("{e:#}"), "could not advance");
+                }
+            });
         }
+        // Waited out before the next tick, so a stalled order cannot make the
+        // sweeps pile up on top of each other.
+        while tasks.join_next().await.is_some() {}
     }
 }

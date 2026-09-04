@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 
-use crate::order::{Order, Stage};
+use crate::order::Order;
 
 /// Every order this coordinator knows about.
 #[derive(Debug, Clone)]
@@ -104,6 +104,35 @@ impl OrderStore {
             .collect()
     }
 
+    /// How many orders are still open.
+    ///
+    /// Used to bound what a caller can create. Eviction is deliberately not
+    /// offered: an order this process forgets is an escrow whose release
+    /// nobody can assemble, and the user's only recovery is the refund at `T`.
+    /// So the limit is applied at the door, and orders leave only by reaching
+    /// a terminal stage.
+    pub fn open_count(&self) -> usize {
+        self.orders
+            .lock()
+            .expect("order store lock")
+            .values()
+            .filter(|o| o.stage.is_open())
+            .count()
+    }
+
+    /// Open orders for one Venmo handle.
+    ///
+    /// The per-caller bound. A handle is the only thing an order names that a
+    /// caller cannot mint for free.
+    pub fn open_for_handle(&self, handle: &str) -> usize {
+        self.orders
+            .lock()
+            .expect("order store lock")
+            .values()
+            .filter(|o| o.stage.is_open() && o.handle.eq_ignore_ascii_case(handle))
+            .count()
+    }
+
     /// Orders still holding the in-flight slot.
     pub fn open_orders(&self) -> Vec<Order> {
         self.orders
@@ -115,20 +144,19 @@ impl OrderStore {
             .collect()
     }
 
-    /// Whether some *other* order has money in flight.
-    ///
-    /// One payment at a time, across the whole process. Two payments in flight
-    /// means two feed entries of the same amount to the same handle, and
-    /// `locate_payment` refuses to choose between them - after both have left.
-    pub fn another_payment_in_flight(&self, except: &str) -> Option<String> {
-        self.orders
-            .lock()
-            .expect("order store lock")
-            .values()
-            .find(|o| o.order_id != except && o.stage == Stage::Paid)
-            .map(|o| o.order_id.clone())
-    }
 }
+
+// The payment slot deliberately does **not** live here. It used to: a helper on
+// this store looked for another order at `Stage::Paid`. That was wrong twice
+// over (R1-2). An order in the middle of `settle` is still `Locked`, so the
+// check passed while a browser was being driven; and an order whose process
+// died mid-payment is `Locked` on restart too, so the check passed there as
+// well. Both let the coordinator pay twice.
+//
+// The slot is read from the journal instead - see `slot.rs`. The journal line
+// is written before the click, so it is the only record that distinguishes
+// "has not started" from "may already have paid", and it is on disk rather
+// than in this process's memory.
 
 #[cfg(test)]
 mod tests {
@@ -201,22 +229,6 @@ mod tests {
         std::fs::write(dir.path().join("esc_bad.json"), "{ not json").unwrap();
         let err = OrderStore::open(dir.path()).expect_err("a corrupt order must stop the load");
         assert!(format!("{err:#}").contains("corrupt"));
-    }
-
-    #[test]
-    fn only_one_payment_is_in_flight_at_a_time() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = OrderStore::open(dir.path()).unwrap();
-        store.put(&an_order("esc_a", Stage::Paid)).unwrap();
-        store.put(&an_order("esc_b", Stage::Locked)).unwrap();
-
-        // b is about to pay, and a already has money out.
-        assert_eq!(
-            store.another_payment_in_flight("esc_b").as_deref(),
-            Some("esc_a")
-        );
-        // a does not block itself.
-        assert_eq!(store.another_payment_in_flight("esc_a"), None);
     }
 
     #[test]

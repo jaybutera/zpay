@@ -175,11 +175,16 @@ async fn quote(
     )
     .map_err(|e| ApiError::bad_request(e.to_string()))?;
 
-    state
-        .quotes
-        .lock()
-        .expect("quote lock")
-        .insert(quote.quote_id.clone(), quote.clone());
+    {
+        let mut quotes = state.quotes.lock().expect("quote lock");
+        // Quotes expire, so unlike orders they can be dropped: an expired one
+        // is refused at `/escrow/orders` anyway. Sweeping them here keeps a
+        // caller who types in the amount box from growing this map without
+        // bound.
+        let now = chrono::Utc::now();
+        quotes.retain(|_, q| !q.is_expired(now));
+        quotes.insert(quote.quote_id.clone(), quote.clone());
+    }
 
     Ok(Json(view::QuoteView::from(&quote)))
 }
@@ -220,6 +225,22 @@ async fn open_order(
     if !state.config.serve.serves(&handle) {
         return Err(ApiError::bad_request(
             "zpay is not taking orders for that account right now.",
+        ));
+    }
+
+    // Orders cannot be evicted, so the bound is applied here. A caller in a
+    // loop would otherwise leave this process scanning an unbounded number of
+    // addresses on every sweep, and each of those scans is a node call.
+    if state.store.open_count() >= state.config.quote.max_open_orders {
+        return Err(ApiError::unavailable(
+            "zpay has as many escrows open as it will watch at once. Try again in a \
+             few minutes.",
+        ));
+    }
+    if state.store.open_for_handle(&handle) >= state.config.quote.max_open_per_handle {
+        return Err(ApiError::bad_request(
+            "there are already several escrows open for that Venmo account. Finish or \
+             let those refund before opening another.",
         ));
     }
 
@@ -384,6 +405,13 @@ async fn presign(
     Path(order_id): Path<String>,
     Json(body): Json<PresignRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    // The same lock the driver takes. Two pre-signatures arriving together
+    // would both read `needs_presignature`, both pass, and both spawn a
+    // settlement task; the second would then be refused by the payment slot,
+    // but relying on that is relying on the last line of defence.
+    let lock = state.order_lock(&order_id).await;
+    let _held = lock.lock().await;
+
     let mut order = state
         .store
         .get(&order_id)
@@ -457,11 +485,27 @@ struct RefundRequest {
 /// transaction with a key this process has never seen, shows the bytes on
 /// screen, and says any node will take them. A refusal here costs the user
 /// nothing but a copy and paste.
+///
+/// # Why this checks the bytes
+///
+/// R1-5: it used to parse the transaction only far enough to compare its txid
+/// to the one the caller sent alongside it, which is a claim checked against
+/// itself. So anyone holding an order id could hand this endpoint any valid
+/// transaction, have the coordinator's node broadcast it, and move the order to
+/// terminal `refunded` - an open relay that also destroyed the order's own
+/// status. It now refuses anything that does not spend this escrow's outpoint,
+/// refuses outside the stage where a refund is due, and takes the order lock so
+/// it cannot race the settlement path.
 async fn refund(
     State(state): State<Arc<AppState>>,
     Path(order_id): Path<String>,
     Json(body): Json<RefundRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    // Held across the whole handler, so a refund cannot interleave with the
+    // settlement path deciding to pay the same escrow.
+    let lock = state.order_lock(&order_id).await;
+    let _held = lock.lock().await;
+
     let mut order = state
         .store
         .get(&order_id)
@@ -474,17 +518,49 @@ async fn refund(
         ));
     }
 
+    // A refund is only due once the escrow is past `T` and unsettled. Outside
+    // those stages this endpoint has nothing to broadcast, and answering
+    // anyway is what let a caller drive an arbitrary order to `refunded`.
+    if !matches!(order.stage, Stage::Refundable | Stage::Unpaid | Stage::Failed) {
+        return Err(ApiError::bad_request(format!(
+            "this escrow is not refundable yet (it is {}). Your key can spend the timeout \
+             branch from block {} and the page will offer it then.",
+            order.stage.as_str(),
+            order.refund_height
+        )));
+    }
+
     let raw = hex::decode(body.raw_tx.trim())
         .map_err(|_| ApiError::bad_request("that is not a transaction"))?;
     if raw.len() < 100 {
         return Err(ApiError::bad_request("that is not a transaction"));
     }
 
-    // It must spend this escrow's outpoint, at minimum. The signature is the
-    // user's own and the node checks it; what this checks is that the
-    // coordinator is not being used to relay some unrelated transaction.
     let parsed_txid = zecp2p_escrow::tx::txid_of_signed(&raw)
         .map_err(|e| ApiError::bad_request(format!("that transaction does not parse: {e}")))?;
+
+    // The bytes must spend *this* escrow. This is the check that keeps the
+    // endpoint from being a relay: the signature is the user's own and the node
+    // validates it, but nothing except this ties the transaction to the order
+    // whose status is about to be overwritten.
+    let funding = order.funding.ok_or_else(|| {
+        ApiError::bad_request(
+            "zpay does not know this escrow's funding transaction, so it cannot tell \
+             whether that refund spends it. The signed bytes are on your screen and any \
+             Zcash node will take them.",
+        )
+    })?;
+    let spends = zecp2p_escrow::tx::spends_outpoint(&raw, &funding.txid, funding.vout)
+        .map_err(|e| ApiError::bad_request(format!("that transaction does not parse: {e}")))?;
+    if !spends {
+        return Err(ApiError::bad_request(format!(
+            "that transaction does not spend this escrow ({}:{}). zpay only broadcasts \
+             the refund of the order you asked about.",
+            zecp2p_escrow::rpc::txid_to_display(&funding.txid),
+            funding.vout
+        )));
+    }
+
     if let Some(claimed) = &body.txid {
         if claimed.trim().to_ascii_lowercase()
             != zecp2p_escrow::rpc::txid_to_display(&parsed_txid)

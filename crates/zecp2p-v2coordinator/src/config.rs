@@ -159,6 +159,17 @@ pub struct QuoteConfig {
     /// The ceiling on a single Venmo payment, in cents. The last line against
     /// a units/dollars confusion; `money::payment_cents` refuses above it.
     pub max_payment_cents: u64,
+    /// The most orders that may be open at once.
+    ///
+    /// An order costs a file, a scan of an address on every sweep, and a slot
+    /// in the operator's attention. Nothing stops a caller opening them in a
+    /// loop, and they cannot be evicted: an order this process forgets is an
+    /// escrow whose release nobody can assemble, so the bound goes at the door.
+    #[serde(default = "default_max_open_orders")]
+    pub max_open_orders: usize,
+    /// The most open orders for any one Venmo handle.
+    #[serde(default = "default_max_open_per_handle")]
+    pub max_open_per_handle: usize,
 }
 
 fn default_fee_bps() -> u64 {
@@ -169,6 +180,12 @@ fn default_min_zat() -> u64 {
 }
 fn default_quote_seconds() -> u64 {
     300
+}
+fn default_max_open_orders() -> usize {
+    200
+}
+fn default_max_open_per_handle() -> usize {
+    5
 }
 
 /// Whose escrows this coordinator will front fiat for.
@@ -433,6 +450,9 @@ impl CoordinatorConfig {
         if self.quote.max_payment_cents == 0 {
             bail!("quote.max_payment_cents is zero; every payment would be refused");
         }
+        if self.quote.max_open_orders == 0 || self.quote.max_open_per_handle == 0 {
+            bail!("quote.max_open_orders and max_open_per_handle must be at least 1");
+        }
         if !(self.quote.rate_usd_per_zec.is_finite() && self.quote.rate_usd_per_zec > 0.0) {
             bail!("quote.rate_usd_per_zec must be a positive number");
         }
@@ -568,6 +588,8 @@ mod tests {
                 max_zat: 5_000_000_000,
                 quote_seconds: 300,
                 max_payment_cents: 2500,
+                max_open_orders: default_max_open_orders(),
+                max_open_per_handle: default_max_open_per_handle(),
             },
             serve: ServeConfig {
                 allow_any_handle: false,

@@ -50,6 +50,10 @@ quote_seconds = 300
 # The ceiling on one Venmo payment. The last line against a units/dollars
 # confusion, and the operator's own limit on a single trade.
 max_payment_cents = 2500
+# Orders cannot be evicted: one this process forgets is an escrow whose release
+# nobody can assemble. So the bound is applied when an order is opened.
+max_open_orders = 200
+max_open_per_handle = 5
 
 [serve]
 # Whose escrows this coordinator fronts fiat for. An empty list with

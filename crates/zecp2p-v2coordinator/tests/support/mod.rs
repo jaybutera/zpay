@@ -36,6 +36,8 @@ type NodeUtxo = (String, u64, u32);
 
 struct NodeInner {
     height: Mutex<u32>,
+    /// Settable, so a test can upgrade the network mid-escrow.
+    branch_id: Mutex<u32>,
     utxos: Mutex<HashMap<Outpoint, NodeUtxo>>,
     broadcasts: Mutex<Vec<Vec<u8>>>,
 }
@@ -44,6 +46,7 @@ impl FakeNode {
     pub async fn spawn() -> Self {
         let inner = Arc::new(NodeInner {
             height: Mutex::new(3_470_700),
+            branch_id: Mutex::new(BRANCH_ID),
             utxos: Mutex::new(HashMap::new()),
             broadcasts: Mutex::new(Vec::new()),
         });
@@ -79,8 +82,22 @@ impl FakeNode {
         );
     }
 
+    /// Unwinds an output, standing in for a reorg or a spend.
+    pub async fn remove_utxo(&self, txid: [u8; 32], vout: u32) {
+        self.inner
+            .utxos
+            .lock()
+            .await
+            .remove(&(zecp2p_escrow::rpc::txid_to_display(&txid), vout));
+    }
+
     pub async fn broadcasts(&self) -> Vec<Vec<u8>> {
         self.inner.broadcasts.lock().await.clone()
+    }
+
+    /// A network upgrade, which is what changes the ZIP 244 sighash.
+    pub async fn set_branch_id(&self, branch_id: u32) {
+        *self.inner.branch_id.lock().await = branch_id;
     }
 }
 
@@ -96,11 +113,14 @@ async fn node_rpc(
     axum::Json(call): axum::Json<RpcCall>,
 ) -> axum::Json<serde_json::Value> {
     let result = match call.method.as_str() {
-        "getblockchaininfo" => serde_json::json!({
-            "chain": "test",
-            "blocks": *inner.height.lock().await,
-            "consensus": { "chaintip": format!("{BRANCH_ID:08x}") },
-        }),
+        "getblockchaininfo" => {
+            let branch = *inner.branch_id.lock().await;
+            serde_json::json!({
+                "chain": "test",
+                "blocks": *inner.height.lock().await,
+                "consensus": { "chaintip": format!("{branch:08x}") },
+            })
+        }
         "gettxout" => {
             let txid = call.params[0].as_str().unwrap_or_default().to_string();
             let vout = call.params[1].as_u64().unwrap_or(0) as u32;
@@ -320,6 +340,39 @@ impl TestUser {
         zecp2p_escrow::dlc::pre_sign(&secp, &digest, &self.u_priv, &y)
     }
 
+    /// Signs the refund, the way the page does at `T`: `u` alone, spending the
+    /// timeout branch to a transparent address.
+    pub fn sign_refund(&self, order: &Order, funding_txid: &[u8; 32], vout: u32) -> Vec<u8> {
+        let terms = zecp2p_escrow::tx::EscrowTerms {
+            funding_txid: *funding_txid,
+            vout,
+            amount_zat: order.quote.amount_zat,
+            u_pub: order.u_pub,
+            l_pub: order.l_pub,
+            refund_height: order.refund_height,
+            consensus_branch_id: order.consensus_branch_id,
+        };
+        let user_script = zecp2p_escrow::address::script_pubkey_for(
+            "tmVHejhMFq979Z7oRwseWMW7snYoQsj22yn",
+            zecp2p_escrow::address::AddrNetwork::Test,
+        )
+        .expect("a valid testnet address");
+        let redeem = terms.redeem_script().expect("valid keys");
+        let fee = zecp2p_escrow::fees::refund_fee_to_transparent_zat(redeem.len());
+        let tx = zecp2p_escrow::tx::build_refund(&terms, &user_script, fee).expect("builds");
+        let digest = tx.sighash().expect("digest");
+
+        let secp = secp256k1::Secp256k1::new();
+        let key = secp256k1::SecretKey::from_slice(&self.u_priv.secret_bytes()).unwrap();
+        let sig = secp.sign_ecdsa(&secp256k1::Message::from_digest(digest), &key);
+        let script_sig = zecp2p_escrow::script::refund_script_sig(
+            &zecp2p_escrow::tx::encode_signature(&sig),
+            &redeem,
+        );
+        zecp2p_escrow::tx::serialize_refund(&terms, &user_script, fee, &script_sig)
+            .expect("serializes")
+    }
+
     /// Pre-signs an arbitrary digest, for the tests that prove the gate holds.
     pub fn pre_sign_over_digest(
         &self,
@@ -406,6 +459,84 @@ impl FiatRail for TestFiat {
             encoded_payment_details: hex::encode(vec![0u8; 448]),
         })
     }
+}
+
+/// A rail that counts what it was asked to send.
+///
+/// The assertion the audit's pay-side findings need is "no dollars left", and
+/// that is only meaningful if something is counting.
+pub struct CountingFiat {
+    sent: std::sync::atomic::AtomicUsize,
+}
+
+impl CountingFiat {
+    pub fn new() -> Self {
+        Self {
+            sent: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    pub fn payments(&self) -> usize {
+        self.sent.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl FiatRail for CountingFiat {
+    async fn pay(&self, leg: &zecp2p_taker::auto::rail::FiatLeg) -> anyhow::Result<PaidFiat> {
+        self.sent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(PaidFiat {
+            cents: u64::try_from(leg.payment.cents())?,
+            fiat_left: true,
+        })
+    }
+
+    async fn attest(
+        &self,
+        leg: &zecp2p_taker::auto::rail::FiatLeg,
+    ) -> anyhow::Result<zecp2p_escrow::lp_client::WireAttestation> {
+        Ok(zecp2p_escrow::lp_client::WireAttestation {
+            intent_hash: hex::encode(leg.intent_hash.0),
+            release_amount: leg.intent_amount_6dec.to_string(),
+            data_hash: hex::encode([0u8; 32]),
+            signature: hex::encode([0u8; 65]),
+            encoded_payment_details: hex::encode(vec![0u8; 448]),
+        })
+    }
+}
+
+/// A coordinator from a caller-supplied configuration.
+///
+/// For the tests that need to change a limit rather than a service URL.
+pub fn coordinator_from_config(
+    config: CoordinatorConfig,
+    scanner: Arc<dyn FundingScanner>,
+    node: &FakeNode,
+    fiat: Option<Arc<dyn FiatRail>>,
+) -> Arc<AppState> {
+    std::env::set_var("ZECP2P_LP_PRIV", hex::encode([0x22u8; 32]));
+    let curator = FakeCurator::spawn_blocking_new();
+    let mut config = config;
+    config.zec.rpc_url = node.url.clone();
+    config.zkp2p.api_url = curator.url.clone();
+    std::mem::forget(curator);
+
+    let mut builder = AppStateBuilder::new(config).with_scanner(scanner);
+    if let Some(f) = fiat {
+        builder = builder.with_fiat(f);
+    }
+    builder.build().expect("the test coordinator builds")
+}
+
+/// A coordinator with a caller-supplied rail.
+pub fn coordinator_with_fiat(
+    dir: &std::path::Path,
+    scanner: Arc<dyn FundingScanner>,
+    node: &FakeNode,
+    attestor: &TestAttestor,
+    fiat: Arc<dyn FiatRail>,
+) -> Arc<AppState> {
+    build(dir, scanner, node, Some(attestor), Some(fiat))
 }
 
 /// A curator stub, so no test reaches the live zk-p2p API.

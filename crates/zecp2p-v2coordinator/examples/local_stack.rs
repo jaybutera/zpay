@@ -24,11 +24,18 @@ use tokio::sync::Mutex;
 const BRANCH_ID: u32 = 0x37a5_165b;
 const CURATOR_HASH: [u8; 32] = [0x5au8; 32];
 
+/// A txid in display order, and a vout.
+type Outpoint = (String, u32);
+/// A scriptPubKey in hex, a value, and a confirmation count.
+type NodeUtxo = (String, u64, u32);
+/// One output at an address: txid, vout, value, scriptPubKey.
+type AddressOutput = (String, u32, u64, String);
+
 struct Node {
     height: Mutex<u32>,
-    utxos: Mutex<HashMap<(String, u32), (String, u64, u32)>>,
+    utxos: Mutex<HashMap<Outpoint, NodeUtxo>>,
     /// Outputs by address, for the coordinator's block scan.
-    by_address: Mutex<HashMap<String, Vec<(String, u32, u64, String)>>>,
+    by_address: Mutex<HashMap<String, Vec<AddressOutput>>>,
     broadcasts: Mutex<Vec<String>>,
 }
 

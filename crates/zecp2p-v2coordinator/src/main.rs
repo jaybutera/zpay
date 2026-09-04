@@ -125,6 +125,31 @@ async fn main() -> Result<()> {
         }
     }
 
+    // The address-index scanner needs zcashd with `addressindex=1`; zebrad
+    // does not implement `getaddressutxos` at all. Asking now means an
+    // operator hears about it at startup rather than from an order that never
+    // leaves `awaiting_zec`.
+    if state.config.zec.scanner == zecp2p_v2coordinator::config::ScannerKind::AddressIndex {
+        let rpc = state.rpc.clone();
+        let supported = tokio::task::spawn_blocking(move || {
+            zecp2p_v2coordinator::funding::NodeRpc::new(&rpc)
+                .map(|node| node.supports_address_index())
+                .unwrap_or(false)
+        })
+        .await
+        .unwrap_or(false);
+        if supported {
+            tracing::info!("the node answers getaddressutxos");
+        } else {
+            tracing::warn!(
+                "zec.scanner is address_index but this node does not answer \
+                 getaddressutxos. zcashd needs addressindex=1 and zebrad does not \
+                 implement it at all, so no funding output will ever be found. Switch \
+                 zec.scanner to block_scan."
+            );
+        }
+    }
+
     if !state.config.serve.live_payments {
         tracing::warn!(
             "serve.live_payments is false: this coordinator drives the browser and stops \

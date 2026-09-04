@@ -101,27 +101,56 @@ impl VenmoRail {
 
 #[async_trait::async_trait]
 impl FiatRail for VenmoRail {
-    /// The session and a logged-in tab, checked before anything is committed.
+    /// Everything `pay` will refuse on, asked before anything is committed.
     ///
-    /// Both are operator state rather than trade state: a stale cookie or a
-    /// closed browser means this coordinator cannot pay *yet*, and the escrow
-    /// should wait and then refund, not fail.
+    /// All of it is operator state rather than trade state: a stale cookie, a
+    /// closed browser, a tab sitting on the login page. Each means this
+    /// coordinator cannot pay *yet*, and an escrow whose LP never started is
+    /// one the user refunds at `T`.
+    ///
+    /// R1-4: this used to check that a Venmo tab existed but not that it was
+    /// signed in, while `VenmoBrowser::pay` bails on exactly that
+    /// (`session_looks_live`). So a tab bounced to `/signin` passed preflight,
+    /// `Paying` was journaled, `pay` refused, and the order went terminal
+    /// saying a payment may have left - when the browser had not been driven at
+    /// all. The rule this now follows: **preflight must refuse on every
+    /// condition `pay` refuses on, before the journal is written.**
     async fn preflight(&self) -> Result<()> {
         // The enclave replays this to prove the payment, so a payment sent
         // without one could never be recovered from the escrow.
         self.session()?;
-        self.browser
+
+        // `find_venmo_tab` is the payment path's own finder and deliberately
+        // will not create a tab: a payment that opened its own tab would be
+        // driving a page nobody had signed into.
+        let tab = self
+            .browser
             .find_venmo_tab()
             .await
             .context("no logged-in Venmo tab to pay from")?;
+
+        // The same predicate `pay` uses, from the same place, so the two cannot
+        // drift into disagreeing about what signed out looks like.
+        if !VenmoBrowser::session_looks_live(&tab) {
+            anyhow::bail!(
+                "the Venmo tab is on {} and looks signed out; sign in again and the \
+                 escrow will be paid on the next sweep",
+                tab.url
+            );
+        }
         Ok(())
     }
 
+    /// Sends the dollars.
+    ///
+    /// No session recheck here. It used to be, and it was on the wrong side of
+    /// the line: a failure inside `pay` is treated as "money may have left",
+    /// so a *cheap and certain* refusal placed here turns an operator problem
+    /// into a terminal order. Every condition that can be checked without
+    /// driving the browser belongs in `preflight`, before the journal claim.
+    /// What remains here is the drive itself, whose failures really are
+    /// ambiguous.
     async fn pay(&self, leg: &FiatLeg) -> Result<PaidFiat> {
-        // Checked again: `preflight` ran on an earlier tick and a session can
-        // expire between then and now.
-        let _ = self.session()?;
-
         let sent = zecp2p_taker::auto::fiat::pay(&self.browser, leg, &self.note, self.mode).await?;
         Ok(PaidFiat {
             cents: u64::try_from(leg.payment.cents())

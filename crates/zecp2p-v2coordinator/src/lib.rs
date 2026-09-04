@@ -26,7 +26,19 @@
 //!    split rather than from anything the request carried.
 //! 3. The chain is still on the branch the pre-signature was made for, and the
 //!    pay deadline has not passed. `lp::check_branch` and `lp::may_pay_before`,
-//!    re-read immediately before the browser opens.
+//!    re-read immediately before the browser opens. **`check_branch` is a
+//!    separate call and has to be made explicitly**: `lp::evaluate` never reads
+//!    the branch id, so `require_payable` alone does not cover it. Round 1 of
+//!    the audit found this paragraph describing a check the code was not
+//!    making.
+//!
+//! And one thing that must be true before a *second* dollar leaves:
+//!
+//! 4. No payment for this escrow, or any other, is already under way. Read
+//!    from the journal in `slot.rs`, not from the order store: the store says
+//!    `Locked` both for an order that has not started and for one whose process
+//!    died halfway through paying, and only the journal line - written before
+//!    the click - tells those apart.
 //!
 //! Everything else in this crate exists to get to those three checks with the
 //! right arguments, and to record enough that a crash between them is
@@ -39,6 +51,7 @@ pub mod order;
 pub mod quote;
 #[cfg(feature = "test-rails")]
 pub mod simulated_rail;
+pub mod slot;
 pub mod state;
 pub mod store;
 pub mod view;

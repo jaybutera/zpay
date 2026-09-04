@@ -648,6 +648,33 @@ pub fn txid_of_signed(raw_tx: &[u8]) -> Result<[u8; 32], TxError> {
     Ok(*tx.txid().as_ref())
 }
 
+/// Whether a signed transaction spends `txid:vout`.
+///
+/// For a caller that has been handed a transaction and a claim about what it
+/// spends, and must not take the claim on trust. The coordinator's refund
+/// endpoint is the case this exists for: it broadcasts a transaction the user
+/// signed with a key the server has never seen, so the only thing the server
+/// can check is that the bytes really spend the escrow it is being asked about.
+/// Without that check the endpoint relays anything.
+///
+/// `txid` is internal byte order, as everywhere else in this crate.
+pub fn spends_outpoint(raw_tx: &[u8], txid: &[u8; 32], vout: u32) -> Result<bool, TxError> {
+    use zcash_primitives::transaction::Transaction;
+    use zcash_protocol::consensus::BranchId;
+
+    let tx = Transaction::read(raw_tx, BranchId::Nu5)
+        .map_err(|e| TxError::Serialize(format!("could not parse the transaction: {e}")))?;
+
+    let Some(bundle) = tx.transparent_bundle() else {
+        // A transaction with no transparent inputs cannot spend a P2SH escrow.
+        return Ok(false);
+    };
+    Ok(bundle.vin.iter().any(|input| {
+        // `OutPoint::hash` is the internal order the wire format uses.
+        input.prevout().hash() == txid && input.prevout().n() == vout
+    }))
+}
+
 /// The txid a *signed* release will have, computed from the unsigned form plus
 /// the signatures that will go into it.
 ///
