@@ -56,3 +56,6 @@ http-body-util = "0.1"
 zecp2p-attestor = { path = "../zecp2p-attestor", features = ["test-signer"] }
 zecp2p-escrow = { path = "../zecp2p-escrow", features = ["test-signer"] }
 zecp2p-v2coordinator = { path = ".", features = ["test-rails"] }
+# `Journal::append_unchecked`, for staging journal state in tests. The binary
+# never sees it: the feature is on here and nowhere else.
+zecp2p-taker = { path = "../zecp2p-taker", features = ["journal-fixtures"] }

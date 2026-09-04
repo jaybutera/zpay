@@ -236,6 +236,12 @@ pub fn holder_among(latest: &[FillRecord], mine: &WorkId) -> Option<FillRecord> 
 /// The states past reservation. `Seen` is not one of them: it is written before
 /// any network call and means only that somebody intends to pay.
 ///
+/// R7-c: `Signalled` is one of them. No payment has gone out at that point, but
+/// an intent has, and it holds the maker's USDC and a 14-day stake lock. An
+/// intent-readback error rewinds the scan cursor, and without this the next
+/// poll signals a *second* intent against the same deposit - one payment, two
+/// stakes locked. Whoever owns the first has to cancel it or let it expire.
+///
 /// R6-2: both daemons need this against their *own* work id, not just against
 /// somebody else's. The taker re-enters its own deposits routinely - an error
 /// anywhere after the payment rewinds the scan cursor - and without this check
@@ -245,7 +251,11 @@ pub fn holder_among(latest: &[FillRecord], mine: &WorkId) -> Option<FillRecord> 
 pub fn may_already_have_paid(state: FillState) -> bool {
     matches!(
         state,
-        FillState::Signalling | FillState::Paying | FillState::Paid | FillState::NeedsOperator
+        FillState::Signalling
+            | FillState::Signalled
+            | FillState::Paying
+            | FillState::Paid
+            | FillState::NeedsOperator
     )
 }
 
@@ -317,6 +327,92 @@ pub fn slot_verdict(latest: &[FillRecord], mine: &WorkId) -> SlotVerdict {
         return SlotVerdict::HeldByAnother(holder);
     }
     SlotVerdict::Free
+}
+
+/// Gives a reservation back, and only if it is still ours to give.
+///
+/// R7-1: every give-back in both daemons wrote its new state blind - `record`
+/// checks that the work id exists and nothing else. So a second coordinator
+/// that reserved, found no logged-in browser and retracted would write
+/// `Cancelled` over the *winner's* `Paying` line, and the next sweep read a
+/// free slot and paid again. Round 6 closed one arm of that; the other four in
+/// the coordinator and five in the taker had the same shape.
+///
+/// This is the one function both daemons use, and it is a compare-and-set: the
+/// latest line for the work must still be the record the caller is holding -
+/// same state, same timestamp - or nothing is written. Anything else means
+/// somebody moved the fill on, and their line is the one that matters.
+///
+/// Never fatal. Failing to release leaves the slot held, which an operator sees
+/// as a stuck fill; writing over somebody else's claim is what costs money.
+pub fn release_if_still_ours(journal: &Journal, held: &FillRecord, to: FillState, why: &str) {
+    let work = held.work_id();
+    let result = journal.claim_if(|existing| {
+        let Some(latest) = existing.iter().find(|r| r.work_id() == work) else {
+            // Nothing to release. A caller holding a record for work the
+            // journal has never seen is confused, and writing would open a fill
+            // through the back door.
+            return None;
+        };
+        if latest.state != held.state || latest.updated_at != held.updated_at {
+            return None;
+        }
+        let mut giving_back = held.clone();
+        giving_back.state = to;
+        giving_back.note = Some(format!("not paid: {why}"));
+        Some(giving_back)
+    });
+
+    match result {
+        Ok(Some(_)) => {}
+        Ok(None) => tracing::warn!(
+            %work,
+            expected = ?held.state,
+            "not releasing the payment slot: the journal has moved on since this fill \
+             reserved it, so the latest line belongs to somebody else. Leaving it alone."
+        ),
+        Err(e) => tracing::error!(
+            %work,
+            error = %e,
+            "could not release the payment slot; it stays held until an operator clears it"
+        ),
+    }
+}
+
+/// Whether this fill may take the next step, given the line it believes it left.
+///
+/// The question a fill asks *mid-flight*, which is not the one `slot_verdict`
+/// answers. By the time a taker fill reaches its `Paying` claim it has written
+/// `Signalling` and `Signalled` for its own work, and those states block a
+/// *new* fill precisely because they mean an intent is outstanding - so asking
+/// `slot_verdict` here would have a fill refuse its own progress.
+///
+/// The distinction is whose line it is. `held` is the record this caller wrote
+/// and is carrying; if the latest line for the work is still that one, the fill
+/// is where it thinks it is and may continue. If it has moved, somebody else is
+/// driving this work and this caller must stop - which is the two-instance case
+/// (R7-2) that the old "skip my own work id" check let straight through.
+// The `Err` carries a whole `FillRecord`, which clippy notes is large. It is
+// the right shape: the caller needs the offending record to tell an operator
+// what stopped it, and the error path is the rare one.
+#[allow(clippy::result_large_err)]
+pub fn may_continue(latest: &[FillRecord], held: &FillRecord) -> Result<(), SlotVerdict> {
+    let work = held.work_id();
+
+    // Somebody else's open fill always stops us, whatever our own line says.
+    if let Some(holder) = holder_among(latest, &work) {
+        return Err(SlotVerdict::HeldByAnother(holder));
+    }
+
+    match latest.iter().find(|r| r.work_id() == work) {
+        // Still our line: same state, same timestamp. Carry on.
+        Some(ours) if ours.state == held.state && ours.updated_at == held.updated_at => Ok(()),
+        // Moved on without us. Another instance is driving this work, and the
+        // states it has reached may already have spent money.
+        Some(other) => Err(SlotVerdict::OwnPaymentUnderway(other.clone())),
+        // Gone entirely, which should not happen: the journal is append-only.
+        None => Err(SlotVerdict::OwnPaymentUnderway(held.clone())),
+    }
 }
 
 /// The gate a fill must pass before it touches a chain, and the reservation it
@@ -428,7 +524,15 @@ impl Journal {
 
     /// Append a state change. Flushed before returning, because the caller's
     /// next act is the one this record exists to describe.
-    pub fn record(&self, record: &FillRecord) -> Result<()> {
+    /// Returns the line as written, including the timestamp it was stamped
+    /// with.
+    ///
+    /// R7-1: the caller needs that back. `release_if_still_ours` recognises its
+    /// own line by state *and* `updated_at`, and a caller holding a pre-write
+    /// copy would never match - so every give-back would decline and every
+    /// refused fill would leave the slot held forever. Callers that carry a
+    /// record across steps assign this back to it.
+    pub fn record(&self, record: &FillRecord) -> Result<FillRecord> {
         let mut record = record.clone();
         record.updated_at = chrono::Utc::now();
         let line = serde_json::to_string(&record).context("could not serialise a fill record")?;
@@ -459,16 +563,29 @@ impl Journal {
             format!("could not read the journal at {}", self.path.display())
         })?);
         let work = record.work_id();
-        if !existing.iter().any(|r| r.work_id() == work) {
-            anyhow::bail!(
+        match existing.iter().find(|r| r.work_id() == work) {
+            None => anyhow::bail!(
                 "refusing to open a fill for {work} through `record`. A first line for a \
                  work item is a claim on the one payment slot, and it has to be taken \
                  through `open_fill`, which decides and writes under one lock. Appending \
                  it directly is how the same escrow gets paid twice."
-            );
+            ),
+            // R7-a: and the fill has to still be running. A finished fill -
+            // `Fulfilled`, or `Cancelled` after somebody gave the slot back -
+            // holds nothing, so appending to it is opening a new one with the
+            // gate skipped. That is the same hole as the missing-work case,
+            // reached by a caller holding a stale record.
+            Some(latest) if !latest.state.is_open() => anyhow::bail!(
+                "refusing to reopen {work}, which is {:?}. A finished fill holds no slot, \
+                 so continuing it would put a payment past the gate; take a new one \
+                 through `open_fill`.",
+                latest.state
+            ),
+            Some(_) => {}
         }
 
-        Self::write_line(&mut file, &line, &self.path)
+        Self::write_line(&mut file, &line, &self.path)?;
+        Ok(record)
     }
 
     /// Appends a line without the gate, for tests and for recovery tooling.
@@ -478,8 +595,12 @@ impl Journal {
     /// state, and an operator following the recovery runbook, who has read the
     /// Venmo feed and is the one making the decision.
     ///
-    /// Production code takes `open_fill` instead. Nothing in either daemon
-    /// calls this.
+    /// Production code takes `open_fill` instead. R7-b: this is behind the
+    /// `journal-fixtures` feature, which only the dev-dependencies turn on, so
+    /// a daemon binary cannot compile a call to it even by accident. A guard
+    /// with a public bypass beside it is a suggestion; this one is not
+    /// reachable from the code that pays.
+    #[cfg(feature = "journal-fixtures")]
     pub fn append_unchecked(&self, record: &FillRecord) -> Result<()> {
         let mut record = record.clone();
         record.updated_at = chrono::Utc::now();

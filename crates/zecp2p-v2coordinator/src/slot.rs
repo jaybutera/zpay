@@ -38,38 +38,13 @@ use anyhow::{Context, Result};
 use zecp2p_taker::auto::journal::{FillRecord, FillState, Journal};
 use zecp2p_taker::auto::rail::WorkId;
 
-/// Whether an open journal record must hold the payment slot.
-///
-/// R2-2: this used to be `fiat_may_have_left() || state == Paying`, which let
-/// `NeedsOperator` through. That is the state `settle` writes when `fiat::pay`
-/// fails - the case whose whole meaning is "a payment may have left and a human
-/// has to look" - so the slot was freed by exactly the outcome that most needs
-/// it held. The next order for the same handle then paid, into a feed that
-/// already had an entry nobody had reconciled.
-///
-/// The rule is the taker's: **every open record holds the slot.** `is_open` is
-/// false only for `Fulfilled` and `Cancelled`, both of which are somebody
-/// having decided the fill is over. Anything else - `Seen`, `Signalling`,
-/// `Signalled`, `Paying`, `Paid`, `NeedsOperator` - is unfinished work against
-/// one Venmo balance, and `Journal::in_flight` treats all of it the same way.
-fn holds_the_slot(state: FillState) -> bool {
-    state.is_open()
-}
-
-/// Whether an open record for *this* work item means a payment may already
-/// have gone out for it.
-///
-/// Narrower than [`holds_the_slot`], because the two answers differ: a `Seen`
-/// line for this order is its own claim on the slot and must not lock the order
-/// out of its first payment, whereas a `Seen` line for a *different* order
-/// still occupies the one balance.
-fn may_already_have_paid(state: FillState) -> bool {
-    state.fiat_may_have_left()
-        || matches!(
-            state,
-            FillState::Paying | FillState::NeedsOperator | FillState::Signalling
-        )
-}
+// R7-2: the rule lives in `zecp2p_taker::auto::journal` and nothing here
+// restates it. This module had its own `holds_the_slot` and
+// `may_already_have_paid`, and the two copies drifted: the coordinator gained
+// an own-work guard in round 5 that the taker did not get until round 6, and
+// the taker's `Signalled` case was missing from this one. Two daemons sharing
+// one Venmo balance need one definition of "may I pay".
+use zecp2p_taker::auto::journal::may_already_have_paid;
 
 /// Why a payment may not start.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,7 +117,7 @@ pub fn fiat_may_have_left(journal: &Journal, work: &WorkId) -> Result<bool> {
 ///
 /// The state written is `Seen`, not `Paying`, and the difference matters.
 /// `Seen` holds the slot against every other work item, because
-/// [`holds_the_slot`] counts every open record - but it does not assert that
+/// `slot_verdict` counts every open record - but it does not assert that
 /// money may have moved, so this order can still [`retract`] it when the chain
 /// check or the preflight refuses. `Paying` comes later, from [`claim`], and is
 /// never retracted: past that point a crash means a human reads the feed.
@@ -157,35 +132,26 @@ pub fn take(
 ) -> Result<Result<FillRecord, SlotRefusal>> {
     let mut refusal = None;
     let claimed = journal.claim_if(|existing| {
-        for record in existing {
-            if !holds_the_slot(record.state) {
-                continue;
+        // R7-2: the shared rule, not a second copy of it. `slot_verdict` asks
+        // the own-work question first and everybody else's second, and both
+        // daemons ask it the same way - the two copies had already drifted
+        // once, and a drift here is a payment.
+        match zecp2p_taker::auto::journal::slot_verdict(existing, work) {
+            zecp2p_taker::auto::journal::SlotVerdict::Free => {}
+            zecp2p_taker::auto::journal::SlotVerdict::OwnPaymentUnderway(r) => {
+                refusal = Some(SlotRefusal::ThisOrderMayHavePaid {
+                    work: work.to_string(),
+                    state: r.state,
+                });
+                return None;
             }
-            let holder = record.work_id();
-            if &holder == work {
-                // R5-a: an own-work record that says a payment may have moved
-                // stops us, and that check has to be here rather than only in
-                // the caller - two coordinators sharing a state directory both
-                // reach this point for the same order, and each would otherwise
-                // treat the other's line as its own and claim over it.
-                if may_already_have_paid(record.state) {
-                    refusal = Some(SlotRefusal::ThisOrderMayHavePaid {
-                        work: holder.to_string(),
-                        state: record.state,
-                    });
-                    return None;
-                }
-                // A `Seen` for this order and nothing further: our own earlier
-                // attempt, or another instance still deciding. Claiming over it
-                // is safe because neither has paid, and the `Paying` claim below
-                // re-reads under the lock before anything is sent.
-                continue;
+            zecp2p_taker::auto::journal::SlotVerdict::HeldByAnother(r) => {
+                refusal = Some(SlotRefusal::HeldByAnother {
+                    work: r.work_id().to_string(),
+                    state: r.state,
+                });
+                return None;
             }
-            refusal = Some(SlotRefusal::HeldByAnother {
-                work: holder.to_string(),
-                state: record.state,
-            });
-            return None;
         }
 
         let mut record = FillRecord::new_zec(
@@ -216,15 +182,13 @@ pub fn take(
 /// A failure here leaves the slot held by a `Seen` line, which blocks payments
 /// until an operator looks - the safe direction, and the reason this is
 /// best-effort rather than fatal.
-pub fn retract(journal: &Journal, mut record: FillRecord, why: &str) {
-    record.state = FillState::Cancelled;
-    record.note = Some(format!("not paid: {why}"));
-    if let Err(e) = journal.record(&record) {
-        tracing::error!(
-            error = %e,
-            "could not release the payment slot after deciding not to pay; it stays held"
-        );
-    }
+pub fn retract(journal: &Journal, record: FillRecord, why: &str) {
+    zecp2p_taker::auto::journal::release_if_still_ours(
+        journal,
+        &record,
+        FillState::Cancelled,
+        why,
+    );
 }
 
 /// Writes the claim that must precede a payment.
@@ -242,35 +206,34 @@ pub fn claim(
     let work = reserved.work_id();
 
     // R4-3: the slot is read again, under the lock, immediately before the
-    // `Paying` line goes down. The reservation above closed most of the window,
-    // but "most" is not the standard for the last write before money moves:
-    // between the reservation and here sit a chain round-trip and the rail's
-    // preflight, and a second daemon that had already reserved could have
-    // become the holder in that time.
+    // `Paying` line goes down. The reservation closed most of the window, but
+    // "most" is not the standard for the last write before money moves: between
+    // the reservation and here sit a chain round-trip and the rail's preflight.
+    //
+    // R7-2: through the same `slot_verdict` the taker uses, so the own-work
+    // case - a second instance already paying this order - cannot be caught on
+    // one daemon and missed on the other.
     let mut lost = None;
     let written = journal.claim_if(|existing| {
-        for record in existing {
-            if !holds_the_slot(record.state) {
-                continue;
-            }
-            let holder = record.work_id();
-            if holder == work {
-                // R5-a: our own work id, but a state past reservation means
-                // somebody is already paying this order - a second coordinator
-                // on the same state directory, or this one re-entered. Writing
-                // a second `Paying` line here is how one order gets paid twice.
-                if may_already_have_paid(record.state) {
-                    lost = Some(SlotRefusal::ThisOrderMayHavePaid {
-                        work: holder.to_string(),
-                        state: record.state,
-                    });
-                    return None;
+        // `may_continue`, not `slot_verdict`: this fill is mid-flight and is
+        // holding its own reservation, so the question is "is the latest line
+        // still mine" rather than "is the slot free". The taker asks the same
+        // one at the same point.
+        if let Err(verdict) = zecp2p_taker::auto::journal::may_continue(existing, &reserved) {
+            lost = Some(match verdict {
+                zecp2p_taker::auto::journal::SlotVerdict::HeldByAnother(r) => {
+                    SlotRefusal::HeldByAnother {
+                        work: r.work_id().to_string(),
+                        state: r.state,
+                    }
                 }
-                continue;
-            }
-            lost = Some(SlotRefusal::HeldByAnother {
-                work: holder.to_string(),
-                state: record.state,
+                zecp2p_taker::auto::journal::SlotVerdict::OwnPaymentUnderway(r) => {
+                    SlotRefusal::ThisOrderMayHavePaid {
+                        work: work.to_string(),
+                        state: r.state,
+                    }
+                }
+                zecp2p_taker::auto::journal::SlotVerdict::Free => unreachable!("Err is not Free"),
             });
             return None;
         }
@@ -328,6 +291,7 @@ pub fn fulfilled(
     record.note = Some(format!("released in {release_txid}"));
     journal
         .record(&record)
+        .map(|_| ())
         .context("could not record the fill as fulfilled; the slot will stay held")
 }
 

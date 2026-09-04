@@ -2123,17 +2123,28 @@ async fn a_second_coordinator_cannot_pay_the_same_order() {
 
 #[tokio::test]
 async fn a_losing_instance_does_not_cancel_the_winners_claim() {
-    // R6-1, which the R5-1 retract introduced. `claim` bailed with a string, so
-    // `settle` retracted on *every* claim error - including the one that means
-    // "somebody is already paying this order". That wrote `Cancelled` over the
-    // winner's `Paying` line while its dollars were in flight, so the next sweep
-    // read a free slot, re-took the order and paid a second time. The
-    // single-instance guard from R5-a was undone by the retract from R5-1.
+    // R6-1, and R7-3: the earlier version of this test never reached the arm it
+    // was written for. It put the winner's `Paying` line on disk *before*
+    // calling `advance`, so `take` refused first and `claim` was never
+    // exercised - the round-6 bug could be re-inserted verbatim and every test
+    // stayed green.
+    //
+    // The line has to land *between* `take` and `claim`, which is the
+    // preflight window. A slow rail holds it open long enough for the intruder
+    // to claim the same work id, which is what a second coordinator on one
+    // state directory does.
+    //
+    // Verifying by reverting: there are two defences here and both must go to
+    // see this fail. R6-1 is the typed refusal that keeps `settle` from
+    // retracting on "somebody is already paying"; R7-1 is the compare-and-set
+    // inside `retract`, which declines to write over a line that has moved on.
+    // Either alone still protects the winner's claim - which is the point of
+    // fixing the whole class rather than one arm.
     let dir = tempfile::tempdir().unwrap();
     let node = FakeNode::spawn().await;
     let scanner = Arc::new(FakeScanner::new());
     let attestor = TestAttestor::new();
-    let fiat = Arc::new(CountingFiat::new());
+    let fiat = Arc::new(SlowFiat::new(400));
     let state = coordinator_with_fiat(dir.path(), scanner.clone(), &node, &attestor, fiat.clone());
     let app = zecp2p_v2coordinator::web::router(state.clone());
     let user = TestUser::new();
@@ -2142,21 +2153,27 @@ async fn a_losing_instance_does_not_cancel_the_winners_claim() {
         locked_order(&app, &state, &node, &scanner, &attestor, &user).await;
     let work = zecp2p_v2coordinator::slot::work_id_for(&funding_txid, 0);
 
-    // Two instances, in the order the reviewer reproduced. Both `take` the
-    // order - an own-work `Seen` is allowed through, because that is what a
-    // retry looks like - and then one of them claims.
-    //
-    // This instance reserves first, and holds that reservation across its chain
-    // call and preflight, which is where the real one sits.
-    let ours = zecp2p_v2coordinator::slot::take(&state.journal, &work, 700_000, "alice")
-        .unwrap()
-        .expect("the slot is free");
+    // Make sure the order is waiting to be paid, whatever the presign task did.
+    let mut relocked = state.store.get(&order_id).unwrap();
+    relocked.stage = Stage::Locked;
+    relocked.payment = None;
+    relocked.release_txid = None;
+    state.store.put(&relocked).unwrap();
 
-    // The other instance takes the same order and wins the claim: it is now
-    // driving a browser, and its dollars are in flight.
+    // This instance starts paying: it takes the slot, then sits in preflight.
+    let driving = {
+        let s = state.clone();
+        let id = order_id.clone();
+        tokio::spawn(async move { zecp2p_v2coordinator::driver::advance(&s, &id).await })
+    };
+
+    // While it is in there, a second instance takes the same order - an
+    // own-work `Seen` is allowed through, because that is what a retry looks
+    // like - and wins the claim. Its dollars are now in flight.
+    tokio::time::sleep(std::time::Duration::from_millis(120)).await;
     let theirs = zecp2p_v2coordinator::slot::take(&state.journal, &work, 700_000, "alice")
         .unwrap()
-        .expect("an own-work Seen does not block a retry");
+        .expect("an own-work Seen does not block a second instance");
     zecp2p_v2coordinator::slot::claim(
         &state.journal,
         theirs,
@@ -2164,41 +2181,13 @@ async fn a_losing_instance_does_not_cancel_the_winners_claim() {
         1_700_000_000_000,
     )
     .unwrap()
-    .expect("the winner claims");
+    .expect("the intruder claims");
 
-    // Now this instance reaches its own claim, holding a stale reservation.
-    // What it must not do is retract - that writes `Cancelled` over the
-    // winner's `Paying` line while the dollars are gone.
-    let refusal = zecp2p_v2coordinator::slot::claim(
-        &state.journal,
-        ours.clone(),
-        alloy::primitives::B256::repeat_byte(0xbb),
-        1_700_000_000_000,
-    )
-    .unwrap()
-    .expect_err("the loser must be refused");
-    assert!(
-        matches!(
-            refusal,
-            zecp2p_v2coordinator::slot::SlotRefusal::ThisOrderMayHavePaid { .. }
-        ),
-        "the refusal must say a payment is under way, not merely that the slot is busy: \
-         {refusal:?}"
-    );
+    // The first instance now reaches its own claim and loses. It must not
+    // retract: that writes `Cancelled` over the winner's `Paying` line while
+    // the dollars are gone, and the next sweep then reads a free slot.
+    let _ = driving.await;
 
-    // And drive the real path to the same point, which is what must not retract.
-    let mut relocked2 = state.store.get(&order_id).unwrap();
-    relocked2.stage = Stage::Locked;
-    relocked2.payment = None;
-    relocked2.release_txid = None;
-    state.store.put(&relocked2).unwrap();
-
-    let paid_before = fiat.payments();
-    zecp2p_v2coordinator::driver::advance(&state, &order_id)
-        .await
-        .expect("refusing is not an error");
-    // The winner's claim must still stand. If it was cancelled, the next sweep
-    // pays again - which is the whole bug.
     let latest: Vec<_> = state
         .journal
         .latest()
@@ -2206,17 +2195,27 @@ async fn a_losing_instance_does_not_cancel_the_winners_claim() {
         .into_iter()
         .filter(|r| r.work_id() == work)
         .collect();
-    assert_eq!(latest.len(), 1);
+    assert_eq!(latest.len(), 1, "one line per work item");
     assert_eq!(
         latest[0].state,
         zecp2p_taker::auto::journal::FillState::Paying,
-        "the loser cancelled the winner's claim while its dollars were in flight"
+        "the loser cancelled the winner's claim while its dollars were in flight; the \
+         next sweep would read a free slot and pay again"
     );
-    assert_eq!(fiat.payments(), paid_before, "it paid over the top");
 
-    // And a following sweep still refuses, rather than reading a free slot.
+    // And the proof of the consequence: another sweep must still refuse.
+    let paid_before = fiat.payments();
+    let mut relocked = state.store.get(&order_id).unwrap();
+    relocked.stage = Stage::Locked;
+    relocked.payment = None;
+    state.store.put(&relocked).unwrap();
     zecp2p_v2coordinator::driver::advance(&state, &order_id)
         .await
         .expect("refusing is not an error");
-    assert_eq!(fiat.payments(), paid_before, "the next sweep paid a second time");
+    assert_eq!(
+        fiat.payments(),
+        paid_before,
+        "a second payment went out for one escrow"
+    );
 }
+

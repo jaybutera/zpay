@@ -491,3 +491,166 @@ fn a_dry_run_gives_the_slot_back() {
         "a dry run left its reservation behind, blocking the coordinator"
     );
 }
+
+// ---------- the shared give-back ----------
+
+#[test]
+fn a_give_back_will_not_write_over_a_line_that_moved_on() {
+    // R7-1, the whole class. Every reservation give-back in both daemons wrote
+    // its new state blind: `record` checked the work id existed and nothing
+    // more. So a second coordinator that reserved, found no logged-in browser
+    // and retracted would write `Cancelled` over the *winner's* `Paying` line,
+    // and the next sweep read a free slot and paid again.
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Journal::open(dir.path().join("fills.jsonl")).unwrap();
+
+    // This instance reserves.
+    let ours = open_fill(
+        &journal,
+        &WorkId::base(U256::from(4499)),
+        "deposit 4499",
+        || base_record(4499, FillState::Seen),
+    )
+    .unwrap()
+    .expect("the slot is free");
+
+    // Somebody else moves the same fill on - the winner, mid-browser.
+    let mut theirs = ours.clone();
+    theirs.state = FillState::Paying;
+    journal.record(&theirs).unwrap();
+
+    // Now this instance gives up and releases what it thinks it holds.
+    zecp2p_taker::auto::journal::release_if_still_ours(
+        &journal,
+        &ours,
+        FillState::Cancelled,
+        "no logged-in browser",
+    );
+
+    let latest = journal.latest().unwrap();
+    assert_eq!(latest.len(), 1);
+    assert_eq!(
+        latest[0].state,
+        FillState::Paying,
+        "the give-back cancelled a claim that was not its own"
+    );
+}
+
+#[test]
+fn a_give_back_does_release_a_line_that_is_still_ours() {
+    // The other half: the compare-and-set must not break the ordinary case, or
+    // every refused fill would leave the slot held.
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Journal::open(dir.path().join("fills.jsonl")).unwrap();
+
+    let ours = open_fill(
+        &journal,
+        &WorkId::base(U256::from(4499)),
+        "deposit 4499",
+        || base_record(4499, FillState::Seen),
+    )
+    .unwrap()
+    .expect("the slot is free");
+
+    zecp2p_taker::auto::journal::release_if_still_ours(
+        &journal,
+        &ours,
+        FillState::Cancelled,
+        "the chain says not yet",
+    );
+
+    assert!(
+        journal
+            .holder_against(&WorkId::zec("aa", 0))
+            .unwrap()
+            .is_none(),
+        "the slot was not released, so nothing else can ever pay"
+    );
+}
+
+#[test]
+fn two_taker_instances_do_not_both_claim_paying() {
+    // R7-2. The taker's `Paying` claim skipped its own work id in every state,
+    // so two instances on one journal both passed `open_fill` - an own `Seen`
+    // is allowed, because that is what a retry looks like - both signalled, and
+    // both claimed. Two payments for one deposit.
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Journal::open(dir.path().join("fills.jsonl")).unwrap();
+    let work = WorkId::base(U256::from(4499));
+
+    // Instance A reserves and gets as far as `Signalled`.
+    let mut a = open_fill(&journal, &work, "deposit 4499", || {
+        base_record(4499, FillState::Seen)
+    })
+    .unwrap()
+    .expect("the slot is free");
+    a.state = FillState::Signalled;
+    // The write stamps a fresh `updated_at`, and the caller carries that back:
+    // `may_continue` recognises its own line by state and timestamp, so a copy
+    // from before the write would never match.
+    a = journal.record(&a).unwrap();
+
+    // Instance B holds a stale reservation from before that.
+    let mut b = base_record(4499, FillState::Seen);
+    b.updated_at = chrono::Utc::now() - chrono::Duration::seconds(30);
+
+    // A may continue: the latest line is still its own.
+    assert!(
+        zecp2p_taker::auto::journal::may_continue(&journal.latest().unwrap(), &a).is_ok(),
+        "a fill must be able to continue its own progress"
+    );
+
+    // B may not: the fill has moved on without it.
+    let verdict = zecp2p_taker::auto::journal::may_continue(&journal.latest().unwrap(), &b)
+        .expect_err("a second instance must not claim over the first");
+    assert!(
+        matches!(verdict, SlotVerdict::OwnPaymentUnderway(_)),
+        "{verdict:?}"
+    );
+}
+
+#[test]
+fn a_signalled_intent_blocks_a_second_one() {
+    // R7-c. No payment has gone out at `Signalled`, but an intent has, and it
+    // holds the maker's USDC and a 14-day stake lock. An intent-readback error
+    // rewinds the scan cursor, and without this the next poll signals a second
+    // intent against the same deposit: one payment, two stakes locked.
+    let mine = WorkId::base(U256::from(4499));
+    let journal = vec![base_record(4499, FillState::Signalled)];
+    assert!(
+        matches!(
+            slot_verdict(&journal, &mine),
+            SlotVerdict::OwnPaymentUnderway(_)
+        ),
+        "a signalled intent did not stop a second one"
+    );
+}
+
+#[test]
+fn a_finished_fill_cannot_be_reopened_through_record() {
+    // R7-a. `record` required the work id to exist, but not the fill to be
+    // running - so a caller holding a stale record could continue a
+    // `Cancelled` or `Fulfilled` fill, which is opening a new one with the gate
+    // skipped.
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Journal::open(dir.path().join("fills.jsonl")).unwrap();
+
+    let mut record = open_fill(
+        &journal,
+        &WorkId::base(U256::from(4499)),
+        "deposit 4499",
+        || base_record(4499, FillState::Seen),
+    )
+    .unwrap()
+    .expect("the slot is free");
+
+    record.state = FillState::Cancelled;
+    journal.record(&record).unwrap();
+
+    // The stale caller tries to carry on.
+    record.state = FillState::Paying;
+    let err = journal
+        .record(&record)
+        .expect_err("a finished fill must not be reopened");
+    assert!(format!("{err:#}").contains("open_fill"), "{err:#}");
+}

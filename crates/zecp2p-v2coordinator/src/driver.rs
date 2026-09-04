@@ -594,7 +594,17 @@ async fn settle(state: &Arc<AppState>, order: Order) -> Result<()> {
             // `Paying`, which is the ambiguous state a human resolves.
             record.state = zecp2p_taker::auto::journal::FillState::NeedsOperator;
             record.note = Some(format!("the Venmo leg failed: {e}"));
-            let _ = state.journal.record(&record);
+            // R7-d: not discarded. This is the line that says money may have
+            // left, and it is also what holds the slot; losing it silently
+            // means the next order pays into an unreconciled feed.
+            if let Err(write_err) = state.journal.record(&record) {
+                tracing::error!(
+                    order = %order.order_id,
+                    error = %format!("{write_err:#}"),
+                    "the Venmo leg failed AND the journal could not record it. The slot may \
+                     read as free to the next order; check the feed before anything else runs."
+                );
+            }
             order.fail(format!(
                 "the payment could not be completed: {e}. Check the Venmo feed before \
                  anything else: a payment may have left."
