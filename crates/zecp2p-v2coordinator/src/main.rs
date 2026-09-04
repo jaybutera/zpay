@@ -88,8 +88,10 @@ async fn main() -> Result<()> {
     // Fail at startup, not at the first order. A node that cannot be reached
     // or an attestor that will not answer is something the operator should
     // hear about now.
+    // Uncached on purpose: this is the startup check that the node is actually
+    // reachable, and a cache hit here would report a node nobody had asked.
     let (height, branch) = state
-        .chain_head()
+        .chain_head_uncached()
         .await
         .context("could not reach the Zcash node")?;
     tracing::info!(height, branch = format!("{branch:#x}"), "node reachable");

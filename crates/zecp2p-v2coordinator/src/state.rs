@@ -18,6 +18,15 @@ use crate::config::CoordinatorConfig;
 use crate::funding::{FundingScanner, NodeRpc};
 use crate::store::OrderStore;
 
+/// How long a chain head read stays usable.
+///
+/// Well under one block (`zec.block_seconds`, 75 s in the deployed config), so
+/// a cached head is the same head the node would report, not an older one. The
+/// point is the request *rate*: this caps node reads for the head at two a
+/// minute no matter how many pages are open, which is what keeps the keyless
+/// hosted endpoint under its limit.
+pub const CHAIN_HEAD_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// How the coordinator settles the fiat leg.
 ///
 /// A trait so a test can run the whole flow without a browser or an enclave.
@@ -85,6 +94,24 @@ pub struct AppState {
     /// pay - or both broadcast. The lock is per order rather than global so a
     /// slow browser on one trade does not stall the sweep on every other.
     advancing: Arc<tokio::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// The last chain head read, and when it was read.
+    ///
+    /// Every `/escrow/capabilities` and every `/escrow/quote` needs the height
+    /// and the branch id, and without this each one is two calls to the node.
+    /// The hosted keyless endpoint answers about five requests a sliding minute
+    /// and 429s after that, and `rpc`'s rate-limit handling waits 60 s on a 429.
+    /// So under any real traffic the page's own polling exhausted the window and
+    /// those endpoints stopped answering inside any sane client timeout.
+    ///
+    /// A block is `zec.block_seconds` apart (75 s configured), so a head a few
+    /// seconds stale is not a different answer, it is the same answer arriving
+    /// without a network round trip. `CHAIN_HEAD_TTL` is kept well under one
+    /// block for that reason.
+    ///
+    /// This is a cache and not a substitute for reading the node: it holds a
+    /// value that was true, never a value that was guessed, and it is empty
+    /// until a real read succeeds. A node that cannot be reached still fails.
+    chain_head_cache: Arc<std::sync::Mutex<Option<((u32, u32), std::time::Instant)>>>,
     /// One payment at a time, across every order.
     ///
     /// R2-1: the per-order lock above serialises an order with itself and
@@ -158,8 +185,30 @@ impl AppState {
         secp.sign_ecdsa(&secp256k1::Message::from_digest(*digest), &key)
     }
 
-    /// Reads the chain height and branch id.
+    /// Reads the chain height and branch id, from the cache when it is fresh.
+    ///
+    /// See [`AppState::chain_head_cache`] for why this is cached at all. Use
+    /// [`AppState::chain_head_uncached`] where the caller must see the node.
     pub async fn chain_head(&self) -> Result<(u32, u32)> {
+        if let Some(head) = self.cached_chain_head() {
+            return Ok(head);
+        }
+        let head = self.chain_head_uncached().await?;
+        if let Ok(mut slot) = self.chain_head_cache.lock() {
+            *slot = Some((head, std::time::Instant::now()));
+        }
+        Ok(head)
+    }
+
+    /// The cached head, if one was read less than [`CHAIN_HEAD_TTL`] ago.
+    fn cached_chain_head(&self) -> Option<(u32, u32)> {
+        let slot = self.chain_head_cache.lock().ok()?;
+        let (head, read_at) = (*slot)?;
+        (read_at.elapsed() < CHAIN_HEAD_TTL).then_some(head)
+    }
+
+    /// Reads the chain height and branch id from the node, ignoring the cache.
+    pub async fn chain_head_uncached(&self) -> Result<(u32, u32)> {
         let rpc = self.rpc.clone();
         tokio::task::spawn_blocking(move || {
             let chain = RpcChainClient::new(rpc)?;
@@ -341,6 +390,7 @@ impl AppStateBuilder {
             journal: Arc::new(journal),
             secp,
             advancing: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            chain_head_cache: Arc::new(std::sync::Mutex::new(None)),
             paying: Arc::new(tokio::sync::Mutex::new(())),
         }))
     }
@@ -376,4 +426,46 @@ fn load_lp_key(config: &CoordinatorConfig) -> Result<SecretKey> {
         .load_or_create(&config.lp.key_label)
         .map_err(|e| anyhow::anyhow!("could not load the LP key: {e}"))?;
     SecretKey::from_slice(&key.secret_bytes()).context("the keystore key is not a valid scalar")
+}
+
+#[cfg(test)]
+mod chain_head_cache_tests {
+    use super::CHAIN_HEAD_TTL;
+    use std::time::{Duration, Instant};
+
+    /// The freshness rule `cached_chain_head` applies, exercised on its own.
+    ///
+    /// `AppState` needs a key, a store and a node to build, so the rule is
+    /// checked here rather than through a constructed state; the function under
+    /// test in `cached_chain_head` is this comparison and nothing else.
+    fn is_fresh(read_at: Instant) -> bool {
+        read_at.elapsed() < CHAIN_HEAD_TTL
+    }
+
+    #[test]
+    fn a_head_read_just_now_is_reused() {
+        assert!(is_fresh(Instant::now()));
+    }
+
+    #[test]
+    fn a_head_older_than_the_ttl_is_refetched() {
+        let old = Instant::now() - (CHAIN_HEAD_TTL + Duration::from_secs(1));
+        assert!(!is_fresh(old), "a stale head must not be served from cache");
+    }
+
+    /// The cache exists to keep the node read rate under the hosted endpoint's
+    /// limit. That only holds if the TTL is short enough to stay inside one
+    /// block and long enough to cap reads well under the ~5/minute budget that
+    /// `rpc::RpcConfig` documents.
+    #[test]
+    fn the_ttl_caps_reads_below_the_hosted_endpoints_budget() {
+        let reads_per_minute = 60.0 / CHAIN_HEAD_TTL.as_secs_f64();
+        assert!(
+            reads_per_minute <= 5.0,
+            "head reads would be {reads_per_minute}/min, at or over the keyless budget"
+        );
+        // A block is 75 s in the deployed config; a TTL at or above that would
+        // mean routinely serving a height the node had already moved past.
+        assert!(CHAIN_HEAD_TTL.as_secs() < 75, "TTL must stay inside one block");
+    }
 }

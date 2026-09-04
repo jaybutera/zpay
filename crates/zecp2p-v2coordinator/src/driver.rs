@@ -252,7 +252,11 @@ async fn announce(state: &Arc<AppState>, mut order: Order) -> Result<()> {
 /// Moves an unfunded or unsigned order to its terminal state when a deadline
 /// has passed. Nothing here spends anything.
 async fn check_deadlines(state: &Arc<AppState>, mut order: Order) -> Result<()> {
-    let (height, _) = match state.chain_head().await {
+    // Uncached: this decides when the user is *offered their refund*, and a
+    // height held over from before the chain passed `T` keeps an order Locked
+    // when it has become Refundable. The sweep runs on a timer rather than per
+    // request, so reading the node here costs a bounded number of calls.
+    let (height, _) = match state.chain_head_uncached().await {
         Ok(h) => h,
         Err(e) => {
             tracing::debug!(error = %e, "could not read the height for a deadline check");

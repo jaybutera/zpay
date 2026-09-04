@@ -112,12 +112,18 @@ const nowStamp = () => new Date().toTimeString().slice(0, 8);
 
 // ---------- health ----------
 
+// A reachable coordinator is the whole signal. This used to also test
+// `h.status === 'ok'`, a field the v2 coordinator does not send: every live
+// reply fell through to 'coordinator responding', so the only way to read
+// 'coordinator online' was for the server to be the old v1 build. Testing a
+// body shape here is worse than useless anyway, because the failure that
+// matters is `api()` throwing, and that is the branch below.
 async function checkHealth() {
   const conn = $('conn'), text = $('conn-text');
   try {
-    const h = await api('/health');
+    await api('/health');
     conn.dataset.state = 'up';
-    text.textContent = (h && h.status === 'ok') ? 'coordinator online' : 'coordinator responding';
+    text.textContent = 'coordinator online';
   } catch (_) {
     conn.dataset.state = 'down';
     text.textContent = 'coordinator offline';
