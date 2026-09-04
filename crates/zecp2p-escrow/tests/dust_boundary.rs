@@ -168,7 +168,7 @@ fn the_escrows_gate_sits_on_the_boundary_in_both_directions() {
 /// fail to build.
 #[test]
 fn the_fee_policy_and_the_transaction_builder_agree_on_the_line() {
-    for amount in [27_000u64, 26_999, 120_000, 200_000, 1_000_000] {
+    for amount in [36_000u64, 35_999, 120_000, 200_000, 1_000_000] {
         let fee = platform_fee_zat(amount, PLATFORM_FEE_BPS);
         assert!(
             fee == 0 || fee >= DUST_THRESHOLD_ZAT,

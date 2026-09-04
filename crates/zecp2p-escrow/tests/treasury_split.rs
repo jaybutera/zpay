@@ -97,7 +97,7 @@ fn the_three_way_split_adds_up_to_the_escrow_exactly() {
     let terms = escrow_terms(&secp);
     let miner = release_fee_to_transparent_zat(terms.redeem_script().unwrap().len());
     let fee = default_platform_fee_zat(AMOUNT);
-    assert_eq!(fee, 400, "20 bps of 200000 zat");
+    assert_eq!(fee, 300, "15 bps of 200000 zat");
 
     let split = ReleaseSplit {
         payout_script: lp_script(),
@@ -123,7 +123,7 @@ fn the_treasury_output_is_always_last() {
     let split = ReleaseSplit {
         payout_script: lp_script(),
         miner_fee_zat: 15_000,
-        platform_fee_zat: 400,
+        platform_fee_zat: 300,
         treasury_script: treasury_script(),
     };
     let outs = split.outputs(AMOUNT).unwrap();
@@ -204,7 +204,7 @@ fn an_empty_output_script_is_refused_rather_than_burned() {
     let split = ReleaseSplit {
         payout_script: Vec::new(),
         miner_fee_zat: 15_000,
-        platform_fee_zat: 400,
+        platform_fee_zat: 300,
         treasury_script: treasury_script(),
     };
     assert!(matches!(
@@ -223,7 +223,7 @@ fn changing_the_treasury_output_changes_the_digest() {
     let base = ReleaseSplit {
         payout_script: lp_script(),
         miner_fee_zat: 15_000,
-        platform_fee_zat: 400,
+        platform_fee_zat: 300,
         treasury_script: treasury_script(),
     };
     let d = |s: &ReleaseSplit| build_release_split(&terms, s).unwrap().sighash().unwrap();
@@ -307,7 +307,7 @@ fn an_lp_that_rewrites_the_treasury_address_is_refused_before_funding() {
     let mut store = MemoryRecordStore::default();
 
     let quote = honest_quote(&secp);
-    assert_eq!(quote.platform_fee_zat(), 400, "20 bps of 200000 zat");
+    assert_eq!(quote.platform_fee_zat(), 300, "15 bps of 200000 zat");
     let lp_terms = canonical_with(quote.platform_fee_zat(), lp_own_script(), &secp);
 
     let err = prepare_escrow(
@@ -376,8 +376,8 @@ fn the_treasury_address_is_in_the_terms_hash_and_therefore_in_the_outcome_point(
     let secp = Secp256k1::new();
     let (ann, _, _) = announcement_for(&secp);
 
-    let honest = canonical_with(400, treasury_script(), &secp);
-    let rewritten = canonical_with(400, lp_own_script(), &secp);
+    let honest = canonical_with(300, treasury_script(), &secp);
+    let rewritten = canonical_with(300, lp_own_script(), &secp);
     assert_ne!(honest.terms_hash(), rewritten.terms_hash());
 
     let y = |t: &CanonicalTerms| {
@@ -415,7 +415,7 @@ fn the_refund_pays_the_user_everything_and_the_treasury_nothing() {
         &ReleaseSplit {
             payout_script: lp_script(),
             miner_fee_zat: 15_000,
-            platform_fee_zat: 400,
+            platform_fee_zat: 300,
             treasury_script: treasury_script(),
         },
     )
@@ -441,8 +441,8 @@ fn a_refund_is_never_charged_even_when_the_terms_carry_a_fee() {
     let user = p2pkh([0x0b; 20]);
     let miner = 10_000;
 
-    let with_fee_in_terms = canonical_with(400, treasury_script(), &secp);
-    assert_eq!(with_fee_in_terms.platform_fee_zat, 400);
+    let with_fee_in_terms = canonical_with(300, treasury_script(), &secp);
+    assert_eq!(with_fee_in_terms.platform_fee_zat, 300);
 
     let raw = zecp2p_escrow::tx::serialize_refund(&terms, &user, miner, &[0x51]).unwrap();
     let outputs = transparent_outputs(&raw);
@@ -488,7 +488,7 @@ fn the_attestors_scalar_only_decrypts_the_release_that_pays_the_agreed_fee() {
     // The end-to-end statement of the enforcement claim, run through the real
     // adaptor path rather than asserted.
     //
-    // The user pre-signs a release that pays the treasury 400 zat, under an
+    // The user pre-signs a release that pays the treasury 300 zat, under an
     // outcome point derived from terms carrying that fee. The attestor later
     // publishes a scalar for those terms. The scalar decrypts the
     // pre-signature, and the signature it yields covers the digest of the
@@ -500,13 +500,13 @@ fn the_attestors_scalar_only_decrypts_the_release_that_pays_the_agreed_fee() {
     let terms = escrow_terms(&secp);
     let (ann, d, k) = announcement_for(&secp);
 
-    let agreed = canonical_with(400, treasury_script(), &secp);
+    let agreed = canonical_with(300, treasury_script(), &secp);
     let y = outcome_point(&secp, &ann.r, &ann.p, &ann.event_id, &agreed.terms_hash()).unwrap();
 
     let honest_split = ReleaseSplit {
         payout_script: lp_script(),
         miner_fee_zat: 15_000,
-        platform_fee_zat: 400,
+        platform_fee_zat: 300,
         treasury_script: treasury_script(),
     };
     let honest_digest = build_release_split(&terms, &honest_split)
@@ -574,14 +574,14 @@ fn a_scalar_for_a_different_fee_does_not_open_the_pre_signature() {
     let terms = escrow_terms(&secp);
     let (ann, d, k) = announcement_for(&secp);
 
-    let agreed = canonical_with(400, treasury_script(), &secp);
+    let agreed = canonical_with(300, treasury_script(), &secp);
     let y = outcome_point(&secp, &ann.r, &ann.p, &ann.event_id, &agreed.terms_hash()).unwrap();
     let digest = build_release_split(
         &terms,
         &ReleaseSplit {
             payout_script: lp_script(),
             miner_fee_zat: 15_000,
-            platform_fee_zat: 400,
+            platform_fee_zat: 300,
             treasury_script: treasury_script(),
         },
     )
@@ -593,7 +593,7 @@ fn a_scalar_for_a_different_fee_does_not_open_the_pre_signature() {
     // The attestor signs a different fee, and a different treasury, in turn.
     for other in [
         canonical_with(1, treasury_script(), &secp),
-        canonical_with(400, lp_own_script(), &secp),
+        canonical_with(300, lp_own_script(), &secp),
     ] {
         assert_ne!(other.terms_hash(), agreed.terms_hash());
         let wrong = sign_outcome(&secp, &k, &d, &ann.event_id, &other.terms_hash()).unwrap();
@@ -642,16 +642,16 @@ fn a_fee_below_dust_is_dropped_rather_than_written() {
     // non-standard, so the trade would fail rather than merely go unbilled.
     // Both sides of the boundary, one zatoshi of escrow apart.
     assert_eq!(DUST_THRESHOLD_ZAT, 54);
-    assert_eq!(platform_fee_zat(27_000, PLATFORM_FEE_BPS), 54);
-    assert_eq!(platform_fee_zat(26_999, PLATFORM_FEE_BPS), 0);
+    assert_eq!(platform_fee_zat(36_000, PLATFORM_FEE_BPS), 54);
+    assert_eq!(platform_fee_zat(35_999, PLATFORM_FEE_BPS), 0);
 
-    // At 20 bps the gate never fires on an escrow this protocol would quote:
-    // `MINIMUM_ESCROW_ZAT` is 120,000 zat and the boundary is 27,000. That is
+    // At 15 bps the gate never fires on an escrow this protocol would quote:
+    // `MINIMUM_ESCROW_ZAT` is 120,000 zat and the boundary is 36,000. That is
     // worth pinning rather than leaving implicit, because it means the
     // two-output path below is reached only through a lower rate.
     // A const assertion: lowering `MINIMUM_ESCROW_ZAT` past the dust boundary
     // should break the build here, so that whoever lowers it reads this note.
-    const _: () = assert!(zecp2p_escrow::client::MINIMUM_ESCROW_ZAT > 27_000);
+    const _: () = assert!(zecp2p_escrow::client::MINIMUM_ESCROW_ZAT > 36_000);
 
     // At 1 bp a 120,000 zat escrow yields 12 zat, which is dust. The split then
     // has one output, not a 12 zat one the node would refuse to relay.
@@ -736,12 +736,12 @@ fn a_split_with_only_half_the_fee_set_is_refused() {
     let fee_no_script = ReleaseSplit {
         payout_script: lp_script(),
         miner_fee_zat: 15_000,
-        platform_fee_zat: 400,
+        platform_fee_zat: 300,
         treasury_script: Vec::new(),
     };
     assert!(matches!(
         fee_no_script.outputs(AMOUNT),
-        Err(TxError::InconsistentFee { fee: 400, .. })
+        Err(TxError::InconsistentFee { fee: 300, .. })
     ));
 
     let script_no_fee = ReleaseSplit {
@@ -798,9 +798,9 @@ fn the_taker_refuses_half_a_fee_when_it_rebuilds_terms() {
     // destination with no fee both hash to terms that look plausible, and the
     // disagreement only becomes visible as a release nobody can broadcast.
     let secp = Secp256k1::new();
-    let fee_only = canonical_with(400, Vec::new(), &secp);
+    let fee_only = canonical_with(300, Vec::new(), &secp);
     let script_only = canonical_with(0, treasury_script(), &secp);
-    let honest = canonical_with(400, treasury_script(), &secp);
+    let honest = canonical_with(300, treasury_script(), &secp);
 
     // They are distinguishable at the hash, which is what lets any party that
     // checks refuse them.
