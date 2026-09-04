@@ -2228,3 +2228,68 @@ async fn a_losing_instance_does_not_cancel_the_winners_claim() {
     );
 }
 
+
+#[tokio::test]
+async fn a_coordinator_killed_mid_reservation_heals_and_pays_once() {
+    // R10-3. The crash-heal was only covered by a `slot::take` unit test, so a
+    // reordering in `settle` - the reservation moving after a network call, or
+    // the refusal arm changing - would not be caught. This drives the real
+    // `advance`, from an order and a journal in exactly the state a kill
+    // between the reservation and the chain read leaves.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+    let fiat = Arc::new(CountingFiat::new());
+    let state = coordinator_with_fiat(dir.path(), scanner.clone(), &node, &attestor, fiat.clone());
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+    let user = TestUser::new();
+
+    let (order_id, funding_txid) =
+        locked_order(&app, &state, &node, &scanner, &attestor, &user).await;
+    let work = zecp2p_v2coordinator::slot::work_id_for(&funding_txid, 0);
+
+    // The kill: a reservation on disk, and an order still `Locked` because the
+    // process died before writing anything else.
+    let mut relocked = state.store.get(&order_id).unwrap();
+    relocked.stage = Stage::Locked;
+    relocked.payment = None;
+    relocked.release_txid = None;
+    state.store.put(&relocked).unwrap();
+
+    let orphan = zecp2p_taker::auto::journal::FillRecord::new_zec(
+        work.local.clone(),
+        alloy::primitives::U256::from(700_000u64),
+        alloy::primitives::U256::from(1_000_000_000_000_000_000u128),
+        "alice".into(),
+    );
+    state.journal.append_unchecked(&orphan).unwrap();
+    assert!(
+        !state.journal.open_fills().unwrap().is_empty(),
+        "the orphan is not holding the slot, so this proves nothing"
+    );
+
+    // The restart. It must displace its own leftover and finish the trade,
+    // rather than failing the order and stalling every later one.
+    zecp2p_v2coordinator::driver::advance(&state, &order_id)
+        .await
+        .expect("a restart must not error");
+
+    let after = state.store.get(&order_id).unwrap();
+    assert_ne!(
+        after.stage,
+        Stage::Failed,
+        "a crashed reservation stalled the order permanently"
+    );
+    assert_eq!(after.stage, Stage::Released, "the restart did not finish the trade");
+
+    // Exactly one payment, and exactly one release: healing must not repeat.
+    assert_eq!(fiat.payments(), 1, "the restart paid twice");
+    assert_eq!(node.broadcasts().await.len(), 1, "the restart released twice");
+
+    // And the slot is free for the next order.
+    assert!(
+        state.journal.open_fills().unwrap().is_empty(),
+        "the finished trade is still holding the slot"
+    );
+}

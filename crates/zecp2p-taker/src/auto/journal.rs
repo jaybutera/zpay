@@ -605,6 +605,23 @@ pub fn record_outcome(journal: &Journal, held: &FillRecord, now: &FillRecord) ->
     }
 }
 
+/// This daemon's own pre-payment lines, left behind by a crash.
+///
+/// R10-1: displacement only happens when the same work reaches `open_fill`
+/// again, and a taker never gets there for a deposit that is now exhausted -
+/// which a `Signalled` orphan's own intent can make it. So the orphan holds the
+/// global slot indefinitely, and the coordinator waits behind it too.
+///
+/// `rail` is the caller's own: a daemon must only clear its own leftovers. The
+/// other rail's lines belong to a process that may still be running.
+pub fn own_pre_payment_orphans(latest: &[FillRecord], rail: Rail) -> Vec<FillRecord> {
+    latest
+        .iter()
+        .filter(|r| r.rail == rail && r.state.is_open() && is_displaceable_reservation(r.state))
+        .cloned()
+        .collect()
+}
+
 /// The gate a fill must pass before it touches a chain, and the reservation it
 /// takes if it does.
 ///
@@ -640,6 +657,20 @@ pub fn open_fill(
     }
 }
 
+/// The note a fill carries when it left an intent on chain that nobody
+/// cancelled.
+///
+/// R10-2: an uncancelled intent outlives the line that recorded it. A displaced
+/// taker whose cancel fails forces `NeedsOperator`; the winner then forces
+/// `Paid` and `Fulfilled` over the top, the line closes, and the fact drops out
+/// of both operator lists - while the intent is still on chain holding the
+/// maker's USDC and a stake.
+///
+/// So it is a marker in the note rather than a state, because states get
+/// overwritten and notes accumulate, and [`Journal::uncancelled_intents`] finds
+/// it whether the line is open or closed.
+pub const UNCANCELLED_INTENT: &str = "[uncancelled intent]";
+
 /// Whether a fill is one a human has to read the Venmo feed for.
 ///
 /// R9-SF3 and R9-3: `fiat_may_have_left` alone missed two cases that matter.
@@ -658,7 +689,7 @@ pub fn needs_a_human(record: &FillRecord) -> bool {
         || record
             .note
             .as_deref()
-            .is_some_and(|n| n.contains("[written over "))
+            .is_some_and(|n| n.contains("[written over ") || n.contains(UNCANCELLED_INTENT))
 }
 
 /// An advisory exclusive lock held for the life of the value.
@@ -1046,6 +1077,50 @@ impl Journal {
             .into_iter()
             .filter(|r| r.state.is_open() && needs_a_human(r))
             .collect())
+    }
+
+    /// Fills that left an intent on chain nobody cancelled.
+    ///
+    /// R10-2: deliberately **not** filtered on `is_open`. The whole problem is
+    /// that this fact survives the line being closed by somebody else's forced
+    /// write, and an intent holding a maker's USDC has to stay visible until a
+    /// person has seen it - it expires on its own, but not for two weeks.
+    pub fn uncancelled_intents(&self) -> Result<Vec<FillRecord>> {
+        // Every line, not `latest`. R10-2: `latest` keeps only the last line
+        // per work item, so a note-based marker disappears the moment anybody
+        // writes that work again - which is exactly what the winner's forced
+        // `Paid` and `Fulfilled` do. The intent is still on chain either way.
+        let contents = match std::fs::read_to_string(&self.path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => {
+                return Err(e).with_context(|| format!("could not read {}", self.path.display()))
+            }
+        };
+
+        // One entry per intent, and a later `cancelled` for the same intent
+        // clears it: an operator who cancelled it by hand should not keep
+        // seeing it.
+        let mut flagged: std::collections::BTreeMap<String, FillRecord> = Default::default();
+        for line in contents.lines() {
+            let Ok(record) = serde_json::from_str::<FillRecord>(line) else {
+                continue;
+            };
+            let Some(intent) = record.intent_hash else {
+                continue;
+            };
+            let key = format!("{intent:?}");
+            match record.note.as_deref() {
+                Some(n) if n.contains(UNCANCELLED_INTENT) => {
+                    flagged.insert(key, record);
+                }
+                _ if record.state == FillState::Cancelled => {
+                    flagged.remove(&key);
+                }
+                _ => {}
+            }
+        }
+        Ok(flagged.into_values().collect())
     }
 
     /// Every open fill, whatever state it is in.

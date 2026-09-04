@@ -994,3 +994,150 @@ fn every_open_fill_is_visible_to_an_operator() {
         "a closed fill is still being listed"
     );
 }
+
+#[test]
+fn a_startup_sweep_clears_this_rails_own_leftovers() {
+    // R10-1. Displacement only happens when the same deposit reaches
+    // `open_fill` again, and a taker never gets there for a deposit that is now
+    // exhausted - which a `Signalled` orphan's own intent can make it, by
+    // taking the whole deposit. So the line holds the global slot indefinitely,
+    // and the coordinator waits behind it too.
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Journal::open(dir.path().join("fills.jsonl")).unwrap();
+
+    // Leftovers from crashed runs, one per pre-payment state. Staged directly
+    // because only one fill can hold the slot at a time, so this is what
+    // several crashes across several runs leave behind.
+    for (deposit, state) in [
+        (4001u64, FillState::Seen),
+        (4002, FillState::Signalling),
+        (4003, FillState::Signalled),
+    ] {
+        let mut r = base_record(deposit, state);
+        r.intent_hash = Some(B256::repeat_byte(0xcc));
+        journal.append_unchecked(&r).unwrap();
+    }
+
+    // A new deposit cannot start: the leftovers hold the global slot, which is
+    // the stall this sweep exists for.
+    assert!(
+        open_fill(&journal, &WorkId::base(U256::from(4004)), "d", || {
+            base_record(4004, FillState::Seen)
+        })
+        .unwrap()
+        .is_err(),
+        "the leftovers are not holding the slot, so this proves nothing"
+    );
+
+    let orphans = zecp2p_taker::auto::journal::own_pre_payment_orphans(
+        &journal.latest().unwrap(),
+        Rail::Base,
+    );
+    assert_eq!(orphans.len(), 3, "the sweep must find every pre-payment state");
+
+    // The sweep gives each one back, the way `run_auto` does.
+    for orphan in &orphans {
+        zecp2p_taker::auto::journal::release_if_still_ours(
+            &journal,
+            orphan,
+            FillState::Cancelled,
+            "a leftover reservation; nothing was sent",
+        );
+    }
+
+    // The slot is free and work can start again.
+    assert!(
+        journal.open_fills().unwrap().is_empty(),
+        "the sweep left something holding the slot"
+    );
+    assert!(
+        open_fill(&journal, &WorkId::base(U256::from(4004)), "d", || {
+            base_record(4004, FillState::Seen)
+        })
+        .unwrap()
+        .is_ok(),
+        "the deposit is still locked out after the sweep"
+    );
+}
+
+#[test]
+fn the_sweep_leaves_alone_what_may_have_been_paid() {
+    // The sweep must never touch a line at `Paying` or past it, nor the other
+    // rail's lines: those belong to a process that may still be running.
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Journal::open(dir.path().join("fills.jsonl")).unwrap();
+
+    let held = open_fill(&journal, &WorkId::base(U256::from(4499)), "d", || {
+        base_record(4499, FillState::Seen)
+    })
+    .unwrap()
+    .expect("free");
+    zecp2p_taker::auto::journal::advance_if_still_ours(&journal, &held, FillState::Paying)
+        .unwrap()
+        .expect("claims");
+    journal
+        .append_unchecked(&zec_record(0xcc, FillState::Seen))
+        .unwrap();
+
+    let orphans = zecp2p_taker::auto::journal::own_pre_payment_orphans(
+        &journal.latest().unwrap(),
+        Rail::Base,
+    );
+    assert!(
+        orphans.is_empty(),
+        "the sweep would have cleared a payment or another rail's line: {orphans:?}"
+    );
+}
+
+#[test]
+fn an_uncancelled_intent_stays_visible_after_its_line_closes() {
+    // R10-2. A displaced fill whose cancel fails forces `NeedsOperator`; the
+    // winner then forces `Paid` and `Fulfilled` over the top, the line closes,
+    // and the fact drops out of both operator lists - while the intent is still
+    // on chain holding a maker's USDC.
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Journal::open(dir.path().join("fills.jsonl")).unwrap();
+    let work = WorkId::base(U256::from(4499));
+
+    let held = open_fill(&journal, &work, "deposit 4499", || {
+        base_record(4499, FillState::Seen)
+    })
+    .unwrap()
+    .expect("free");
+
+    // The displaced fill records an intent nobody cancelled.
+    let mut stuck = held.clone();
+    stuck.state = FillState::NeedsOperator;
+    // The intent this fill left on chain: what makes the line worth keeping.
+    stuck.intent_hash = Some(B256::repeat_byte(0xab));
+    stuck.note = Some(format!(
+        "{} intent 0xab.. is still on chain",
+        zecp2p_taker::auto::journal::UNCANCELLED_INTENT
+    ));
+    zecp2p_taker::auto::journal::record_outcome(&journal, &held, &stuck).unwrap();
+    assert!(!journal.needs_operator().unwrap().is_empty());
+
+    // The winner then closes the line over the top, comparing against what is
+    // actually there.
+    let standing = journal
+        .latest()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.work_id() == work)
+        .unwrap();
+    let mut done = standing.clone();
+    done.state = FillState::Fulfilled;
+    done.note = None;
+    zecp2p_taker::auto::journal::record_outcome(&journal, &standing, &done).unwrap();
+
+    // The line is closed, so it is out of the open lists - and that is exactly
+    // when the intent must still be findable.
+    assert!(
+        journal.open_fills().unwrap().is_empty(),
+        "the line did not close, so this proves nothing"
+    );
+    assert!(
+        !journal.uncancelled_intents().unwrap().is_empty(),
+        "an intent holding a maker's USDC vanished when somebody closed the line"
+    );
+}

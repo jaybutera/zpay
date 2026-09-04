@@ -587,6 +587,38 @@ fn print_terms(terms: &IntentTerms) {
 /// The selectors in `venmo.rs` are guesses at Venmo's markup until something
 /// runs them against the page, and `PaymentStep::Fill` sets a React-controlled
 /// input, which is the failure that silently does nothing. This runs the live
+/// Records that an intent was left on chain because the cancel failed.
+///
+/// R10-2: the fact has to outlive the line. A displaced fill whose cancel fails
+/// may have its line closed by the winner's forced writes moments later, and
+/// then nothing anywhere says a maker's USDC is locked behind an intent that
+/// will sit there until it expires. The marker goes in the note, which
+/// `Journal::uncancelled_intents` finds whether the line is open or closed.
+///
+/// Best-effort by design: it runs on a path that has already failed, and a
+/// second failure here must not replace the first in the operator's view.
+fn note_uncancelled_intent(
+    journal: &Journal,
+    record: &FillRecord,
+    intent_hash: alloy::primitives::B256,
+    why: &str,
+) {
+    let mut stuck = record.clone();
+    stuck.state = FillState::NeedsOperator;
+    stuck.note = Some(format!(
+        "{} {why} intent {intent_hash} is still on chain and will expire on its own; \
+         this instance sent no payment",
+        zecp2p_taker::auto::journal::UNCANCELLED_INTENT
+    ));
+    if let Err(e) = zecp2p_taker::auto::journal::record_outcome(journal, record, &stuck) {
+        tracing::error!(
+            error = %e,
+            %intent_hash,
+            "could not record an uncancelled intent; it is only in this log now"
+        );
+    }
+}
+
 /// Refuses a live payment from a path that does not take the payment slot.
 ///
 /// R5-2: two subcommands drove the browser with no journal read and no journal
@@ -1297,6 +1329,67 @@ async fn run_auto<P: alloy::providers::Provider + Clone>(
         );
     }
 
+    // R10-1: clear this rail's own pre-payment leftovers before starting.
+    //
+    // A crash between reserving and the next write leaves a line that only
+    // displacement clears, and displacement only happens when the same deposit
+    // reaches `open_fill` again. A taker never gets there for a deposit that is
+    // now exhausted - which a `Signalled` orphan's own intent can make it, by
+    // taking the whole deposit. So the line sits there holding the global slot,
+    // and `zecp2p-v2coordinator` waits behind it too, for as long as nobody
+    // looks.
+    //
+    // Only this rail's own lines, and only the pre-payment states: anything at
+    // `Paying` or past it is caught by the check above and is a human's to
+    // resolve. Nothing here was ever sent.
+    let orphans = zecp2p_taker::auto::journal::own_pre_payment_orphans(
+        &journal.latest()?,
+        zecp2p_taker::auto::rail::Rail::Base,
+    );
+    let sweeper = Claimer::new(
+        provider.clone(),
+        config.contracts.zkp2p_orchestrator,
+        config.contracts.zkp2p_escrow,
+        config.contracts.stake_vault,
+        config.contracts.usdc,
+        taker,
+    );
+    for orphan in &orphans {
+        println!(
+            "clearing a leftover reservation: deposit {} is {:?} from a previous run",
+            orphan.deposit_id, orphan.state
+        );
+
+        // A `Signalled` orphan has an intent on chain. It has to come back, or
+        // the maker's USDC stays locked until it expires.
+        if let (FillState::Signalled, Some(intent_hash)) = (orphan.state, orphan.intent_hash) {
+            match sweeper.cancel_intent(intent_hash).await {
+                Ok(tx) => println!("  cancelled its intent {intent_hash} in {tx}"),
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        %intent_hash,
+                        "could not cancel a leftover intent; it will expire on its own"
+                    );
+                    note_uncancelled_intent(
+                        &journal,
+                        orphan,
+                        intent_hash,
+                        &format!("cleared a leftover reservation and the cancel failed ({e:#});"),
+                    );
+                    continue;
+                }
+            }
+        }
+
+        zecp2p_taker::auto::journal::release_if_still_ours(
+            &journal,
+            orphan,
+            FillState::Cancelled,
+            "a leftover reservation from a previous run; nothing was sent",
+        );
+    }
+
     let store = CookieStore::new(&config.session.path, config.session.max_age_hours)
         .with_identity(
             config.session.sender_id.clone(),
@@ -1898,6 +1991,12 @@ async fn run_fill<P: alloy::providers::Provider + Clone>(
                     intent = %intent.intent_hash,
                     "the intent could not be cancelled and will expire on its own"
                 );
+                note_uncancelled_intent(
+                    journal,
+                    record,
+                    intent.intent_hash,
+                    &format!("lost the slot and the cancel failed ({e:#});"),
+                );
             }
             return Ok(Outcome::Skipped { why });
         }
@@ -1934,6 +2033,12 @@ async fn run_fill<P: alloy::providers::Provider + Clone>(
                     intent = %intent.intent_hash,
                     "the intent could not be cancelled and will expire on its own"
                 );
+                note_uncancelled_intent(
+                    journal,
+                    record,
+                    intent.intent_hash,
+                    &format!("lost the slot and the cancel failed ({e:#});"),
+                );
             }
             return Ok(Outcome::Skipped { why });
         }
@@ -1963,16 +2068,12 @@ async fn run_fill<P: alloy::providers::Provider + Clone>(
                     "declined at the pay gate and cancelIntent also failed; holding the \
                      slot until an operator looks, because the intent is still on chain"
                 );
-                let mut stuck = record.clone();
-                stuck.state = FillState::NeedsOperator;
-                stuck.note = Some(format!(
-                    "declined at the payment gate, and the intent could not be cancelled \
-                     ({e:#}). It will expire on its own. This instance sent no payment."
-                ));
-                match zecp2p_taker::auto::journal::record_outcome(journal, record, &stuck) {
-                    Ok(written) => *record = written,
-                    Err(e) => tracing::error!(error = %e, "could not record the stuck intent"),
-                }
+                note_uncancelled_intent(
+                    journal,
+                    record,
+                    intent.intent_hash,
+                    &format!("declined at the payment gate and the cancel failed ({e:#});"),
+                );
             }
         }
         return Ok(Outcome::Declined { gate: Gate::Pay });
@@ -2039,20 +2140,12 @@ async fn run_fill<P: alloy::providers::Provider + Clone>(
                     // "nothing was paid" while a payment is in flight is
                     // exactly the wrong conclusion. `record_outcome` names what
                     // it wrote over.
-                    let mut stuck = record.clone();
-                    stuck.state = FillState::NeedsOperator;
-                    stuck.note = Some(format!(
-                        "{why}; the intent could not be cancelled ({e:#}) and will expire. \
-                         This instance sent no payment - check the feed before concluding \
-                         that nobody did."
-                    ));
-                    match zecp2p_taker::auto::journal::record_outcome(journal, record, &stuck) {
-                        Ok(written) => *record = written,
-                        Err(e) => tracing::error!(
-                            error = %e,
-                            "could not record an uncancelled intent; it will expire on its own"
-                        ),
-                    }
+                    note_uncancelled_intent(
+                        journal,
+                        record,
+                        intent_hash,
+                        &format!("{why} the cancel failed ({e:#});"),
+                    );
                 }
             },
             None => {
