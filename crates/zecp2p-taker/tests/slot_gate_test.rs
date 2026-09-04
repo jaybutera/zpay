@@ -156,9 +156,11 @@ fn the_gate_refuses_a_deposit_this_taker_may_already_have_paid() {
     // wrote a fresh `Seen` over the `Paid` line, a second intent was signalled,
     // a second payment went out - and the `Paid` line vanished from every later
     // reader, including the startup check meant to catch exactly this.
+    // R9-1: the states from `Paying` on. The pre-payment ones are displaceable,
+    // because a crash in one of them would otherwise lock the deposit out for
+    // good, and the compare-and-set stops the crashed attempt coming back.
     let mine = WorkId::base(U256::from(4499));
     for state in [
-        FillState::Signalling,
         FillState::Paying,
         FillState::Paid,
         FillState::NeedsOperator,
@@ -178,22 +180,43 @@ fn the_gate_refuses_a_deposit_this_taker_may_already_have_paid() {
 }
 
 #[test]
-fn a_standing_seen_line_stops_a_second_reservation() {
-    // R8-1. A second `Seen` used to be allowed, on the reasoning that a retry
-    // looks like one. But the journal keeps the last line per work item, so
-    // writing it *displaces* the reservation already there - and the fill
-    // holding that one can then no longer advance, while the newcomer walks the
-    // whole sequence and pays. Same burying, one step earlier than the one the
-    // reviewer reproduced.
+fn a_standing_reservation_may_be_displaced_but_a_payment_may_not() {
+    // R8-1 blocked a second reservation, which closed a burying hole and opened
+    // a stall: a crash between reserving and the next write left a `Seen`
+    // nobody would advance, and the deposit was refused forever.
+    //
+    // R9-1 splits the two. A pre-payment line may be displaced, because the
+    // compare-and-set makes that safe - the displaced holder cannot advance and
+    // cannot give the slot back. A line at `Paying` or past it may not, because
+    // those mean money may already have gone out.
     let mine = WorkId::base(U256::from(4499));
-    let journal = vec![base_record(4499, FillState::Seen)];
-    assert!(
-        matches!(
-            slot_verdict(&journal, &mine),
-            SlotVerdict::OwnPaymentUnderway(_)
-        ),
-        "a standing reservation was displaced by a second one"
-    );
+
+    for displaceable in [
+        FillState::Seen,
+        FillState::Signalling,
+        FillState::Signalled,
+    ] {
+        let journal = vec![base_record(4499, displaceable)];
+        assert!(
+            slot_verdict(&journal, &mine).is_free(),
+            "{displaceable:?} is pre-payment: a crash there must not lock the deposit out"
+        );
+    }
+
+    for blocking in [
+        FillState::Paying,
+        FillState::Paid,
+        FillState::NeedsOperator,
+    ] {
+        let journal = vec![base_record(4499, blocking)];
+        assert!(
+            matches!(
+                slot_verdict(&journal, &mine),
+                SlotVerdict::OwnPaymentUnderway(_)
+            ),
+            "{blocking:?} means money may have moved and must still block"
+        );
+    }
 }
 
 #[test]
@@ -627,19 +650,10 @@ fn two_taker_instances_do_not_both_pay_one_deposit() {
     })
     .unwrap()
     .expect("A takes the free slot");
-    // B cannot even reserve now: A's `Seen` is standing, and a second one would
-    // displace it. That is the earliest possible refusal, and it is the right
-    // one - B has done nothing to undo.
-    let b_refused = open_fill(&journal, &work, "deposit 4499", || {
-        base_record(4499, FillState::Seen)
-    })
-    .unwrap()
-    .expect_err("a second instance must not displace A's reservation");
-    assert!(b_refused.contains("pay twice"), "{b_refused}");
-
-    // To reach the write that caused the reported double payment, B has to be
-    // holding a reservation from *before* A took one - the real interleaving,
-    // where B reserved, went slow in gating and staking, and A got there first.
+    // B holds a reservation from before A took one: B reserved, went slow in
+    // gating and staking, and A got there first. R9-1 allows that displacement,
+    // because refusing it turns a crash into a permanent stall - the protection
+    // is at B's next write, not at its reservation.
     let mut b = base_record(4499, FillState::Seen);
     b.updated_at = chrono::Utc::now() - chrono::Duration::seconds(30);
 
@@ -699,20 +713,51 @@ fn two_taker_instances_do_not_both_pay_one_deposit() {
 }
 
 #[test]
-fn a_signalled_intent_blocks_a_second_one() {
-    // R7-c. No payment has gone out at `Signalled`, but an intent has, and it
-    // holds the maker's USDC and a 14-day stake lock. An intent-readback error
-    // rewinds the scan cursor, and without this the next poll signals a second
-    // intent against the same deposit: one payment, two stakes locked.
-    let mine = WorkId::base(U256::from(4499));
-    let journal = vec![base_record(4499, FillState::Signalled)];
+fn a_signalled_intent_cannot_be_advanced_by_the_attempt_that_lost_it() {
+    // R7-c said an outstanding intent must not become two. R9-1 changes *where*
+    // that is enforced, not whether: a `Signalled` line may now be displaced,
+    // because otherwise a crash there locks the deposit out forever. What stops
+    // a second payment is that the displaced attempt cannot go on - its next
+    // write finds a line that is not its own.
+    //
+    // The cost is an intent that expires rather than being cancelled, which is
+    // the lesser harm against a deposit nobody can ever fill again.
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Journal::open(dir.path().join("fills.jsonl")).unwrap();
+    let work = WorkId::base(U256::from(4499));
+
+    let stale = open_fill(&journal, &work, "deposit 4499", || {
+        base_record(4499, FillState::Seen)
+    })
+    .unwrap()
+    .expect("the slot was free");
+    let stale = zecp2p_taker::auto::journal::advance_if_still_ours(
+        &journal,
+        &stale,
+        FillState::Signalled,
+    )
+    .unwrap()
+    .expect("its intent is on chain");
+
+    // A restart fills the deposit again.
+    let fresh = open_fill(&journal, &work, "deposit 4499", || {
+        base_record(4499, FillState::Seen)
+    })
+    .unwrap()
+    .expect("a crashed attempt must not lock the deposit out");
+
+    // The stale attempt cannot reach a payment.
     assert!(
-        matches!(
-            slot_verdict(&journal, &mine),
-            SlotVerdict::OwnPaymentUnderway(_)
-        ),
-        "a signalled intent did not stop a second one"
+        zecp2p_taker::auto::journal::advance_if_still_ours(
+            &journal,
+            &stale,
+            FillState::Paying,
+        )
+        .unwrap()
+        .is_err(),
+        "the displaced attempt signalled a second payment"
     );
+    let _ = fresh;
 }
 
 #[test]
@@ -742,4 +787,210 @@ fn a_finished_fill_cannot_be_reopened_through_record() {
         .record(&record)
         .expect_err("a finished fill must not be reopened");
     assert!(format!("{err:#}").contains("open_fill"), "{err:#}");
+}
+
+#[test]
+fn a_crash_between_reserving_and_signalling_self_heals() {
+    // R9-1. R8-1 made *any* open own line block a new fill, which closed the
+    // burying hole and opened a stall: a crash between the reservation and the
+    // next write leaves a `Seen` nobody will ever advance, and the deposit is
+    // then refused forever. Worse, it is silent - `Seen` is not
+    // `fiat_may_have_left`, so `needs_operator` lists nothing.
+    //
+    // Displacing an own *pre-payment* reservation is safe under the
+    // compare-and-set: whoever held it can no longer advance (its next write
+    // finds a line that is not its own) and its give-back declines for the same
+    // reason. What must still block is an own `Paying`/`Paid`/`NeedsOperator`,
+    // because those mean money may have moved.
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Journal::open(dir.path().join("fills.jsonl")).unwrap();
+    let work = WorkId::base(U256::from(4499));
+
+    // The crashed attempt: a reservation and nothing after it.
+    let orphan = open_fill(&journal, &work, "deposit 4499", || {
+        base_record(4499, FillState::Seen)
+    })
+    .unwrap()
+    .expect("the slot was free");
+
+    // After the restart the deposit must be fillable again.
+    let fresh = open_fill(&journal, &work, "deposit 4499", || {
+        base_record(4499, FillState::Seen)
+    })
+    .unwrap()
+    .expect("a crashed reservation must not lock the deposit out forever");
+
+    // And the orphan cannot come back to life: its next write refuses, so the
+    // displacement cannot turn into two fills running at once.
+    let refused = zecp2p_taker::auto::journal::advance_if_still_ours(
+        &journal,
+        &orphan,
+        FillState::Signalling,
+    )
+    .unwrap()
+    .expect_err("the displaced holder must not be able to advance");
+    assert!(matches!(refused, SlotVerdict::OwnPaymentUnderway(_)), "{refused:?}");
+
+    // Its give-back declines too, so it cannot free the slot under the new fill.
+    zecp2p_taker::auto::journal::release_if_still_ours(
+        &journal,
+        &orphan,
+        FillState::Cancelled,
+        "the orphan gives up",
+    );
+    let latest = journal.latest().unwrap();
+    assert_eq!(latest.len(), 1);
+    assert_eq!(latest[0].state, FillState::Seen);
+    assert_eq!(
+        latest[0].updated_at, fresh.updated_at,
+        "the orphan cancelled the new fill's reservation"
+    );
+
+    // The new fill can go on and pay.
+    zecp2p_taker::auto::journal::advance_if_still_ours(&journal, &fresh, FillState::Signalling)
+        .unwrap()
+        .expect("the fresh fill owns the slot now");
+}
+
+#[test]
+fn a_crash_after_paying_still_blocks_a_retry() {
+    // The other side of the same rule: `Paying` and everything past it must
+    // keep blocking, because those mean money may already have gone out. This
+    // is the case R8-1 was for, and relaxing `Seen` must not relax these.
+    for state in [
+        FillState::Paying,
+        FillState::Paid,
+        FillState::NeedsOperator,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Journal::open(dir.path().join("fills.jsonl")).unwrap();
+        let work = WorkId::base(U256::from(4499));
+
+        let held = open_fill(&journal, &work, "deposit 4499", || {
+            base_record(4499, FillState::Seen)
+        })
+        .unwrap()
+        .expect("the slot was free");
+        zecp2p_taker::auto::journal::advance_if_still_ours(&journal, &held, state)
+            .unwrap()
+            .expect("the fill advances");
+
+        let refused = open_fill(&journal, &work, "deposit 4499", || {
+            base_record(4499, FillState::Seen)
+        })
+        .unwrap()
+        .expect_err(&format!("{state:?} must still block a retry"));
+        assert!(refused.contains("pay twice"), "{refused}");
+    }
+}
+
+#[test]
+fn a_post_payment_fact_lands_even_past_a_closed_line() {
+    // R9-SF1. `record_outcome`'s fallback went through `record`, which refuses
+    // to continue a closed fill - so a `Paid` write whose line had been
+    // cancelled bailed, stopping the fill before its attestation with the
+    // dollars already gone. And the next poll then found a closed line, treated
+    // the work as free, and started again.
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Journal::open(dir.path().join("fills.jsonl")).unwrap();
+    let work = WorkId::base(U256::from(4499));
+
+    let held = open_fill(&journal, &work, "deposit 4499", || {
+        base_record(4499, FillState::Seen)
+    })
+    .unwrap()
+    .expect("the slot was free");
+
+    // Somebody closes the line underneath this fill.
+    let mut cancelled = held.clone();
+    cancelled.state = FillState::Cancelled;
+    journal.record(&cancelled).unwrap();
+
+    // The payment went out anyway, and that fact has to land.
+    let mut paid = held.clone();
+    paid.state = FillState::Paid;
+    paid.paid = Some("2.00".into());
+    let written = zecp2p_taker::auto::journal::record_outcome(&journal, &held, &paid)
+        .expect("a spent-dollars fact must never be dropped");
+    assert_eq!(written.state, FillState::Paid);
+
+    // And a reader sees it, so nothing treats the deposit as free.
+    let latest = journal.latest().unwrap();
+    assert_eq!(latest[0].state, FillState::Paid);
+    assert!(
+        !journal.needs_operator().unwrap().is_empty(),
+        "the payment is invisible to the operator list"
+    );
+}
+
+#[test]
+fn a_forced_write_reaches_the_operator_list() {
+    // R9-SF3. A forced `NeedsOperator` over a `Paying` line used to leave
+    // `needs_operator` empty, because `NeedsOperator` is not
+    // `fiat_may_have_left` - so the fact that a payment was in flight survived
+    // only as prose inside a note. That is the opposite of what forcing is for.
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Journal::open(dir.path().join("fills.jsonl")).unwrap();
+    let work = WorkId::base(U256::from(4499));
+
+    let held = open_fill(&journal, &work, "deposit 4499", || {
+        base_record(4499, FillState::Seen)
+    })
+    .unwrap()
+    .expect("the slot was free");
+    let paying = zecp2p_taker::auto::journal::advance_if_still_ours(
+        &journal,
+        &held,
+        FillState::Paying,
+    )
+    .unwrap()
+    .expect("it claims");
+
+    // A stale caller forces `NeedsOperator` over that line.
+    let mut stuck = held.clone();
+    stuck.state = FillState::NeedsOperator;
+    stuck.note = Some("the browser step failed".into());
+    zecp2p_taker::auto::journal::record_outcome(&journal, &held, &stuck)
+        .expect("the outcome lands");
+
+    let flagged = journal.needs_operator().unwrap();
+    assert!(
+        !flagged.is_empty(),
+        "a forced write buried a payment and told nobody"
+    );
+    // And the note names this fill's own line, not somebody else's work.
+    let note = flagged[0].note.clone().unwrap_or_default();
+    assert!(
+        note.contains("written over") && note.contains("Paying"),
+        "the note does not say what it replaced: {note}"
+    );
+    let _ = paying;
+}
+
+#[test]
+fn every_open_fill_is_visible_to_an_operator() {
+    // R9: `Seen`, `Signalling` and `Signalled` all hold the global slot, and a
+    // daemon restarting behind one starts cleanly and then skips every deposit.
+    // `open_fills` is what a status command prints so that stall is not silent.
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Journal::open(dir.path().join("fills.jsonl")).unwrap();
+
+    let held = open_fill(&journal, &WorkId::base(U256::from(4499)), "deposit 4499", || {
+        base_record(4499, FillState::Seen)
+    })
+    .unwrap()
+    .expect("the slot was free");
+
+    assert_eq!(journal.open_fills().unwrap().len(), 1, "the reservation is invisible");
+
+    zecp2p_taker::auto::journal::release_if_still_ours(
+        &journal,
+        &held,
+        FillState::Cancelled,
+        "done",
+    );
+    assert!(
+        journal.open_fills().unwrap().is_empty(),
+        "a closed fill is still being listed"
+    );
 }

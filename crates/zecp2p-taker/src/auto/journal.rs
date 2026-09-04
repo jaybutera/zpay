@@ -259,6 +259,28 @@ pub fn may_already_have_paid(state: FillState) -> bool {
     )
 }
 
+/// Whether an own open line may be displaced by a fresh attempt at the same
+/// work.
+///
+/// R9-1. The states before anything is committed on chain: a reservation, and
+/// the two that bracket signalling an intent. A line stuck in one of these is
+/// an attempt that died, and the deposit has to become fillable again or a
+/// crash locks it out for good.
+///
+/// Safe because of the compare-and-set: the displaced holder cannot advance
+/// afterwards, and cannot give the slot back either, so displacing it does not
+/// produce two live fills. What it can leave behind is an uncancelled intent
+/// from a `Signalled` line, which expires on its own and is the lesser harm
+/// against a deposit nobody can ever fill.
+///
+/// `Paying` and past it are **not** here. Those mean money may have moved.
+pub fn is_displaceable_reservation(state: FillState) -> bool {
+    matches!(
+        state,
+        FillState::Seen | FillState::Signalling | FillState::Signalled
+    )
+}
+
 /// The work item's own record, when it says a payment may already have gone.
 ///
 /// Separate from [`holder_among`], which is about *other* work: this is the
@@ -320,19 +342,29 @@ impl SlotVerdict {
 /// already paid for this" and "somebody else is paying" call for different
 /// answers, and the first is the more expensive mistake.
 pub fn slot_verdict(latest: &[FillRecord], mine: &WorkId) -> SlotVerdict {
-    // R8-1: *any* open line for this work stops a new fill, not only the states
-    // past reservation. A second `Seen` used to be allowed on the reasoning
-    // that a retry looks like one - but the journal keeps the last line per
-    // work item, so writing it displaces the reservation already there, and the
-    // fill holding that one can no longer advance. That is the same burying
-    // that let two instances pay, one step earlier.
+    // What an own line means depends on how far it got, and the two answers are
+    // opposite.
     //
-    // A retry after a genuine crash is not blocked by this: whatever ended that
-    // attempt wrote `Cancelled`, or an operator did, and a closed line does not
-    // hold the slot. A `Seen` still standing means somebody is mid-decision.
+    // R8-1 made *any* open own line block, which closed the burying hole and
+    // opened a stall: a crash between the reservation and the next write leaves
+    // a `Seen` nobody will advance, and the deposit is refused forever - a
+    // silent one, since `Seen` is not `fiat_may_have_left` and so never reaches
+    // an operator's list.
+    //
+    // R9-1 splits it. An own **pre-payment** reservation may be displaced,
+    // because displacing it is now safe: the compare-and-set means whoever held
+    // it cannot advance afterwards - its next write finds a line that is not
+    // its own - and its give-back declines for the same reason. So a crashed
+    // attempt heals on the next poll and cannot come back to life.
+    //
+    // An own line at `Paying` or past it still blocks, and that is the whole
+    // point: those states mean money may already have gone out, and a second
+    // fill is a second payment. Nothing about R9-1 relaxes them.
     if let Some(own) = latest
         .iter()
-        .find(|r| &r.work_id() == mine && r.state.is_open())
+        .find(|r| {
+            &r.work_id() == mine && r.state.is_open() && !is_displaceable_reservation(r.state)
+        })
     {
         return SlotVerdict::OwnPaymentUnderway(own.clone());
     }
@@ -517,26 +549,58 @@ pub fn record_outcome(journal: &Journal, held: &FillRecord, now: &FillRecord) ->
     match advance_to_if_still_ours(journal, held, now)? {
         Ok(written) => Ok(written),
         Err(verdict) => {
-            let buried = match &verdict {
-                SlotVerdict::OwnPaymentUnderway(r) | SlotVerdict::HeldByAnother(r) => {
-                    format!("{} as {:?}", r.describe(), r.state)
-                }
-                SlotVerdict::Free => "nothing".into(),
+            // R9-4: name the line this write actually replaces, which is the
+            // one for *this* work item. `verdict` may be `HeldByAnother`, whose
+            // record belongs to a different work item entirely - reporting that
+            // one sent an operator to the wrong fill.
+            let work = now.work_id();
+            let replaced = journal
+                .latest()
+                .ok()
+                .and_then(|l| l.into_iter().find(|r| r.work_id() == work));
+            let buried = match &replaced {
+                Some(r) => format!("this fill's own {:?} line", r.state),
+                None => "no line for this fill".to_string(),
             };
+            let alongside = match &verdict {
+                SlotVerdict::HeldByAnother(r) => {
+                    format!("; {} also holds the slot as {:?}", r.describe(), r.state)
+                }
+                _ => String::new(),
+            };
+
             tracing::error!(
-                work = %now.work_id(),
-                buried = %buried,
-                "recording {:?} over a line this fill did not write. Money has already \
-                 moved for this fill, so the fact has to land - but another line was \
-                 standing here, and it is named in the note.",
+                work = %work,
+                replaced = %buried,
+                "recording {:?} over {buried}{alongside}. Money has already moved for this \
+                 fill, so the fact has to land - what it replaced is in the note.",
                 now.state
             );
+
             let mut forced = now.clone();
             forced.note = Some(match &forced.note {
-                Some(n) => format!("{n} [written over {buried}]"),
-                None => format!("[written over {buried}]"),
+                Some(n) => format!("{n} [written over {buried}{alongside}]"),
+                None => format!("[written over {buried}{alongside}]"),
             });
-            journal.record(&forced)
+
+            // R9-SF1: `record` refuses to continue a *closed* fill, which is
+            // right for an ordinary write and wrong here: a post-payment fact
+            // has to land whatever state the line is in. A `Paid` that bailed
+            // because somebody had cancelled the line would stop the fill
+            // before its attestation with the dollars already gone, and the
+            // next poll would re-enter and pay again.
+            match journal.record(&forced) {
+                Ok(written) => Ok(written),
+                Err(e) => {
+                    tracing::warn!(
+                        work = %work,
+                        error = %e,
+                        "the gated write refused this outcome, so it is being appended \
+                         directly: a fact about spent dollars cannot be dropped"
+                    );
+                    journal.force_append(&forced)
+                }
+            }
         }
     }
 }
@@ -574,6 +638,27 @@ pub fn open_fill(
         (None, Some(why)) => Ok(Err(why)),
         (None, None) => anyhow::bail!("the payment slot could not be reserved"),
     }
+}
+
+/// Whether a fill is one a human has to read the Venmo feed for.
+///
+/// R9-SF3 and R9-3: `fiat_may_have_left` alone missed two cases that matter.
+///
+/// `NeedsOperator` is the state whose entire name says it, and it was not in
+/// that predicate - so a forced `NeedsOperator` written over a `Paying` line
+/// left the operator list *empty*, and the payment survived only as prose in a
+/// note. That is the exact opposite of what the forced write is for.
+///
+/// A line whose note records that it was written over another is also here: the
+/// forcing means two facts are stacked on one line, and only a person can
+/// separate them.
+pub fn needs_a_human(record: &FillRecord) -> bool {
+    record.state.fiat_may_have_left()
+        || record.state == FillState::NeedsOperator
+        || record
+            .note
+            .as_deref()
+            .is_some_and(|n| n.contains("[written over "))
 }
 
 /// An advisory exclusive lock held for the life of the value.
@@ -738,6 +823,31 @@ impl Journal {
             .with_context(|| format!("could not open the journal at {}", self.path.display()))?;
         let _lock = FileLock::exclusive(&file, &self.path)?;
         Self::write_line(&mut file, &line, &self.path)
+    }
+
+    /// Appends a line past the gate, for facts that must land.
+    ///
+    /// R9-SF1: `record` refuses to open or reopen a fill, which is right for
+    /// every ordinary write and wrong for a post-payment outcome. `Paid`,
+    /// `Fulfilled` and a `NeedsOperator` after a failed browser step are facts
+    /// about money that has already moved, and dropping one is worse than any
+    /// ordering problem it could cause: the next poll would find a closed line,
+    /// treat the work as free, and pay again.
+    ///
+    /// Only `record_outcome` calls this, and only after its compare-and-set and
+    /// then `record` have both refused.
+    fn force_append(&self, record: &FillRecord) -> Result<FillRecord> {
+        let mut record = record.clone();
+        record.updated_at = chrono::Utc::now();
+        let line = serde_json::to_string(&record).context("could not serialise a fill record")?;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .with_context(|| format!("could not open the journal at {}", self.path.display()))?;
+        let _lock = FileLock::exclusive(&file, &self.path)?;
+        Self::write_line(&mut file, &line, &self.path)?;
+        Ok(record)
     }
 
     /// Appends one line in a single `write` syscall.
@@ -934,7 +1044,22 @@ impl Journal {
         Ok(self
             .latest()?
             .into_iter()
-            .filter(|r| r.state.is_open() && r.state.fiat_may_have_left())
+            .filter(|r| r.state.is_open() && needs_a_human(r))
+            .collect())
+    }
+
+    /// Every open fill, whatever state it is in.
+    ///
+    /// R9: `Seen`, `Signalling`, `Signalled` and `NeedsOperator` all hold the
+    /// global payment slot, and none of them used to appear anywhere an
+    /// operator looks - so a daemon restarting behind one started cleanly and
+    /// then skipped every deposit in silence. This is what a status command
+    /// prints.
+    pub fn open_fills(&self) -> Result<Vec<FillRecord>> {
+        Ok(self
+            .latest()?
+            .into_iter()
+            .filter(|r| r.state.is_open())
             .collect())
     }
 }

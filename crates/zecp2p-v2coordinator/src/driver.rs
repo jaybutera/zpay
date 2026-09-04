@@ -888,13 +888,28 @@ fn release_slot(state: &AppState, order: &Order, release_txid: &str) {
         return;
     };
     let work = crate::slot::work_id_for(&funding.txid, funding.vout);
-    if let Err(e) = crate::slot::fulfilled(
-        &state.journal,
-        &work,
-        order.quote.usd_amount_6dec,
-        &order.handle,
-        release_txid,
-    ) {
+
+    // R9-2: the line as it actually stands, so the compare-and-set matches on a
+    // normal trade. Rebuilding it here - which is what this did - produced a
+    // fresh timestamp that never matched, so every completed trade took the
+    // forced path and logged an error about writing over a line it had not.
+    let held = match state.journal.latest() {
+        Ok(latest) => latest.into_iter().find(|r| r.work_id() == work),
+        Err(e) => {
+            tracing::error!(
+                order = %order.order_id,
+                error = %format!("{e:#}"),
+                "could not read the journal to release the slot; it stays held"
+            );
+            return;
+        }
+    };
+    let Some(held) = held else {
+        // No line at all. Nothing holds the slot, so nothing to release.
+        return;
+    };
+
+    if let Err(e) = crate::slot::fulfilled(&state.journal, &held, release_txid) {
         tracing::error!(
             order = %order.order_id,
             error = %format!("{e:#}"),

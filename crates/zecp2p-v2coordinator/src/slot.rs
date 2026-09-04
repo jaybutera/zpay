@@ -274,30 +274,30 @@ pub fn claim(
 /// Best-effort by design. It runs after the release is on chain, so a failure
 /// to write it cannot lose money; it can only leave the slot held, which the
 /// next operator sees as a stuck fill rather than as a double payment.
-pub fn fulfilled(
-    journal: &Journal,
-    work: &WorkId,
-    usd_amount_6dec: u64,
-    recipient: &str,
-    release_txid: &str,
-) -> Result<()> {
-    let mut record = FillRecord::new_zec(
-        work.local.clone(),
-        alloy::primitives::U256::from(usd_amount_6dec),
-        alloy::primitives::U256::from(zecp2p_escrow::payment_details::IDENTITY_RATE_18DEC),
-        recipient.to_string(),
-    );
-    record.state = FillState::Fulfilled;
-    record.note = Some(format!("released in {release_txid}"));
+pub fn fulfilled(journal: &Journal, paid: &FillRecord, release_txid: &str) -> Result<()> {
+    // R9-2: the caller passes the `Paid` record it is actually holding, so the
+    // compare-and-set matches on a normal trade. This used to rebuild that
+    // record from scratch with a fresh timestamp, which never matched - so
+    // every completed trade took the forced path and logged an error naming the
+    // line it "wrote over". The one alarm meant to flag a real bury fired on
+    // every single trade, which is the fastest way to teach an operator to
+    // ignore it.
+    let mut done = paid.clone();
+    done.state = FillState::Fulfilled;
+    done.note = Some(format!("released in {release_txid}"));
 
-    // A terminal outcome: the release is on chain, so this fact lands whatever
-    // else is in the file - and `record_outcome` names anything it wrote over
-    // rather than burying it. The `held` copy is the `Paid` line this follows,
-    // which is what the compare-and-set matches against when nothing has gone
-    // wrong.
-    let mut held = record.clone();
-    held.state = FillState::Paid;
-    zecp2p_taker::auto::journal::record_outcome(journal, &held, &record)
+    // Already fulfilled is not an error. A second call - a restart finishing an
+    // order whose release landed before the crash - has nothing to do.
+    let latest = journal.latest().context("could not read the journal back")?;
+    let work = paid.work_id();
+    if latest
+        .iter()
+        .any(|r| r.work_id() == work && r.state == FillState::Fulfilled)
+    {
+        return Ok(());
+    }
+
+    zecp2p_taker::auto::journal::record_outcome(journal, paid, &done)
         .map(|_| ())
         .context("could not record the fill as fulfilled; the slot will stay held")
 }
@@ -414,17 +414,37 @@ mod tests {
     }
 
     #[test]
-    fn a_standing_seen_record_blocks_a_second_reservation() {
-        // R8-1: a second `Seen` used to be allowed here on the reasoning that a
-        // retry looks like one. But the journal keeps the last line per work
-        // item, so a second reservation *displaces* the first - and the fill
-        // holding that one can no longer advance, while the newcomer walks the
-        // sequence and pays. A retry after a real crash is not blocked: the
-        // attempt that ended wrote `Cancelled`, and a closed line holds nothing.
+    fn a_crashed_reservation_does_not_lock_the_order_out() {
+        // R9-1. R8-1 blocked a second `Seen`, which stopped one burying case
+        // and created a stall: a coordinator killed between reserving and its
+        // chain call left a line nobody would advance, and every later order
+        // then waited on it forever - silently, because `Seen` never reaches an
+        // operator's list.
+        //
+        // Displacing it is safe under the compare-and-set: the crashed attempt
+        // cannot advance afterwards, and cannot give the slot back either.
         let (_d, j) = journal();
         let work = zec_work(1);
         write(&j, &work, FillState::Seen);
-        assert!(take(&j, &work, 700_000, "alice").unwrap().is_err());
+        assert!(
+            take(&j, &work, 700_000, "alice").unwrap().is_ok(),
+            "a crashed reservation locked the order out"
+        );
+    }
+
+    #[test]
+    fn an_order_being_paid_still_blocks_a_second_attempt() {
+        // The states that mean money may have moved still block, which is the
+        // case R8-1 was for. R9-1 relaxes only the pre-payment ones.
+        for state in [FillState::Paying, FillState::Paid, FillState::NeedsOperator] {
+            let (_d, j) = journal();
+            let work = zec_work(1);
+            write(&j, &work, state);
+            assert!(
+                take(&j, &work, 700_000, "alice").unwrap().is_err(),
+                "{state:?} must still block"
+            );
+        }
     }
 
     #[test]

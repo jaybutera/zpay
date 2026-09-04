@@ -944,6 +944,19 @@ async fn run_rails(config: &TakerConfig, check_chain: bool) -> Result<()> {
         None => println!("the in-flight slot is free; either rail may start work"),
     }
 
+    // R9: every open fill, not only the ones that may have moved money. `Seen`,
+    // `Signalling` and `Signalled` all hold the slot, and a daemon restarting
+    // behind one starts cleanly and then skips every deposit - in silence,
+    // until somebody prints this.
+    let open = journal.open_fills()?;
+    if open.len() > 1 {
+        println!();
+        println!("{} open fill(s) in the journal:", open.len());
+        for record in &open {
+            println!("  {} is {:?}", record.describe(), record.state);
+        }
+    }
+
     let stuck = journal.needs_operator()?;
     if !stuck.is_empty() {
         println!();
