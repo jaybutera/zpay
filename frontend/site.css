@@ -1,7 +1,7 @@
-/* zpay front door: index.html and takers/.
-   Same dark slate ground as the app terminal (app/styles.css), plus one accent:
-   Venmo blue. Headlines are sans; numbers, addresses and labels stay mono so
-   the page and the app read as one product. No build step. */
+/* zpay front door: index.html, takers/, and the room app/ is built in.
+   Dark slate ground, one accent: Venmo blue. Headlines are sans; numbers,
+   addresses and labels stay mono so the page and the app read as one product.
+   No build step. */
 
 /* Self-hosted so the page makes no third-party font call. Latin subsets only. */
 @font-face {
@@ -364,6 +364,24 @@ p { margin: 0; }
 .quote-fine { margin-top: 12px; font-size: 12.5px; line-height: 1.5; color: var(--text-mute); text-align: center; }
 .quote-fine a { color: var(--text-dim); }
 
+/* the terms list inside the hero card */
+.terms { list-style: none; margin: 0; padding: 0; border-top: 1px solid var(--line-soft); }
+.terms li {
+  display: grid;
+  grid-template-columns: 96px minmax(0, 1fr);
+  gap: 12px;
+  align-items: baseline;
+  padding: 11px 0;
+  border-bottom: 1px solid var(--line-soft);
+  font-size: 14px;
+  color: var(--text-dim);
+}
+.terms li .k { padding-top: 2px; }
+.terms li .v { color: var(--text); }
+.terms li .v b { color: #fff; font-weight: 600; }
+.terms li .v .mono { font: 600 13.5px/1.4 var(--mono); }
+.terms li .v .blue { color: var(--blue-lit); }
+
 /* ---------- live strip ---------- */
 
 .strip { padding: 28px 0 8px; }
@@ -381,10 +399,11 @@ p { margin: 0; }
 .strip .cell .v { font: 600 26px/1.1 var(--mono); color: #fff; letter-spacing: -.02em; }
 .strip .cell .v.blue { color: var(--blue-lit); }
 .strip .cell .sub { display: block; margin-top: 8px; font: 11.5px/1.35 var(--mono); color: var(--text-mute); }
-@media (max-width: 900px) { .strip .grid { grid-template-columns: repeat(3, 1fr); } }
-@media (max-width: 560px) { .strip .grid { grid-template-columns: 1fr 1fr; } }
+.strip .grid.four { grid-template-columns: repeat(4, 1fr); }
+@media (max-width: 900px) { .strip .grid { grid-template-columns: repeat(3, 1fr); } .strip .grid.four { grid-template-columns: 1fr 1fr; } }
+@media (max-width: 560px) { .strip .grid { grid-template-columns: 1fr 1fr; } .strip .cell { padding: 16px 16px; } .strip .cell .v { font-size: 22px; } }
 
-/* what the offramp runs on: the outside contracts and services, each a link */
+/* what the escrow leans on: the outside pieces, each a link */
 .stack {
   margin-top: 18px;
   display: flex;
@@ -453,8 +472,18 @@ section.block > .wrap > .label { margin-bottom: 12px; display: block; }
 .flow .box { fill: var(--panel); stroke: var(--line); }
 .flow .box.blue { stroke: var(--blue); }
 .flow .box.zec { stroke: #6b5a1f; }
-.flow .line { stroke: var(--text-mute); fill: none; }
+.flow .line { stroke: var(--text-mute); stroke-width: 1.5; fill: none; }
 .flow .line.blue { stroke: var(--blue); }
+.flow .line.dashed { stroke-dasharray: 4 4; }
+.flow .arrow { fill: var(--text-mute); }
+.flow .arrow.blue { fill: var(--blue); }
+/* the same diagram twice: sideways on a desk, top to bottom on a phone */
+.flow .flow-tall { display: none; min-width: 0; max-width: 380px; margin: 0 auto; }
+@media (max-width: 640px) {
+  .flow { padding: 18px 14px 10px; overflow-x: hidden; }
+  .flow .flow-wide { display: none; }
+  .flow .flow-tall { display: block; }
+}
 
 /* trust cards */
 .trust {

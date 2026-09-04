@@ -5,9 +5,8 @@
    footer are the ones on zpay.cash by construction, not by copy. What lives
    here is the app card (fields, quote, address, ladder, refund) and the few
    places the app page differs from the front door: the card sits next to the
-   headline, the status dot stays visible on a phone, and the diagram has a
-   tall variant for narrow screens instead of a sideways scroll. The advanced
-   route keeps its own terminal styling on purpose. */
+   headline and the status dot stays visible on a phone. The advanced route
+   keeps its own terminal styling on purpose. */
 
 :root {
   --zec:      #d7b34a;
@@ -38,7 +37,8 @@ main { flex: 1; }
 /* ---------- hero: headline, card, lede ----------
    The headline and the card share the fold. On a wide screen the copy stacks
    under the headline in the left column; on a phone the card comes right
-   after the headline and the lede follows it. */
+   after the headline and the lede follows it. The four-cell strip and the
+   two-variant flow diagram are site.css's; the front door draws the same. */
 
 .hero { padding: 72px 0 36px; }
 .hero .wrap {
@@ -60,27 +60,9 @@ main { flex: 1; }
   .hero .hero-cta { display: none; }
 }
 
-/* ---------- strip: four cells, not five ---------- */
+/* ---------- strip: sits right under the card ---------- */
 
 .strip { padding: 0 0 8px; }
-.strip .grid { grid-template-columns: repeat(4, 1fr); }
-@media (max-width: 900px) { .strip .grid { grid-template-columns: 1fr 1fr; } }
-@media (max-width: 560px) { .strip .cell { padding: 16px 16px; } .strip .cell .v { font-size: 22px; } }
-
-/* ---------- flow diagram: the site's panel, with a tall variant for phones ---------- */
-
-.flow .flow-wide { min-width: 720px; }
-.flow .flow-tall { display: none; min-width: 0; max-width: 380px; margin: 0 auto; }
-.flow .line { stroke-width: 1.5; }
-.flow .line.dashed { stroke-dasharray: 4 4; }
-.flow .arrow { fill: var(--text-mute); }
-.flow .arrow.blue { fill: var(--blue); }
-.flow .box.zec { stroke: var(--zec-line); }
-@media (max-width: 640px) {
-  .flow { padding: 18px 14px 10px; overflow-x: hidden; }
-  .flow .flow-wide { display: none; }
-  .flow .flow-tall { display: block; }
-}
 
 /* ---------- the card ---------- */
 

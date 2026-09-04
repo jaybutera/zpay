@@ -6,7 +6,7 @@ to zpay.cash is this directory, minus this file.
 ```
 frontend/
   index.html       the front door
-  site.css/js      its styling and live numbers
+  site.css/js      its styling, the links and the fee, and the status dot
   takers/          running a taker
   fonts/           Inter and JetBrains Mono, self-hosted
   app/             the app: pay a Venmo handle with ZEC, native Zcash escrow

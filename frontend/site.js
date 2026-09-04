@@ -1,19 +1,21 @@
-/* zpay front door: live numbers, the quote widget, the platform picker.
-   Plain ES2020, no build step. Read-only against the coordinator: GET /stats,
-   GET /health, GET /quote. Nothing here ever posts. */
+/* zpay front door: the links, the fee, and the coordinator's status dot.
+   Plain ES2020, no build step. Read-only against the coordinator: one GET of
+   /escrow/capabilities, the same call the app makes first, so the dot in this
+   nav and the dot in the app's nav agree. Nothing here ever posts. */
 
 'use strict';
 
 // ---------- one place to edit ----------
 //
 // Every link and every number the copy leans on. Change it here, not in the
-// markup: both index.html and takers/index.html fill from this block.
+// markup: index.html and takers/index.html fill from this block.
 const SITE = {
-  // Placeholder until the fee is fixed. Rendered everywhere as data-fee.
+  // Rendered everywhere as data-fee. A live coordinator's fee.bps overrides
+  // it below, so the page and the app never disagree once one answers.
   feePercent: '0.15',
 
-  // OfframpGlue on Base mainnet (chain 8453). /stats overrides this when the
-  // coordinator answers, so a redeploy needs no page edit.
+  // The Base-rail contract the takers page still documents. Not on the front
+  // door any more: the escrow is on Zcash.
   glueContract: '0x617544CC688F7f742cA68B5d9106890500b6C689',
   chainId: 8453,
 
@@ -28,29 +30,13 @@ const SITE = {
     verifier: 'https://basescan.org/address/0xC6F4a193576C60892a47e111Bb5706c30162502B',
     stakeVault: 'https://basescan.org/address/0x47c26258222e2f96424bD2B21bf173f0DA5034C7',
   },
-
-  // zk-p2p's buyer platform enum, as the enclave enumerates it. Venmo is the
-  // one the coordinator registers payees for today.
-  platforms: [
-    { id: 'venmo',    name: 'Venmo',       on: true },
-    { id: 'cashapp',  name: 'Cash App' },
-    { id: 'paypal',   name: 'PayPal' },
-    { id: 'zelle',    name: 'Zelle' },
-    { id: 'wise',     name: 'Wise' },
-    { id: 'revolut',  name: 'Revolut' },
-    { id: 'monzo',    name: 'Monzo' },
-    { id: 'chime',    name: 'Chime' },
-    { id: 'monobank', name: 'Monobank' },
-    { id: 'alipay',   name: 'Alipay' },
-    { id: 'upi',      name: 'UPI' },
-  ],
 };
 
 // ---------- coordinator base URL ----------
 //
 // Same resolution as the app, minus ?api=: this page only reads, but it still
 // should not be pointed anywhere by a link. A loopback origin saved by the app
-// is honoured so a dev setup works out of the box.
+// is honoured so a dev setup works out of the box. Same origin otherwise.
 const API = (() => {
   let saved = null;
   try { saved = localStorage.getItem('zecp2p.api'); } catch (_) {}
@@ -58,12 +44,7 @@ const API = (() => {
   if (location.protocol === 'file:' || location.port === '5173' || location.port === '8080') {
     return 'http://127.0.0.1:3000';
   }
-  // Same origin, behind CloudFront's /api/* behaviour. Same-origin means no
-  // preflight, and it keeps the read API on the one hostname the page already
-  // trusts. It answers /stats and /quote in the coordinator's shapes; it is a
-  // snapshot for the counters and a live 1Click call for the quote, until the
-  // coordinator itself gets a public host.
-  return '/api';
+  return '';
 })();
 
 const $ = (id) => document.getElementById(id);
@@ -81,48 +62,24 @@ async function api(path) {
 
 // ---------- fill the static parts ----------
 
+function setFee(pct) {
+  $$('[data-fee]').forEach((el) => { el.textContent = pct + '%'; });
+}
+
 function applySite() {
-  $$('[data-fee]').forEach((el) => { el.textContent = SITE.feePercent + '%'; });
+  setFee(SITE.feePercent);
   $$('[data-link]').forEach((el) => {
     const href = SITE.links[el.dataset.link];
     if (href) el.href = href;
   });
-  setContract(SITE.glueContract, SITE.chainId);
-}
-
-function setContract(addr, chainId) {
-  if (!addr) return;
-  $$('[data-contract]').forEach((el) => { el.textContent = addr; });
+  $$('[data-contract]').forEach((el) => { el.textContent = SITE.glueContract; });
   $$('[data-contract-link]').forEach((el) => {
-    el.href = 'https://basescan.org/address/' + addr;
+    el.href = 'https://basescan.org/address/' + SITE.glueContract;
   });
-  $$('[data-chain]').forEach((el) => { el.textContent = 'Base ' + chainId; });
+  $$('[data-chain]').forEach((el) => { el.textContent = 'Base ' + SITE.chainId; });
 }
 
-// ---------- number formatting ----------
-
-function usdFromUnits(units) {
-  // 6-decimal USDC string -> "$1,234.56". BigInt keeps large totals exact.
-  let n;
-  try { n = BigInt(String(units)); } catch (_) { return null; }
-  const whole = n / 1000000n;
-  const cents = (n % 1000000n) / 10000n;
-  return '$' + whole.toLocaleString('en-US') + '.' + String(cents).padStart(2, '0');
-}
-
-function ago(iso) {
-  const t = Date.parse(iso);
-  if (Number.isNaN(t)) return '';
-  const s = Math.max(0, Math.round((Date.now() - t) / 1000));
-  if (s < 60) return s + 's ago';
-  const m = Math.round(s / 60);
-  if (m < 60) return m + 'm ago';
-  const h = Math.round(m / 60);
-  if (h < 48) return h + 'h ago';
-  return Math.round(h / 24) + 'd ago';
-}
-
-// ---------- live strip ----------
+// ---------- the status dot ----------
 
 function setState(el, state, text) {
   if (!el) return;
@@ -131,150 +88,19 @@ function setState(el, state, text) {
   if (t) t.textContent = text;
 }
 
-async function refreshStats() {
+async function refreshStatus() {
   const conn = $('conn');
   try {
-    const s = await api('/stats');
+    const c = await api('/escrow/capabilities');
     setState(conn, 'up', 'coordinator up');
-    if ($('s-fills')) $('s-fills').textContent = String(s.fulfilled ?? 0);
-    if ($('s-settled')) $('s-settled').textContent = usdFromUnits(s.settled_usdc ?? '0') || '—';
-    if ($('s-open')) $('s-open').textContent = String(s.open_deposits ?? 0);
-    if ($('s-open-sub')) $('s-open-sub').textContent = (s.in_flight ?? 0) + ' in flight';
-    if ($('s-last')) $('s-last').textContent = s.last_fulfilled_at ? ago(s.last_fulfilled_at) : 'none yet';
-    if ($('s-last-sub')) $('s-last-sub').textContent = "from the coordinator's log";
-    if (s.glue_contract) setContract(s.glue_contract, s.chain_id || SITE.chainId);
-  } catch (e) {
-    setState(conn, 'down', 'coordinator down');
-    ['s-fills', 's-settled', 's-open', 's-last'].forEach((id) => { if ($(id)) $(id).textContent = '—'; });
-  }
-}
-
-function money(decimalStr) {
-  // "48.123456" -> "48.12". The API already formats these as decimal strings.
-  const n = Number(decimalStr);
-  if (!Number.isFinite(n)) return null;
-  return n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-}
-
-async function refreshRate() {
-  if (!$('s-rate')) return;
-  try {
-    const q = await api('/quote?zec_amount=1');
-    const r = money(q.rate);
-    if (r) {
-      $('s-rate').textContent = r;
-      if ($('s-rate-sub')) $('s-rate-sub').textContent = 'USDC per ZEC, live from 1Click';
-      if ($('q-head')) $('q-head').textContent = '1 ZEC = ' + r + ' USDC';
-    }
+    if (c && c.fee && typeof c.fee.bps === 'number') setFee((c.fee.bps / 100).toFixed(2));
   } catch (_) {
-    $('s-rate').textContent = '—';
+    setState(conn, 'down', 'coordinator down');
   }
-}
-
-// ---------- quote widget ----------
-
-function validZec(v) {
-  return /^\d+(\.\d{1,8})?$/.test(v) && Number(v) > 0;
-}
-
-function buildPicker() {
-  const menu = $('picker-menu');
-  const btn = $('picker-btn');
-  if (!menu || !btn) return;
-
-  menu.innerHTML = '';
-  SITE.platforms.forEach((p) => {
-    const li = document.createElement('li');
-    li.setAttribute('role', 'option');
-    li.setAttribute('aria-selected', p.on ? 'true' : 'false');
-    if (!p.on) li.setAttribute('aria-disabled', 'true');
-    const name = document.createElement('span');
-    name.className = 'name';
-    name.textContent = p.name;
-    const tag = document.createElement('span');
-    tag.className = 'tag';
-    tag.textContent = p.on ? 'live' : 'soon';
-    li.append(name, tag);
-    if (p.on) li.addEventListener('click', () => close());
-    menu.appendChild(li);
-  });
-
-  function open() { menu.hidden = false; btn.setAttribute('aria-expanded', 'true'); }
-  function close() { menu.hidden = true; btn.setAttribute('aria-expanded', 'false'); }
-  btn.addEventListener('click', () => (menu.hidden ? open() : close()));
-  document.addEventListener('click', (e) => {
-    if (!menu.hidden && !menu.contains(e.target) && e.target !== btn && !btn.contains(e.target)) close();
-  });
-  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') close(); });
-}
-
-let quoteSeq = 0;
-
-async function getQuote() {
-  const input = $('q-zec');
-  const note = $('q-note');
-  const v = input.value.trim();
-  const seq = ++quoteSeq;
-  note.className = 'quote-note';
-  if (v === '') {
-    $('q-out').hidden = true;
-    note.textContent = 'type an amount to see what lands in their Venmo';
-    return;
-  }
-  if (!validZec(v)) {
-    $('q-out').hidden = true;
-    note.textContent = 'Enter a ZEC amount, up to 8 decimal places.';
-    note.className = 'quote-note err';
-    return;
-  }
-  note.textContent = 'asking 1Click for a route…';
-  try {
-    const q = await api('/quote?zec_amount=' + encodeURIComponent(v));
-    if (seq !== quoteSeq) return; // a newer keystroke owns the card now
-    $('q-usdc').textContent = money(q.usdc_amount) + ' USDC';
-    $('q-venmo').innerHTML = '';
-    const cur = document.createElement('span');
-    cur.className = 'cur';
-    cur.textContent = '$';
-    $('q-venmo').append(cur, document.createTextNode(money(q.venmo_amount) || '—'));
-    $('q-rate').textContent = money(q.rate) || '—';
-    $('q-out').hidden = false;
-    const exp = q.expires_at ? Date.parse(q.expires_at) : NaN;
-    note.textContent = Number.isNaN(exp)
-      ? 'route found'
-      : 'route quoted until ' + new Date(exp).toLocaleTimeString();
-    note.className = 'quote-note ok';
-  } catch (e) {
-    if (seq !== quoteSeq) return;
-    $('q-out').hidden = true;
-    note.textContent = e.message === 'Failed to fetch' ? 'coordinator unreachable; no quote' : e.message;
-    note.className = 'quote-note err';
-  }
-}
-
-function syncStart() {
-  const v = $('q-zec').value.trim();
-  const ok = validZec(v);
-  $('q-start').href = ok ? 'app/?zec=' + encodeURIComponent(v) : 'app/';
-  $('q-start').textContent = ok ? 'Start with ' + v + ' ZEC' : 'Continue in the app';
 }
 
 // ---------- boot ----------
 
 applySite();
-buildPicker();
-
-if ($('q-zec')) {
-  let timer = null;
-  $('q-zec').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); clearTimeout(timer); getQuote(); } });
-  $('q-zec').addEventListener('input', () => {
-    syncStart();
-    clearTimeout(timer);
-    timer = setTimeout(getQuote, 450);
-  });
-}
-
-refreshStats();
-setInterval(refreshStats, 30000);
-refreshRate();
-setInterval(refreshRate, 120000);
+refreshStatus();
+setInterval(refreshStatus, 30000);
