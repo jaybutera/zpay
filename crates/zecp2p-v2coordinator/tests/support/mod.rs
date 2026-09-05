@@ -413,6 +413,33 @@ impl FiatRail for UnavailableRail {
     }
 }
 
+/// A rail that gets past preflight and then errors inside `pay`.
+///
+/// This is the ambiguous failure the driver is built around: the journal claim
+/// is already written, the browser may or may not have sent the dollars, and
+/// nothing downstream can tell. It is the writer that leaves `Failed` with no
+/// `payment` recorded, which is a different thing from a rail that could never
+/// start.
+pub struct PayErrorsRail;
+
+#[async_trait::async_trait]
+impl FiatRail for PayErrorsRail {
+    async fn preflight(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn pay(&self, _leg: &zecp2p_taker::auto::rail::FiatLeg) -> anyhow::Result<PaidFiat> {
+        anyhow::bail!("the browser died halfway through the payment")
+    }
+
+    async fn attest(
+        &self,
+        _leg: &zecp2p_taker::auto::rail::FiatLeg,
+    ) -> anyhow::Result<zecp2p_escrow::lp_client::WireAttestation> {
+        anyhow::bail!("nothing to attest")
+    }
+}
+
 /// A coordinator whose rail cannot pay at all.
 pub fn coordinator_that_cannot_pay(
     dir: &std::path::Path,

@@ -2131,6 +2131,113 @@ async fn a_failed_order_keeps_its_reason_on_the_way_to_refundable() {
 }
 
 #[tokio::test]
+async fn an_order_nobody_ever_funded_is_not_offered_a_refund() {
+    // R4-2. The predicate did not ask whether anything was ever at the address,
+    // so an abandoned order went `Unpaid` at the pay deadline and `Refundable`
+    // at T with `funding` null. The page then tells the user their ZEC "is in
+    // the escrow" and shows the form; the refund builder cannot fill it and the
+    // endpoint refuses. The order also stays in the sweep list for good.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+    let state = coordinator_that_cannot_pay(dir.path(), scanner.clone(), &node, &attestor);
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+    let user = TestUser::new();
+    let (order_id, _amount_zat, stored) = opened_order(&app, &state, &user).await;
+
+    // Never funded: no block scan hit, no mempool sighting.
+    let mut abandoned = state.store.get(&order_id).unwrap();
+    abandoned.stage = Stage::Unpaid;
+    state.store.put(&abandoned).unwrap();
+    assert!(state.store.get(&order_id).unwrap().funding.is_none());
+
+    node.set_height(u32::try_from(stored.refund_height).unwrap() + 1).await;
+    for _ in 0..3 {
+        for o in state.store.open_orders() {
+            zecp2p_v2coordinator::driver::advance(&state, &o.order_id).await.ok();
+        }
+    }
+
+    let end = state.store.get(&order_id).unwrap();
+    assert_eq!(
+        end.stage,
+        Stage::Unpaid,
+        "an order with an empty escrow was promoted to {:?} and handed a refund form",
+        end.stage
+    );
+    assert!(
+        !state.store.open_orders().iter().any(|o| o.order_id == order_id),
+        "a never-funded order is swept for ever"
+    );
+}
+
+#[tokio::test]
+async fn a_venmo_leg_that_errored_is_not_steered_to_a_refund() {
+    // R4-1. The R3-3 guard keys on `Order.payment`, and three of the driver's
+    // four post-claim `Failed` writers never set it - only the release-failed
+    // one does. The committed test built its order by hand with `payment` set,
+    // so it exercised the single writer that worked.
+    //
+    // This drives the real thing: a rail that gets past preflight and then
+    // errors inside `pay`. The journal claim is already written, the browser
+    // may or may not have sent the dollars, and nothing downstream can tell.
+    // The order needs an operator to read the feed. Promoting it to
+    // `Refundable` and putting the form in front of the user takes that
+    // decision away from them.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+    let state = coordinator_with_fiat(
+        dir.path(),
+        scanner.clone(),
+        &node,
+        &attestor,
+        Arc::new(PayErrorsRail),
+    );
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+    let user = TestUser::new();
+
+    // A funded, signed, locked order - through the driver, not by hand.
+    let (order_id, _) = locked_order(&app, &state, &node, &scanner, &attestor, &user).await;
+    let stored = state.store.get(&order_id).unwrap();
+
+    // The payment attempt errors after the claim.
+    for _ in 0..2 {
+        zecp2p_v2coordinator::driver::advance(&state, &order_id).await.ok();
+    }
+    let failed = state.store.get(&order_id).unwrap();
+    assert_eq!(
+        failed.stage,
+        Stage::Failed,
+        "expected the errored pay to fail the order, got {:?}",
+        failed.stage
+    );
+    assert!(
+        failed.payment.is_none(),
+        "this writer does not record a payment; the test would not prove anything if it did"
+    );
+
+    // Past T, swept the way `run` does.
+    node.set_height(u32::try_from(stored.refund_height).unwrap() + 1).await;
+    for _ in 0..3 {
+        for o in state.store.open_orders() {
+            zecp2p_v2coordinator::driver::advance(&state, &o.order_id).await.ok();
+        }
+    }
+
+    let end = state.store.get(&order_id).unwrap();
+    assert_eq!(
+        end.stage,
+        Stage::Failed,
+        "an order whose journal says the dollars may have left was promoted to {:?}, \
+         which is the screen that hands the user a refund form",
+        end.stage
+    );
+}
+
+#[tokio::test]
 async fn a_failure_after_the_dollars_left_is_not_steered_to_a_refund() {
     // R3-3. `Failed` is also what the driver writes when the Venmo leg errors
     // after the journal claim, and when the payment left and the release did

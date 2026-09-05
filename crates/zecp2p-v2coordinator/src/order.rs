@@ -339,6 +339,13 @@ impl Order {
         matches!(self.stage, Stage::Unpaid | Stage::Failed)
             && self.payment.is_none()
             && !self.stage.fiat_may_have_left()
+            // Something has to be at the address. An order nobody ever funded
+            // has no escrow to refund: promoting it says "your ZEC is in the
+            // escrow" over an empty one, hands the user a form the refund
+            // builder cannot fill, and keeps the order in the sweep list for
+            // good. A mempool sighting counts - the coin is on its way even if
+            // no block holds it yet.
+            && (self.funding.is_some() || self.mempool_announced_txid.is_some())
     }
 
     /// Moves to `Failed` with a reason the page shows.

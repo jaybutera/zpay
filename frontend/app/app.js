@@ -678,8 +678,24 @@ function renderReturns(view) {
       }
       break;
     case 'refundable':
+      // Same guard as the stopped branch, one stage along. The coordinator now
+      // promotes finished orders to `refundable`, so this is where a user whose
+      // dollars already went would land - and offering the form here would be
+      // this page telling them to race a release the LP holds.
+      if (view.payment) {
+        $('returns-title').textContent = 'This one needs a person';
+        $('returns-body').textContent =
+          `${view.reason ? view.reason + ' ' : ''}The dollars for this order were already sent, ` +
+          'so the refund is not yours to take on your own. Keep this link and get in touch.';
+        form.hidden = true;
+        break;
+      }
       $('returns-title').textContent = 'Where should your ZEC go?';
+      // R4-3: the reason survives the promotion to `refundable`, and it is the
+      // only place the user learns why the trade stopped. A page opened after
+      // the sweep never saw the `failed` screen that carried it.
       $('returns-body').textContent =
+        `${view.reason ? view.reason + ' ' : ''}` +
         `${zec(view.escrow.amount_zat)} is in the escrow and block ${T.toLocaleString()} has passed. ` +
         'This page signs the refund with your key; no one else is involved.';
       form.hidden = !state.key;

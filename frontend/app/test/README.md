@@ -79,3 +79,15 @@ refundable the next day.
 ```
 node frontend/app/test/refund-wait.js
 ```
+
+## When the refund form is offered
+
+`refund-form-visibility.js` drives `renderReturns` under a stub DOM. The form
+signs the escrow's timeout branch, which is right when the trade is over and
+nobody was paid and wrong when the dollars already left - there the LP holds a
+valid release over the same escrow, and offering the form is this page telling
+the user to race it.
+
+```
+node frontend/app/test/refund-form-visibility.js
+```

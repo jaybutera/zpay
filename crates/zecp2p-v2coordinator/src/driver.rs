@@ -487,6 +487,42 @@ async fn announce(state: &Arc<AppState>, mut order: Order) -> Result<()> {
 /// one question answered - has the chain passed `T` - so this asks that and
 /// writes nothing else.
 async fn check_refund_deadline_only(state: &Arc<AppState>, mut order: Order) -> Result<()> {
+    // The journal decides this, not the order.
+    //
+    // `Order.payment` is set by exactly one of the four `Failed` writers that
+    // follow a journal claim - the one where the release failed after a
+    // recorded payment. The other three leave it unset: the Venmo leg erroring
+    // inside `pay`, a stale `Paying` line this instance will not adopt, and
+    // another payment already under way. In all of those the dollars may
+    // already have gone and only the journal knows, so keying the guard on the
+    // order let three quarters of the cases through.
+    //
+    // These orders need an operator to read the feed and decide. Promoting them
+    // to `Refundable` puts a refund form in front of the user instead, over an
+    // escrow the LP may have already bought.
+    if let Some(funding) = order.funding {
+        let work = crate::slot::work_id_for(&funding.txid, funding.vout);
+        match crate::slot::fiat_may_have_left(&state.journal, &work) {
+            Ok(true) => {
+                tracing::debug!(
+                    order = %order.order_id,
+                    "not offering a refund: the journal says a payment may already have left"
+                );
+                return Ok(());
+            }
+            Ok(false) => {}
+            Err(e) => {
+                // Unreadable journal is not permission to offer the refund.
+                tracing::warn!(
+                    order = %order.order_id,
+                    error = %e,
+                    "could not read the journal, so not promoting this order to refundable"
+                );
+                return Ok(());
+            }
+        }
+    }
+
     let (height, _) = match state.chain_head_uncached().await {
         Ok(h) => h,
         Err(e) => {
