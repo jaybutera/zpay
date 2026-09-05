@@ -29,6 +29,8 @@ impl FiatRail for SimulatedRail {
         Ok(PaidFiat {
             cents,
             fiat_left: true,
+            // No browser drove, so no note was typed.
+            note: None,
         })
     }
 

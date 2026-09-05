@@ -658,6 +658,7 @@ async fn a_refund_is_refused_once_the_dollars_have_gone() {
     stored.payment = Some(zecp2p_v2coordinator::order::Payment {
         sent_at: chrono::Utc::now(),
         cents: 100,
+        note: None,
     });
     state.store.put(&stored).unwrap();
 
@@ -2275,10 +2276,17 @@ async fn two_orders_inserted_together_do_not_both_win() {
 
 #[tokio::test]
 async fn every_order_carries_a_tag_the_feed_can_be_matched_on() {
-    // The tag replaces the duplicate refusal as the primary way two payments to
-    // one handle are told apart. It has to reach the leg the rail pays from and
-    // the feed search reads back, and it has to differ per order - a tag two
-    // orders share discriminates nothing.
+    // The tag is what tells two payments of the same amount to one handle
+    // apart in the feed. It has to reach the leg the rail pays from, it has to
+    // differ per order - a tag two orders share discriminates nothing - and it
+    // must not print any of the order id, which is the bearer credential for
+    // this order's own endpoint and its refund.
+    //
+    // It does not replace the duplicate refusal. That guard is untouched and
+    // still refuses a second order for one handle and one cent figure, so two
+    // such orders cannot coexist to be told apart. The tag is what makes the
+    // feed unambiguous once the guard is relaxed, and until the live run proves
+    // Venmo echoes the note it stays a second line rather than the first.
     let dir = tempfile::tempdir().unwrap();
     let node = FakeNode::spawn().await;
     let scanner = Arc::new(FakeScanner::new());
@@ -2296,13 +2304,88 @@ async fn every_order_carries_a_tag_the_feed_can_be_matched_on() {
             tag.chars().all(|c| c.is_ascii_hexdigit()),
             "the note round-trips through Venmo, so the tag stays ASCII: {tag:?}"
         );
-        assert!(id.ends_with(&tag), "the tag comes from the order it belongs to");
+        assert!(
+            !id.contains(&tag),
+            "the tag prints part of the order id into a note Venmo shows the \
+             payee, and that id is what reads and refunds this order: {tag} in {id}"
+        );
+        // An unpaid order is matched on the tag it is about to be paid with.
+        assert_eq!(order.tag_to_match(), Some(tag.clone()));
         tags.push(tag);
     }
 
     tags.sort();
     tags.dedup();
     assert_eq!(tags.len(), 3, "two orders shared a tag, which discriminates nothing");
+}
+
+#[tokio::test]
+async fn a_paid_order_records_the_note_the_rail_typed() {
+    // What the feed search looks for has to be what was actually typed, not
+    // what the code doing the searching would type now. The attestation runs on
+    // a later sweep and can run under a later binary, so the note goes on the
+    // order when the payment is made.
+    //
+    // Without this, an order paid by a build that wrote a bare configured note
+    // and attested after a deploy of a build that appends a tag is searched for
+    // under a tag its entry does not carry. `locate_payment` finds nothing,
+    // refuses, and the driver retries it every sweep with the dollars gone and
+    // the one payment slot held.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+    let fiat = Arc::new(CountingFiat::new());
+    let state = coordinator_with_fiat(dir.path(), scanner.clone(), &node, &attestor, fiat.clone());
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+    let user = TestUser::new();
+    let (order_id, amount_zat, stored) = opened_order(&app, &state, &user).await;
+
+    let funding_txid = [0x73u8; 32];
+    scanner.pay(
+        &stored.script_pubkey,
+        FoundOutput { txid: funding_txid, vout: 0, amount_zat },
+    );
+    node.add_utxo(funding_txid, 0, stored.script_pubkey.clone(), amount_zat, 30)
+        .await;
+    zecp2p_v2coordinator::driver::advance(&state, &order_id).await.unwrap();
+    sign_it(&app, &state, &attestor, &user, &order_id).await;
+
+    for _ in 0..60 {
+        let stage = state.store.get(&order_id).unwrap().stage;
+        if matches!(stage, Stage::Paid | Stage::Released) {
+            break;
+        }
+        let _ = zecp2p_v2coordinator::driver::advance(&state, &order_id).await;
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    }
+
+    let paid = state.store.get(&order_id).unwrap();
+    assert_eq!(fiat.payments(), 1, "the dollars went {} times", fiat.payments());
+    let payment = paid.payment.as_ref().expect("a paid order records its payment");
+    let note = payment
+        .note
+        .as_deref()
+        .expect("the rail reported what it typed, and the order kept it");
+    let tag = paid.payment_tag();
+    assert!(
+        note.contains(&tag),
+        "the note that went out does not carry this order's tag: {note:?} vs {tag}"
+    );
+    // And that is what the feed will be searched for.
+    assert_eq!(paid.tag_to_match(), Some(tag));
+
+    // The same order, paid the way the pre-tag build paid it. The recorded note
+    // decides, so it is searched for on amount and receiver - the terms it was
+    // actually sent under - rather than under a tag that is not in the feed.
+    let mut paid_before_the_deploy = paid.clone();
+    paid_before_the_deploy.payment.as_mut().unwrap().note = Some("thanks".into());
+    assert_eq!(
+        paid_before_the_deploy.tag_to_match(),
+        None,
+        "an order paid before tags existed would be searched for under one, and \
+         every sweep would refuse with the dollars already gone"
+    );
 }
 
 #[tokio::test]
@@ -2753,6 +2836,7 @@ async fn a_failure_after_the_dollars_left_is_not_steered_to_a_refund() {
     paid_then_failed.payment = Some(zecp2p_v2coordinator::order::Payment {
         sent_at: chrono::Utc::now(),
         cents: 200,
+        note: None,
     });
     paid_then_failed.fail("the dollars were sent and the release did not broadcast");
     state.store.put(&paid_then_failed).unwrap();

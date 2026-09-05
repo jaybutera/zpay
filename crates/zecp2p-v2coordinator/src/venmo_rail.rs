@@ -165,6 +165,10 @@ impl FiatRail for VenmoRail {
             cents: u64::try_from(leg.payment.cents())
                 .context("the payment does not fit a cent count")?,
             fiat_left: sent.fiat_left(),
+            // What was typed, reported back so the attestation searches the
+            // feed for the note this payment actually carries rather than the
+            // one a later build would have written.
+            note: Some(note),
         })
     }
 

@@ -463,41 +463,63 @@ pub mod feed {
         stories: Vec<Story>,
     }
 
+    /// Reads a field that may be absent, present, or explicitly `null`.
+    ///
+    /// `#[serde(default)]` alone covers the absent case only. An explicit
+    /// `"note": null` is a *type* error against a struct field, and serde
+    /// aborts the whole document on it - so one story that carries a null
+    /// anywhere in the feed fails every story's parse, and with it every
+    /// attestation, not merely the story it appeared on. The feed is somebody
+    /// else's JSON and holds story types this code never asked about: a bank
+    /// transfer or a request has no note to put there.
+    ///
+    /// Reading through `Option` makes a null read as the default, which for a
+    /// note is the empty string - carrying no tag, so a null-noted story is
+    /// skipped rather than matched.
+    fn null_is_default<'de, D, T>(deserializer: D) -> std::result::Result<T, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+        T: Default + Deserialize<'de>,
+    {
+        Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+    }
+
     #[derive(Debug, Deserialize)]
     struct Story {
         /// Rendered with a sign and a currency symbol: "- $4.84", "+ $1.00".
-        #[serde(default)]
+        #[serde(default, deserialize_with = "null_is_default")]
         amount: String,
         /// ISO 8601, e.g. "2026-09-02T02:21:39". Local to Venmo, no zone.
-        #[serde(default)]
+        #[serde(default, deserialize_with = "null_is_default")]
         date: String,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "null_is_default")]
         title: Title,
         /// What the sender typed in the note field.
         ///
-        /// Present on every story in the live feed, checked 2026-09-05,
+        /// Present on all ten stories of the live feed read on 2026-09-05,
         /// including this account's own past payments. It is the only field the
         /// paying side controls, which makes it the only place a per-payment
-        /// tag can go.
-        #[serde(default)]
+        /// tag can go. Ten stories is not every story type Venmo returns,
+        /// which is why it is read null-tolerantly below.
+        #[serde(default, deserialize_with = "null_is_default")]
         note: Note,
     }
 
     #[derive(Debug, Default, Deserialize)]
     struct Note {
-        #[serde(default)]
+        #[serde(default, deserialize_with = "null_is_default")]
         content: String,
     }
 
     #[derive(Debug, Default, Deserialize)]
     struct Title {
-        #[serde(default)]
+        #[serde(default, deserialize_with = "null_is_default")]
         receiver: Party,
     }
 
     #[derive(Debug, Default, Deserialize)]
     struct Party {
-        #[serde(default)]
+        #[serde(default, deserialize_with = "null_is_default")]
         username: String,
     }
 
@@ -624,8 +646,19 @@ pub mod feed {
         // only ever narrowing: an entry that lacks it is not ours, and a caller
         // that has none - an order made before tags existed - matches on the
         // amount and the receiver exactly as before.
+        //
+        // Compared case-insensitively. Whether Venmo returns the note byte for
+        // byte is the one claim in this mechanism that cannot be settled by
+        // reading code, and title-casing a note is a plausible thing for a
+        // consumer product to do. The tag is lowercase hex either way, so
+        // folding case costs one allocation and removes one way the match could
+        // silently stop discriminating.
         match tag {
-            Some(tag) => story.note.content.contains(tag),
+            Some(tag) => story
+                .note
+                .content
+                .to_ascii_lowercase()
+                .contains(&tag.to_ascii_lowercase()),
             None => true,
         }
     }
@@ -779,6 +812,60 @@ pub mod feed {
         fn the_recipient_must_match_and_case_does_not() {
             assert!(is_our_payment_untagged(&story("- $1.00", "test-payee"), "test-payee", "1.00"));
             assert!(!is_our_payment_untagged(&story("- $1.00", "someone-else"), "test-payee", "1.00"));
+        }
+
+        /// The note is read back out of Venmo, which is free to return it in a
+        /// case other than the one that was typed. The tag is lowercase hex, so
+        /// folding case here costs nothing and removes one way the match could
+        /// silently stop discriminating.
+        #[test]
+        fn the_tag_is_matched_whatever_case_the_note_comes_back_in() {
+            for note in ["thanks ABCD1234", "Thanks Abcd1234", "thanks abcd1234"] {
+                let ours = noted_story("- $2.00", "jay-butera", "2026-09-05T10:00:00", note);
+                assert!(
+                    is_our_payment(&ours, "jay-butera", "2.00", Some("abcd1234")),
+                    "the feed returned {note:?} and the tag stopped matching"
+                );
+            }
+        }
+
+        /// A story whose note or title came back JSON `null` must not break the
+        /// parse of the whole feed.
+        ///
+        /// `#[serde(default)]` covers a *missing* field only: an explicit null
+        /// is a type error against a struct, and one such story anywhere in the
+        /// feed fails `Stories` entirely - which is every attestation, not just
+        /// the one story. Before the note field existed nothing in this struct
+        /// could be null-valued in a way that mattered; the note is the field
+        /// most likely to come back null, since a story type that carries no
+        /// note (a bank transfer, a request) has nothing to put there.
+        #[test]
+        fn a_null_note_or_title_does_not_break_the_feed_parse() {
+            for body in [
+                r#"{"stories":[{"amount":"- $1.00"}]}"#,
+                r#"{"stories":[{"amount":"- $1.00","note":null}]}"#,
+                r#"{"stories":[{"amount":"- $1.00","note":{"content":null}}]}"#,
+                r#"{"stories":[{"amount":"- $1.00","title":null}]}"#,
+                r#"{"stories":[{"amount":"- $1.00","title":{"receiver":null}}]}"#,
+                r#"{"stories":[{"amount":"- $1.00","title":{"receiver":{"username":null}}}]}"#,
+                r#"{"stories":[{"amount":null,"date":null,"note":null,"title":null}]}"#,
+            ] {
+                let parsed: Stories = serde_json::from_str(body)
+                    .unwrap_or_else(|e| panic!("a null field broke the whole feed: {e} in {body}"));
+                assert_eq!(parsed.stories.len(), 1);
+            }
+        }
+
+        /// The story that carries a null note is still skipped rather than
+        /// matched: a null note reads as an empty one, which carries no tag.
+        #[test]
+        fn a_null_note_is_never_a_tagged_payment() {
+            let body = r#"{"stories":[{"amount":"- $1.00","note":null,
+                           "title":{"receiver":{"username":"jay-butera"}}}]}"#;
+            let parsed: Stories = serde_json::from_str(body).unwrap();
+            let story = &parsed.stories[0];
+            assert!(is_our_payment_untagged(story, "jay-butera", "1.00"));
+            assert!(!is_our_payment(story, "jay-butera", "1.00", Some("abcd1234")));
         }
 
         #[test]

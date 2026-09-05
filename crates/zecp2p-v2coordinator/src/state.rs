@@ -75,6 +75,19 @@ pub struct PaidFiat {
     pub cents: u64,
     /// False when the rail stopped at the irreversible step.
     pub fiat_left: bool,
+    /// The note this rail actually typed into the payment.
+    ///
+    /// Recorded rather than re-derived, because the attestation happens on a
+    /// later sweep - possibly under a later binary - and what the feed will
+    /// hold is what *this* run typed, not what the code reading it would type
+    /// now. An order paid by a build that wrote a bare configured note and
+    /// attested by a build that appends a tag would otherwise be searched for
+    /// under a tag its feed entry does not carry, and every sweep would refuse
+    /// with the dollars already gone and the payment slot held.
+    ///
+    /// `None` from a rail that does not report one, which reads the same way as
+    /// an order paid before this field existed: matched on amount and receiver.
+    pub note: Option<String>,
 }
 
 /// Everything the handlers and the driver share.

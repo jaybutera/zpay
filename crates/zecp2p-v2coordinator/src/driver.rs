@@ -793,6 +793,14 @@ async fn settle(state: &Arc<AppState>, mut order: Order) -> Result<()> {
                     order.payment = Some(crate::order::Payment {
                         sent_at: chrono::Utc::now(),
                         cents: order.quote.net_cents,
+                        // Reconstructed from the journal, not observed: the run
+                        // that typed the note is the one whose store write
+                        // failed, so what it typed is not known here. `None`
+                        // searches the feed on amount and receiver, which is
+                        // what this payment would have been matched on before
+                        // tags existed. It can only widen the search, never
+                        // send it looking for a tag that is not there.
+                        note: None,
                     });
                     order.stage = Stage::Paid;
                     order.touch();
@@ -1002,6 +1010,10 @@ async fn settle(state: &Arc<AppState>, mut order: Order) -> Result<()> {
     order.payment = Some(crate::order::Payment {
         sent_at: chrono::Utc::now(),
         cents: paid.cents,
+        // What the rail reported it typed. The attestation runs on a later
+        // sweep and reads the feed for this note, so it is recorded here rather
+        // than re-derived there.
+        note: paid.note.clone(),
     });
     order.stage = Stage::Paid;
     order.touch();
@@ -1282,7 +1294,7 @@ fn watched_escrow(
         // What tells this payment apart from any other of the same amount to
         // the same handle. Without it `locate_payment` refuses on two matching
         // feed entries, after the dollars have gone.
-        tag: Some(order.payment_tag()),
+        tag: order.tag_to_match(),
         terms: order.escrow_terms(&funding),
         canonical,
         recipient: order.handle.clone(),

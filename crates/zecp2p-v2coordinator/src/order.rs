@@ -216,6 +216,22 @@ pub struct Order {
 pub struct Payment {
     pub sent_at: chrono::DateTime<chrono::Utc>,
     pub cents: u64,
+    /// The note the rail typed into this payment, as it typed it.
+    ///
+    /// The feed search happens on a later sweep than the payment, and possibly
+    /// under a later binary. What the feed holds is what was typed at the time,
+    /// so it is recorded rather than re-derived: an order paid with a bare
+    /// configured note and attested after a deploy that appends tags would
+    /// otherwise be looked for under a tag its entry does not carry, and every
+    /// sweep would refuse - after the dollars had gone, with the one payment
+    /// slot held.
+    ///
+    /// `None` on an order paid before this field existed, and on one paid by a
+    /// rail that reports no note. Both mean the same thing to the search:
+    /// nothing is known about the note, so match on amount and receiver, which
+    /// is what those payments were matched on when they were made.
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 impl Order {
@@ -362,22 +378,65 @@ impl Order {
     /// Checked against the live feed on 2026-09-05: every story returned a
     /// `note.content`, including our own past payments.
     ///
-    /// Derived from the order id rather than drawn separately, so it needs no
-    /// new state and cannot disagree with the order it belongs to. Hex, and
-    /// short, because it goes in a field a person reads.
+    /// Hex, and short, because it goes in a field a person reads.
+    ///
+    /// **Hashed, not sliced.** The order id is the only credential for
+    /// `GET /escrow/orders/{id}`, which returns the handle, the escrow address,
+    /// the funding txid and the amounts, and for the refund POST. Taking
+    /// characters of the id straight would print a third of that bearer token
+    /// into a note Venmo shows the payee, and - if the LP account's default
+    /// audience is public - to anyone reading the LP's feed. Sixty-four bits
+    /// would remain, so the id would not be enumerable over HTTP, but nothing
+    /// about the tag requires leaking any of it.
+    ///
+    /// The hash keeps everything the derivation was chosen for. It is a pure
+    /// function of the order, so it needs no new state, it cannot disagree with
+    /// the order it belongs to, and it gives the same answer after a restart.
+    /// It is domain-separated so this digest cannot be confused with any other
+    /// the coordinator takes over an order id.
     pub fn payment_tag(&self) -> String {
-        // The id is `esc_` and 24 hex characters of randomness; the last eight
-        // are as unpredictable as the whole.
-        let tail: String = self
-            .order_id
-            .chars()
-            .rev()
-            .take(8)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
-        tail
+        payment_tag_for(&self.order_id)
+    }
+
+    /// The tag the feed search should look for on this order, if any.
+    ///
+    /// Two callers, and they ask different questions.
+    ///
+    /// **Before the payment** there is no note yet, and this is the tag the
+    /// rail is about to write. The order's own tag is the answer.
+    ///
+    /// **After the payment** the only tag that can be found is the one that was
+    /// actually typed, and that was recorded when it was typed. Deriving it
+    /// again here would be a guess about a past run. An order paid by a build
+    /// that wrote the bare configured note, and attested after a deploy of a
+    /// build that appends a tag, would be searched for under a tag its feed
+    /// entry does not carry: `locate_payment` finds nothing, refuses, and the
+    /// driver retries it on every sweep - with the dollars already gone and the
+    /// one payment slot held. That order is by definition the one whose money
+    /// has already left.
+    ///
+    /// So a paid order is matched on what its note actually says. A recorded
+    /// note carrying this order's tag is matched on the tag. One that does not
+    /// carry it - a bare `thanks` from before the deploy - and an order whose
+    /// note was never recorded are matched on amount and receiver, exactly as
+    /// they were when they were sent.
+    pub fn tag_to_match(&self) -> Option<String> {
+        let tag = self.payment_tag();
+        match &self.payment {
+            // Not paid yet: this is the tag the rail will write.
+            None => Some(tag),
+            // Paid, and the note that went out carries the tag.
+            Some(payment)
+                if payment
+                    .note
+                    .as_deref()
+                    .is_some_and(|note| note_carries_tag(note, &tag)) =>
+            {
+                Some(tag)
+            }
+            // Paid with something else, or with a note nobody recorded.
+            Some(_) => None,
+        }
     }
 
     /// Moves to `Failed` with a reason the page shows.
@@ -386,6 +445,30 @@ impl Order {
         self.reason = Some(why.into());
         self.touch();
     }
+}
+
+/// Whether a note carries a tag, on the same terms the feed search uses.
+///
+/// Case-insensitive, because the note is read back out of somebody else's
+/// system and nothing on this side guarantees the case it comes back in.
+fn note_carries_tag(note: &str, tag: &str) -> bool {
+    note.to_ascii_lowercase().contains(&tag.to_ascii_lowercase())
+}
+
+/// The tag for an order id: the first eight hex characters of a
+/// domain-separated SHA-256 of it.
+///
+/// Free-standing so the note the rail typed can be checked against the order it
+/// belongs to without an `Order` in hand.
+pub fn payment_tag_for(order_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"zpay/payment-tag/v1");
+    hasher.update(order_id.as_bytes());
+    // 32 bits of a 256-bit digest. The tag has to fit a note a person reads,
+    // and it only has to separate the payments in flight at one moment, which
+    // the global slot holds at one.
+    hex::encode(&hasher.finalize()[..4])
 }
 
 /// Hex for the fixed-width fields. Serde has no array impls past 32, and an
@@ -485,6 +568,155 @@ mod tests {
         ] {
             assert!(open.is_open(), "{} still holds the slot", open.as_str());
         }
+    }
+
+    /// A minimal order, enough for the pure functions over one.
+    fn an_order(id: &str) -> Order {
+        Order {
+            order_id: id.into(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            stage: Stage::Locked,
+            reason: None,
+            handle: "jay-butera".into(),
+            quote: Quote {
+                quote_id: "q1".into(),
+                amount_zat: 200_000,
+                gross_cents: 100,
+                net_cents: 90,
+                usd_amount_6dec: 900_000,
+                platform_fee_zat: 400,
+                miner_fee_zat: 15_000,
+                rate_usd_per_zec: 40.25,
+                lines: vec![],
+                expires_at: chrono::Utc::now(),
+            },
+            opened_height: 100,
+            scanned_through: None,
+            mempool_announced_txid: None,
+            mempool_announced_vout: None,
+            network: "test".into(),
+            consensus_branch_id: 0x37a5_165b,
+            u_pub: [2u8; 33],
+            l_pub: [3u8; 33],
+            refund_height: 1252,
+            address: "t2Address".into(),
+            redeem_script: vec![1, 2, 3],
+            script_pubkey: vec![0xa9, 0x14],
+            payee_hash: [7u8; 32],
+            treasury_script: vec![],
+            lp_output_script: vec![0x76, 0xa9],
+            funding: None,
+            lock_confirmed_ms: None,
+            announcement: None,
+            pre_signature: None,
+            pre_signed_at: None,
+            payment: None,
+            release_txid: None,
+            refund_txid: None,
+        }
+    }
+
+    fn paid_with(id: &str, note: Option<&str>) -> Order {
+        let mut order = an_order(id);
+        order.stage = Stage::Paid;
+        order.payment = Some(Payment {
+            sent_at: chrono::Utc::now(),
+            cents: 90,
+            note: note.map(Into::into),
+        });
+        order
+    }
+
+    /// The tag must not print any of the order id, which is the bearer
+    /// credential for the order's own endpoint and for its refund.
+    #[test]
+    fn the_tag_leaks_no_part_of_the_order_id() {
+        let id = "esc_1f2809bcb726cd630ff7932c";
+        let tag = an_order(id).payment_tag();
+
+        assert_eq!(tag.len(), 8, "a tag goes in a field a person reads: {tag:?}");
+        assert!(
+            tag.chars().all(|c| c.is_ascii_hexdigit()),
+            "the note round-trips through Venmo, so the tag stays ASCII: {tag:?}"
+        );
+        // Not a slice of the id, from either end or anywhere in the middle.
+        let body = id.trim_start_matches("esc_");
+        assert!(
+            !body.contains(&tag),
+            "the tag is a substring of the order id, so the note publishes part \
+             of the credential that reads and refunds this order: {tag} in {id}"
+        );
+    }
+
+    /// It still has to be a function of the order alone: no new state, and the
+    /// same answer after a restart.
+    #[test]
+    fn the_tag_is_the_same_every_time_and_different_per_order() {
+        let one = an_order("esc_1f2809bcb726cd630ff7932c");
+        let two = an_order("esc_0102030405060708090a0b0c");
+
+        assert_eq!(one.payment_tag(), one.payment_tag());
+        assert_ne!(
+            one.payment_tag(),
+            two.payment_tag(),
+            "two orders sharing a tag discriminates nothing"
+        );
+    }
+
+    /// An order paid before a deploy that appends tags, attested after it.
+    ///
+    /// The feed entry carries the bare configured note. Searching it for a tag
+    /// finds nothing, and that refusal repeats on every sweep with the dollars
+    /// gone and the payment slot held. What the note says is what decides.
+    #[test]
+    fn an_order_paid_with_a_bare_note_is_not_searched_for_under_a_tag() {
+        let id = "esc_1f2809bcb726cd630ff7932c";
+        assert_eq!(
+            paid_with(id, Some("thanks")).tag_to_match(),
+            None,
+            "a payment whose note has no tag must be matched the way it was sent"
+        );
+        // Same for one paid before the note was recorded at all.
+        assert_eq!(paid_with(id, None).tag_to_match(), None);
+    }
+
+    /// The ordinary case, both sides of the payment.
+    #[test]
+    fn an_order_is_matched_on_the_tag_it_was_actually_paid_with() {
+        let id = "esc_1f2809bcb726cd630ff7932c";
+        let tag = an_order(id).payment_tag();
+
+        // Before the click: the tag the rail is about to write.
+        assert_eq!(an_order(id).tag_to_match(), Some(tag.clone()));
+
+        // After it, with the note the rail reports having typed.
+        let paid = paid_with(id, Some(&format!("thanks {tag}")));
+        assert_eq!(paid.tag_to_match(), Some(tag.clone()));
+
+        // And a note that carries somebody else's tag is not this one's.
+        let other = an_order("esc_0102030405060708090a0b0c").payment_tag();
+        assert_eq!(paid_with(id, Some(&format!("thanks {other}"))).tag_to_match(), None);
+    }
+
+    /// The note comes back out of Venmo, which is free to change its case.
+    #[test]
+    fn a_recorded_note_matches_its_tag_whatever_case_it_comes_back_in() {
+        let id = "esc_1f2809bcb726cd630ff7932c";
+        let tag = an_order(id).payment_tag();
+        let shouted = format!("THANKS {}", tag.to_ascii_uppercase());
+        assert_eq!(paid_with(id, Some(&shouted)).tag_to_match(), Some(tag));
+    }
+
+    /// An order written before the note field existed still loads.
+    #[test]
+    fn a_payment_stored_without_a_note_still_deserialises() {
+        let payment: Payment = serde_json::from_str(
+            r#"{"sent_at":"2026-09-05T10:00:00Z","cents":90}"#,
+        )
+        .expect("an order written before the note field must still load");
+        assert_eq!(payment.cents, 90);
+        assert_eq!(payment.note, None);
     }
 
     #[test]

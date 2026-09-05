@@ -452,6 +452,20 @@ pub fn coordinator_that_cannot_pay(
 
 /// A fiat rail that reports a payment without one having happened.
 ///
+/// The note a rail types, built the way `VenmoRail` builds it: the configured
+/// note, then the leg's tag.
+///
+/// The test rails report this back on `PaidFiat` so the coordinator records a
+/// note that carries the tag, exactly as the real rail does. Without it every
+/// test would exercise the "paid, but nobody recorded a note" path instead of
+/// the ordinary one.
+pub fn note_a_rail_would_type(leg: &zecp2p_taker::auto::rail::FiatLeg) -> String {
+    match &leg.tag {
+        Some(tag) => format!("thanks {tag}"),
+        None => "thanks".to_string(),
+    }
+}
+
 /// Only ever installed by a test. The production binary builds `VenmoRail`,
 /// which drives a real browser and a real enclave.
 pub struct TestFiat {
@@ -474,6 +488,7 @@ impl FiatRail for TestFiat {
         Ok(PaidFiat {
             cents,
             fiat_left: true,
+            note: Some(note_a_rail_would_type(leg)),
         })
     }
 
@@ -520,6 +535,7 @@ impl FiatRail for CountingFiat {
         Ok(PaidFiat {
             cents: u64::try_from(leg.payment.cents())?,
             fiat_left: true,
+            note: Some(note_a_rail_would_type(leg)),
         })
     }
 
@@ -645,6 +661,7 @@ impl FiatRail for SlowFiat {
         Ok(PaidFiat {
             cents: u64::try_from(leg.payment.cents())?,
             fiat_left: true,
+            note: Some(note_a_rail_would_type(leg)),
         })
     }
 
@@ -701,6 +718,7 @@ impl FiatRail for PayThenBreakJournal {
         Ok(PaidFiat {
             cents: u64::try_from(leg.payment.cents())?,
             fiat_left: true,
+            note: Some(note_a_rail_would_type(leg)),
         })
     }
 
