@@ -27,6 +27,16 @@ use crate::store::OrderStore;
 /// hosted endpoint under its limit.
 pub const CHAIN_HEAD_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How long one sweep's mempool listing is reused.
+///
+/// This is a within-sweep cache, not a stale-tolerance setting: 20 s is under
+/// every poll interval this runs at, so orders in the same sweep share one
+/// reading and the next sweep takes a fresh one. A missed sighting costs a
+/// sweep of latency on collecting a signature, never correctness - the mempool
+/// is only ever used to announce, and the funding record still comes from a
+/// block.
+pub const MEMPOOL_TTL: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// How the coordinator settles the fiat leg.
 ///
 /// A trait so a test can run the whole flow without a browser or an enclave.
@@ -83,6 +93,21 @@ pub struct AppState {
     /// succeeds. An empty or expired cache means the coordinator refuses to
     /// quote rather than pricing a trade on a guess.
     pub prices: Arc<crate::price::PriceCache>,
+    /// The mempool, read once per sweep and shared by every order in it.
+    ///
+    /// The mempool scan is per *order*: each unfunded order asks whether the
+    /// mempool holds an output paying its escrow. Asking the node separately
+    /// for each one meant one list call plus one verbose read per entry, per
+    /// order, per sweep - about 10,000 calls a day for a single idle order at a
+    /// six-entry mempool, multiplied by the open-order cap of 200. Under a
+    /// provider that rate-limits, each of those reads waits inside a blocking
+    /// task and the sweep joins all of them.
+    ///
+    /// The mempool is the same for every order in a sweep, so it is read once
+    /// and matched locally. Held only for [`MEMPOOL_TTL`], which is under the
+    /// poll interval, so this is a within-sweep cache rather than a value that
+    /// can go stale across them.
+    mempool_cache: Arc<std::sync::Mutex<Option<(Arc<Vec<crate::funding::MempoolTx>>, std::time::Instant)>>>,
     /// The LP's key. Its public half is in every order and every capability
     /// answer, and the page checks that the two agree.
     l_priv: SecretKey,
@@ -190,6 +215,40 @@ impl AppState {
         let key = secp256k1::SecretKey::from_slice(&self.l_priv.secret_bytes())
             .expect("the LP key round-trips through its own bytes");
         secp.sign_ecdsa(&secp256k1::Message::from_digest(*digest), &key)
+    }
+
+    /// The mempool for this sweep, read once and shared by every order in it.
+    ///
+    /// Returns an empty listing rather than an error when the node will not
+    /// serve one: the mempool is an optimisation on *when* a signature can be
+    /// collected, and losing it costs a block of latency rather than
+    /// correctness.
+    pub async fn sweep_mempool(&self) -> Arc<Vec<crate::funding::MempoolTx>> {
+        if let Ok(slot) = self.mempool_cache.lock() {
+            if let Some((txs, read_at)) = slot.as_ref() {
+                if read_at.elapsed() < MEMPOOL_TTL {
+                    return txs.clone();
+                }
+            }
+        }
+
+        let scanner = self.scanner.clone();
+        let read = tokio::task::spawn_blocking(move || scanner.mempool()).await;
+        let txs = match read {
+            Ok(Ok(txs)) => Arc::new(txs),
+            Ok(Err(e)) => {
+                tracing::debug!(error = %e, "the node would not list its mempool");
+                Arc::new(Vec::new())
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "the mempool read did not complete");
+                Arc::new(Vec::new())
+            }
+        };
+        if let Ok(mut slot) = self.mempool_cache.lock() {
+            *slot = Some((txs.clone(), std::time::Instant::now()));
+        }
+        txs
     }
 
     /// Reads the chain height and branch id, from the cache when it is fresh.
@@ -411,6 +470,7 @@ impl AppStateBuilder {
             scanner,
             http: reqwest::Client::new(),
             prices: crate::price::PriceCache::new(),
+            mempool_cache: Arc::new(std::sync::Mutex::new(None)),
             l_priv,
             l_pub,
             lp_output_script,

@@ -243,23 +243,11 @@ async fn announce_from_mempool(state: &Arc<AppState>, mut order: Order) -> Resul
         return check_deadlines(state, order).await;
     }
 
-    let scanner = state.scanner.clone();
-    let script = order.script_pubkey.clone();
-    let address = order.address.clone();
-    let seen = tokio::task::spawn_blocking(move || {
-        scanner.outputs_paying_in_mempool(&script, &address)
-    })
-    .await
-    .context("the mempool scan did not complete")?;
-
-    let seen = match seen {
-        Ok(s) => s,
-        Err(e) => {
-            // Losing this costs a block of latency, never correctness.
-            tracing::debug!(order = %order.order_id, error = %e, "the mempool scan failed");
-            return check_deadlines(state, order).await;
-        }
-    };
+    // One reading of the mempool for the whole sweep, matched locally. Asking
+    // the node per order meant a listing plus a read per entry for each
+    // unfunded order, every sweep.
+    let txs = state.sweep_mempool().await;
+    let seen = crate::funding::MempoolTx::outputs_paying(&txs, &order.script_pubkey, &order.address);
 
     let Some(output) = choose_funding(&seen, order.quote.amount_zat) else {
         return check_deadlines(state, order).await;
@@ -581,7 +569,7 @@ pub fn verify_pre_signature(state: &AppState, order: &Order, pre_signature_hex: 
 }
 
 /// The paid path: check, pay, attest, release.
-async fn settle(state: &Arc<AppState>, order: Order) -> Result<()> {
+async fn settle(state: &Arc<AppState>, mut order: Order) -> Result<()> {
     let Some(fiat) = state.fiat.clone() else {
         tracing::debug!(
             order = %order.order_id,
@@ -598,6 +586,41 @@ async fn settle(state: &Arc<AppState>, order: Order) -> Result<()> {
         return check_deadlines(state, order).await;
     };
     let work = crate::slot::work_id_for(&funding.txid, funding.vout);
+
+    // A signature that no longer authorises this outpoint is a dead trade, and
+    // it is dead permanently rather than not-yet.
+    //
+    // It happens when the funding transaction the user signed over is replaced
+    // - Zcash expires an unmined transaction after 40 blocks, so a wallet
+    // resend is ordinary - and a different one confirms. `bound_outpoint` then
+    // names the confirmed outpoint, the stored pre-signature decrypts onto a
+    // digest nobody will spend, and `lp::evaluate` refuses.
+    //
+    // Refusing was already correct; saying nothing was not. Every sweep took
+    // the global payment lock, read the chain and appended two journal lines
+    // for an order that could never pay, and the page read `locked` for the
+    // whole pay window - about a day - on a trade the coordinator knew was
+    // finished on the first sweep after the confirmation. `Failed` carries a
+    // reason the page shows, and `refund` accepts it, so the user is told to
+    // take their ZEC back instead of waiting for a payment that is not coming.
+    if let Some(sig) = order.pre_signature.as_deref() {
+        if verify_pre_signature(state, &order, sig).is_err() {
+            tracing::error!(
+                order = %order.order_id,
+                txid = %zecp2p_escrow::rpc::txid_to_display(&funding.txid),
+                "the stored pre-signature does not authorise the confirmed funding output, so \
+                 this escrow can never be released. It is almost always a funding transaction \
+                 that expired and was resent under a new txid after the page had signed."
+            );
+            order.fail(
+                "The Zcash transaction that funded this escrow was replaced after you signed, \
+                 so the signature no longer matches it and zpay cannot release it. Nothing was \
+                 sent and nothing was taken: your ZEC is refundable from this page.",
+            );
+            state.store.put(&order)?;
+            return Ok(());
+        }
+    }
 
     // **The critical section starts here.**
     //

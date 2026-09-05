@@ -38,6 +38,52 @@ pub struct FoundOutput {
     pub amount_zat: u64,
 }
 
+/// One unconfirmed transaction, with just the outputs an escrow match needs.
+#[derive(Debug, Clone)]
+pub struct MempoolTx {
+    pub txid: [u8; 32],
+    pub outputs: Vec<MempoolOutput>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MempoolOutput {
+    pub vout: u32,
+    pub amount_zat: u64,
+    /// Hex, as the node prints it. Compared case-insensitively.
+    pub script_pubkey_hex: String,
+    pub addresses: Vec<String>,
+}
+
+impl MempoolTx {
+    /// The outputs in these transactions that pay `script_pubkey` or `address`.
+    ///
+    /// Matching is done here, over a listing the caller read once, rather than
+    /// asking the node per escrow.
+    pub fn outputs_paying(
+        txs: &[MempoolTx],
+        script_pubkey: &[u8],
+        address: &str,
+    ) -> Vec<FoundOutput> {
+        let want_hex = hex::encode(script_pubkey);
+        let mut found = Vec::new();
+        for tx in txs {
+            for o in &tx.outputs {
+                let matches = (!o.script_pubkey_hex.is_empty()
+                    && o.script_pubkey_hex.eq_ignore_ascii_case(&want_hex))
+                    || o.addresses.iter().any(|a| a == address);
+                if matches {
+                    found.push(FoundOutput {
+                        txid: tx.txid,
+                        vout: o.vout,
+                        amount_zat: o.amount_zat,
+                    });
+                }
+            }
+        }
+        found
+    }
+}
+
 /// How the coordinator finds the output that paid an escrow address.
 ///
 /// Blocking, like everything else that talks to the node, so it is called from
@@ -54,7 +100,7 @@ pub trait FundingScanner: Send + Sync {
         from_height: u32,
     ) -> Result<Vec<FoundOutput>>;
 
-    /// Outputs paying `script_pubkey` that are in the mempool, unconfirmed.
+    /// The mempool's transactions and their outputs, unconfirmed.
     ///
     /// This exists for exactly one purpose: learning the funding **outpoint**
     /// early enough that the user's page is still open to sign over it. The
@@ -72,13 +118,15 @@ pub trait FundingScanner: Send + Sync {
     /// decrypted, and the escrow refunds at T exactly as if nothing had
     /// happened.
     ///
+    /// Returned whole rather than filtered per escrow, because the mempool is
+    /// the same for every order in a sweep: filtering here meant one listing
+    /// plus one read per entry for each order separately, which is thousands of
+    /// node calls a day for one idle order and multiplies by the open-order
+    /// cap. The caller reads it once and matches locally.
+    ///
     /// The default is empty, so a scanner that cannot see the mempool - or a
     /// node without `getrawmempool` - behaves exactly as it did before.
-    fn outputs_paying_in_mempool(
-        &self,
-        _script_pubkey: &[u8],
-        _address: &str,
-    ) -> Result<Vec<FoundOutput>> {
+    fn mempool(&self) -> Result<Vec<MempoolTx>> {
         Ok(Vec::new())
     }
 
@@ -393,11 +441,7 @@ impl FundingScanner for BlockScanScanner {
     /// `getrawmempool`, or that errors, yields nothing rather than failing the
     /// sweep: this is an optimisation on when a signature can be collected, and
     /// losing it costs a block of latency, not correctness.
-    fn outputs_paying_in_mempool(
-        &self,
-        script_pubkey: &[u8],
-        address: &str,
-    ) -> Result<Vec<FoundOutput>> {
+    fn mempool(&self) -> Result<Vec<MempoolTx>> {
         let txids: Vec<String> = match self.rpc.call("getrawmempool", serde_json::json!([])) {
             Ok(t) => t,
             Err(e) => {
@@ -406,8 +450,7 @@ impl FundingScanner for BlockScanScanner {
             }
         };
 
-        let want_hex = hex::encode(script_pubkey);
-        let mut found = Vec::new();
+        let mut out = Vec::new();
         for txid in txids.iter().take(MEMPOOL_SCAN_LIMIT) {
             let tx: VerboseTx = match self
                 .rpc
@@ -421,39 +464,32 @@ impl FundingScanner for BlockScanScanner {
                     continue;
                 }
             };
-            for out in &tx.vout {
-                let matches = (!out.script_pub_key.hex.is_empty()
-                    && out.script_pub_key.hex.eq_ignore_ascii_case(&want_hex))
-                    || out
-                        .script_pub_key
-                        .addresses
-                        .iter()
-                        .any(|a| a == address);
-                if !matches {
+            let txid_bytes = match zecp2p_escrow::rpc::txid_from_display(&tx.txid) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::debug!(%txid, error = %e, "a mempool transaction had a bad txid");
                     continue;
                 }
-                let amount_zat = match out.zat() {
-                    Ok(z) => z,
-                    Err(e) => {
-                        tracing::debug!(%txid, error = %e, "a mempool output had no readable value");
-                        continue;
-                    }
+            };
+            let mut outputs = Vec::new();
+            for o in &tx.vout {
+                let Ok(amount_zat) = o.zat() else {
+                    tracing::debug!(%txid, "a mempool output had no readable value");
+                    continue;
                 };
-                let txid_bytes = match zecp2p_escrow::rpc::txid_from_display(&tx.txid) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        tracing::debug!(%txid, error = %e, "a mempool transaction had a bad txid");
-                        continue;
-                    }
-                };
-                found.push(FoundOutput {
-                    txid: txid_bytes,
-                    vout: out.n,
+                outputs.push(MempoolOutput {
+                    vout: o.n,
                     amount_zat,
+                    script_pubkey_hex: o.script_pub_key.hex.clone(),
+                    addresses: o.script_pub_key.addresses.clone(),
                 });
             }
+            out.push(MempoolTx {
+                txid: txid_bytes,
+                outputs,
+            });
         }
-        Ok(found)
+        Ok(out)
     }
 
     fn outputs_paying(
@@ -544,6 +580,9 @@ pub struct FakeScanner {
     outputs: std::sync::Mutex<Vec<(Vec<u8>, FoundOutput)>>,
     /// Outputs the scanner reports as *unconfirmed*, in the mempool only.
     mempool: std::sync::Mutex<Vec<(Vec<u8>, FoundOutput)>>,
+    /// How many times the mempool has been listed, so a test can show that one
+    /// sweep asks the node once however many orders are open.
+    mempool_reads: std::sync::atomic::AtomicUsize,
 }
 
 impl FakeScanner {
@@ -568,6 +607,12 @@ impl FakeScanner {
             .push((script_pubkey.to_vec(), output));
     }
 
+    /// How many times the mempool has been listed.
+    pub fn mempool_reads(&self) -> usize {
+        self.mempool_reads
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Stops the scanner reporting anything, without unwinding the chain.
     ///
     /// This is what a real scan does once `scanned_through` passes the block
@@ -580,18 +625,25 @@ impl FakeScanner {
 }
 
 impl FundingScanner for FakeScanner {
-    fn outputs_paying_in_mempool(
-        &self,
-        script_pubkey: &[u8],
-        _address: &str,
-    ) -> Result<Vec<FoundOutput>> {
+    fn mempool(&self) -> Result<Vec<MempoolTx>> {
+        self.mempool_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // One transaction per staged output is enough for a test: the matching
+        // is by script, not by how they are grouped.
         Ok(self
             .mempool
             .lock()
             .expect("fake scanner lock")
             .iter()
-            .filter(|(spk, _)| spk.as_slice() == script_pubkey)
-            .map(|(_, o)| *o)
+            .map(|(spk, o)| MempoolTx {
+                txid: o.txid,
+                outputs: vec![MempoolOutput {
+                    vout: o.vout,
+                    amount_zat: o.amount_zat,
+                    script_pubkey_hex: hex::encode(spk),
+                    addresses: Vec::new(),
+                }],
+            })
             .collect())
     }
 

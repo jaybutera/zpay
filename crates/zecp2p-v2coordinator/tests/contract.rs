@@ -2024,6 +2024,116 @@ async fn a_mempool_announcement_is_drawn_once() {
 }
 
 #[tokio::test]
+async fn one_sweep_reads_the_mempool_once_however_many_orders_are_open() {
+    // Audit finding 3. The mempool is the same for every order in a sweep, but
+    // it was asked per order: one listing plus one verbose read per entry, each
+    // time. At the open-order cap that is the same small mempool fetched two
+    // hundred times a minute, and under a provider that rate-limits every one
+    // of those reads waits inside a blocking task the sweep then joins.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+    let state = coordinator_that_cannot_pay(dir.path(), scanner.clone(), &node, &attestor);
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+
+    // Three unfunded orders, none of them announced.
+    let mut ids = Vec::new();
+    for _ in 0..3 {
+        let user = TestUser::new();
+        let (id, _, _) = opened_order(&app, &state, &user).await;
+        ids.push(id);
+    }
+
+    let before = scanner.mempool_reads();
+    for id in &ids {
+        zecp2p_v2coordinator::driver::advance(&state, id).await.ok();
+    }
+    let reads = scanner.mempool_reads() - before;
+
+    assert_eq!(
+        reads, 1,
+        "three orders in one sweep listed the mempool {reads} times; it is the same \
+         mempool for all of them"
+    );
+}
+
+#[tokio::test]
+async fn a_replaced_funding_tells_the_user_instead_of_reading_locked() {
+    // Audit finding 2. Refusing to pay was already right; saying nothing was
+    // not. The signature is over the replaced outpoint and can never authorise
+    // the confirmed one, so the trade is dead on the first sweep after the
+    // confirmation - but the order read `locked` for the whole pay window,
+    // about a day, and the page decides what to offer by stage. Meanwhile every
+    // sweep took the global payment lock, read the chain and appended journal
+    // lines for an order that could never pay.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+    let fiat = Arc::new(CountingFiat::new());
+    let state = coordinator_with_fiat(dir.path(), scanner.clone(), &node, &attestor, fiat.clone());
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+    let user = TestUser::new();
+    let (order_id, amount_zat, stored) = opened_order(&app, &state, &user).await;
+
+    let tx_a = [0xa1u8; 32];
+    scanner.pay_mempool(
+        &stored.script_pubkey,
+        FoundOutput { txid: tx_a, vout: 0, amount_zat },
+    );
+    zecp2p_v2coordinator::driver::advance(&state, &order_id).await.unwrap();
+    sign_it(&app, &state, &attestor, &user, &order_id).await;
+
+    // A never confirms; B does. Same escrow, same amount, different txid - an
+    // ordinary wallet resend after Zcash's 40-block expiry.
+    let tx_b = [0xb1u8; 32];
+    let mut forced = state.store.get(&order_id).unwrap();
+    forced.funding = Some(zecp2p_v2coordinator::order::Funding {
+        txid: tx_b,
+        vout: 0,
+        confirmations: 30,
+        required: 10,
+    });
+    forced.stage = Stage::Locked;
+    state.store.put(&forced).unwrap();
+    node.add_utxo(tx_b, 0, stored.script_pubkey.clone(), amount_zat, 30).await;
+
+    zecp2p_v2coordinator::driver::advance(&state, &order_id).await.ok();
+
+    let end = state.store.get(&order_id).unwrap();
+    assert_eq!(fiat.payments(), 0, "it paid on a signature that cannot release");
+    assert_eq!(
+        end.stage,
+        Stage::Failed,
+        "the order still reads {:?}; the user waits a day for a payment that is not coming",
+        end.stage
+    );
+    assert!(
+        end.reason.as_deref().is_some_and(|r| r.contains("replaced")),
+        "the page shows the reason, so it has to say what happened: {:?}",
+        end.reason
+    );
+    // And the refund endpoint takes `Failed`, so the ZEC is recoverable now
+    // rather than at T.
+    let (status, body) = post(
+        &app,
+        &format!("/escrow/orders/{order_id}/refund"),
+        serde_json::json!({ "raw_tx": "00" }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "expected a refusal about the transaction, not the stage: {body}"
+    );
+    assert!(
+        !body.to_string().contains("not refundable yet"),
+        "the stage still blocks the refund: {body}"
+    );
+}
+
+#[tokio::test]
 async fn a_replaced_funding_never_reaches_a_payment() {
     // The user broadcasts A, signs a digest over A, then replaces A with B
     // paying the same escrow the same amount. B confirms. The stored signature

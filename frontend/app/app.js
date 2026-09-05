@@ -682,10 +682,22 @@ $('form-return').addEventListener('submit', async (ev) => {
   }
   btn.disabled = true;
   try {
+    // The LIVE view wins over the saved record for the outpoint.
+    //
+    // The record's outpoint is whatever this page saw when it signed. Under a
+    // mempool announcement that is the unconfirmed transaction, and Zcash
+    // expires an unmined transaction after 40 blocks - so a wallet that resends
+    // produces a different txid, the coordinator learns it, and a refund built
+    // over the saved one spends an outpoint that never existed on chain. No
+    // node would take it, while this page told the user any node would.
+    //
+    // The record is still the fallback, for the case it was written for: a view
+    // that has not caught up, or an order this page knows more about than the
+    // coordinator has served yet.
     const f = view.funding || {};
-    const fundingTxid = rec.fundingTxid || f.txid;
-    const vout = rec.vout !== undefined ? rec.vout : f.vout;
-    const branch = rec.consensusBranchId || view.consensus_branch_id;
+    const fundingTxid = f.txid || rec.fundingTxid;
+    const vout = f.vout !== undefined ? f.vout : rec.vout;
+    const branch = view.consensus_branch_id || rec.consensusBranchId;
     if (!fundingTxid || branch === undefined) throw new Error('The funding transaction is not known to this page yet.');
 
     const terms = E.escrowTerms({
