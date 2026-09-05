@@ -34,12 +34,17 @@ const API = (() => {
   return '';
 })();
 
-/* The attestor key this page trusts, per network. On mainnet an empty pin
-   means the page refuses to pre-sign: the coordinator relays the attestor's
-   announcement, and a coordinator that could also name the attestor could
-   name one it controls. On a test network the announced key is accepted. */
+/* The attestor key this page trusts, per network. The coordinator relays the
+   attestor's announcement, so a coordinator that could also name the attestor
+   could name one it controls; the pin is what stops that, and it has to come
+   from somewhere the coordinator cannot reach.
+
+   This one did: the private key is held off the hub, and the public key below
+   is the point it multiplies out to. It was checked that way rather than by
+   reading it back from /escrow/capabilities, which is the coordinator
+   vouching for itself. On a test network the announced key is accepted. */
 const PINS = {
-  main: { attestor_pubkey: '' },
+  main: { attestor_pubkey: '0258603ee5702d5e571a19b08312e94d0eedd85df7405135cf4a02b2227f18c218' },
 };
 
 const $ = (id) => document.getElementById(id);
@@ -107,6 +112,52 @@ const RECORD_PREFIX = 'zpay.escrow.';
 function saveRecord(rec) {
   try { localStorage.setItem(RECORD_PREFIX + rec.orderId, JSON.stringify(rec)); } catch (_) {}
 }
+/** Rebuild the record from the coordinator's view of an order.
+ *
+ * The record normally comes from this browser: it is written when the order is
+ * opened, and it is what `presign` and the refund are built from. A status
+ * link opened anywhere else - another browser, another device, after the site
+ * data was cleared - has the key in the fragment and no record, and every
+ * field the record holds is also in the order view.
+ *
+ * The view cannot simply be believed, because these are the terms that get
+ * signed. So the escrow address is derived again from the key in the fragment
+ * and the numbers the view supplies, and the record is only returned if it
+ * comes back to the address the escrow actually holds. A view that named a
+ * different refund height, amount or payer key derives a different address and
+ * is refused here rather than signed.
+ */
+function recordFromView(orderId, key, view) {
+  const esc = view && view.escrow;
+  if (!esc) return null;
+
+  const uPub = E.pubkey(key);
+  if (E.toHex(uPub) !== String(esc.u_pub || '').toLowerCase()) return null;
+
+  const network = view.network || 'main';
+  const redeem = E.redeemScript(uPub, E.fromHex(esc.l_pub), esc.refund_height);
+  if (E.escrowAddress(redeem, network) !== esc.address) return null;
+
+  return {
+    orderId,
+    network,
+    uPriv: key.toString(16).padStart(64, '0'),
+    uPub: E.toHex(uPub),
+    lPub: esc.l_pub,
+    refundHeight: esc.refund_height,
+    amountZat: esc.amount_zat,
+    address: esc.address,
+    redeemScript: E.toHex(redeem),
+    usdAmount6dec: esc.usd_amount_6dec,
+    payeeHash: esc.payee_hash,
+    platformFeeZat: esc.platform_fee_zat || 0,
+    treasuryScript: esc.treasury_script || '',
+    handle: (view.destination || {}).handle || '',
+    createdAt: new Date().toISOString(),
+    rebuiltFromView: true,
+  };
+}
+
 function loadRecord(orderId) {
   try {
     const raw = localStorage.getItem(RECORD_PREFIX + orderId);
@@ -470,6 +521,18 @@ function render(view) {
   renderReturns(view);
   renderDetails(view);
 
+  // A status link opened in another browser has the key but no record, and
+  // everything the pre-signature needs is in this view. Rebuilding it here -
+  // against the key, checked by re-deriving the escrow address - is what lets
+  // that link still sign. Without it `presign` read `rec.amountZat` off null.
+  if (!state.record && state.key && state.orderId) {
+    const rebuilt = recordFromView(state.orderId, state.key, view);
+    if (rebuilt) {
+      state.record = rebuilt;
+      saveRecord(rebuilt);
+    }
+  }
+
   if (stage === 'needs_presignature' && state.key && state.presign === 'idle') presign(view);
   if (['released', 'refunded', 'failed'].includes(stage)) stopPolling();
 }
@@ -480,7 +543,17 @@ async function presign(view) {
   state.presign = 'signing';
   msg('order-msg', '');
   try {
+    // Last line before the terms are built. `renderStatus` rebuilds the record
+    // from the view when this browser has none, so a null here means that
+    // rebuild refused: the key in the link does not derive the escrow this
+    // order names. Signing on it anyway would sign somebody else's terms.
     const rec = state.record;
+    if (!rec) {
+      throw new Error(
+        'This link does not match the escrow zpay is describing, so this page will not sign it. ' +
+        'Open the original status link, and if this keeps happening your ZEC stays refundable from it.'
+      );
+    }
     const caps = state.caps || {};
     const network = view.network || rec.network;
     const a = view.announcement;
@@ -489,7 +562,7 @@ async function presign(view) {
     let pinned = (PINS[network] || {}).attestor_pubkey;
     if (network === 'main') {
       if (!pinned) {
-        throw new Error('This page has no attestor key pinned for mainnet, so it will not sign. Your ZEC stays refundable from this link at block ' + rec.refundHeight + '.');
+        throw new Error('This page has no attestor key pinned for mainnet, so it will not sign. Your ZEC stays refundable from this link at block ' + Number(rec.refundHeight).toLocaleString() + '.');
       }
     } else {
       pinned = pinned || a.P;
