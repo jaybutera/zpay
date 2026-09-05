@@ -54,6 +54,34 @@ pub trait FundingScanner: Send + Sync {
         from_height: u32,
     ) -> Result<Vec<FoundOutput>>;
 
+    /// Outputs paying `script_pubkey` that are in the mempool, unconfirmed.
+    ///
+    /// This exists for exactly one purpose: learning the funding **outpoint**
+    /// early enough that the user's page is still open to sign over it. The
+    /// release digest commits to the outpoint (ZIP 244 S.2g), so nothing can be
+    /// signed until it is known - and it is known the moment the transaction is
+    /// broadcast, seconds after the user presses send, rather than a block
+    /// later.
+    ///
+    /// What comes back is **not** evidence of funding. A mempool entry can be
+    /// replaced, evicted, or never mined. It is used to announce and to collect
+    /// a signature, never to decide that an escrow is paid: `advance_funded`
+    /// still reads `chain.utxo`, which asks `gettxout` with `include_mempool`
+    /// false, and `lp::evaluate` re-checks the depth again before any dollars
+    /// move. A signature over an outpoint that never confirms is simply never
+    /// decrypted, and the escrow refunds at T exactly as if nothing had
+    /// happened.
+    ///
+    /// The default is empty, so a scanner that cannot see the mempool - or a
+    /// node without `getrawmempool` - behaves exactly as it did before.
+    fn outputs_paying_in_mempool(
+        &self,
+        _script_pubkey: &[u8],
+        _address: &str,
+    ) -> Result<Vec<FoundOutput>> {
+        Ok(Vec::new())
+    }
+
     /// The same search, also reporting the highest block it actually searched.
     ///
     /// The caller persists that height and passes it back as `from_height` next
@@ -358,6 +386,76 @@ impl VerboseVout {
 }
 
 impl FundingScanner for BlockScanScanner {
+    /// Walks `getrawmempool` looking for an output that pays this escrow.
+    ///
+    /// The mempool is small - tens of transactions on Zcash - so this reads
+    /// each one and stops at the first sighting. A node that does not serve
+    /// `getrawmempool`, or that errors, yields nothing rather than failing the
+    /// sweep: this is an optimisation on when a signature can be collected, and
+    /// losing it costs a block of latency, not correctness.
+    fn outputs_paying_in_mempool(
+        &self,
+        script_pubkey: &[u8],
+        address: &str,
+    ) -> Result<Vec<FoundOutput>> {
+        let txids: Vec<String> = match self.rpc.call("getrawmempool", serde_json::json!([])) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::debug!(error = %e, "the node would not list its mempool");
+                return Ok(Vec::new());
+            }
+        };
+
+        let want_hex = hex::encode(script_pubkey);
+        let mut found = Vec::new();
+        for txid in txids.iter().take(MEMPOOL_SCAN_LIMIT) {
+            let tx: VerboseTx = match self
+                .rpc
+                .call("getrawtransaction", serde_json::json!([txid, 1]))
+            {
+                Ok(t) => t,
+                // A transaction can leave the mempool between the list and the
+                // read. That is not an error, it is the mempool.
+                Err(e) => {
+                    tracing::debug!(%txid, error = %e, "a mempool transaction could not be read");
+                    continue;
+                }
+            };
+            for out in &tx.vout {
+                let matches = (!out.script_pub_key.hex.is_empty()
+                    && out.script_pub_key.hex.eq_ignore_ascii_case(&want_hex))
+                    || out
+                        .script_pub_key
+                        .addresses
+                        .iter()
+                        .any(|a| a == address);
+                if !matches {
+                    continue;
+                }
+                let amount_zat = match out.zat() {
+                    Ok(z) => z,
+                    Err(e) => {
+                        tracing::debug!(%txid, error = %e, "a mempool output had no readable value");
+                        continue;
+                    }
+                };
+                let txid_bytes = match zecp2p_escrow::rpc::txid_from_display(&tx.txid) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::debug!(%txid, error = %e, "a mempool transaction had a bad txid");
+                        continue;
+                    }
+                };
+                found.push(FoundOutput {
+                    txid: txid_bytes,
+                    vout: out.n,
+                    amount_zat,
+                });
+            }
+        }
+        Ok(found)
+    }
+
     fn outputs_paying(
         &self,
         script_pubkey: &[u8],
@@ -433,10 +531,19 @@ impl FundingScanner for BlockScanScanner {
     }
 }
 
+/// The most mempool transactions one sweep will read.
+///
+/// Zcash's mempool is small; this is a bound against a node that reports a
+/// pathological one, not a tuning knob. Missing a sighting costs a block of
+/// latency and nothing else.
+const MEMPOOL_SCAN_LIMIT: usize = 200;
+
 /// A scanner a test drives directly.
 #[derive(Debug, Default)]
 pub struct FakeScanner {
     outputs: std::sync::Mutex<Vec<(Vec<u8>, FoundOutput)>>,
+    /// Outputs the scanner reports as *unconfirmed*, in the mempool only.
+    mempool: std::sync::Mutex<Vec<(Vec<u8>, FoundOutput)>>,
 }
 
 impl FakeScanner {
@@ -446,6 +553,16 @@ impl FakeScanner {
 
     pub fn pay(&self, script_pubkey: &[u8], output: FoundOutput) {
         self.outputs
+            .lock()
+            .expect("fake scanner lock")
+            .push((script_pubkey.to_vec(), output));
+    }
+
+    /// An output paying `script_pubkey` that is in the mempool and not in any
+    /// block. `outputs_paying` will not report it; `outputs_paying_in_mempool`
+    /// will.
+    pub fn pay_mempool(&self, script_pubkey: &[u8], output: FoundOutput) {
+        self.mempool
             .lock()
             .expect("fake scanner lock")
             .push((script_pubkey.to_vec(), output));
@@ -463,6 +580,21 @@ impl FakeScanner {
 }
 
 impl FundingScanner for FakeScanner {
+    fn outputs_paying_in_mempool(
+        &self,
+        script_pubkey: &[u8],
+        _address: &str,
+    ) -> Result<Vec<FoundOutput>> {
+        Ok(self
+            .mempool
+            .lock()
+            .expect("fake scanner lock")
+            .iter()
+            .filter(|(spk, _)| spk.as_slice() == script_pubkey)
+            .map(|(_, o)| *o)
+            .collect())
+    }
+
     fn outputs_paying(
         &self,
         script_pubkey: &[u8],

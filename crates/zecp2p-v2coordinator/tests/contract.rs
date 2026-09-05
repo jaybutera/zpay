@@ -1685,6 +1685,279 @@ async fn a_funding_that_never_reaches_depth_still_becomes_refundable() {
 }
 
 #[tokio::test]
+async fn a_mempool_sighting_is_enough_to_announce_and_sign() {
+    // The user's page signs by itself but only while it is open, and the
+    // outpoint the release digest commits to exists as soon as the funding
+    // transaction is broadcast - seconds after they press send. Waiting for a
+    // block meant waiting up to 150 s for something knowable in five.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+    let state = coordinator_that_cannot_pay(dir.path(), scanner.clone(), &node, &attestor);
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+    let user = TestUser::new();
+    let (order_id, amount_zat, stored) = opened_order(&app, &state, &user).await;
+
+    let funding_txid = [0x21u8; 32];
+    scanner.pay_mempool(
+        &stored.script_pubkey,
+        FoundOutput { txid: funding_txid, vout: 0, amount_zat },
+    );
+    zecp2p_v2coordinator::driver::advance(&state, &order_id)
+        .await
+        .expect("a mempool sighting is not an error");
+
+    let after = state.store.get(&order_id).unwrap();
+    assert_eq!(after.stage, Stage::NeedsPresignature);
+    assert!(after.announcement.is_some());
+    assert_eq!(after.mempool_announced_txid, Some(funding_txid));
+    assert!(after.funding.is_none(), "a mempool sighting must not count as funding");
+}
+
+#[tokio::test]
+async fn a_mempool_announced_order_still_completes_when_the_tx_confirms() {
+    // The happy path, all the way through. Its absence is what let a total
+    // deadlock pass: every other mempool test stops at or before `Locked`, and
+    // the bug only shows once the transaction confirms. `watch_funding` is the
+    // only writer of `order.funding`, so an order announced from the mempool
+    // must still be able to reach it, or `settle` bails on the missing outpoint
+    // every sweep and the escrow sits locked forever.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+    let state = coordinator_that_cannot_pay(dir.path(), scanner.clone(), &node, &attestor);
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+    let user = TestUser::new();
+    let (order_id, amount_zat, stored) = opened_order(&app, &state, &user).await;
+
+    let funding_txid = [0x31u8; 32];
+    scanner.pay_mempool(
+        &stored.script_pubkey,
+        FoundOutput { txid: funding_txid, vout: 0, amount_zat },
+    );
+    zecp2p_v2coordinator::driver::advance(&state, &order_id).await.unwrap();
+    sign_it(&app, &state, &attestor, &user, &order_id).await;
+
+    // The SAME transaction confirms. Nothing replaced, nothing hostile.
+    scanner.pay(
+        &stored.script_pubkey,
+        FoundOutput { txid: funding_txid, vout: 0, amount_zat },
+    );
+    node.add_utxo(funding_txid, 0, stored.script_pubkey.clone(), amount_zat, 30)
+        .await;
+    for _ in 0..4 {
+        zecp2p_v2coordinator::driver::advance(&state, &order_id).await.ok();
+    }
+
+    let end = state.store.get(&order_id).unwrap();
+    assert!(
+        end.funding.is_some(),
+        "the order never learned its funding after the tx confirmed; stuck at {:?}",
+        end.stage
+    );
+    assert_eq!(end.funding.unwrap().txid, funding_txid);
+}
+
+#[tokio::test]
+async fn a_mempool_announced_order_that_never_confirms_becomes_refundable() {
+    // The other half of the deadlock. `settle` bailing with `?` on a missing
+    // outpoint skips the deadline check, so the order never reaches
+    // `Refundable` and the page - which asks the stage, not the chain - never
+    // offers the refund the user's ZEC is already entitled to.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+    let state = coordinator_that_cannot_pay(dir.path(), scanner.clone(), &node, &attestor);
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+    let user = TestUser::new();
+    let (order_id, amount_zat, stored) = opened_order(&app, &state, &user).await;
+
+    let funding_txid = [0x32u8; 32];
+    scanner.pay_mempool(
+        &stored.script_pubkey,
+        FoundOutput { txid: funding_txid, vout: 0, amount_zat },
+    );
+    zecp2p_v2coordinator::driver::advance(&state, &order_id).await.unwrap();
+    sign_it(&app, &state, &attestor, &user, &order_id).await;
+
+    // It never confirms, and the chain runs past T.
+    //
+    // The mempool sighting is also gone - evicted, as a transaction that never
+    // confirms eventually is. So the re-entry path finds nothing and the order
+    // reaches `settle` with no outpoint, which is the branch that used to bail
+    // with `?` and skip the deadline check entirely.
+    scanner.forget();
+    node.set_height(u32::try_from(stored.refund_height).unwrap() + 1).await;
+    for _ in 0..3 {
+        zecp2p_v2coordinator::driver::advance(&state, &order_id).await.ok();
+    }
+
+    assert_eq!(
+        state.store.get(&order_id).unwrap().stage,
+        Stage::Refundable,
+        "the user was never offered the refund their ZEC was already entitled to"
+    );
+}
+
+#[tokio::test]
+async fn a_mempool_sighting_never_pays() {
+    // The invariant: announcing from the mempool collects a signature early and
+    // moves not one cent. `lp::evaluate` re-reads the outpoint with
+    // `include_mempool` false and re-checks the depth.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+    let fiat = Arc::new(CountingFiat::new());
+    let state = coordinator_with_fiat(dir.path(), scanner.clone(), &node, &attestor, fiat.clone());
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+    let user = TestUser::new();
+    let (order_id, amount_zat, stored) = opened_order(&app, &state, &user).await;
+
+    let funding_txid = [0x22u8; 32];
+    scanner.pay_mempool(
+        &stored.script_pubkey,
+        FoundOutput { txid: funding_txid, vout: 0, amount_zat },
+    );
+    zecp2p_v2coordinator::driver::advance(&state, &order_id).await.unwrap();
+    sign_it(&app, &state, &attestor, &user, &order_id).await;
+
+    for _ in 0..3 {
+        zecp2p_v2coordinator::driver::advance(&state, &order_id).await.ok();
+    }
+    assert_eq!(fiat.payments(), 0, "the LP paid for an escrow only in the mempool");
+    assert!(state.store.get(&order_id).unwrap().funding.is_none());
+}
+
+#[tokio::test]
+async fn a_mempool_announcement_is_drawn_once() {
+    // A second announcement carries a fresh R - a different outcome point - and
+    // the signature already made is not encrypted under it.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+    let state = coordinator_that_cannot_pay(dir.path(), scanner.clone(), &node, &attestor);
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+    let user = TestUser::new();
+    let (order_id, amount_zat, stored) = opened_order(&app, &state, &user).await;
+
+    scanner.pay_mempool(
+        &stored.script_pubkey,
+        FoundOutput { txid: [0x23u8; 32], vout: 0, amount_zat },
+    );
+    zecp2p_v2coordinator::driver::advance(&state, &order_id).await.unwrap();
+    let first = state.store.get(&order_id).unwrap().announcement.clone().unwrap();
+    for _ in 0..3 {
+        zecp2p_v2coordinator::driver::advance(&state, &order_id).await.ok();
+    }
+    let again = state.store.get(&order_id).unwrap().announcement.clone().unwrap();
+    assert_eq!(first.event_id, again.event_id);
+    assert_eq!(first.r, again.r);
+}
+
+#[tokio::test]
+async fn a_replaced_funding_never_reaches_a_payment() {
+    // The user broadcasts A, signs a digest over A, then replaces A with B
+    // paying the same escrow the same amount. B confirms. The stored signature
+    // will not decrypt onto a transaction spending B, so if the pay gate is
+    // satisfied by "a pre-signature exists" rather than "one that matches these
+    // terms", the LP sends real dollars for a coin it can never take.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+    let fiat = Arc::new(CountingFiat::new());
+    let state = coordinator_with_fiat(dir.path(), scanner.clone(), &node, &attestor, fiat.clone());
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+    let user = TestUser::new();
+    let (order_id, amount_zat, stored) = opened_order(&app, &state, &user).await;
+
+    let tx_a = [0xaau8; 32];
+    scanner.pay_mempool(
+        &stored.script_pubkey,
+        FoundOutput { txid: tx_a, vout: 0, amount_zat },
+    );
+    zecp2p_v2coordinator::driver::advance(&state, &order_id).await.unwrap();
+    sign_it(&app, &state, &attestor, &user, &order_id).await;
+
+    // B confirms instead. Forced, because a `Locked` order does not re-scan.
+    let tx_b = [0xbbu8; 32];
+    let mut forced = state.store.get(&order_id).unwrap();
+    forced.funding = Some(zecp2p_v2coordinator::order::Funding {
+        txid: tx_b,
+        vout: 0,
+        confirmations: 30,
+        required: 10,
+    });
+    forced.stage = Stage::Locked;
+    state.store.put(&forced).unwrap();
+    node.add_utxo(tx_b, 0, stored.script_pubkey.clone(), amount_zat, 30).await;
+
+    for _ in 0..3 {
+        zecp2p_v2coordinator::driver::advance(&state, &order_id).await.ok();
+    }
+    assert_eq!(
+        fiat.payments(),
+        0,
+        "the LP paid for an escrow whose release signature is over a replaced outpoint"
+    );
+    assert!(!state.store.get(&order_id).unwrap().stage.fiat_may_have_left());
+}
+
+/// Opens an order and returns its id, amount and stored form.
+async fn opened_order(
+    app: &axum::Router,
+    state: &Arc<AppState>,
+    user: &TestUser,
+) -> (String, u64, zecp2p_v2coordinator::order::Order) {
+    let (_, q) = get(app, "/escrow/quote?amount=0.05&unit=zec").await;
+    let (status, order) = post(
+        app,
+        "/escrow/orders",
+        serde_json::json!({
+            "quote_id": q["quote_id"],
+            "u_pub": hex::encode(user.u_pub),
+            "destination": { "rail": "venmo", "handle": "alice" },
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{order}");
+    let order_id = order["order_id"].as_str().unwrap().to_string();
+    let amount_zat = order["escrow"]["amount_zat"].as_u64().unwrap();
+    let stored = state.store.get(&order_id).unwrap();
+    (order_id, amount_zat, stored)
+}
+
+/// Signs the announced terms as the page does, with no user interaction.
+async fn sign_it(
+    app: &axum::Router,
+    state: &Arc<AppState>,
+    attestor: &TestAttestor,
+    user: &TestUser,
+    order_id: &str,
+) {
+    let (_, view) = get(app, &format!("/escrow/orders/{order_id}")).await;
+    assert_eq!(view["stage"], "needs_presignature", "{view}");
+    let announced = view["announcement"].clone();
+    let stored = state.store.get(order_id).unwrap();
+    let pre_sig = user.pre_sign(&stored, attestor, &announced);
+    let (status, body) = post(
+        app,
+        &format!("/escrow/orders/{order_id}/presign"),
+        serde_json::json!({
+            "pre_signature": hex::encode(pre_sig.as_ref()),
+            "terms_hash": announced["terms_hash"],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
 async fn a_reorg_that_unwinds_the_funding_stops_the_payment() {
     // The should-fix "stale funding" concern, resolved by showing the check
     // already happens: `require_payable` calls `lp::evaluate`, which re-reads

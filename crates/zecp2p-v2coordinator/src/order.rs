@@ -157,6 +157,19 @@ pub struct Order {
     /// progress rather than skipping blocks.
     #[serde(default)]
     pub scanned_through: Option<u32>,
+    /// The outpoint an announcement was drawn against while it was still only
+    /// in the mempool.
+    ///
+    /// Separate from `funding` on purpose. `funding` means "seen in a block by
+    /// the scanner and re-read with `gettxout`", and it is what the payment
+    /// decision is built on. This means only "a transaction paying this escrow
+    /// was in the mempool, and the terms the user signed name it". If that
+    /// transaction is replaced or never mined, this stays set, `funding` stays
+    /// `None`, nothing is ever paid, and the escrow refunds at T.
+    #[serde(default, with = "opt_hex32")]
+    pub mempool_announced_txid: Option<[u8; 32]>,
+    #[serde(default)]
+    pub mempool_announced_vout: Option<u32>,
     pub network: String,
     pub consensus_branch_id: u32,
 
@@ -219,17 +232,36 @@ impl Order {
         }
     }
 
+    /// The outpoint these terms are bound to.
+    ///
+    /// `funding` when the scanner has seen it in a block, and otherwise the one
+    /// a mempool sighting announced against. They are the same outpoint in the
+    /// ordinary case: the mempool entry is the transaction that later confirms.
+    ///
+    /// Preferring `funding` matters when they differ, which means the mempool
+    /// transaction was replaced and a different one confirmed. The terms the
+    /// user signed name the replaced outpoint, so the pre-signature will not
+    /// decrypt onto the confirmed one - `verify_pre_signature` re-derives the
+    /// digest and refuses. That is the correct outcome: nothing is paid and the
+    /// escrow refunds at T.
+    fn bound_outpoint(&self) -> Option<([u8; 32], u32)> {
+        if let Some(f) = self.funding {
+            return Some((f.txid, f.vout));
+        }
+        Some((self.mempool_announced_txid?, self.mempool_announced_vout?))
+    }
+
     /// The full canonical terms, once the escrow has locked.
     ///
-    /// Returns `None` before there is a funding outpoint or a lock time,
-    /// because both are committed by `terms_hash` and a placeholder for either
-    /// would produce a hash that binds nothing.
+    /// Returns `None` before there is an outpoint or a lock time, because both
+    /// are committed by `terms_hash` and a placeholder for either would produce
+    /// a hash that binds nothing.
     pub fn canonical_terms(&self) -> Option<CanonicalTerms> {
-        let funding = self.funding?;
+        let (funding_txid, vout) = self.bound_outpoint()?;
         let lock_confirmed_ms = self.lock_confirmed_ms?;
         Some(CanonicalTerms {
-            funding_txid: funding.txid,
-            vout: funding.vout,
+            funding_txid,
+            vout,
             amount_zat: self.quote.amount_zat,
             u_pub: self.u_pub,
             l_pub: self.l_pub,
@@ -259,10 +291,17 @@ impl Order {
 
     /// The ZIP 244 digest the user pre-signed and the LP will complete.
     pub fn release_digest(&self) -> anyhow::Result<[u8; 32]> {
-        let funding = self
-            .funding
+        // The same outpoint the announcement was drawn against, so what the
+        // user signs and what `terms_hash` commits to cannot disagree.
+        let (txid, vout) = self
+            .bound_outpoint()
             .ok_or_else(|| anyhow::anyhow!("this order has no funding outpoint yet"))?;
-        let terms = self.escrow_terms(&funding);
+        let terms = self.escrow_terms(&Funding {
+            txid,
+            vout,
+            confirmations: 0,
+            required: 0,
+        });
         let split = self.release_split();
         let tx = zecp2p_escrow::tx::build_release_split(&terms, &split)
             .map_err(|e| anyhow::anyhow!("could not build the release: {e}"))?;
@@ -306,6 +345,28 @@ macro_rules! hex_array {
 
 hex_array!(hex32, 32);
 hex_array!(hex33, 33);
+
+/// The same, for a field that may be absent. `None` round-trips as JSON null,
+/// so an order written before the field existed still loads.
+mod opt_hex32 {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &Option<[u8; 32]>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(b) => s.serialize_str(&hex::encode(b)),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<[u8; 32]>, D::Error> {
+        let s = Option::<String>::deserialize(d)?;
+        let Some(s) = s else { return Ok(None) };
+        let raw = hex::decode(&s).map_err(serde::de::Error::custom)?;
+        raw.try_into()
+            .map(Some)
+            .map_err(|_| serde::de::Error::custom("expected 32 bytes"))
+    }
+}
 
 /// Hex for byte vectors, so an order on disk is readable and diffable.
 mod hexbytes {

@@ -52,6 +52,37 @@ pub async fn advance(state: &Arc<AppState>, order_id: &str) -> Result<()> {
         return Ok(());
     }
 
+    // An order announced from the mempool has no funding outpoint yet, and
+    // `watch_funding` is the only thing that writes one. Without this it never
+    // could: `NeedsPresignature` and `Locked` both route past it, so `settle`
+    // bailed on the missing outpoint every sweep and the escrow sat locked
+    // forever with the LP never paying and the page never offering a refund.
+    //
+    // Re-entering the scan is safe at either stage. `find_funding` writes the
+    // outpoint and hands to `advance_funded`, which reaches `announce` - and
+    // `announce` no-ops when an announcement already exists, so the `R` the
+    // user's signature is encrypted under is never redrawn.
+    if order.funding.is_none()
+        && order.mempool_announced_txid.is_some()
+        && matches!(order.stage, Stage::NeedsPresignature | Stage::Locked)
+    {
+        let stage_before = order.stage;
+        find_funding(state, order).await?;
+        // `find_funding` moves the stage on as if the order were newly funded.
+        // Put back the stage the user's progress had already reached, so a
+        // signed order stays signed.
+        let Some(mut order) = state.store.get(order_id) else {
+            return Ok(());
+        };
+        if order.funding.is_some() && order.stage != stage_before {
+            order.stage = stage_before;
+            order.touch();
+            state.store.put(&order)?;
+        }
+        // Fall through on the next sweep with a funding outpoint in hand.
+        return Ok(());
+    }
+
     match order.stage {
         Stage::AwaitingZec | Stage::Confirming => watch_funding(state, order).await,
         Stage::NeedsPresignature => check_deadlines(state, order).await,
@@ -138,7 +169,9 @@ async fn find_funding(state: &Arc<AppState>, mut order: Order) -> Result<()> {
                 "outputs at the address, none for the quoted amount"
             );
         }
-        return check_deadlines(state, order).await;
+        // Nothing in a block yet. Ask the mempool, purely so the page can be
+        // given something to sign while it is still open.
+        return announce_from_mempool(state, order).await;
     };
 
     // Record the outpoint before reading it. From here on this order is
@@ -159,6 +192,76 @@ async fn find_funding(state: &Arc<AppState>, mut order: Order) -> Result<()> {
     state.store.put(&order)?;
 
     advance_funded(state, order).await
+}
+
+/// Announces against a funding output that is only in the mempool.
+///
+/// The point of this is latency, and only latency. The user's page signs by
+/// itself but only while it is open, and the outpoint - which the release
+/// digest commits to - exists as soon as the funding transaction is broadcast.
+/// Waiting for a block means waiting up to 150 s for something that was
+/// knowable in five, and every second of that is a second in which closing the
+/// tab strands the escrow.
+///
+/// **This must never move money, and it does not.** What it writes is
+/// `mempool_announced_txid`, not `funding`. `funding` is still only ever
+/// written by `find_funding` from a block scan, `advance_funded` still reads
+/// `chain.utxo` with `include_mempool` false, and `lp::evaluate` re-reads the
+/// outpoint and re-checks the depth before a dollar moves. A transaction that
+/// is replaced or never mined leaves an announcement and a signature that are
+/// simply never used, and the escrow refunds at T as if this had not run.
+async fn announce_from_mempool(state: &Arc<AppState>, mut order: Order) -> Result<()> {
+    // Only worth asking before there is an announcement to sign against, and
+    // only once: a second sighting cannot improve on the first, and re-reading
+    // the mempool every sweep for the life of an order is a lot of calls for
+    // nothing.
+    if order.announcement.is_some() || order.mempool_announced_txid.is_some() {
+        return check_deadlines(state, order).await;
+    }
+
+    let scanner = state.scanner.clone();
+    let script = order.script_pubkey.clone();
+    let address = order.address.clone();
+    let seen = tokio::task::spawn_blocking(move || {
+        scanner.outputs_paying_in_mempool(&script, &address)
+    })
+    .await
+    .context("the mempool scan did not complete")?;
+
+    let seen = match seen {
+        Ok(s) => s,
+        Err(e) => {
+            // Losing this costs a block of latency, never correctness.
+            tracing::debug!(order = %order.order_id, error = %e, "the mempool scan failed");
+            return check_deadlines(state, order).await;
+        }
+    };
+
+    let Some(output) = choose_funding(&seen, order.quote.amount_zat) else {
+        return check_deadlines(state, order).await;
+    };
+
+    tracing::info!(
+        order = %order.order_id,
+        txid = %zecp2p_escrow::rpc::txid_to_display(&output.txid),
+        vout = output.vout,
+        "funding seen in the mempool; announcing so the page can sign now"
+    );
+
+    // The lock time is the cut for the payment search and is committed by
+    // `terms_hash`, so it is recorded here for the same reason the confirmed
+    // path records it: once, and never recomputed.
+    if order.lock_confirmed_ms.is_none() {
+        order.lock_confirmed_ms = Some(chrono::Utc::now().timestamp_millis() as u64);
+    }
+    // Remembered so this runs once per order, and so the terms the user signs
+    // name the outpoint the announcement was drawn for.
+    order.mempool_announced_txid = Some(output.txid);
+    order.mempool_announced_vout = Some(output.vout);
+    order.touch();
+    state.store.put(&order)?;
+
+    announce(state, order).await
 }
 
 /// Reads the recorded funding outpoint and moves the order on from what it says.
@@ -463,9 +566,13 @@ async fn settle(state: &Arc<AppState>, order: Order) -> Result<()> {
         return Ok(());
     };
 
-    let funding = order
-        .funding
-        .ok_or_else(|| anyhow::anyhow!("settling an order with no funding outpoint"))?;
+    // No outpoint yet - the funding is still only in the mempool. Wait, but
+    // never past T: every other early return in this function runs the deadline
+    // check, and a bare `?` here left an order reading `locked` while its CLTV
+    // had already made the user's ZEC spendable, with `refund` asking the stage.
+    let Some(funding) = order.funding else {
+        return check_deadlines(state, order).await;
+    };
     let work = crate::slot::work_id_for(&funding.txid, funding.vout);
 
     // **The critical section starts here.**
@@ -1042,9 +1149,23 @@ fn watched_escrow(
         terms: order.escrow_terms(&funding),
         canonical,
         recipient: order.handle.clone(),
-        // Only ever true because `verify_pre_signature` returned Ok and the
-        // order was moved to `Locked` as a result.
-        pre_signature_verified: order.pre_signature.is_some(),
+        // Re-verified against the terms as they stand now, not merely present.
+        //
+        // `is_some()` was enough while the outpoint could not change after the
+        // signature. Announcing from the mempool breaks that: the user can
+        // replace the funding transaction, a different one confirms, and
+        // `bound_outpoint` then prefers the confirmed outpoint - so the stored
+        // signature is over a digest nobody will ever spend. Trusting presence
+        // alone, the LP sends the dollars and then cannot build a release: it
+        // has paid for a coin it can never take.
+        //
+        // This re-runs the same check `presign` ran, against the current
+        // digest. A signature that no longer matches reads as unverified, and
+        // `lp::evaluate` refuses to pay.
+        pre_signature_verified: order
+            .pre_signature
+            .as_deref()
+            .is_some_and(|sig| verify_pre_signature(state, order, sig).is_ok()),
         venmo_paid: order.payment.is_some(),
         outcome_secret_held: false,
     })
