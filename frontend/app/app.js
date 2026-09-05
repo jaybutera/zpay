@@ -321,7 +321,7 @@ function readFragment() {
 
 async function loadCapabilities() {
   try {
-    const caps = await api('/v2/capabilities');
+    const caps = await api('/escrow/capabilities');
     state.rails = caps.rails || [];
     if (caps.fee && caps.fee.label) state.feeLabel = caps.fee.label;
   } catch (_) {
@@ -362,7 +362,7 @@ async function doQuote() {
 
   try {
     const q = await api(
-      `/v2/quote?amount=${encodeURIComponent(amount)}&unit=${state.unit}` +
+      `/escrow/quote?amount=${encodeURIComponent(amount)}&unit=${state.unit}` +
       `&rail=${encodeURIComponent($('rail').value)}`
     );
     state.quote = q;
@@ -490,7 +490,7 @@ $('form-pay').addEventListener('submit', async (ev) => {
     const scope = `${state.quote.quote_id}:${rail}:${handle}`;
     const signature = personalSign(state.key, ownershipMessage('open', address, scope));
 
-    const opened = await api('/v2/orders', {
+    const opened = await api('/escrow/orders', {
       method: 'POST',
       headers: { 'x-zecp2p-signature': signature },
       body: JSON.stringify({
@@ -723,7 +723,7 @@ $('form-return').addEventListener('submit', async (ev) => {
 async function fetchStatus() {
   if (!state.orderId) return;
   try {
-    const view = await api('/v2/orders/' + encodeURIComponent(state.orderId));
+    const view = await api('/escrow/orders/' + encodeURIComponent(state.orderId));
     renderStatus(view);
     if (['done', 'returned', 'failed'].includes(view.timeline.stage)) stopPolling();
   } catch (_) {
