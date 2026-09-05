@@ -237,13 +237,33 @@ pub fn order_view(order: &Order, current_height: u32) -> OrderView {
             treasury_script: hex::encode(&order.treasury_script),
             zip321_uri: zip321(&order.address, order.quote.amount_zat),
         },
-        funding: order.funding.map(|f| FundingView {
-            // Display order: the page reverses this.
-            txid: zecp2p_escrow::rpc::txid_to_display(&f.txid),
-            vout: f.vout,
-            confirmations: f.confirmations,
-            required: f.required,
-        }),
+        // The outpoint the page must rebuild the release digest over.
+        //
+        // `order.funding` alone is not enough once an escrow can be announced
+        // from a mempool sighting: the page reaches `needs_presignature`, finds
+        // no funding in the view, and refuses to sign ("the announcement has
+        // not arrived yet") - so the order announces and can never be signed.
+        // The mempool outpoint is reported with zero confirmations, which is
+        // the truth: it is in no block, and the page shows it as unconfirmed.
+        funding: order
+            .funding
+            .map(|f| FundingView {
+                // Display order: the page reverses this.
+                txid: zecp2p_escrow::rpc::txid_to_display(&f.txid),
+                vout: f.vout,
+                confirmations: f.confirmations,
+                required: f.required,
+            })
+            .or_else(|| {
+                let txid = order.mempool_announced_txid?;
+                let vout = order.mempool_announced_vout?;
+                Some(FundingView {
+                    txid: zecp2p_escrow::rpc::txid_to_display(&txid),
+                    vout,
+                    confirmations: 0,
+                    required: zecp2p_escrow::depth::required_depth(order.quote.usd_amount_6dec),
+                })
+            }),
         announcement: announcement_view(order),
         pre_signature: order.pre_signed_at.map(|at| PreSignatureView {
             received_at: at.to_rfc3339(),

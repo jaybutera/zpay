@@ -1716,6 +1716,49 @@ async fn a_mempool_sighting_is_enough_to_announce_and_sign() {
 }
 
 #[tokio::test]
+async fn a_mempool_announced_order_shows_the_page_an_outpoint_to_sign_over() {
+    // The page rebuilds the release digest itself rather than trusting the
+    // coordinator for it, and the digest commits the outpoint - so `presign`
+    // in `app.js` refuses outright when `view.funding` is absent ("the
+    // announcement has not arrived yet").
+    //
+    // Announcing from the mempool leaves `order.funding` unset by design, so
+    // without this the page reached `needs_presignature` and could never sign:
+    // an order that announces and is unsignable, which is worse than the delay
+    // it was meant to remove. Found on regtest, not by a unit test.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+    let state = coordinator_that_cannot_pay(dir.path(), scanner.clone(), &node, &attestor);
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+    let user = TestUser::new();
+    let (order_id, amount_zat, stored) = opened_order(&app, &state, &user).await;
+
+    let funding_txid = [0x41u8; 32];
+    scanner.pay_mempool(
+        &stored.script_pubkey,
+        FoundOutput { txid: funding_txid, vout: 0, amount_zat },
+    );
+    zecp2p_v2coordinator::driver::advance(&state, &order_id).await.unwrap();
+
+    let (_, view) = get(&app, &format!("/escrow/orders/{order_id}")).await;
+    assert_eq!(view["stage"], "needs_presignature");
+    let funding = &view["funding"];
+    assert!(
+        !funding.is_null(),
+        "the page has nothing to build the release digest over, so it cannot sign"
+    );
+    assert_eq!(
+        funding["txid"].as_str().unwrap(),
+        zecp2p_escrow::rpc::txid_to_display(&funding_txid),
+        "the view must name the outpoint the announcement was drawn against"
+    );
+    // Unconfirmed, and honest about it.
+    assert_eq!(funding["confirmations"].as_u64(), Some(0));
+}
+
+#[tokio::test]
 async fn a_mempool_announced_order_still_completes_when_the_tx_confirms() {
     // The happy path, all the way through. Its absence is what let a total
     // deadlock pass: every other mempool test stops at or before `Locked`, and
