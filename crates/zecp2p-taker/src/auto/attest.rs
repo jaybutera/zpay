@@ -463,36 +463,47 @@ pub mod feed {
         stories: Vec<Story>,
     }
 
-    /// Reads a field that may be absent, present, or explicitly `null`.
+    /// Reads a field whose value may be anything at all, and keeps only what
+    /// this code can use.
     ///
-    /// `#[serde(default)]` alone covers the absent case only. An explicit
-    /// `"note": null` is a *type* error against a struct field, and serde
-    /// aborts the whole document on it - so one story that carries a null
-    /// anywhere in the feed fails every story's parse, and with it every
-    /// attestation, not merely the story it appeared on. The feed is somebody
-    /// else's JSON and holds story types this code never asked about: a bank
-    /// transfer or a request has no note to put there.
+    /// Two failures, both of which cost the *whole* document rather than the
+    /// one field. `#[serde(default)]` covers an absent field only, so an
+    /// explicit `"note": null` is a type error against a struct field; and a
+    /// value of an unexpected type - a bare `"note": "thanks"`, a `content`
+    /// that came back a number - is a type error too. Either aborts the parse
+    /// of every story on the page, and with it every attestation, not merely
+    /// the story it appeared on.
     ///
-    /// Reading through `Option` makes a null read as the default, which for a
-    /// note is the empty string - carrying no tag, so a null-noted story is
-    /// skipped rather than matched.
-    fn null_is_default<'de, D, T>(deserializer: D) -> std::result::Result<T, D::Error>
+    /// That is somebody else's JSON. All ten stories of the live feed sampled
+    /// on 2026-09-05 held `note` as an object with a string `content`, but ten
+    /// stories is not every story type Venmo returns, and this code has no say
+    /// in what the eleventh looks like. Before this branch read the note at all
+    /// it was an unknown field and ignored, so a shape this rejects would have
+    /// been harmless on master; keeping that tolerance is the point.
+    ///
+    /// So the value is taken as an untyped `Value` first and converted only if
+    /// it fits. Anything else - null, the wrong type, a nested field of the
+    /// wrong type - reads as the default. For a note that is the empty string,
+    /// which carries no tag, so an odd story is skipped rather than matched and
+    /// keeps its index for the enclave's own `$.stories[INDEX]` selection.
+    fn anything_else_is_default<'de, D, T>(deserializer: D) -> std::result::Result<T, D::Error>
     where
         D: serde::Deserializer<'de>,
-        T: Default + Deserialize<'de>,
+        T: Default + serde::de::DeserializeOwned,
     {
-        Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+        let value = serde_json::Value::deserialize(deserializer)?;
+        Ok(serde_json::from_value(value).unwrap_or_default())
     }
 
     #[derive(Debug, Deserialize)]
     struct Story {
         /// Rendered with a sign and a currency symbol: "- $4.84", "+ $1.00".
-        #[serde(default, deserialize_with = "null_is_default")]
+        #[serde(default, deserialize_with = "anything_else_is_default")]
         amount: String,
         /// ISO 8601, e.g. "2026-09-02T02:21:39". Local to Venmo, no zone.
-        #[serde(default, deserialize_with = "null_is_default")]
+        #[serde(default, deserialize_with = "anything_else_is_default")]
         date: String,
-        #[serde(default, deserialize_with = "null_is_default")]
+        #[serde(default, deserialize_with = "anything_else_is_default")]
         title: Title,
         /// What the sender typed in the note field.
         ///
@@ -501,25 +512,25 @@ pub mod feed {
         /// paying side controls, which makes it the only place a per-payment
         /// tag can go. Ten stories is not every story type Venmo returns,
         /// which is why it is read null-tolerantly below.
-        #[serde(default, deserialize_with = "null_is_default")]
+        #[serde(default, deserialize_with = "anything_else_is_default")]
         note: Note,
     }
 
     #[derive(Debug, Default, Deserialize)]
     struct Note {
-        #[serde(default, deserialize_with = "null_is_default")]
+        #[serde(default, deserialize_with = "anything_else_is_default")]
         content: String,
     }
 
     #[derive(Debug, Default, Deserialize)]
     struct Title {
-        #[serde(default, deserialize_with = "null_is_default")]
+        #[serde(default, deserialize_with = "anything_else_is_default")]
         receiver: Party,
     }
 
     #[derive(Debug, Default, Deserialize)]
     struct Party {
-        #[serde(default, deserialize_with = "null_is_default")]
+        #[serde(default, deserialize_with = "anything_else_is_default")]
         username: String,
     }
 
@@ -653,7 +664,18 @@ pub mod feed {
         // consumer product to do. The tag is lowercase hex either way, so
         // folding case costs one allocation and removes one way the match could
         // silently stop discriminating.
+        //
+        // An empty tag refuses rather than matching. Every string contains the
+        // empty string, so `Some("")` would accept every note on the page - a
+        // match-all in a position whose whole job is to narrow, and one that
+        // reads as tagged in the "many" refusal's own message. No caller can
+        // produce it today: `payment_tag_for` always yields eight hex
+        // characters and `tag_to_match` returns that or `None`. This is here
+        // for the caller that does not exist yet, and refusing is the safe
+        // direction - it stops the attestation instead of picking an arbitrary
+        // entry.
         match tag {
+            Some(tag) if tag.trim().is_empty() => false,
             Some(tag) => story
                 .note
                 .content
@@ -854,6 +876,93 @@ pub mod feed {
                     .unwrap_or_else(|e| panic!("a null field broke the whole feed: {e} in {body}"));
                 assert_eq!(parsed.stories.len(), 1);
             }
+        }
+
+        /// A note of an unexpected *shape* must degrade the same way a null
+        /// one does: the story loses its note, and the rest of the feed is
+        /// still read.
+        ///
+        /// Round 2 found this. Null was covered; a bare string `"note":
+        /// "thanks"`, or a `content` that came back a number, still failed the
+        /// whole document - and those two shapes are *new* breakage on this
+        /// branch, because before the note was read at all it was an unknown
+        /// field and ignored. Every one of the ten live stories sampled had an
+        /// object with a string `content`, so this is defence against a story
+        /// type nobody has seen rather than a shape anybody has observed.
+        #[test]
+        fn a_note_of_the_wrong_shape_degrades_instead_of_failing_the_feed() {
+            for body in [
+                r#"{"stories":[{"amount":"- $1.00","note":"thanks"}]}"#,
+                r#"{"stories":[{"amount":"- $1.00","note":2}]}"#,
+                r#"{"stories":[{"amount":"- $1.00","note":true}]}"#,
+                r#"{"stories":[{"amount":"- $1.00","note":[]}]}"#,
+                r#"{"stories":[{"amount":"- $1.00","note":{"content":2}}]}"#,
+                r#"{"stories":[{"amount":"- $1.00","note":{"content":["a"]}}]}"#,
+                r#"{"stories":[{"amount":"- $1.00","title":"Paid Jay"}]}"#,
+                r#"{"stories":[{"amount":"- $1.00","title":{"receiver":"jay"}}]}"#,
+                r#"{"stories":[{"amount":"- $1.00","title":{"receiver":{"username":7}}}]}"#,
+            ] {
+                let parsed: Stories = serde_json::from_str(body).unwrap_or_else(|e| {
+                    panic!("a note of an odd shape broke the whole feed: {e} in {body}")
+                });
+                assert_eq!(parsed.stories.len(), 1);
+                // The story is there; it simply carries no note to match on.
+                assert!(!is_our_payment(
+                    &parsed.stories[0],
+                    "jay-butera",
+                    "1.00",
+                    Some("abcd1234")
+                ));
+            }
+        }
+
+        /// One odd story must not cost the entries around it, and the indices
+        /// the enclave selects on must not shift.
+        #[test]
+        fn an_odd_story_does_not_take_the_feed_down_with_it() {
+            let body = r#"{"stories":[
+                {"amount":"- $1.00","note":"a bare string","title":{"receiver":{"username":"jay-butera"}}},
+                {"amount":"- $2.00","note":{"content":"thanks abcd1234"},
+                 "title":{"receiver":{"username":"jay-butera"}}}
+            ]}"#;
+            let parsed: Stories = serde_json::from_str(body).expect("the feed still parses");
+            assert_eq!(parsed.stories.len(), 2, "the odd story must keep its place");
+
+            let hits: Vec<usize> = parsed
+                .stories
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| is_our_payment(s, "jay-butera", "2.00", Some("abcd1234")))
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(hits, vec![1], "the tagged payment is at index 1, and only it");
+        }
+
+        /// An empty tag must never match everything.
+        ///
+        /// Every string contains the empty string, so `Some("")` would accept
+        /// any note at all - the exact opposite of what a tag is for. No
+        /// current caller can produce one: `payment_tag_for` always yields
+        /// eight hex characters and `tag_to_match` returns that or `None`.
+        /// This is a guard for the caller that does not exist yet.
+        #[test]
+        fn an_empty_tag_matches_nothing_rather_than_everything() {
+            let bare = noted_story("- $2.00", "jay-butera", "2026-09-05T10:00:00", "thanks");
+            let tagged = noted_story(
+                "- $2.00",
+                "jay-butera",
+                "2026-09-05T10:00:00",
+                "thanks abcd1234",
+            );
+            for story in [&bare, &tagged] {
+                assert!(
+                    !is_our_payment(story, "jay-butera", "2.00", Some("")),
+                    "an empty tag matched a payment, which is match-all wearing \
+                     a tag's clothes"
+                );
+            }
+            // A whitespace-only tag is the same mistake with a different shape.
+            assert!(!is_our_payment(&tagged, "jay-butera", "2.00", Some("   ")));
         }
 
         /// The story that carries a null note is still skipped rather than
