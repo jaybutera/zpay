@@ -2201,10 +2201,16 @@ async fn two_usd_orders_for_the_same_dollars_are_refused_across_a_rate_move() {
 
 #[tokio::test]
 async fn two_orders_inserted_together_do_not_both_win() {
-    // A check followed by an insert is not a guard. Two requests that both read
-    // an empty store both pass and both write, which is exactly the pair the
-    // refusal exists to prevent - and the sweep then has two escrows to the one
-    // handle for the one amount.
+    // A check followed by an insert is not a guard: two requests that both read
+    // an empty store both pass and both write, and the sweep then has two
+    // escrows to one handle for one cent figure - the pair `locate_payment`
+    // cannot attribute.
+    //
+    // The store must therefore start EMPTY of anything matching. An earlier
+    // version of this test seeded a matching in-flight order first, so both
+    // candidates were refused by that one whatever the lock did, and it passed
+    // against a check-then-insert. Here the only thing that can refuse the
+    // second candidate is the first candidate, which is the property at issue.
     let dir = tempfile::tempdir().unwrap();
     let node = FakeNode::spawn().await;
     let scanner = Arc::new(FakeScanner::new());
@@ -2213,18 +2219,36 @@ async fn two_orders_inserted_together_do_not_both_win() {
     let app = zecp2p_v2coordinator::web::router(state.clone());
     let user = TestUser::new();
 
-    // One real order, to borrow its shape.
+    // One order, only to borrow a well-formed shape - then moved to
+    // `Refundable`, which the guard ignores by design, so nothing that can
+    // refuse either candidate is in the store when the race starts.
     let (status, body) = open_for(&app, &user, "alice", "0.05").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let template = state.store.get(body["order_id"].as_str().unwrap()).unwrap();
+    let mut parked = template.clone();
+    parked.stage = Stage::Refundable;
+    state.store.put(&parked).unwrap();
+    assert!(
+        state.store.open_orders().iter().all(|o| o.stage == Stage::Refundable),
+        "nothing that can refuse a candidate may be in the store when the race starts"
+    );
 
-    // Two more with the same handle and cents, inserted from two threads.
+    // Both candidates wait on one barrier and are released together, so they
+    // are inside the decision at the same moment rather than one after another.
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
     let mut tasks = tokio::task::JoinSet::new();
     for n in 0..2u8 {
         let state = state.clone();
+        let barrier = barrier.clone();
         let mut candidate = template.clone();
         candidate.order_id = format!("esc_concurrent_{n}");
-        tasks.spawn(async move { state.store.put_unless_in_flight(&candidate).unwrap() });
+        tasks.spawn(async move {
+            barrier.wait().await;
+            tokio::task::spawn_blocking(move || state.store.put_unless_in_flight(&candidate))
+                .await
+                .unwrap()
+                .unwrap()
+        });
     }
     let mut accepted = 0;
     while let Some(r) = tasks.join_next().await {
@@ -2234,9 +2258,18 @@ async fn two_orders_inserted_together_do_not_both_win() {
     }
 
     assert_eq!(
-        accepted, 0,
-        "an order was inserted alongside one already in flight for the same handle \
-         and cents"
+        accepted, 1,
+        "expected exactly one of two simultaneous creations to win, got {accepted}"
+    );
+    let racers = state
+        .store
+        .all()
+        .into_iter()
+        .filter(|o| o.order_id.starts_with("esc_concurrent_"))
+        .count();
+    assert_eq!(
+        racers, 1,
+        "{racers} escrows to one handle for one cent figure are in the store"
     );
 }
 
