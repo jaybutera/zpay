@@ -450,6 +450,16 @@ impl FakeScanner {
             .expect("fake scanner lock")
             .push((script_pubkey.to_vec(), output));
     }
+
+    /// Stops the scanner reporting anything, without unwinding the chain.
+    ///
+    /// This is what a real scan does once `scanned_through` passes the block
+    /// the funding is in: the output is still on chain and still spendable, the
+    /// scan simply no longer looks at the block holding it. Distinct from a
+    /// reorg, where the output is genuinely gone.
+    pub fn forget(&self) {
+        self.outputs.lock().expect("fake scanner lock").clear();
+    }
 }
 
 impl FundingScanner for FakeScanner {

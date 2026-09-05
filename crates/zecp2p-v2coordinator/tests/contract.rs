@@ -1351,6 +1351,207 @@ async fn a_refund_is_refused_before_the_escrow_is_refundable() {
 }
 
 #[tokio::test]
+async fn confirmations_keep_rising_after_the_scan_cursor_passes_the_funding_block() {
+    // The mainnet freeze, as a test. Order esc_1f2809bcb726cd630ff7932c was
+    // funded at block 3,472,533 with 214,140 zat and then sat at "2 of 10"
+    // while the chain ran 15 blocks past it, because:
+    //
+    //   - the scan resumes after `scanned_through`, so once the cursor passed
+    //     the funding block every later sweep searched only newer blocks;
+    //   - `choose_funding` therefore found nothing;
+    //   - and `watch_funding` returned on that empty result BEFORE re-reading
+    //     the outpoint, so `confirmations` could never be written again.
+    //
+    // An escrow deep enough to settle stayed `confirming` forever. `forget()`
+    // is that exactly: the output is still on chain and still in the node, the
+    // scan simply no longer looks at the block holding it.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+    let state = coordinator_that_cannot_pay(dir.path(), scanner.clone(), &node, &attestor);
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+    let user = TestUser::new();
+
+    let (_, q) = get(&app, "/escrow/quote?amount=0.05&unit=zec").await;
+    let (status, order) = post(
+        &app,
+        "/escrow/orders",
+        serde_json::json!({
+            "quote_id": q["quote_id"],
+            "u_pub": hex::encode(user.u_pub),
+            "destination": { "rail": "venmo", "handle": "alice" },
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{order}");
+    let order_id = order["order_id"].as_str().unwrap().to_string();
+    let amount_zat = order["escrow"]["amount_zat"].as_u64().unwrap();
+    let stored = state.store.get(&order_id).unwrap();
+
+    // Funded, but only one confirmation deep: not enough to settle.
+    let funding_txid = [0x5au8; 32];
+    scanner.pay(
+        &stored.script_pubkey,
+        FoundOutput { txid: funding_txid, vout: 0, amount_zat },
+    );
+    node.add_utxo(funding_txid, 0, stored.script_pubkey.clone(), amount_zat, 1)
+        .await;
+
+    zecp2p_v2coordinator::driver::advance(&state, &order_id)
+        .await
+        .expect("the first sighting is not an error");
+
+    let seen = state.store.get(&order_id).unwrap();
+    assert_eq!(seen.stage, Stage::Confirming, "one confirmation is not enough");
+    let funding = seen.funding.expect("the outpoint is recorded on first sighting");
+    assert_eq!(funding.confirmations, 1);
+    assert_eq!(funding.txid, funding_txid);
+
+    // The cursor moves past the funding block: the scan stops reporting it,
+    // while the chain keeps burying it.
+    scanner.forget();
+    node.add_utxo(funding_txid, 0, stored.script_pubkey.clone(), amount_zat, 30)
+        .await;
+
+    zecp2p_v2coordinator::driver::advance(&state, &order_id)
+        .await
+        .expect("a funded order advances from its own outpoint");
+
+    let after = state.store.get(&order_id).unwrap();
+    let funding = after.funding.expect("the outpoint does not go away");
+    assert_eq!(
+        funding.confirmations, 30,
+        "confirmations froze at {} - the sweep is still depending on the scan \
+         re-finding an output it will never look for again",
+        funding.confirmations
+    );
+    assert_ne!(
+        after.stage,
+        Stage::Confirming,
+        "an escrow 30 deep with 10 required must leave `confirming`"
+    );
+}
+
+#[tokio::test]
+async fn a_funded_order_whose_output_vanishes_still_becomes_refundable() {
+    // The refund guarantee, on the funded path.
+    //
+    // Splitting `watch_funding` so a funded order reads its own outpoint moved
+    // every funded order off the scan path - and the scan path was where the
+    // deadline check lived when nothing was found. Without the check on this
+    // side, a reorg that unwound the funding left the order reading
+    // "confirming" forever, while the CLTV had made the user's ZEC spendable
+    // hours earlier and `refund` asks the stage, not the chain.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+    let state = coordinator_that_cannot_pay(dir.path(), scanner.clone(), &node, &attestor);
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+    let user = TestUser::new();
+
+    let (_, q) = get(&app, "/escrow/quote?amount=0.05&unit=zec").await;
+    let (status, order) = post(
+        &app,
+        "/escrow/orders",
+        serde_json::json!({
+            "quote_id": q["quote_id"],
+            "u_pub": hex::encode(user.u_pub),
+            "destination": { "rail": "venmo", "handle": "alice" },
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{order}");
+    let order_id = order["order_id"].as_str().unwrap().to_string();
+    let amount_zat = order["escrow"]["amount_zat"].as_u64().unwrap();
+    let stored = state.store.get(&order_id).unwrap();
+
+    // Funded and recorded, one confirmation deep.
+    let funding_txid = [0x7bu8; 32];
+    scanner.pay(
+        &stored.script_pubkey,
+        FoundOutput { txid: funding_txid, vout: 0, amount_zat },
+    );
+    node.add_utxo(funding_txid, 0, stored.script_pubkey.clone(), amount_zat, 1)
+        .await;
+    zecp2p_v2coordinator::driver::advance(&state, &order_id)
+        .await
+        .expect("the first sighting is not an error");
+    assert!(state.store.get(&order_id).unwrap().funding.is_some());
+
+    // The funding is unwound, the scan no longer reports it, and the chain
+    // runs past T.
+    node.remove_utxo(funding_txid, 0).await;
+    scanner.forget();
+    node.set_height(u32::try_from(stored.refund_height).unwrap() + 1).await;
+
+    zecp2p_v2coordinator::driver::advance(&state, &order_id)
+        .await
+        .expect("a vanished output is not an error");
+
+    assert_eq!(
+        state.store.get(&order_id).unwrap().stage,
+        Stage::Refundable,
+        "the user was never offered the refund their ZEC was already entitled to"
+    );
+}
+
+#[tokio::test]
+async fn a_funding_that_never_reaches_depth_still_becomes_refundable() {
+    // Same guarantee, the other way in: an output that stays too shallow to
+    // settle - a stuck low-fee transaction, or a node that under-reports -
+    // must not count confirmations past T forever.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+    let state = coordinator_that_cannot_pay(dir.path(), scanner.clone(), &node, &attestor);
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+    let user = TestUser::new();
+
+    let (_, q) = get(&app, "/escrow/quote?amount=0.05&unit=zec").await;
+    let (status, order) = post(
+        &app,
+        "/escrow/orders",
+        serde_json::json!({
+            "quote_id": q["quote_id"],
+            "u_pub": hex::encode(user.u_pub),
+            "destination": { "rail": "venmo", "handle": "alice" },
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{order}");
+    let order_id = order["order_id"].as_str().unwrap().to_string();
+    let amount_zat = order["escrow"]["amount_zat"].as_u64().unwrap();
+    let stored = state.store.get(&order_id).unwrap();
+
+    let funding_txid = [0x7cu8; 32];
+    scanner.pay(
+        &stored.script_pubkey,
+        FoundOutput { txid: funding_txid, vout: 0, amount_zat },
+    );
+    // One confirmation, and it never gets deeper.
+    node.add_utxo(funding_txid, 0, stored.script_pubkey.clone(), amount_zat, 1)
+        .await;
+    zecp2p_v2coordinator::driver::advance(&state, &order_id)
+        .await
+        .expect("the first sighting is not an error");
+    assert_eq!(state.store.get(&order_id).unwrap().stage, Stage::Confirming);
+
+    node.set_height(u32::try_from(stored.refund_height).unwrap() + 1).await;
+    zecp2p_v2coordinator::driver::advance(&state, &order_id)
+        .await
+        .expect("a shallow funding is not an error");
+
+    assert_eq!(
+        state.store.get(&order_id).unwrap().stage,
+        Stage::Refundable,
+        "an escrow that never confirmed deep enough counted confirmations past T forever"
+    );
+}
+
+#[tokio::test]
 async fn a_reorg_that_unwinds_the_funding_stops_the_payment() {
     // The should-fix "stale funding" concern, resolved by showing the check
     // already happens: `require_payable` calls `lp::evaluate`, which re-reads

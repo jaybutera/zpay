@@ -63,7 +63,30 @@ pub async fn advance(state: &Arc<AppState>, order_id: &str) -> Result<()> {
 }
 
 /// Looks for the funding output, and moves the order along as it confirms.
-async fn watch_funding(state: &Arc<AppState>, mut order: Order) -> Result<()> {
+async fn watch_funding(state: &Arc<AppState>, order: Order) -> Result<()> {
+    // An order whose funding is already known does not need finding again, and
+    // must not depend on finding it again.
+    //
+    // The scan resumes after `scanned_through`, so once the cursor passes the
+    // block the funding is in, every later sweep searches only newer blocks and
+    // comes back empty. `choose_funding` then returns None and this function
+    // used to return before ever re-reading the outpoint - so `confirmations`
+    // stayed at whatever it was on first sighting, and an escrow that was deep
+    // enough to settle sat at "2 of 10" forever. Measured on mainnet order
+    // esc_1f2809bcb726cd630ff7932c: funded at block 3,472,533, frozen at 2
+    // while the chain went 15 blocks past it.
+    //
+    // The outpoint is the durable fact. Once it is recorded, confirmations come
+    // from `gettxout` on that outpoint, which is the same call the scan path
+    // ends in and is what `advance_funded` already does.
+    if order.funding.is_some() {
+        return advance_funded(state, order).await;
+    }
+    find_funding(state, order).await
+}
+
+/// Walks blocks for an output paying this escrow, for an order with none yet.
+async fn find_funding(state: &Arc<AppState>, mut order: Order) -> Result<()> {
     let scanner = state.scanner.clone();
     let script = order.script_pubkey.clone();
     let address = order.address.clone();
@@ -118,9 +141,39 @@ async fn watch_funding(state: &Arc<AppState>, mut order: Order) -> Result<()> {
         return check_deadlines(state, order).await;
     };
 
-    // The scanner found an outpoint; the escrow crate decides what it is worth.
-    let txid = output.txid;
-    let vout = output.vout;
+    // Record the outpoint before reading it. From here on this order is
+    // "funded" and every later sweep goes down `advance_funded`, which reads
+    // this outpoint directly rather than needing the scan to find it again.
+    order.funding = Some(Funding {
+        txid: output.txid,
+        vout: output.vout,
+        confirmations: 0,
+        required: zecp2p_escrow::depth::required_depth(order.quote.usd_amount_6dec),
+    });
+    tracing::info!(
+        order = %order.order_id,
+        txid = %zecp2p_escrow::rpc::txid_to_display(&output.txid),
+        vout = output.vout,
+        "funding output seen"
+    );
+    state.store.put(&order)?;
+
+    advance_funded(state, order).await
+}
+
+/// Reads the recorded funding outpoint and moves the order on from what it says.
+///
+/// The outpoint, not the scan, is the source of truth here. `gettxout` reports
+/// `null` for an output that is spent or only in the mempool, and both mean
+/// "wait" rather than "gone": the order stays where it is and the next sweep
+/// asks again.
+async fn advance_funded(state: &Arc<AppState>, mut order: Order) -> Result<()> {
+    let funding = order
+        .funding
+        .as_ref()
+        .expect("advance_funded is only called with funding recorded");
+    let txid = funding.txid;
+    let vout = funding.vout;
     let utxo = state
         .with_chain(move |chain| {
             chain
@@ -131,8 +184,15 @@ async fn watch_funding(state: &Arc<AppState>, mut order: Order) -> Result<()> {
 
     let Some(utxo) = utxo else {
         // Seen by the scanner but not by `gettxout`: either in the mempool
-        // only, or spent. Both are "wait".
-        return Ok(());
+        // only, or spent. Both are "wait" - but waiting must not outlast T.
+        //
+        // Before the funded path existed, an order that lost its output fell
+        // through to the scan's empty-result branch, which ran the deadline
+        // check. Every funded order comes here now, so the check has to be
+        // here too: without it a reorg that unwound the funding would leave
+        // the order reading "confirming" forever while the CLTV made the
+        // user's ZEC spendable hours earlier, and `refund` asks the stage.
+        return check_deadlines(state, order).await;
     };
 
     if utxo.script_pubkey != order.script_pubkey {
@@ -142,33 +202,32 @@ async fn watch_funding(state: &Arc<AppState>, mut order: Order) -> Result<()> {
             order = %order.order_id,
             "the output the scan found does not pay this escrow's script"
         );
-        return Ok(());
+        // Nothing to settle against, but the refund is still owed at T.
+        return check_deadlines(state, order).await;
     }
 
+    // The depth is recomputed rather than trusted from the stored record, so a
+    // change to the depth table applies to orders already in flight.
     let required = zecp2p_escrow::depth::required_depth(order.quote.usd_amount_6dec);
     let confirmations = utxo.confirmations;
 
-    let first_sighting = order.funding.is_none();
+    // Refresh the count every sweep. This is the write that used to be
+    // unreachable once the scan cursor passed the funding block.
     order.funding = Some(Funding {
         txid,
         vout,
         confirmations,
         required,
     });
-    if first_sighting {
-        tracing::info!(
-            order = %order.order_id,
-            txid = %zecp2p_escrow::rpc::txid_to_display(&txid),
-            vout,
-            "funding output seen"
-        );
-    }
 
     if confirmations < required {
         order.stage = Stage::Confirming;
         order.touch();
         state.store.put(&order)?;
-        return Ok(());
+        // A funding that never reaches depth - a stuck low-fee transaction, a
+        // node that under-reports - must still become refundable at T rather
+        // than counting confirmations past it forever.
+        return check_deadlines(state, order).await;
     }
 
     // Deep enough. The lock time is recorded once, here, and never recomputed:
