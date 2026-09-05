@@ -138,6 +138,58 @@ async fn a_quote_prices_the_fee_the_treasury_and_the_conventional_miner_fee() {
 }
 
 #[tokio::test]
+async fn a_dollar_quote_pays_the_payee_what_was_typed_and_adds_the_fees_on_top() {
+    // The promise the page makes: type $2 and $2.00 lands in their Venmo. The
+    // fees are added to the ZEC the sender is asked for, never taken out of
+    // what the payee receives. `net_cents` is the number the rail is told to
+    // send, so it is the one that must equal what was typed.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let state = coordinator_with_node(dir.path(), Arc::new(FakeScanner::new()), &node);
+    let app = zecp2p_v2coordinator::web::router(state);
+
+    let (status, q) = get(&app, "/escrow/quote?amount=2&unit=usd").await;
+    assert_eq!(status, StatusCode::OK, "{q}");
+
+    assert_eq!(q["net_cents"], 200, "the payee receives exactly the typed amount");
+    assert_eq!(q["usd_amount_6dec"], 2_000_000);
+    assert!(
+        q["gross_cents"].as_u64().unwrap() > 200,
+        "the sender pays more than the payee receives: {q}"
+    );
+
+    // The escrow really does hold the payout plus both fees.
+    let amount = q["amount_zat"].as_u64().unwrap();
+    let fee = q["platform_fee_zat"].as_u64().unwrap();
+    let miner = q["miner_fee_zat"].as_u64().unwrap();
+    // At the harness's pinned $40.25/ZEC, $2.00 is 4,968,944 zat.
+    let payout = ((2.0f64 / 40.25) * 1e8).round() as u64;
+    assert_eq!(
+        amount - fee - miner,
+        payout,
+        "the escrow does not leave the payee the typed amount"
+    );
+}
+
+#[tokio::test]
+async fn a_zec_quote_still_prices_what_leaves_the_wallet() {
+    // The other unit is unchanged. A sender who types ZEC is choosing against
+    // a balance, so that figure is the escrow and the fees come out of it.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let state = coordinator_with_node(dir.path(), Arc::new(FakeScanner::new()), &node);
+    let app = zecp2p_v2coordinator::web::router(state);
+
+    let (status, q) = get(&app, "/escrow/quote?amount=0.05&unit=zec").await;
+    assert_eq!(status, StatusCode::OK, "{q}");
+    assert_eq!(q["amount_zat"], 5_000_000, "the escrow is what was typed");
+    assert!(
+        q["net_cents"].as_u64().unwrap() < q["gross_cents"].as_u64().unwrap(),
+        "the fees come out of a ZEC-denominated send"
+    );
+}
+
+#[tokio::test]
 async fn an_order_returns_an_address_the_page_can_derive_for_itself() {
     // The page rebuilds the address from u_pub, l_pub and the refund height,
     // and refuses the order if it differs. This asserts the same derivation.
@@ -182,6 +234,52 @@ async fn an_order_returns_an_address_the_page_can_derive_for_itself() {
     assert!(esc["zip321_uri"].as_str().unwrap().starts_with("zcash:"));
     // The payee hash came from the curator stub, not from a local hash.
     assert_eq!(esc["payee_hash"], hex::encode(CURATOR_HASH));
+}
+
+#[tokio::test]
+async fn an_order_from_a_dollar_quote_escrows_the_grossed_up_amount() {
+    // The gross-up has to survive into the order, because the escrow address
+    // commits to the amount and the release is built from it. An order that
+    // escrowed the un-grossed figure would pay the payee short, and the
+    // address the page derived would not match.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let state = coordinator_with_node(dir.path(), Arc::new(FakeScanner::new()), &node);
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+
+    let user = TestUser::new();
+    let (_, q) = get(&app, "/escrow/quote?amount=2&unit=usd").await;
+    let (status, order) = post(
+        &app,
+        "/escrow/orders",
+        serde_json::json!({
+            "quote_id": q["quote_id"],
+            "u_pub": hex::encode(user.u_pub),
+            "destination": { "rail": "venmo", "handle": "alice" },
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{order}");
+
+    let esc = &order["escrow"];
+    assert_eq!(
+        esc["amount_zat"], q["amount_zat"],
+        "the order escrows what the quote priced"
+    );
+    assert_eq!(order["quote"]["net_cents"], 200, "the payee still gets $2.00");
+    assert_eq!(esc["usd_amount_6dec"], 2_000_000);
+
+    // And the address the page will derive is the one for the grossed-up
+    // amount, so the ZIP-321 link asks for the right ZEC.
+    let derived = zecp2p_escrow::funding::escrow_address(
+        &user.u_pub,
+        &state.l_pub,
+        esc["refund_height"].as_u64().unwrap(),
+        q["amount_zat"].as_u64().unwrap(),
+        zecp2p_escrow::funding::AddressNetwork::Test,
+    )
+    .unwrap();
+    assert_eq!(esc["address"].as_str().unwrap(), derived.address);
 }
 
 #[tokio::test]
