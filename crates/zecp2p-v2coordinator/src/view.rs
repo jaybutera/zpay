@@ -160,6 +160,12 @@ pub struct EscrowView {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FundingView {
+    /// True when this outpoint is only in the mempool: in no block, and it may
+    /// never be. Distinct from `confirmations: 0`, which on a mined output
+    /// cannot happen - so without this a page renders "0 of 10" identically
+    /// for "not mined yet" and for a state that does not exist.
+    #[serde(default)]
+    pub mempool: bool,
     /// **Display order**, which is what explorers print and what the page
     /// reverses before it builds terms.
     pub txid: String,
@@ -253,6 +259,7 @@ pub fn order_view(order: &Order, current_height: u32) -> OrderView {
                 vout: f.vout,
                 confirmations: f.confirmations,
                 required: f.required,
+                mempool: false,
             })
             .or_else(|| {
                 let txid = order.mempool_announced_txid?;
@@ -262,6 +269,7 @@ pub fn order_view(order: &Order, current_height: u32) -> OrderView {
                     vout,
                     confirmations: 0,
                     required: zecp2p_escrow::depth::required_depth(order.quote.usd_amount_6dec),
+                    mempool: true,
                 })
             }),
         announcement: announcement_view(order),

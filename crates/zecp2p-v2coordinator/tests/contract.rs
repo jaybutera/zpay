@@ -1716,6 +1716,68 @@ async fn a_mempool_sighting_is_enough_to_announce_and_sign() {
 }
 
 #[tokio::test]
+async fn re_entering_the_scan_does_not_resurrect_a_finished_order() {
+    // The re-entry block puts back the stage an order had before it was sent
+    // through `find_funding`. That restore must not fire over a stage the
+    // deadline check chose: `find_funding` can end in `check_deadlines`, and
+    // `check_deadlines` writes `Refundable` past T and `Unpaid` past the pay
+    // deadline. `Unpaid` is terminal - `is_open` excludes it - so writing
+    // `Locked` back over it makes an abandoned order live again, and writing
+    // `Locked` over `Refundable` withholds a refund the chain already permits
+    // and the page decides by stage.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+    let state = coordinator_that_cannot_pay(dir.path(), scanner.clone(), &node, &attestor);
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+    let user = TestUser::new();
+    let (order_id, amount_zat, stored) = opened_order(&app, &state, &user).await;
+
+    // Announced from the mempool and signed, so the order is `Locked` with no
+    // funding outpoint - the exact state the re-entry block acts on.
+    let funding_txid = [0x61u8; 32];
+    scanner.pay_mempool(
+        &stored.script_pubkey,
+        FoundOutput { txid: funding_txid, vout: 0, amount_zat },
+    );
+    zecp2p_v2coordinator::driver::advance(&state, &order_id).await.unwrap();
+    sign_it(&app, &state, &attestor, &user, &order_id).await;
+    assert_eq!(state.store.get(&order_id).unwrap().stage, Stage::Locked);
+
+    // The transaction confirms only after the chain has run past T - a slow
+    // miner, a stuck fee, a restart after an outage. This is the population the
+    // mempool announcement exists to serve, not an adversarial case.
+    scanner.pay(
+        &stored.script_pubkey,
+        FoundOutput { txid: funding_txid, vout: 0, amount_zat },
+    );
+    node.add_utxo(funding_txid, 0, stored.script_pubkey.clone(), amount_zat, 30)
+        .await;
+    node.set_height(u32::try_from(stored.refund_height).unwrap() + 1).await;
+
+    // ONE sweep: the one in which the re-entry block runs and restores.
+    zecp2p_v2coordinator::driver::advance(&state, &order_id).await.ok();
+    let after_one = state.store.get(&order_id).unwrap();
+    assert!(
+        !matches!(after_one.stage, Stage::Locked) || after_one.funding.is_none(),
+        "the restore wrote `Locked` over a stage the deadline check chose; for a whole \
+         sweep the page shows locked and refuses the refund the chain already permits"
+    );
+
+    for _ in 0..3 {
+        zecp2p_v2coordinator::driver::advance(&state, &order_id).await.ok();
+    }
+
+    let end = state.store.get(&order_id).unwrap();
+    assert!(
+        matches!(end.stage, Stage::Refundable | Stage::Unpaid),
+        "past T the order reads {:?}; the user is owed a refund and the page asks the stage",
+        end.stage
+    );
+}
+
+#[tokio::test]
 async fn re_entering_the_scan_does_not_undo_a_signed_order() {
     // The re-entry block sends a `Locked` order back through `find_funding` to
     // learn its outpoint, and `find_funding` ends at `NeedsPresignature` as if

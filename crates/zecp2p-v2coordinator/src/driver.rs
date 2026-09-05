@@ -68,16 +68,40 @@ pub async fn advance(state: &Arc<AppState>, order_id: &str) -> Result<()> {
     {
         let stage_before = order.stage;
         find_funding(state, order).await?;
-        // `find_funding` moves the stage on as if the order were newly funded.
-        // Put back the stage the user's progress had already reached, so a
-        // signed order stays signed.
+        // `find_funding` moves the stage on as if the order were newly funded,
+        // so a signed order comes back reading `needs_presignature`. Put
+        // `Locked` back - but only over the two stages that path itself
+        // writes.
+        //
+        // Restoring on "the stage changed" alone was wrong. `find_funding` can
+        // also end in `check_deadlines`, which writes `Refundable` past T and
+        // `Unpaid` past the pay deadline, and both are the deadline check's
+        // decision rather than a step this block should undo. Writing `Locked`
+        // over `Refundable` makes the page refuse a refund the chain already
+        // permits, since `refund` asks the stage; writing it over `Unpaid`,
+        // which `is_open` treats as terminal, makes an abandoned order live
+        // again. Measured: one sweep of a wrongly withheld refund.
         let Some(mut order) = state.store.get(order_id) else {
             return Ok(());
         };
-        if order.funding.is_some() && order.stage != stage_before {
+        if order.funding.is_some()
+            && stage_before == Stage::Locked
+            && matches!(order.stage, Stage::NeedsPresignature | Stage::Confirming)
+        {
             order.stage = stage_before;
             order.touch();
             state.store.put(&order)?;
+        }
+        // The outpoint is known now, so the deadlines apply. `advance_funded`
+        // reaches `announce` when an announcement already exists and never
+        // runs the deadline check on that path, so without this an order whose
+        // funding confirmed after T would read `locked` until some later sweep
+        // happened to take a branch that checks - and `refund` asks the stage.
+        let Some(order) = state.store.get(order_id) else {
+            return Ok(());
+        };
+        if order.funding.is_some() {
+            return check_deadlines(state, order).await;
         }
         // Fall through on the next sweep with a funding outpoint in hand.
         return Ok(());
