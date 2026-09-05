@@ -68,6 +68,12 @@ pub struct WatchedEscrow {
     pub venmo_paid: bool,
     /// Whether the attestor's scalar is in hand.
     pub outcome_secret_held: bool,
+    /// A per-payment tag for the Venmo note, so this payment is distinguishable
+    /// in the feed from any other of the same amount to the same handle.
+    ///
+    /// `None` leaves the old behaviour: matched on amount and receiver alone.
+    #[allow(clippy::struct_field_names)]
+    pub tag: Option<String>,
 }
 
 impl WatchedEscrow {
@@ -120,6 +126,7 @@ impl WatchedEscrow {
             recipient: self.recipient.clone(),
             payment,
             not_before,
+            tag: self.tag.clone(),
             intent_hash: B256::from(self.canonical.intent_hash()),
             intent_amount_6dec: amount_6dec,
             rate_18dec: rate,
@@ -337,6 +344,7 @@ mod tests {
         )
         .unwrap();
         WatchedEscrow {
+            tag: None,
             terms,
             canonical,
             recipient: "jay-butera".into(),

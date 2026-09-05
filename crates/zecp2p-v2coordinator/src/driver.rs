@@ -1279,6 +1279,10 @@ fn watched_escrow(
         .ok_or_else(|| anyhow::anyhow!("this order has not locked"))?;
     let _ = state;
     Ok(zecp2p_taker::auto::zec::WatchedEscrow {
+        // What tells this payment apart from any other of the same amount to
+        // the same handle. Without it `locate_payment` refuses on two matching
+        // feed entries, after the dollars have gone.
+        tag: Some(order.payment_tag()),
         terms: order.escrow_terms(&funding),
         canonical,
         recipient: order.handle.clone(),

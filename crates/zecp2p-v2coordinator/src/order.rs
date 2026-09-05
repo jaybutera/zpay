@@ -348,6 +348,38 @@ impl Order {
             && (self.funding.is_some() || self.mempool_announced_txid.is_some())
     }
 
+    /// The tag written into the Venmo note, so this payment is distinguishable
+    /// from any other in the feed.
+    ///
+    /// `locate_payment` matches a feed entry on the rendered amount and the
+    /// receiver's username, and nothing else. Two entries that agree on both
+    /// give the "many" refusal, which lands after the dollars have gone and
+    /// needs an operator with an explicit index. Two people sending the same
+    /// amount to the same handle is not a rare case; it is the normal one at
+    /// any volume.
+    ///
+    /// The note is the only field the feed carries that this side controls.
+    /// Checked against the live feed on 2026-09-05: every story returned a
+    /// `note.content`, including our own past payments.
+    ///
+    /// Derived from the order id rather than drawn separately, so it needs no
+    /// new state and cannot disagree with the order it belongs to. Hex, and
+    /// short, because it goes in a field a person reads.
+    pub fn payment_tag(&self) -> String {
+        // The id is `esc_` and 24 hex characters of randomness; the last eight
+        // are as unpredictable as the whole.
+        let tail: String = self
+            .order_id
+            .chars()
+            .rev()
+            .take(8)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        tail
+    }
+
     /// Moves to `Failed` with a reason the page shows.
     pub fn fail(&mut self, why: impl Into<String>) {
         self.stage = Stage::Failed;

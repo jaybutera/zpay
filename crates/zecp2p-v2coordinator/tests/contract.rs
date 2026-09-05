@@ -2274,6 +2274,38 @@ async fn two_orders_inserted_together_do_not_both_win() {
 }
 
 #[tokio::test]
+async fn every_order_carries_a_tag_the_feed_can_be_matched_on() {
+    // The tag replaces the duplicate refusal as the primary way two payments to
+    // one handle are told apart. It has to reach the leg the rail pays from and
+    // the feed search reads back, and it has to differ per order - a tag two
+    // orders share discriminates nothing.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+    let state = coordinator_that_cannot_pay(dir.path(), scanner.clone(), &node, &attestor);
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+
+    let mut tags = Vec::new();
+    for amount in ["0.05", "0.06", "0.07"] {
+        let user = TestUser::new();
+        let (id, _, order) = opened_order_for(&app, &state, &user, amount).await;
+        let tag = order.payment_tag();
+        assert_eq!(tag.len(), 8, "a tag goes in a field a person reads: {tag:?}");
+        assert!(
+            tag.chars().all(|c| c.is_ascii_hexdigit()),
+            "the note round-trips through Venmo, so the tag stays ASCII: {tag:?}"
+        );
+        assert!(id.ends_with(&tag), "the tag comes from the order it belongs to");
+        tags.push(tag);
+    }
+
+    tags.sort();
+    tags.dedup();
+    assert_eq!(tags.len(), 3, "two orders shared a tag, which discriminates nothing");
+}
+
+#[tokio::test]
 async fn a_second_order_for_the_same_handle_and_amount_is_refused() {
     // Pre-mainnet condition 3 from the round-6 audit, answered by policy rather
     // than by measuring it with real money.

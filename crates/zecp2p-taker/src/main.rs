@@ -1214,6 +1214,9 @@ async fn run_zec_watch(config: &TakerConfig, command: &Commands) -> Result<()> {
     )?;
 
     let escrow = zecp2p_taker::auto::zec::WatchedEscrow {
+        // The CLI path drives one escrow at a time under a human's eye, so it
+        // matches the way it always did: amount and receiver.
+        tag: None,
         terms,
         canonical,
         recipient: claimed,
@@ -2230,6 +2233,9 @@ async fn run_fill<P: alloy::providers::Provider + Clone>(
         // pays the same handle the same dollar repeatedly, and without this cut
         // a $1.00 run is ambiguous against every earlier $1.00 payment.
         Some(signalled_at),
+        // This subcommand attests a payment a human already sent, so there is
+        // no order to take a tag from.
+        None,
     )
     .await
     .context("could not tell which Venmo feed entry this payment is")?;
@@ -2307,6 +2313,9 @@ async fn run_find_payment(
         recipient,
         amount,
         after,
+        // A lookup subcommand: it reports what the feed holds for an amount and
+        // a handle, with no order in hand to narrow it further.
+        None,
     )
     .await?;
     println!("an outgoing ${amount} to @{recipient} is at feed index {index}");

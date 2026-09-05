@@ -122,6 +122,7 @@ fn mainnet_escrow() -> WatchedEscrow {
     .expect("the mainnet terms must build");
 
     WatchedEscrow {
+        tag: None,
         terms,
         canonical,
         recipient: "jay-butera".into(),

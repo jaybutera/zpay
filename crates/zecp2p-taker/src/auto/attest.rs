@@ -473,6 +473,20 @@ pub mod feed {
         date: String,
         #[serde(default)]
         title: Title,
+        /// What the sender typed in the note field.
+        ///
+        /// Present on every story in the live feed, checked 2026-09-05,
+        /// including this account's own past payments. It is the only field the
+        /// paying side controls, which makes it the only place a per-payment
+        /// tag can go.
+        #[serde(default)]
+        note: Note,
+    }
+
+    #[derive(Debug, Default, Deserialize)]
+    struct Note {
+        #[serde(default)]
+        content: String,
     }
 
     #[derive(Debug, Default, Deserialize)]
@@ -500,6 +514,11 @@ pub mod feed {
         recipient: &str,
         amount: &str,
         after: Option<chrono::DateTime<chrono::Utc>>,
+        // The per-payment tag written into the note, when the caller has one.
+        // Without it two payments of the same amount to the same handle are
+        // indistinguishable and this refuses, which costs an operator and a
+        // held payment slot. With it they are one match each.
+        tag: Option<&str>,
     ) -> Result<u32> {
         let url = format!(
             "https://account.venmo.com/api/stories?feedType=me&externalId={}",
@@ -539,7 +558,7 @@ pub mod feed {
             .stories
             .iter()
             .enumerate()
-            .filter(|(_, s)| is_our_payment(s, recipient, amount))
+            .filter(|(_, s)| is_our_payment(s, recipient, amount, tag))
             .filter(|(_, s)| after.is_none_or(|cut| is_after(s, cut)))
             .map(|(i, _)| i)
             .collect();
@@ -558,10 +577,14 @@ pub mod feed {
                 }
             ),
             many => bail!(
-                "{} feed entries look like a ${amount} payment to @{recipient} (indices {:?}). \
-                 Position alone cannot say which one this intent paid for, so this needs \
-                 an operator and an explicit --index.",
+                "{} feed entries look like a ${amount} payment to @{recipient}{} (indices \
+                 {:?}). Position alone cannot say which one this intent paid for, so this \
+                 needs an operator and an explicit --index.",
                 many.len(),
+                match tag {
+                    Some(t) => format!(" tagged {t}"),
+                    None => String::new(),
+                },
                 many
             ),
         }
@@ -585,7 +608,7 @@ pub mod feed {
     /// Venmo renders the amount with a sign and a symbol and the sign is the
     /// direction: "- $4.84" left the account, "+ $1.00" arrived. Matching on the
     /// digits alone would accept a payment *to* us of the same size.
-    fn is_our_payment(story: &Story, recipient: &str, amount: &str) -> bool {
+    fn is_our_payment(story: &Story, recipient: &str, amount: &str, tag: Option<&str>) -> bool {
         let rendered = story.amount.trim();
         let Some(rest) = rendered.strip_prefix('-') else {
             return false;
@@ -594,7 +617,17 @@ pub mod feed {
             .chars()
             .filter(|c| c.is_ascii_digit() || *c == '.')
             .collect();
-        digits == amount && story.title.receiver.username.eq_ignore_ascii_case(recipient)
+        if digits != amount || !story.title.receiver.username.eq_ignore_ascii_case(recipient) {
+            return false;
+        }
+        // The tag is what tells two otherwise identical payments apart. It is
+        // only ever narrowing: an entry that lacks it is not ours, and a caller
+        // that has none - an order made before tags existed - matches on the
+        // amount and the receiver exactly as before.
+        match tag {
+            Some(tag) => story.note.content.contains(tag),
+            None => true,
+        }
     }
 
     #[cfg(test)]
@@ -606,7 +639,14 @@ pub mod feed {
         }
 
         fn dated_story(amount: &str, receiver: &str, date: &str) -> Story {
+            noted_story(amount, receiver, date, "")
+        }
+
+        fn noted_story(amount: &str, receiver: &str, date: &str, note: &str) -> Story {
             Story {
+                note: Note {
+                    content: note.into(),
+                },
                 amount: amount.into(),
                 date: date.into(),
                 title: Title {
@@ -615,6 +655,12 @@ pub mod feed {
                     },
                 },
             }
+        }
+
+        /// `is_our_payment` for a caller with no tag - the pre-tag behaviour,
+        /// which must keep working for orders made before tags existed.
+        fn is_our_payment_untagged(story: &Story, recipient: &str, amount: &str) -> bool {
+            is_our_payment(story, recipient, amount, None)
         }
 
         fn utc(s: &str) -> chrono::DateTime<chrono::Utc> {
@@ -633,8 +679,8 @@ pub mod feed {
             let ours = dated_story("- $1.00", "test-payee", "2026-09-02T16:00:00");
             let cut = utc("2026-09-02T15:55:00");
 
-            assert!(is_our_payment(&old, "test-payee", "1.00"));
-            assert!(is_our_payment(&ours, "test-payee", "1.00"));
+            assert!(is_our_payment_untagged(&old, "test-payee", "1.00"));
+            assert!(is_our_payment_untagged(&ours, "test-payee", "1.00"));
             // but only one of them is after the cut
             assert!(!is_after(&old, cut));
             assert!(is_after(&ours, cut));
@@ -649,16 +695,72 @@ pub mod feed {
             assert!(!is_after(&odd, utc("2020-01-01T00:00:00")));
         }
 
+        /// The case the tag exists for, in the shape the live feed returns.
+        ///
+        /// Two outgoing payments of the same amount to the same handle. Without
+        /// a tag both match and `locate_payment` refuses - after the dollars
+        /// have gone, needing an operator with an explicit index. With one each
+        /// is a single match.
+        #[test]
+        fn a_tag_tells_two_identical_payments_apart() {
+            let theirs = noted_story("- $2.00", "jay-butera", "2026-09-05T10:00:00", "zpay 1111aaaa");
+            let ours = noted_story("- $2.00", "jay-butera", "2026-09-05T10:01:00", "zpay 2222bbbb");
+
+            // Untagged, both look like ours - this is the ambiguity.
+            assert!(is_our_payment_untagged(&theirs, "jay-butera", "2.00"));
+            assert!(is_our_payment_untagged(&ours, "jay-butera", "2.00"));
+
+            // Tagged, exactly one does.
+            assert!(!is_our_payment(&theirs, "jay-butera", "2.00", Some("2222bbbb")));
+            assert!(is_our_payment(&ours, "jay-butera", "2.00", Some("2222bbbb")));
+        }
+
+        /// The tag narrows and never widens: it cannot make a payment ours that
+        /// the amount or the receiver already said was not.
+        #[test]
+        fn a_tag_never_widens_the_match() {
+            let wrong_amount = noted_story("- $3.00", "jay-butera", "2026-09-05T10:00:00", "zpay abcd1234");
+            let wrong_payee = noted_story("- $2.00", "someone-else", "2026-09-05T10:00:00", "zpay abcd1234");
+            let incoming = noted_story("+ $2.00", "jay-butera", "2026-09-05T10:00:00", "zpay abcd1234");
+            for s in [&wrong_amount, &wrong_payee, &incoming] {
+                assert!(!is_our_payment(s, "jay-butera", "2.00", Some("abcd1234")));
+            }
+        }
+
+        /// A note that does not carry the tag is not ours, even when everything
+        /// else agrees. This is what makes the discrimination real rather than
+        /// advisory.
+        #[test]
+        fn an_untagged_entry_is_not_ours_once_a_tag_is_expected() {
+            let bare = noted_story("- $2.00", "jay-butera", "2026-09-05T10:00:00", "thanks");
+            assert!(is_our_payment_untagged(&bare, "jay-butera", "2.00"));
+            assert!(!is_our_payment(&bare, "jay-butera", "2.00", Some("abcd1234")));
+        }
+
+        /// The tag is looked for as a substring, so whatever the operator puts
+        /// in front of it - the configured note - does not have to be known
+        /// here. The live feed's own notes are free text like "thanks" and "2".
+        #[test]
+        fn the_tag_is_found_inside_a_longer_note() {
+            let ours = noted_story(
+                "- $2.00",
+                "jay-butera",
+                "2026-09-05T10:00:00",
+                "thanks for the coffee zpay abcd1234",
+            );
+            assert!(is_our_payment(&ours, "jay-butera", "2.00", Some("abcd1234")));
+        }
+
         /// The live feed on 2026-09-02, shape and all: index 0 was an *incoming*
         /// $1.00 and the outgoing $4.84 fill was at index 1.
         #[test]
         fn an_incoming_payment_at_index_zero_is_not_ours() {
-            assert!(!is_our_payment(
+            assert!(!is_our_payment_untagged(
                 &story("+ $1.00", "test-payer"),
                 "test-payee",
                 "1.00"
             ));
-            assert!(is_our_payment(
+            assert!(is_our_payment_untagged(
                 &story("- $4.84", "test-payee"),
                 "test-payee",
                 "4.84"
@@ -669,20 +771,20 @@ pub mod feed {
         /// must not be mistaken for the one we sent.
         #[test]
         fn the_sign_decides_direction() {
-            assert!(is_our_payment(&story("- $1.00", "test-payee"), "test-payee", "1.00"));
-            assert!(!is_our_payment(&story("+ $1.00", "test-payee"), "test-payee", "1.00"));
+            assert!(is_our_payment_untagged(&story("- $1.00", "test-payee"), "test-payee", "1.00"));
+            assert!(!is_our_payment_untagged(&story("+ $1.00", "test-payee"), "test-payee", "1.00"));
         }
 
         #[test]
         fn the_recipient_must_match_and_case_does_not() {
-            assert!(is_our_payment(&story("- $1.00", "test-payee"), "test-payee", "1.00"));
-            assert!(!is_our_payment(&story("- $1.00", "someone-else"), "test-payee", "1.00"));
+            assert!(is_our_payment_untagged(&story("- $1.00", "test-payee"), "test-payee", "1.00"));
+            assert!(!is_our_payment_untagged(&story("- $1.00", "someone-else"), "test-payee", "1.00"));
         }
 
         #[test]
         fn the_amount_must_match_exactly() {
-            assert!(!is_our_payment(&story("- $10.00", "test-payee"), "test-payee", "1.00"));
-            assert!(!is_our_payment(&story("- $1.01", "test-payee"), "test-payee", "1.00"));
+            assert!(!is_our_payment_untagged(&story("- $10.00", "test-payee"), "test-payee", "1.00"));
+            assert!(!is_our_payment_untagged(&story("- $1.01", "test-payee"), "test-payee", "1.00"));
         }
     }
 }

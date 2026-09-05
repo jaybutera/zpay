@@ -157,6 +157,18 @@ pub struct FiatLeg {
     /// payment cannot predate the lock it settles, so an earlier entry of the
     /// same amount to the same handle is somebody else's.
     pub not_before: chrono::DateTime<chrono::Utc>,
+    /// A per-payment tag written into the Venmo note, and matched on when the
+    /// feed is read.
+    ///
+    /// `locate_payment` otherwise discriminates on the rendered amount and the
+    /// receiver's username alone, so two people sending the same amount to the
+    /// same handle produce two entries it cannot tell apart - a refusal that
+    /// arrives after the dollars have gone, needing an operator and an explicit
+    /// index. The note is the only feed field the paying side controls.
+    ///
+    /// `None` on a rail that does not set one, which matches on amount and
+    /// receiver exactly as before.
+    pub tag: Option<String>,
     /// What the enclave is told to bind the attestation to.
     ///
     /// On Base this is the `IntentSignaled` hash; on Zcash it is

@@ -112,6 +112,7 @@ pub async fn attest(
         &leg.recipient,
         &leg.payment.to_venmo_string(),
         Some(leg.not_before),
+        leg.tag.as_deref(),
     )
     .await
     .context("could not tell which Venmo feed entry this payment is")?;
@@ -169,6 +170,7 @@ mod tests {
 
     fn leg() -> FiatLeg {
         FiatLeg {
+            tag: None,
             recipient: "jay-butera".into(),
             payment: payment_cents(
                 U256::from(1_500_000u64),

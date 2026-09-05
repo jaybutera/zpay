@@ -151,7 +151,16 @@ impl FiatRail for VenmoRail {
     /// What remains here is the drive itself, whose failures really are
     /// ambiguous.
     async fn pay(&self, leg: &FiatLeg) -> Result<PaidFiat> {
-        let sent = zecp2p_taker::auto::fiat::pay(&self.browser, leg, &self.note, self.mode).await?;
+        // The configured note is a prefix now, not the whole thing: the leg's
+        // tag goes on the end so this payment can be told apart from any other
+        // of the same amount to the same handle when the feed is read back.
+        // `locate_payment` looks for the tag as a substring, so what leads it is
+        // free text for whoever receives the money.
+        let note = match &leg.tag {
+            Some(tag) => format!("{} {tag}", self.note.trim()),
+            None => self.note.clone(),
+        };
+        let sent = zecp2p_taker::auto::fiat::pay(&self.browser, leg, &note, self.mode).await?;
         Ok(PaidFiat {
             cents: u64::try_from(leg.payment.cents())
                 .context("the payment does not fit a cent count")?,
