@@ -1389,13 +1389,13 @@ async fn confirmations_keep_rising_after_the_scan_cursor_passes_the_funding_bloc
     let amount_zat = order["escrow"]["amount_zat"].as_u64().unwrap();
     let stored = state.store.get(&order_id).unwrap();
 
-    // Funded, but only one confirmation deep: not enough to settle.
+    // Seen, but not yet in a block: recorded, and below `ANNOUNCE_DEPTH`.
     let funding_txid = [0x5au8; 32];
     scanner.pay(
         &stored.script_pubkey,
         FoundOutput { txid: funding_txid, vout: 0, amount_zat },
     );
-    node.add_utxo(funding_txid, 0, stored.script_pubkey.clone(), amount_zat, 1)
+    node.add_utxo(funding_txid, 0, stored.script_pubkey.clone(), amount_zat, 0)
         .await;
 
     zecp2p_v2coordinator::driver::advance(&state, &order_id)
@@ -1403,9 +1403,9 @@ async fn confirmations_keep_rising_after_the_scan_cursor_passes_the_funding_bloc
         .expect("the first sighting is not an error");
 
     let seen = state.store.get(&order_id).unwrap();
-    assert_eq!(seen.stage, Stage::Confirming, "one confirmation is not enough");
+    assert_eq!(seen.stage, Stage::Confirming, "not in a block yet");
     let funding = seen.funding.expect("the outpoint is recorded on first sighting");
-    assert_eq!(funding.confirmations, 1);
+    assert_eq!(funding.confirmations, 0);
     assert_eq!(funding.txid, funding_txid);
 
     // The cursor moves past the funding block: the scan stops reporting it,
@@ -1430,6 +1430,138 @@ async fn confirmations_keep_rising_after_the_scan_cursor_passes_the_funding_bloc
         after.stage,
         Stage::Confirming,
         "an escrow 30 deep with 10 required must leave `confirming`"
+    );
+}
+
+#[tokio::test]
+async fn an_escrow_is_signable_one_block_after_funding_not_ten() {
+    // The window a key-holding page has to survive.
+    //
+    // The announcement used to wait for `required_depth` - ten blocks, about
+    // thirteen minutes. The page signs by itself but only while it is open, so
+    // that was thirteen minutes in which a closed tab meant nobody could ever
+    // sign and the escrow could only refund at T. One real order died that way.
+    //
+    // Announcing at one confirmation is safe because it is a different question
+    // from when to pay: the depth guards a reorg double-spend of the funding,
+    // and `lp::evaluate` re-checks it at payment time regardless of this.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+    let state = coordinator_that_cannot_pay(dir.path(), scanner.clone(), &node, &attestor);
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+    let user = TestUser::new();
+
+    let (_, q) = get(&app, "/escrow/quote?amount=0.05&unit=zec").await;
+    let (status, order) = post(
+        &app,
+        "/escrow/orders",
+        serde_json::json!({
+            "quote_id": q["quote_id"],
+            "u_pub": hex::encode(user.u_pub),
+            "destination": { "rail": "venmo", "handle": "alice" },
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{order}");
+    let order_id = order["order_id"].as_str().unwrap().to_string();
+    let amount_zat = order["escrow"]["amount_zat"].as_u64().unwrap();
+    let stored = state.store.get(&order_id).unwrap();
+
+    // Exactly one confirmation: in a block, nowhere near the pay depth of ten.
+    let funding_txid = [0x11u8; 32];
+    scanner.pay(
+        &stored.script_pubkey,
+        FoundOutput { txid: funding_txid, vout: 0, amount_zat },
+    );
+    node.add_utxo(funding_txid, 0, stored.script_pubkey.clone(), amount_zat, 1)
+        .await;
+
+    zecp2p_v2coordinator::driver::advance(&state, &order_id)
+        .await
+        .expect("one confirmation is enough to announce");
+
+    let after = state.store.get(&order_id).unwrap();
+    assert_eq!(
+        after.stage,
+        Stage::NeedsPresignature,
+        "the escrow was funded and in a block, and the page still could not sign"
+    );
+    assert!(
+        after.announcement.is_some(),
+        "there is nothing to sign against without an announcement"
+    );
+    // And the depth it will be paid at is still the real one.
+    assert_eq!(after.funding.unwrap().required, 10);
+}
+
+#[tokio::test]
+async fn signing_early_does_not_let_the_lp_pay_early() {
+    // The other half of the trade-off, and the one that would cost money if it
+    // were wrong. Announcing at one confirmation must not move the payment
+    // gate: `lp::evaluate` re-reads the outpoint and refuses below
+    // `required_depth`, so a signature collected at one block buys nothing
+    // until the escrow is ten deep.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+    let fiat = Arc::new(CountingFiat::new());
+    let state = coordinator_with_fiat(dir.path(), scanner.clone(), &node, &attestor, fiat.clone());
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+    let user = TestUser::new();
+
+    let (_, q) = get(&app, "/escrow/quote?amount=0.05&unit=zec").await;
+    let (status, order) = post(
+        &app,
+        "/escrow/orders",
+        serde_json::json!({
+            "quote_id": q["quote_id"],
+            "u_pub": hex::encode(user.u_pub),
+            "destination": { "rail": "venmo", "handle": "alice" },
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{order}");
+    let order_id = order["order_id"].as_str().unwrap().to_string();
+    let amount_zat = order["escrow"]["amount_zat"].as_u64().unwrap();
+    let stored = state.store.get(&order_id).unwrap();
+
+    let funding_txid = [0x12u8; 32];
+    scanner.pay(
+        &stored.script_pubkey,
+        FoundOutput { txid: funding_txid, vout: 0, amount_zat },
+    );
+    node.add_utxo(funding_txid, 0, stored.script_pubkey.clone(), amount_zat, 1)
+        .await;
+    zecp2p_v2coordinator::driver::advance(&state, &order_id)
+        .await
+        .expect("announcing at one confirmation");
+
+    // The user signs immediately, as the page now can.
+    let (_, view) = get(&app, &format!("/escrow/orders/{order_id}")).await;
+    assert_eq!(view["stage"], "needs_presignature", "{view}");
+    let announced = view["announcement"].clone();
+    let stored = state.store.get(&order_id).unwrap();
+    let pre_sig = user.pre_sign(&stored, &attestor, &announced);
+    let (status, body) = post(
+        &app,
+        &format!("/escrow/orders/{order_id}/presign"),
+        serde_json::json!({
+            "pre_signature": hex::encode(pre_sig.as_ref()),
+            "terms_hash": announced["terms_hash"],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Signed and locked at one confirmation - and still not paid.
+    zecp2p_v2coordinator::driver::advance(&state, &order_id).await.ok();
+    assert_eq!(
+        fiat.payments(),
+        0,
+        "the LP paid an escrow one block deep because the signature arrived early"
     );
 }
 
@@ -1531,8 +1663,9 @@ async fn a_funding_that_never_reaches_depth_still_becomes_refundable() {
         &stored.script_pubkey,
         FoundOutput { txid: funding_txid, vout: 0, amount_zat },
     );
-    // One confirmation, and it never gets deeper.
-    node.add_utxo(funding_txid, 0, stored.script_pubkey.clone(), amount_zat, 1)
+    // Seen but not yet in a block, and it never gets there: below
+    // `ANNOUNCE_DEPTH`, so there is nothing to sign against either.
+    node.add_utxo(funding_txid, 0, stored.script_pubkey.clone(), amount_zat, 0)
         .await;
     zecp2p_v2coordinator::driver::advance(&state, &order_id)
         .await

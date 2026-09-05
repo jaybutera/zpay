@@ -220,7 +220,21 @@ async fn advance_funded(state: &Arc<AppState>, mut order: Order) -> Result<()> {
         required,
     });
 
-    if confirmations < required {
+    // Announce as soon as the outpoint is in a block, not once it is deep.
+    //
+    // These are two different questions and they used to share one answer. The
+    // depth the LP pays at guards against a reorg double-spend of the funding,
+    // and `lp::evaluate` enforces it independently at payment time - it is not
+    // this gate. What this gate decides is when the terms are fixed enough for
+    // the user to sign over, and that is true the moment the outpoint exists,
+    // because the outpoint is what the release digest commits to.
+    //
+    // Holding the announcement to full depth left about thirteen minutes in
+    // which the escrow was funded but unsignable. The page signs by itself but
+    // only while it is open, so a tab closed in that window meant nobody could
+    // ever sign and the escrow could only refund at T. That is what happened to
+    // esc_1f2809bcb726cd630ff7932c. At one confirmation the window is one block.
+    if confirmations < zecp2p_escrow::depth::ANNOUNCE_DEPTH {
         order.stage = Stage::Confirming;
         order.touch();
         state.store.put(&order)?;
@@ -230,8 +244,13 @@ async fn advance_funded(state: &Arc<AppState>, mut order: Order) -> Result<()> {
         return check_deadlines(state, order).await;
     }
 
-    // Deep enough. The lock time is recorded once, here, and never recomputed:
+    // In a block. The lock time is recorded once, here, and never recomputed:
     // it is committed by `terms_hash` and it is the cut for the feed search.
+    //
+    // Recording it earlier does not widen what a stale payment could claim: the
+    // attestor bounds payment recency by `announced_at_ms`, its own clock at
+    // announcement, and never by `terms.lock_confirmed_ms`, which the LP writes
+    // (round 2 finding 2). Both move earlier together.
     if order.lock_confirmed_ms.is_none() {
         order.lock_confirmed_ms = Some(chrono::Utc::now().timestamp_millis() as u64);
     }
