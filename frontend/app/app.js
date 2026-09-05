@@ -538,7 +538,11 @@ function render(view) {
   // becomes possible, and the coordinator moves the stage to `refundable` on
   // the sweep that crosses it. Stopping here left a stopped order frozen on a
   // screen that never offered the refund.
-  const pastT = (view.current_height || 0) >= view.escrow.refund_height;
+  // A height of 0 means the coordinator could not read the chain. It makes
+  // this false, so the page keeps polling - which is the safe direction: it
+  // would rather ask again than stop on a screen that never offers the refund.
+  const h = view.current_height || 0;
+  const pastT = h > 0 && h >= view.escrow.refund_height;
   if (['released', 'refunded'].includes(stage) || (stage === 'failed' && pastT)) stopPolling();
 }
 
@@ -638,16 +642,26 @@ function renderReturns(view) {
   out.hidden = !out.dataset.raw;
 
   const T = view.escrow.refund_height;
+  // 0 means the coordinator could not read the chain, not that the chain is at
+  // genesis. Treated as a height it renders the wait as T blocks - about eighty
+  // years on mainnet - and says it with a confident "about". Unknown is a
+  // different thing from far away, and the page says so.
   const now = view.current_height || 0;
-  const blocks = Math.max(0, T - now);
-  const hours = (blocks * ((state.caps && state.caps.block_seconds) || 75)) / 3600;
+  const heightKnown = now > 0;
+  const blocks = heightKnown ? Math.max(0, T - now) : null;
+  const hours = heightKnown
+    ? (blocks * ((state.caps && state.caps.block_seconds) || 75)) / 3600
+    : null;
+  const whenText = heightKnown
+    ? `about ${hours < 1 ? Math.ceil(hours * 60) + ' minutes' : hours.toFixed(1) + ' hours'} from now`
+    : 'zpay cannot reach the Zcash network to say when';
 
   switch (stage) {
     case 'unpaid':
       // Past T the coordinator moves this to `refundable`, but the page must
       // not depend on having seen that: it can be opened at any moment, and
       // the chain is the authority on whether the timeout branch is spendable.
-      if (blocks === 0) {
+      if (heightKnown && blocks === 0) {
         $('returns-title').textContent = 'Where should your ZEC go?';
         $('returns-body').textContent =
           `Nobody sent the dollars, and block ${T.toLocaleString()} has passed. ` +
@@ -659,8 +673,7 @@ function renderReturns(view) {
         $('returns-title').textContent = 'Your ZEC comes back to you';
         $('returns-body').textContent =
           `Nobody sent the dollars in time. Your coins are refundable at block ${T.toLocaleString()}, ` +
-          `about ${hours < 1 ? Math.ceil(hours * 60) + ' minutes' : hours.toFixed(1) + ' hours'} from now. ` +
-          'Only your key can take them, and it is in this page. Nothing to do until then.';
+          `${whenText}. Only your key can take them, and it is in this page. Nothing to do until then.`;
         form.hidden = true;
       }
       break;
@@ -682,8 +695,24 @@ function renderReturns(view) {
       // funded. The refund is owed exactly as it is on `unpaid`: the coin is
       // the user's, the timeout branch pays it out at T, and hiding the form
       // here is what left a stopped order with no way back to it.
+      //
+      // Unless the dollars already went. `failed` is also what the coordinator
+      // writes when the Venmo payment left and the release did not broadcast,
+      // and there the LP holds a valid release over this same escrow. Offering
+      // the form would be this page telling the user to race it - and the loss
+      // on that race is the LP's, so the page would be steering them into
+      // spending against the party that already paid them. That case needs a
+      // person, not a button.
       $('returns-title').textContent = 'This order stopped';
-      if (blocks === 0) {
+      if (view.payment) {
+        $('returns-body').textContent =
+          `${view.reason ? view.reason + ' ' : ''}The dollars for this order were already sent, ` +
+          'so the refund is not yours to take on your own - zpay has to settle this one by hand. ' +
+          'Keep this link and get in touch.';
+        form.hidden = true;
+        break;
+      }
+      if (heightKnown && blocks === 0) {
         $('returns-body').textContent =
           `${view.reason ? view.reason + ' ' : ''}Block ${T.toLocaleString()} has passed, so ` +
           `${zec(view.escrow.amount_zat)} can come back to you now. This page signs the refund ` +
@@ -693,9 +722,7 @@ function renderReturns(view) {
       } else {
         $('returns-body').textContent =
           `${view.reason ? view.reason + ' ' : ''}Your ZEC is refundable at block ` +
-          `${T.toLocaleString()}, about ` +
-          `${hours < 1 ? Math.ceil(hours * 60) + ' minutes' : hours.toFixed(1) + ' hours'} from now. ` +
-          'Only your key can take it, and it is in this page.';
+          `${T.toLocaleString()}, ${whenText}. Only your key can take it, and it is in this page.`;
         form.hidden = true;
       }
   }

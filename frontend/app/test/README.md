@@ -67,3 +67,15 @@ page says any node will take it.
 ```
 node frontend/app/test/refund-outpoint.js
 ```
+
+## When the refund becomes possible
+
+`refund-wait.js` checks the arithmetic behind the refund screens against the
+real source. `read_order` serves `current_height` 0 when the coordinator cannot
+reach its node, and read as a height rather than as "unknown" that made the page
+render the wait as T blocks - roughly eighty years on mainnet - for an escrow
+refundable the next day.
+
+```
+node frontend/app/test/refund-wait.js
+```

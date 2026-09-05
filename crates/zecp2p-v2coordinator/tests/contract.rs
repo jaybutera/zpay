@@ -2070,6 +2070,127 @@ async fn one_sweep_reads_the_mempool_once_however_many_orders_are_open() {
 }
 
 #[tokio::test]
+async fn a_failed_order_keeps_its_reason_on_the_way_to_refundable() {
+    // R3-2. `check_deadlines` has a second clause that writes `Unpaid` over any
+    // stage past the pay deadline that has not seen fiat, and `Failed`
+    // satisfies it. A replaced-funding failure lands about a day short of T, so
+    // every one of them would be rewritten on its first sweep - and the page's
+    // `unpaid` screen shows no reason at all, so the user who was told their
+    // funding was replaced would next read "nobody sent the dollars in time".
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+    let state = coordinator_that_cannot_pay(dir.path(), scanner.clone(), &node, &attestor);
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+    let user = TestUser::new();
+    let (order_id, amount_zat, stored) = opened_order(&app, &state, &user).await;
+
+    let funding_txid = [0x93u8; 32];
+    scanner.pay(
+        &stored.script_pubkey,
+        FoundOutput { txid: funding_txid, vout: 0, amount_zat },
+    );
+    node.add_utxo(funding_txid, 0, stored.script_pubkey.clone(), amount_zat, 30)
+        .await;
+    zecp2p_v2coordinator::driver::advance(&state, &order_id).await.unwrap();
+
+    let mut failed = state.store.get(&order_id).unwrap();
+    failed.fail("the funding transaction was replaced after you signed");
+    state.store.put(&failed).unwrap();
+
+    // Past the PAY deadline but short of T - the window every such failure
+    // lands in.
+    let pay_deadline_gap = 20u32;
+    node.set_height(u32::try_from(stored.refund_height).unwrap() - pay_deadline_gap)
+        .await;
+    for o in state.store.open_orders() {
+        zecp2p_v2coordinator::driver::advance(&state, &o.order_id).await.ok();
+    }
+
+    let mid = state.store.get(&order_id).unwrap();
+    assert_eq!(mid.stage, Stage::Failed, "the failure was rewritten to {:?}", mid.stage);
+    assert!(
+        mid.reason.as_deref().is_some_and(|r| r.contains("replaced")),
+        "the reason the user is owed was lost: {:?}",
+        mid.reason
+    );
+
+    // And past T it still becomes refundable, reason intact.
+    node.set_height(u32::try_from(stored.refund_height).unwrap() + 1).await;
+    for o in state.store.open_orders() {
+        zecp2p_v2coordinator::driver::advance(&state, &o.order_id).await.ok();
+    }
+    let end = state.store.get(&order_id).unwrap();
+    assert_eq!(end.stage, Stage::Refundable);
+    assert!(
+        end.reason.as_deref().is_some_and(|r| r.contains("replaced")),
+        "the reason did not survive the promotion: {:?}",
+        end.reason
+    );
+}
+
+#[tokio::test]
+async fn a_failure_after_the_dollars_left_is_not_steered_to_a_refund() {
+    // R3-3. `Failed` is also what the driver writes when the Venmo leg errors
+    // after the journal claim, and when the payment left and the release did
+    // not broadcast. There the LP has paid and holds a valid release, and on a
+    // race the loss is the LP's. Promoting those to `Refundable` puts a screen
+    // in front of the user telling them to take a coin the LP has bought -
+    // this coordinator instructing its own counterparty to spend against it.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+    let state = coordinator_that_cannot_pay(dir.path(), scanner.clone(), &node, &attestor);
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+    let user = TestUser::new();
+    let (order_id, amount_zat, stored) = opened_order(&app, &state, &user).await;
+
+    let funding_txid = [0x94u8; 32];
+    scanner.pay(
+        &stored.script_pubkey,
+        FoundOutput { txid: funding_txid, vout: 0, amount_zat },
+    );
+    node.add_utxo(funding_txid, 0, stored.script_pubkey.clone(), amount_zat, 30)
+        .await;
+    zecp2p_v2coordinator::driver::advance(&state, &order_id).await.unwrap();
+
+    // The dollars went, and then something broke.
+    let mut paid_then_failed = state.store.get(&order_id).unwrap();
+    paid_then_failed.payment = Some(zecp2p_v2coordinator::order::Payment {
+        sent_at: chrono::Utc::now(),
+        cents: 200,
+    });
+    paid_then_failed.fail("the dollars were sent and the release did not broadcast");
+    state.store.put(&paid_then_failed).unwrap();
+
+    node.set_height(u32::try_from(stored.refund_height).unwrap() + 1).await;
+    for _ in 0..3 {
+        for o in state.store.open_orders() {
+            zecp2p_v2coordinator::driver::advance(&state, &o.order_id).await.ok();
+        }
+    }
+
+    let end = state.store.get(&order_id).unwrap();
+    assert_eq!(
+        end.stage,
+        Stage::Failed,
+        "an order the LP already paid for was promoted to {:?}, which is the screen \
+         that tells the user to spend against the LP's own release",
+        end.stage
+    );
+    assert!(
+        !state
+            .store
+            .open_orders()
+            .iter()
+            .any(|o| o.order_id == order_id),
+        "a paid-then-failed order is still being swept"
+    );
+}
+
+#[tokio::test]
 async fn an_unpaid_or_failed_order_becomes_refundable_once_the_chain_passes_t() {
     // R2-1. Both stages are terminal - `is_open` excludes them, `open_orders`
     // filters on it, and `advance` returns before `check_deadlines`, which is
@@ -2107,8 +2228,20 @@ async fn an_unpaid_or_failed_order_becomes_refundable_once_the_chain_passes_t() 
 
         // The chain passes T.
         node.set_height(u32::try_from(stored.refund_height).unwrap() + 1).await;
+
+        // Swept the way `run` does - over `open_orders`, not by calling
+        // `advance` on an id we already have. Calling by id is what let a
+        // version of this test pass while the sweep never listed these stages
+        // at all, so the fix it was written for did nothing.
         for _ in 0..3 {
-            zecp2p_v2coordinator::driver::advance(&state, &order_id).await.ok();
+            let listed = state.store.open_orders();
+            assert!(
+                listed.iter().any(|o| o.order_id == order_id),
+                "the sweep does not list a {terminal:?} order, so nothing ever moves it"
+            );
+            for o in listed {
+                zecp2p_v2coordinator::driver::advance(&state, &o.order_id).await.ok();
+            }
         }
 
         assert_eq!(

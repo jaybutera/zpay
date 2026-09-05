@@ -50,11 +50,20 @@ pub async fn advance(state: &Arc<AppState>, order_id: &str) -> Result<()> {
     };
     if !order.stage.is_open() {
         // A finished trade whose escrow is still funded gets one thing done for
-        // it: the deadline check, so it becomes `Refundable` at `T` and the
-        // page can offer the refund. Nothing else in this function may run for
-        // such an order - it must not pay, announce or settle.
-        if order.stage.still_owes_a_refund_check() {
-            return check_deadlines(state, order).await;
+        // it: the `T` check, so it becomes `Refundable` and the page can offer
+        // the refund. Nothing else in this function may run for such an order -
+        // it must not pay, announce or settle.
+        //
+        // `check_deadlines` is the wrong tool: its second clause writes
+        // `Unpaid` over any stage that is past the pay deadline and has not
+        // seen fiat, which `Failed` satisfies. Every replaced-funding failure
+        // lands about a day short of `T`, so each one would be rewritten on its
+        // first sweep and the reason the user is owed - "the funding was
+        // replaced", "the dollars were sent and the release did not broadcast"
+        // - replaced by "nobody sent the dollars in time", which the page shows
+        // without a reason at all.
+        if order.still_owes_a_refund_check() {
+            return check_refund_deadline_only(state, order).await;
         }
         return Ok(());
     }
@@ -471,6 +480,33 @@ async fn announce(state: &Arc<AppState>, mut order: Order) -> Result<()> {
 
 /// Moves an unfunded or unsigned order to its terminal state when a deadline
 /// has passed. Nothing here spends anything.
+/// The `T` check alone, for an order whose trade is already over.
+///
+/// `check_deadlines` also writes `Unpaid`, and that clause would overwrite the
+/// `Failed` stage and lose the reason with it. A finished order needs exactly
+/// one question answered - has the chain passed `T` - so this asks that and
+/// writes nothing else.
+async fn check_refund_deadline_only(state: &Arc<AppState>, mut order: Order) -> Result<()> {
+    let (height, _) = match state.chain_head_uncached().await {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::debug!(error = %e, "could not read the height for a refund deadline check");
+            return Ok(());
+        }
+    };
+    let Ok(refund_height) = u32::try_from(order.refund_height) else {
+        return Ok(());
+    };
+    if state.policy.may_refund_at(refund_height, height) && order.stage != Stage::Refundable {
+        // The reason is kept. The page shows it beside the refund form, so a
+        // user who was told the funding was replaced still sees why.
+        order.stage = Stage::Refundable;
+        order.touch();
+        state.store.put(&order)?;
+    }
+    Ok(())
+}
+
 async fn check_deadlines(state: &Arc<AppState>, mut order: Order) -> Result<()> {
     // Uncached. This decides when a user is *offered their refund*, and it is
     // the one caller where a head that is merely recent is not good enough: a

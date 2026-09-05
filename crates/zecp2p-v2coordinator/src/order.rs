@@ -72,22 +72,6 @@ impl Stage {
     ///
     /// `Locked` counts, because the journal entry is written before the click
     /// and a crash there cannot distinguish "about to pay" from "paid".
-    /// Whether this stage still owes the user a look at the refund deadline.
-    ///
-    /// `Unpaid` and `Failed` are terminal for the *trade* - nothing more will
-    /// be paid or released - but they are not terminal for the user's coin.
-    /// The escrow is still funded and the CLTV branch still pays out at `T`,
-    /// and the page offers its refund form on `Refundable` only. Left out of
-    /// the sweep, an order in either stage never reaches `Refundable`, so the
-    /// user is told the trade is over and shown no way back to their ZEC.
-    ///
-    /// `Refunded` and `Released` are excluded: the escrow output is spent, so
-    /// there is nothing left to refund. `Refundable` is excluded because it is
-    /// already the answer.
-    pub fn still_owes_a_refund_check(self) -> bool {
-        matches!(self, Stage::Unpaid | Stage::Failed)
-    }
-
     pub fn fiat_may_have_left(self) -> bool {
         matches!(self, Stage::Paid | Stage::Released)
     }
@@ -327,6 +311,34 @@ impl Order {
 
     pub fn touch(&mut self) {
         self.updated_at = chrono::Utc::now();
+    }
+
+    /// Whether this order still owes the user a look at the refund deadline.
+    ///
+    /// `Unpaid` and `Failed` are terminal for the *trade* - nothing more will
+    /// be paid or released - but they are not terminal for the user's coin.
+    /// The escrow is still funded and the timeout branch still pays out at `T`,
+    /// while the page offers its refund form on `Refundable` alone. Left out of
+    /// the sweep, an order in either stage never reaches `Refundable` and the
+    /// user is told the trade is over with no way back to their ZEC.
+    ///
+    /// **Unless the dollars went.** `Failed` is also what `settle` writes when
+    /// the Venmo leg errors after the journal claim, and what `finish_payment`
+    /// writes when the payment left and the release did not broadcast. There
+    /// the LP has paid and holds a valid release, and the loss on a race is the
+    /// LP's (spec 4.5). Promoting those to `Refundable` would put a screen in
+    /// front of the user telling them to take a coin the LP has already bought
+    /// - this coordinator instructing its own counterparty to spend against it.
+    /// A recorded payment is the cheap, local signal for that, and the refund
+    /// endpoint independently refuses on the journal.
+    ///
+    /// `Refunded` and `Released` are excluded: the escrow output is spent, so
+    /// there is nothing left to refund. `Refundable` is excluded because it is
+    /// already the answer.
+    pub fn still_owes_a_refund_check(&self) -> bool {
+        matches!(self.stage, Stage::Unpaid | Stage::Failed)
+            && self.payment.is_none()
+            && !self.stage.fiat_may_have_left()
     }
 
     /// Moves to `Failed` with a reason the page shows.

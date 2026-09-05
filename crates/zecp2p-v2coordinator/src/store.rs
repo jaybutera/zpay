@@ -116,11 +116,7 @@ impl OrderStore {
             .lock()
             .expect("order store lock")
             .values()
-            // `Unpaid` and `Failed` are swept too, so an order whose trade is
-            // over still reaches `Refundable` when the chain passes `T`. Their
-            // escrow is funded and the timeout branch still pays out; the page
-            // shows its refund form on `Refundable` and on nothing else.
-            .filter(|o| o.stage.is_open() || o.stage.still_owes_a_refund_check())
+            .filter(|o| o.stage.is_open())
             .count()
     }
 
@@ -178,13 +174,22 @@ impl OrderStore {
             .count()
     }
 
-    /// Orders still holding the in-flight slot.
+    /// What one sweep works through.
+    ///
+    /// Open orders, plus the finished ones that still owe the user a look at
+    /// the refund deadline. This is the list `run` iterates, so a stage missing
+    /// from it is a stage nothing ever moves - `Unpaid` and `Failed` sat here
+    /// forever, and the page offers its refund form on `Refundable` alone.
+    ///
+    /// Deliberately not `open_count`, which is the cap on how many orders may
+    /// be in flight at once: a finished trade must not hold a slot against that
+    /// limit just because its escrow is still refundable.
     pub fn open_orders(&self) -> Vec<Order> {
         self.orders
             .lock()
             .expect("order store lock")
             .values()
-            .filter(|o| o.stage.is_open())
+            .filter(|o| o.stage.is_open() || o.still_owes_a_refund_check())
             .cloned()
             .collect()
     }
