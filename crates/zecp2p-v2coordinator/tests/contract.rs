@@ -1967,6 +1967,113 @@ async fn a_mempool_announced_order_that_never_confirms_becomes_refundable() {
 }
 
 #[tokio::test]
+async fn a_mempool_announced_order_pays_once_and_releases_the_sighted_outpoint() {
+    // Pre-mainnet condition 1 from the round-6 audit, and the only test that
+    // takes a mempool-announced order past the pay gate. Every other
+    // `pay_mempool` test either uses a rail that cannot pay or asserts that
+    // nothing paid, and the full paid-path test funds through a block - so the
+    // whole second half of this branch's flow was uncovered.
+    //
+    // The seam it guards is the one the lock time opened: `lock_confirmed_ms`
+    // is now stamped at the sighting rather than at depth, and it is committed
+    // by `terms_hash`. If either moved when the transaction confirmed, the
+    // release would be built from terms the page never signed and the
+    // pre-signature would not decrypt onto it.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+    let fiat = Arc::new(CountingFiat::new());
+    let state = coordinator_with_fiat(dir.path(), scanner.clone(), &node, &attestor, fiat.clone());
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+    let user = TestUser::new();
+    let (order_id, amount_zat, stored) = opened_order(&app, &state, &user).await;
+
+    // Broadcast and sighted in the mempool, in no block.
+    let funding_txid = [0x71u8; 32];
+    scanner.pay_mempool(
+        &stored.script_pubkey,
+        FoundOutput { txid: funding_txid, vout: 0, amount_zat },
+    );
+    zecp2p_v2coordinator::driver::advance(&state, &order_id).await.unwrap();
+
+    // The page signs while it is still unconfirmed - the whole point of the
+    // mempool announcement.
+    sign_it(&app, &state, &attestor, &user, &order_id).await;
+    let signed = state.store.get(&order_id).unwrap();
+    assert_eq!(signed.stage, Stage::Locked);
+    assert!(signed.funding.is_none(), "nothing is in a block yet");
+    let stamped_lock_ms = signed.lock_confirmed_ms.expect("stamped at the sighting");
+    let signed_terms_hash = signed
+        .announcement
+        .as_ref()
+        .expect("announced")
+        .terms_hash
+        .clone();
+
+    // Nothing may pay while it is unconfirmed.
+    for _ in 0..2 {
+        zecp2p_v2coordinator::driver::advance(&state, &order_id).await.ok();
+    }
+    assert_eq!(fiat.payments(), 0, "it paid for an escrow that is in no block");
+
+    // The same transaction confirms, deep.
+    scanner.pay(
+        &stored.script_pubkey,
+        FoundOutput { txid: funding_txid, vout: 0, amount_zat },
+    );
+    node.add_utxo(funding_txid, 0, stored.script_pubkey.clone(), amount_zat, 30)
+        .await;
+
+    for _ in 0..60 {
+        if state.store.get(&order_id).unwrap().stage == Stage::Released {
+            break;
+        }
+        let _ = zecp2p_v2coordinator::driver::advance(&state, &order_id).await;
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    }
+
+    let end = state.store.get(&order_id).unwrap();
+    assert_eq!(end.stage, Stage::Released, "it never released");
+    assert_eq!(fiat.payments(), 1, "the dollars went {} times", fiat.payments());
+    assert_eq!(node.broadcasts().await.len(), 1, "more than one release went out");
+
+    // The release spends the outpoint that was sighted in the mempool, which is
+    // the one the page signed over.
+    let funding = end.funding.expect("recorded once it confirmed");
+    assert_eq!(funding.txid, funding_txid, "it released a different outpoint");
+    assert_eq!(funding.vout, 0);
+
+    // And the two values `terms_hash` commits to did not move underneath the
+    // signature when the transaction confirmed.
+    assert_eq!(
+        end.lock_confirmed_ms,
+        Some(stamped_lock_ms),
+        "the lock time was restamped after the page signed"
+    );
+    assert_eq!(
+        end.announcement.as_ref().map(|a| a.terms_hash.clone()),
+        Some(signed_terms_hash),
+        "the terms hash moved after the page signed"
+    );
+
+    // A refund after the dollars have gone is refused - the LP holds the
+    // release and the loss on a race would be its own.
+    let (status, body) = post(
+        &app,
+        &format!("/escrow/orders/{order_id}/refund"),
+        serde_json::json!({ "raw_tx": "00".repeat(120) }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body.to_string().contains("already been sent")
+            || body.to_string().contains("may already have been sent"),
+        "expected a refusal naming the payment: {body}"
+    );
+}
+
+#[tokio::test]
 async fn a_mempool_sighting_never_pays() {
     // The invariant: announcing from the mempool collects a signature early and
     // moves not one cent. `lp::evaluate` re-reads the outpoint with
