@@ -1716,6 +1716,65 @@ async fn a_mempool_sighting_is_enough_to_announce_and_sign() {
 }
 
 #[tokio::test]
+async fn re_entering_the_scan_does_not_undo_a_signed_order() {
+    // The re-entry block sends a `Locked` order back through `find_funding` to
+    // learn its outpoint, and `find_funding` ends at `NeedsPresignature` as if
+    // the order were newly funded. The stage is put back afterwards - this
+    // asserts that restoration keeps a signed order signed rather than
+    // dropping it a stage and asking the user's page, which may be long gone,
+    // to sign again.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+    let state = coordinator_that_cannot_pay(dir.path(), scanner.clone(), &node, &attestor);
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+    let user = TestUser::new();
+    let (order_id, amount_zat, stored) = opened_order(&app, &state, &user).await;
+
+    let funding_txid = [0x51u8; 32];
+    scanner.pay_mempool(
+        &stored.script_pubkey,
+        FoundOutput { txid: funding_txid, vout: 0, amount_zat },
+    );
+    zecp2p_v2coordinator::driver::advance(&state, &order_id).await.unwrap();
+    sign_it(&app, &state, &attestor, &user, &order_id).await;
+    let signed = state.store.get(&order_id).unwrap();
+    assert_eq!(signed.stage, Stage::Locked);
+    let sig_before = signed.pre_signature.clone().expect("signed");
+
+    // The same transaction confirms, and the order re-enters the scan.
+    scanner.pay(
+        &stored.script_pubkey,
+        FoundOutput { txid: funding_txid, vout: 0, amount_zat },
+    );
+    node.add_utxo(funding_txid, 0, stored.script_pubkey.clone(), amount_zat, 30)
+        .await;
+    for _ in 0..3 {
+        zecp2p_v2coordinator::driver::advance(&state, &order_id).await.ok();
+    }
+
+    let after = state.store.get(&order_id).unwrap();
+    assert!(after.funding.is_some(), "it never learned the outpoint");
+    assert_eq!(
+        after.stage,
+        Stage::Locked,
+        "a signed order was dropped back a stage; the page may be gone and cannot re-sign"
+    );
+    assert_eq!(
+        after.pre_signature.as_deref(),
+        Some(sig_before.as_str()),
+        "the stored pre-signature changed"
+    );
+    // And the announcement is the same one the signature is encrypted under.
+    assert_eq!(
+        after.announcement.as_ref().map(|a| a.r.clone()),
+        signed.announcement.as_ref().map(|a| a.r.clone()),
+        "R was redrawn, orphaning the signature"
+    );
+}
+
+#[tokio::test]
 async fn a_mempool_announced_order_shows_the_page_an_outpoint_to_sign_over() {
     // The page rebuilds the release digest itself rather than trusting the
     // coordinator for it, and the digest commits the outpoint - so `presign`
