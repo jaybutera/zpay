@@ -2104,6 +2104,26 @@ async fn a_mempool_announced_order_pays_once_and_releases_the_sighted_outpoint()
     );
 }
 
+/// Opens an order for a named handle at a USD amount.
+async fn open_for_usd(
+    app: &axum::Router,
+    user: &TestUser,
+    handle: &str,
+    amount: &str,
+) -> (StatusCode, serde_json::Value) {
+    let (_, q) = get(app, &format!("/escrow/quote?amount={amount}&unit=usd")).await;
+    post(
+        app,
+        "/escrow/orders",
+        serde_json::json!({
+            "quote_id": q["quote_id"],
+            "u_pub": hex::encode(user.u_pub),
+            "destination": { "rail": "venmo", "handle": handle },
+        }),
+    )
+    .await
+}
+
 /// Opens an order for a named handle at the quoted ZEC amount, returning the
 /// HTTP status and body so a test can assert on a refusal.
 async fn open_for(
@@ -2123,6 +2143,101 @@ async fn open_for(
         }),
     )
     .await
+}
+
+#[tokio::test]
+async fn two_usd_orders_for_the_same_dollars_are_refused_across_a_rate_move() {
+    // The guard has to key on what the Venmo feed matches on.
+    //
+    // `locate_payment` searches the feed for a payment of a dollar amount to a
+    // handle. Two USD-mode orders for the same dollar figure, quoted either
+    // side of a rate move, carry different `amount_zat` and identical
+    // `net_cents` - so a guard keyed on zatoshis lets through exactly the pair
+    // it exists to refuse, and the second order's payment finds two matching
+    // entries, errors, and leaves the global slot held with money out.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+    let state = coordinator_that_cannot_pay(dir.path(), scanner.clone(), &node, &attestor);
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+    let user = TestUser::new();
+
+    let (first, body_a) = open_for_usd(&app, &user, "alice", "2").await;
+    assert_eq!(first, StatusCode::OK, "{body_a}");
+    let first_id = body_a["order_id"].as_str().unwrap().to_string();
+
+    let (second, body_b) = open_for_usd(&app, &user, "alice", "2").await;
+    assert_eq!(
+        second,
+        StatusCode::BAD_REQUEST,
+        "a second order for the same dollars was accepted: {body_b}"
+    );
+
+    // The harness pins a rate, so those two also share `amount_zat` and a
+    // zatoshi key would have caught them. This is the case it would not: the
+    // same dollars at a moved rate. Built on the store directly, because the
+    // rate cannot be moved between two quotes through the HTTP surface.
+    let mut moved = state.store.get(&first_id).unwrap();
+    moved.order_id = "esc_rate_moved_since_the_first".into();
+    moved.quote.quote_id = "q_rate_moved".into();
+    moved.quote.amount_zat += 289; // what a 0.15% rate move does to $2 of ZEC
+    assert_ne!(
+        moved.quote.amount_zat,
+        state.store.get(&first_id).unwrap().quote.amount_zat,
+        "the two orders must differ in zatoshis for this to test anything"
+    );
+    assert_eq!(
+        moved.quote.net_cents,
+        state.store.get(&first_id).unwrap().quote.net_cents,
+        "and agree in cents, which is what the feed matches on"
+    );
+    assert!(
+        !state.store.put_unless_in_flight(&moved).unwrap(),
+        "the same dollars at a different rate were accepted, so the feed gets two \
+         identical entries and locate_payment cannot attribute either"
+    );
+}
+
+#[tokio::test]
+async fn two_orders_inserted_together_do_not_both_win() {
+    // A check followed by an insert is not a guard. Two requests that both read
+    // an empty store both pass and both write, which is exactly the pair the
+    // refusal exists to prevent - and the sweep then has two escrows to the one
+    // handle for the one amount.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+    let state = coordinator_that_cannot_pay(dir.path(), scanner.clone(), &node, &attestor);
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+    let user = TestUser::new();
+
+    // One real order, to borrow its shape.
+    let (status, body) = open_for(&app, &user, "alice", "0.05").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let template = state.store.get(body["order_id"].as_str().unwrap()).unwrap();
+
+    // Two more with the same handle and cents, inserted from two threads.
+    let mut tasks = tokio::task::JoinSet::new();
+    for n in 0..2u8 {
+        let state = state.clone();
+        let mut candidate = template.clone();
+        candidate.order_id = format!("esc_concurrent_{n}");
+        tasks.spawn(async move { state.store.put_unless_in_flight(&candidate).unwrap() });
+    }
+    let mut accepted = 0;
+    while let Some(r) = tasks.join_next().await {
+        if r.unwrap() {
+            accepted += 1;
+        }
+    }
+
+    assert_eq!(
+        accepted, 0,
+        "an order was inserted alongside one already in flight for the same handle \
+         and cents"
+    );
 }
 
 #[tokio::test]
@@ -3100,10 +3215,12 @@ async fn a_refundable_order_stops_counting_against_the_handle_limit() {
         ids.push(order["order_id"].as_str().unwrap().to_string());
     }
 
-    // Full up.
+    // Full up. A third amount, so this is refused by the per-handle bound and
+    // not by the same-handle-same-cents guard - the two have different messages
+    // and this test is about the bound.
     let user = TestUser::new();
-    let (_, q) = get(&app, "/escrow/quote?amount=0.05&unit=zec").await;
-    let (status, _) = post(
+    let (_, q) = get(&app, "/escrow/quote?amount=0.07&unit=zec").await;
+    let (status, body) = post(
         &app,
         "/escrow/orders",
         serde_json::json!({
@@ -3113,7 +3230,14 @@ async fn a_refundable_order_stops_counting_against_the_handle_limit() {
         }),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("already several escrows open"),
+        "refused by the wrong rule: {body}"
+    );
 
     // Both abandoned escrows reach T. Nobody funded them and nothing was paid.
     for id in &ids {
@@ -3124,7 +3248,7 @@ async fn a_refundable_order_stops_counting_against_the_handle_limit() {
 
     // The handle is served again.
     let user = TestUser::new();
-    let (_, q) = get(&app, "/escrow/quote?amount=0.05&unit=zec").await;
+    let (_, q) = get(&app, "/escrow/quote?amount=0.07&unit=zec").await;
     let (status, body) = post(
         &app,
         "/escrow/orders",

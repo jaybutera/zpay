@@ -285,12 +285,16 @@ async fn open_order(
         ));
     }
 
+    // Taken, not read. Removing it here under the same lock that found it means
+    // one quote mints one order: two requests racing on a single `quote_id`
+    // used to both find it, because it was only removed after the order was
+    // written. The loser gets the expiry message, which is true - the quote is
+    // gone.
     let quote = state
         .quotes
         .lock()
         .expect("quote lock")
-        .get(&body.quote_id)
-        .cloned()
+        .remove(&body.quote_id)
         .ok_or_else(|| ApiError::bad_request("That quote has expired. Type the amount again."))?;
 
     if quote.is_expired(chrono::Utc::now()) {
@@ -299,28 +303,6 @@ async fn open_order(
         ));
     }
 
-    // One order per handle per amount at a time.
-    //
-    // Two escrows to the same Venmo account for the same number of cents are
-    // the one thing `locate_payment` cannot resolve: it looks for a payment of
-    // that amount to that handle, two identical entries are indistinguishable,
-    // and it refuses rather than guess - after the dollars have already gone.
-    // Announcing from a mempool sighting widened the window, because the feed
-    // cut now sits at the sighting rather than at ten confirmations.
-    //
-    // Refusing the second at the door costs the user a wait and nothing else:
-    // no ZEC has been sent, no escrow exists, no key has been made. Resolving
-    // it afterwards costs an operator reading the feed by hand while a payment
-    // is already out. The check is here rather than in the escrow crate because
-    // it is a policy this coordinator chooses, not a rule the protocol imposes.
-    if state.store.has_in_flight_for(&handle, quote.amount_zat) {
-        return Err(ApiError::bad_request(
-            "You already have an escrow open to that Venmo account for exactly this \
-             amount. Two identical payments cannot be told apart in the feed, so zpay \
-             finishes one before starting another. Wait for that one to complete, or \
-             send a slightly different amount.",
-        ));
-    }
 
     let u_pub_raw = hex::decode(body.u_pub.trim())
         .map_err(|_| ApiError::bad_request("The key this page sent is not hex."))?;
@@ -425,13 +407,30 @@ async fn open_order(
 
     // On disk before the address is returned. An order this process has
     // forgotten is an escrow only the user's refund can recover.
-    state
+    let inserted = state
         .store
-        .put(&order)
+        .put_unless_in_flight(&order)
         .map_err(|e| ApiError::unavailable(format!("zpay could not record the order: {e}")))?;
 
-    // The quote is spent.
-    state.quotes.lock().expect("quote lock").remove(&order.quote.quote_id);
+    // One order per handle per number of cents at a time.
+    //
+    // Two escrows to the same Venmo account for the same cents are the one case
+    // `locate_payment` cannot resolve: it looks for a payment of a dollar
+    // amount to a handle, two identical entries are indistinguishable, and it
+    // refuses rather than guess - after the dollars have gone, with the global
+    // payment slot held. Refusing here costs a wait and nothing else: no ZEC has
+    // been sent, no escrow exists, no key has been made.
+    //
+    // The decision and the write happen under one lock inside the store, so two
+    // requests arriving together cannot both pass a check and both insert.
+    if !inserted {
+        return Err(ApiError::bad_request(
+            "You already have an escrow open to that Venmo account for exactly this \
+             amount. Two identical payments cannot be told apart in the feed, so zpay \
+             finishes one before starting another. Wait for that one to complete, or \
+             send a slightly different amount.",
+        ));
+    }
 
     tracing::info!(
         order = %order.order_id,

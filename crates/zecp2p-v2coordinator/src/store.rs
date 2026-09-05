@@ -72,6 +72,21 @@ impl OrderStore {
     /// exactly the order a crash loses, and the moment that matters is between
     /// opening the order and showing its address.
     pub fn put(&self, order: &Order) -> Result<()> {
+        let mut orders = self.orders.lock().expect("order store lock");
+        self.write_locked(&mut orders, order)
+    }
+
+    /// The write itself, for a caller already holding the map.
+    ///
+    /// Split out so a decision and its insert can share one lock - see
+    /// [`OrderStore::put_unless_in_flight`]. The file goes down before the map
+    /// is updated, so a crash between them loses the in-memory copy and not the
+    /// order: the store is rebuilt from the directory at startup.
+    fn write_locked(
+        &self,
+        orders: &mut std::collections::HashMap<String, Order>,
+        order: &Order,
+    ) -> Result<()> {
         let path = self.path_of(&order.order_id);
         let tmp = path.with_extension("json.tmp");
         let text = serde_json::to_string_pretty(order).context("could not serialize the order")?;
@@ -79,10 +94,7 @@ impl OrderStore {
             .with_context(|| format!("could not write {}", tmp.display()))?;
         std::fs::rename(&tmp, &path)
             .with_context(|| format!("could not move {} into place", tmp.display()))?;
-        self.orders
-            .lock()
-            .expect("order store lock")
-            .insert(order.order_id.clone(), order.clone());
+        orders.insert(order.order_id.clone(), order.clone());
         Ok(())
     }
 
@@ -174,37 +186,52 @@ impl OrderStore {
             .count()
     }
 
-    /// Whether a handle already has an order in flight for this exact amount.
+    /// Inserts an order unless the handle already has one in flight for the
+    /// same number of cents, deciding and writing under one lock.
     ///
-    /// Two escrows to the same Venmo account for the same number of cents are
-    /// the one thing `locate_payment` cannot resolve. It searches the feed for
-    /// a payment of that amount to that handle, and two identical entries are
-    /// indistinguishable: it refuses rather than guess, and the refusal lands
-    /// *after* the dollars have gone. Announcing from a mempool sighting made
-    /// that likelier by widening the window - the feed cut now sits at the
-    /// sighting rather than at ten confirmations, so it admits any same-amount
-    /// payment made in the minutes between.
+    /// Two escrows to the same Venmo account for the same **cents** are the one
+    /// thing `locate_payment` cannot resolve. It searches the feed for a payment
+    /// of a dollar amount to a handle, and two identical entries are
+    /// indistinguishable: it refuses rather than guess, and that refusal lands
+    /// *after* the dollars have gone, with the global payment slot held.
+    /// Announcing from a mempool sighting widened the window, because the feed
+    /// cut now sits at the sighting rather than at ten confirmations.
     ///
-    /// The cheap answer is not to create the ambiguity. One order per handle
-    /// per amount at a time; the second is refused at the door, before anyone
-    /// has sent any ZEC, which costs the user nothing but a wait.
+    /// **Cents, not zatoshis.** They are not the same key. Two USD-mode orders
+    /// for the same dollar figure quoted either side of a rate move carry
+    /// different `amount_zat` and identical `net_cents`, so a zatoshi key lets
+    /// through exactly the pair this exists to refuse. The cost of using cents
+    /// is that two ZEC-mode orders for the same coin can round to one cent
+    /// figure and the second is refused - a wait, for a user who can send a
+    /// slightly different amount, against a payment nobody can attribute.
     ///
-    /// Counted over the stages this coordinator will still act on, the same
+    /// **Decided and written under one lock**, because a check followed by an
+    /// insert is not a guard: two requests that both read an empty store both
+    /// pass and both write. The lock here is the same one every other reader
+    /// takes, so the pair cannot straddle it.
+    ///
+    /// Weighed over the stages this coordinator will still act on, the same
     /// population as `awaiting_for_handle`. A `Refundable` order needs nothing
-    /// further from the coordinator and will never be paid, so it cannot
-    /// collide with anything; letting it block would lock a handle and amount
-    /// out for a day at no cost to whoever opened it.
-    pub fn has_in_flight_for(&self, handle: &str, amount_zat: u64) -> bool {
-        self.orders
-            .lock()
-            .expect("order store lock")
-            .values()
-            .any(|o| {
-                o.handle.eq_ignore_ascii_case(handle)
-                    && o.quote.amount_zat == amount_zat
-                    && o.stage.is_open()
-                    && o.stage != Stage::Refundable
-            })
+    /// further and will never be paid, so it cannot collide; letting it block
+    /// would lock a handle and amount out for a day at no cost to whoever
+    /// opened it.
+    ///
+    /// Returns `false` when an in-flight order already matches, in which case
+    /// nothing is written.
+    pub fn put_unless_in_flight(&self, order: &Order) -> Result<bool> {
+        let mut orders = self.orders.lock().expect("order store lock");
+        let clash = orders.values().any(|o| {
+            o.order_id != order.order_id
+                && o.handle.eq_ignore_ascii_case(&order.handle)
+                && o.quote.net_cents == order.quote.net_cents
+                && o.stage.is_open()
+                && o.stage != Stage::Refundable
+        });
+        if clash {
+            return Ok(false);
+        }
+        self.write_locked(&mut orders, order)?;
+        Ok(true)
     }
 
     /// What one sweep works through.
