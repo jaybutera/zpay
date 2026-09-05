@@ -311,13 +311,19 @@ impl VenmoBrowser {
     /// 2xx means the session bearer is still good; a 401/403, or a redirect to
     /// the sign-in host, means it is not, however the address bar reads.
     ///
+    /// `/api/account` was checked against the live hub on 2026-09-05: 200 with
+    /// account data when cookies are sent, 401 when they are omitted. That
+    /// second half is what makes it a liveness test rather than a reachability
+    /// test. Anything that answers the same way signed in and signed out --
+    /// `/api/user`, which 404s on this account, for one -- proves nothing.
+    ///
     /// Deliberately a read. Nothing in this path may move money, which is the
     /// same rule the rest of this impl follows.
     async fn session_is_authenticated(&self, tab: &CdpTab) -> Result<bool> {
         const PROBE: &str = r#"
         (async () => {
           try {
-            const r = await fetch('https://account.venmo.com/api/user', {
+            const r = await fetch('https://account.venmo.com/api/account', {
               credentials: 'include',
               headers: {'Accept': 'application/json'},
             });
