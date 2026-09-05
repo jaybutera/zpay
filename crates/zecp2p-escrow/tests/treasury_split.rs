@@ -705,17 +705,16 @@ fn the_fee_free_constructor_says_so_in_its_name() {
 }
 
 #[test]
-fn quoting_a_fee_against_the_unpinned_mainnet_treasury_refuses() {
-    // Fail closed. Mainnet has no address yet, and a build that would charge a
-    // fee there has nowhere to put it; quoting one anyway would burn every
-    // zatoshi it collected. This is what keeps the mainnet constant honest
-    // until a funded-and-spent txid is recorded.
+fn quoting_a_fee_on_mainnet_pays_the_pinned_treasury() {
+    // Mainnet was unpinned until 2026-09-04 and this asserted the refusal. An
+    // address is pinned now, so the quote succeeds and names it. The fail-closed
+    // rule it used to cover is tested directly in `treasury`'s own module, on
+    // the function that enforces it rather than on a constant being empty.
     use zecp2p_escrow::address::AddrNetwork;
-    use zecp2p_escrow::client::QuoteError;
 
     let secp = Secp256k1::new();
     let (_, l) = keys();
-    let err = AcceptedQuote::at_identity_rate(
+    let quote = AcceptedQuote::at_identity_rate(
         1_500_000,
         PAYEE,
         REFUND_HEIGHT,
@@ -723,8 +722,17 @@ fn quoting_a_fee_against_the_unpinned_mainnet_treasury_refuses() {
         AMOUNT,
         AddrNetwork::Main,
     )
-    .expect_err("no mainnet treasury is pinned yet");
-    assert!(matches!(err, QuoteError::Treasury(_)), "got {err:?}");
+    .expect("the mainnet treasury is pinned");
+
+    // The fee must go to the pinned mainnet script, not to testnet's.
+    assert!(quote.platform_fee_zat() > 0, "mainnet charges the platform fee");
+    assert_eq!(
+        quote.treasury_script(),
+        zecp2p_escrow::treasury::treasury_script(AddrNetwork::Main)
+            .expect("pinned")
+            .as_slice(),
+        "the quote must pay the mainnet treasury"
+    );
 }
 
 #[test]

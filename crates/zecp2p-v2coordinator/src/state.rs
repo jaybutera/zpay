@@ -202,9 +202,30 @@ impl AppState {
 
     /// The cached head, if one was read less than [`CHAIN_HEAD_TTL`] ago.
     fn cached_chain_head(&self) -> Option<(u32, u32)> {
+        self.chain_head_within(CHAIN_HEAD_TTL)
+    }
+
+    /// The cached head, if it was read within `max_age`.
+    fn chain_head_within(&self, max_age: std::time::Duration) -> Option<(u32, u32)> {
         let slot = self.chain_head_cache.lock().ok()?;
         let (head, read_at) = (*slot)?;
-        (read_at.elapsed() < CHAIN_HEAD_TTL).then_some(head)
+        (read_at.elapsed() < max_age).then_some(head)
+    }
+
+    /// Reads the head from the node and makes it the cached value.
+    ///
+    /// This is what the sweep calls once per tick. Every order it then advances
+    /// reads that head through `chain_head` instead of asking the node itself,
+    /// which is the difference between two node calls per sweep and two per
+    /// order per sweep. The head is genuinely fresh - it was read at the top of
+    /// this sweep - so a deadline decision made against it is as current as one
+    /// the order made for itself.
+    pub async fn refresh_chain_head(&self) -> Result<(u32, u32)> {
+        let head = self.chain_head_uncached().await?;
+        if let Ok(mut slot) = self.chain_head_cache.lock() {
+            *slot = Some((head, std::time::Instant::now()));
+        }
+        Ok(head)
     }
 
     /// Reads the chain height and branch id from the node, ignoring the cache.

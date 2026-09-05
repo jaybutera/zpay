@@ -142,6 +142,21 @@ pub struct Order {
 
     /// The height when the order opened, which bounds a rescan.
     pub opened_height: u32,
+    /// The highest block already searched for this order's funding output.
+    ///
+    /// Without it every sweep re-walked the whole window from `opened_height`,
+    /// which is one `getblock` per block per tick: at a 200-block lookback and
+    /// a 20 s tick that is ~870k node calls a day for a single unfunded order,
+    /// and it is what exhausted the provider's quota. With it a sweep reads
+    /// only the blocks that arrived since the last one.
+    ///
+    /// Absent on orders written before this field existed, and on those the
+    /// scan falls back to `opened_height` - the old behaviour, once, after
+    /// which the cursor is set. It is only ever advanced to a height that has
+    /// actually been searched, so a crash between the scan and the store loses
+    /// progress rather than skipping blocks.
+    #[serde(default)]
+    pub scanned_through: Option<u32>,
     pub network: String,
     pub consensus_branch_id: u32,
 

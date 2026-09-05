@@ -67,24 +67,44 @@ async fn watch_funding(state: &Arc<AppState>, mut order: Order) -> Result<()> {
     let scanner = state.scanner.clone();
     let script = order.script_pubkey.clone();
     let address = order.address.clone();
-    let from_height = order.opened_height;
+    // Resume where the last scan finished rather than re-walking the window
+    // from `opened_height` every tick. `scanned_through` is the last block
+    // already searched, so the next one is where this scan starts; an order
+    // written before the cursor existed has None and starts where it always
+    // did. Re-reading the cursor block itself is harmless and costs one call,
+    // so `saturating_add(1)` is deliberate rather than an off-by-one.
+    let from_height = match order.scanned_through {
+        Some(done) => done.saturating_add(1).max(order.opened_height),
+        None => order.opened_height,
+    };
 
     let found = tokio::task::spawn_blocking(move || {
-        scanner.outputs_paying(&script, &address, from_height)
+        scanner.outputs_paying_through(&script, &address, from_height)
     })
     .await
     .context("the funding scan did not complete")?;
 
-    let found = match found {
+    let (found, searched_through) = match found {
         Ok(f) => f,
         Err(e) => {
             // A scan that failed is not proof the escrow is unfunded. Log it
             // and try again on the next tick; the order stays refundable at T
-            // whatever happens here.
+            // whatever happens here. The cursor is left alone, so the blocks
+            // this scan did not finish are covered again next time.
             tracing::warn!(order = %order.order_id, error = %e, "the funding scan failed");
             return Ok(());
         }
     };
+
+    // Advance the cursor only on a scan that read its whole window, and only
+    // forwards. A funding output found below the cursor is impossible by
+    // construction: the cursor only ever names blocks already searched.
+    if let Some(through) = searched_through {
+        if order.scanned_through.is_none_or(|prev| through > prev) {
+            order.scanned_through = Some(through);
+            state.store.put(&order)?;
+        }
+    }
 
     let Some(output) = choose_funding(&found, order.quote.amount_zat) else {
         if !found.is_empty() {
@@ -252,10 +272,15 @@ async fn announce(state: &Arc<AppState>, mut order: Order) -> Result<()> {
 /// Moves an unfunded or unsigned order to its terminal state when a deadline
 /// has passed. Nothing here spends anything.
 async fn check_deadlines(state: &Arc<AppState>, mut order: Order) -> Result<()> {
-    // Uncached: this decides when the user is *offered their refund*, and a
-    // height held over from before the chain passed `T` keeps an order Locked
-    // when it has become Refundable. The sweep runs on a timer rather than per
-    // request, so reading the node here costs a bounded number of calls.
+    // Uncached. This decides when a user is *offered their refund*, and it is
+    // the one caller where a head that is merely recent is not good enough: a
+    // height read before the chain passed `T` keeps an order Locked when it has
+    // become Refundable, and a time-based cache cannot tell those apart.
+    //
+    // The sweep-wide saving is taken in `advance_all` instead, which reads the
+    // head once and hands it down. That is an explicit "this is the head for
+    // this pass" rather than "a head from within N seconds", so it cannot go
+    // stale behind a caller's back.
     let (height, _) = match state.chain_head_uncached().await {
         Ok(h) => h,
         Err(e) => {
@@ -968,6 +993,16 @@ pub async fn run(state: Arc<AppState>, interval: std::time::Duration) {
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         ticker.tick().await;
+
+        // Refreshes the head the *page* serves, once per tick, so
+        // `/escrow/capabilities` and `/escrow/quote` are usually answered from
+        // a value this loop already paid for rather than each making the user
+        // wait on a node read. Deadline checks below deliberately do not use
+        // it; see `check_deadlines`.
+        if let Err(e) = state.refresh_chain_head().await {
+            tracing::debug!(error = %format!("{e:#}"), "could not refresh the head for this sweep");
+        }
+
         let mut tasks = tokio::task::JoinSet::new();
         for order in state.store.open_orders() {
             let state = state.clone();

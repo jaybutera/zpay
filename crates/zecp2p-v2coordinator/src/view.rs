@@ -301,6 +301,7 @@ mod tests {
                 expires_at: chrono::Utc::now(),
             },
             opened_height: 100,
+            scanned_through: None,
             network: "test".into(),
             consensus_branch_id: 0x37a5_165b,
             u_pub: [2u8; 33],

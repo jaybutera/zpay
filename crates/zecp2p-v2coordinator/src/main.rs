@@ -23,7 +23,18 @@ struct Args {
     check: bool,
 
     /// How often to sweep open orders, in seconds.
-    #[arg(long, default_value_t = 20)]
+    ///
+    /// 60 rather than the 20 this shipped with. Every deadline the sweep acts
+    /// on is measured in tens of minutes - 75 minutes of paying room, 50 of
+    /// broadcast room, 24 hours to `T` - so noticing a block up to 60 s late
+    /// costs nothing any of them can see. What it saves is node calls: the
+    /// sweep is the only periodic caller, so the tick rate multiplies
+    /// everything it does.
+    ///
+    /// 60 s is deliberately still under the 75 s block time, so a sweep cannot
+    /// step over a block; 120 would, which is why this is not simply as long as
+    /// it could be.
+    #[arg(long, default_value_t = 60)]
     poll_seconds: u64,
 
     /// Settle with a simulated fiat leg instead of a browser and an enclave.

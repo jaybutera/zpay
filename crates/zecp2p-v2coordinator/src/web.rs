@@ -335,6 +335,7 @@ async fn open_order(
         handle,
         quote,
         opened_height: height,
+        scanned_through: None,
         network: state.network_name().to_string(),
         consensus_branch_id: branch,
         u_pub,

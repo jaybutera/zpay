@@ -53,6 +53,26 @@ pub trait FundingScanner: Send + Sync {
         address: &str,
         from_height: u32,
     ) -> Result<Vec<FoundOutput>>;
+
+    /// The same search, also reporting the highest block it actually searched.
+    ///
+    /// The caller persists that height and passes it back as `from_height` next
+    /// time, so a repeated scan reads only the blocks that have arrived since.
+    /// The default keeps every scanner that does not walk blocks working
+    /// unchanged: `None` means "no cursor to keep", and the caller then behaves
+    /// exactly as it did before this method existed.
+    ///
+    /// A scanner must only report a height it has genuinely searched. Reporting
+    /// one it skipped would let the caller advance past the block holding the
+    /// funding, and the escrow would look unfunded forever.
+    fn outputs_paying_through(
+        &self,
+        script_pubkey: &[u8],
+        address: &str,
+        from_height: u32,
+    ) -> Result<(Vec<FoundOutput>, Option<u32>)> {
+        Ok((self.outputs_paying(script_pubkey, address, from_height)?, None))
+    }
 }
 
 /// Picks the output an escrow should settle against.
@@ -332,10 +352,28 @@ impl FundingScanner for BlockScanScanner {
         address: &str,
         from_height: u32,
     ) -> Result<Vec<FoundOutput>> {
+        Ok(self
+            .outputs_paying_through(script_pubkey, address, from_height)?
+            .0)
+    }
+
+    /// Walks blocks and reports the tip it reached.
+    ///
+    /// `searched_through` is only ever the tip it read at the start, and only
+    /// when every block in the window was read. A block the node refused leaves
+    /// the cursor unreported, so the next sweep covers that block again rather
+    /// than stepping over it - the funding could be inside it.
+    fn outputs_paying_through(
+        &self,
+        script_pubkey: &[u8],
+        address: &str,
+        from_height: u32,
+    ) -> Result<(Vec<FoundOutput>, Option<u32>)> {
         let tip = self.rpc.height().context("could not read the node height")?;
         let want_hex = hex::encode(script_pubkey);
         let start = from_height.max(tip.saturating_sub(self.max_blocks));
         let mut found = Vec::new();
+        let mut every_block_read = true;
 
         for height in start..=tip {
             let block: VerboseBlock = match self
@@ -348,6 +386,7 @@ impl FundingScanner for BlockScanScanner {
                 // whole scan on its next poll.
                 Err(e) => {
                     tracing::debug!(height, error = %e, "skipping a block the node would not serve");
+                    every_block_read = false;
                     continue;
                 }
             };
@@ -375,7 +414,10 @@ impl FundingScanner for BlockScanScanner {
                 }
             }
         }
-        Ok(found)
+        // Only a fully-read window yields a cursor. `tip` is the height read
+        // before the walk, so a block mined during it is simply next sweep's
+        // work rather than one this cursor claims to have covered.
+        Ok((found, every_block_read.then_some(tip)))
     }
 }
 
@@ -457,5 +499,65 @@ mod tests {
 
         assert_eq!(scanner.outputs_paying(&ours, "t2x", 0).unwrap().len(), 1);
         assert!(scanner.outputs_paying(&theirs, "t2y", 0).unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod scan_cursor_tests {
+    use super::*;
+
+    /// The resume point `watch_funding` computes from a stored cursor.
+    ///
+    /// Mirrors the expression in `driver::watch_funding` so the boundary is
+    /// checked here rather than only inside an integration run: an off-by-one
+    /// the wrong way skips the block the funding is in.
+    fn resume_from(scanned_through: Option<u32>, opened_height: u32) -> u32 {
+        match scanned_through {
+            Some(done) => done.saturating_add(1).max(opened_height),
+            None => opened_height,
+        }
+    }
+
+    #[test]
+    fn no_cursor_scans_from_where_the_order_opened() {
+        assert_eq!(resume_from(None, 900), 900);
+    }
+
+    #[test]
+    fn a_cursor_resumes_at_the_next_unsearched_block() {
+        // 950 has been searched, so 951 is the first block that has not.
+        assert_eq!(resume_from(Some(950), 900), 951);
+    }
+
+    #[test]
+    fn a_cursor_never_walks_back_before_the_order_opened() {
+        // A cursor below `opened_height` cannot happen through the normal path,
+        // but if a record were ever restored oddly, resuming below the open
+        // height would only re-read blocks that predate the order.
+        assert_eq!(resume_from(Some(10), 900), 900);
+    }
+
+    #[test]
+    fn a_cursor_at_the_tip_asks_only_for_the_next_block() {
+        // The steady state: nothing new mined, so the window is one block wide
+        // rather than the whole lookback. This is the saving.
+        assert_eq!(resume_from(Some(1_000), 900), 1_001);
+    }
+
+    #[test]
+    fn the_default_scanner_reports_no_cursor_and_keeps_working() {
+        // A scanner that does not walk blocks (address index, or the fake)
+        // keeps the pre-cursor behaviour: results, and nothing to persist.
+        let s = FakeScanner::default();
+        let script = vec![0x51u8];
+        s.pay(
+            &script,
+            FoundOutput { txid: [3u8; 32], vout: 0, amount_zat: 120_000 },
+        );
+        let (found, cursor) = s
+            .outputs_paying_through(&script, "taddr", 0)
+            .expect("the fake scanner answers");
+        assert_eq!(found.len(), 1);
+        assert_eq!(cursor, None, "no cursor means the caller does not advance one");
     }
 }
