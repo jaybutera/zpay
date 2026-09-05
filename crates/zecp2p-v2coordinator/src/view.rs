@@ -123,6 +123,18 @@ pub struct OrderView {
     pub announcement: Option<AnnouncementView>,
     pub pre_signature: Option<PreSignatureView>,
     pub payment: Option<PaymentView>,
+    /// Whether this coordinator's journal says a payment for this escrow may
+    /// already have left.
+    ///
+    /// `payment` is not the same question and cannot answer it. Only one of the
+    /// four `Failed` writers that follow a journal claim records a payment on
+    /// the order; the other three - the Venmo leg erroring inside `pay`, a
+    /// stale `Paying` line, another payment under way - leave it null while the
+    /// journal says the dollars may be gone. The page hides its refund form on
+    /// this, because offering it there is telling the user to spend against a
+    /// release the LP may already hold.
+    #[serde(default)]
+    pub fiat_may_have_left: bool,
     pub release: Option<TxidView>,
     pub refund: Option<TxidView>,
     /// Only set when the stage is `failed`; the page shows it as the reason.
@@ -207,6 +219,20 @@ pub struct TxidView {
 
 /// Renders one order for the page.
 pub fn order_view(order: &Order, current_height: u32) -> OrderView {
+    order_view_with_journal(order, current_height, false)
+}
+
+/// The same view, told what the journal says about a payment having left.
+///
+/// Split so this module keeps taking no dependency on the journal: the caller
+/// reads it and passes the answer. `order_view` is the plain form for callers
+/// that have no journal to ask - it reports `false`, which is only ever used
+/// where no payment can have started.
+pub fn order_view_with_journal(
+    order: &Order,
+    current_height: u32,
+    fiat_may_have_left: bool,
+) -> OrderView {
     OrderView {
         order_id: order.order_id.clone(),
         network: order.network.clone(),
@@ -276,6 +302,7 @@ pub fn order_view(order: &Order, current_height: u32) -> OrderView {
         pre_signature: order.pre_signed_at.map(|at| PreSignatureView {
             received_at: at.to_rfc3339(),
         }),
+        fiat_may_have_left,
         payment: order.payment.as_ref().map(|p| PaymentView {
             sent_at: p.sent_at.to_rfc3339(),
             cents: p.cents,

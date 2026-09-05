@@ -60,6 +60,44 @@ function check(name, ok, detail) {
 const escrow = { refund_height: 1000, amount_zat: 5_000_000 };
 const paid = { sent_at: '2026-09-05T00:00:00Z', cents: 200 };
 
+// The three failure writers that follow a journal claim and leave `payment`
+// null. Each one means the browser may already have sent the dollars, and only
+// the journal knows - which is what `fiat_may_have_left` carries. The reasons
+// are the driver's own text.
+const JOURNAL_ONLY_FAILURES = [
+  ['the Venmo leg errored inside pay',
+   'the payment could not be completed: the browser died halfway through the payment. ' +
+   'Check the Venmo feed before anything else: a payment may have left.'],
+  ['a stale Paying line this instance will not adopt',
+   'this escrow has a payment line that is not this run\'s, and the feed has to be read ' +
+   'before anything else happens.'],
+  ['another payment already under way',
+   'another payment is already under way for this escrow. Check the Venmo feed: two ' +
+   'identical payments cannot be told apart.'],
+];
+
+for (const [what, reason] of JOURNAL_ONLY_FAILURES) {
+  for (const stage of ['failed', 'refundable']) {
+    const r = run({ stage, escrow, current_height: 1004, payment: null,
+                    fiat_may_have_left: true, reason }, true);
+    check(`${stage}: ${what} hides the form`, r.form.hidden === true,
+      `form.hidden=${r.form.hidden} body=${r.body.textContent.slice(0, 120)}`);
+    check('  and does not tell the user to broadcast',
+      !/can come back to you now/.test(r.body.textContent),
+      `said: ${r.body.textContent.slice(0, 160)}`);
+  }
+}
+
+// The same three with a clean journal are ordinary refusals, and the form is
+// exactly what the user needs.
+{
+  const r = run({ stage: 'failed', escrow, current_height: 1004, payment: null,
+                  fiat_may_have_left: false,
+                  reason: 'the funding transaction was replaced after you signed' }, true);
+  check('a failure with a clean journal still offers the form', r.form.hidden === false,
+    `form.hidden=${r.form.hidden}`);
+}
+
 // 1. Stopped, dollars already sent: never the form.
 {
   const r = run({ stage: 'failed', escrow, current_height: 1001, payment: paid,

@@ -682,7 +682,7 @@ function renderReturns(view) {
       // promotes finished orders to `refundable`, so this is where a user whose
       // dollars already went would land - and offering the form here would be
       // this page telling them to race a release the LP holds.
-      if (view.payment) {
+      if (view.fiat_may_have_left || view.payment) {
         $('returns-title').textContent = 'This one needs a person';
         $('returns-body').textContent =
           `${view.reason ? view.reason + ' ' : ''}The dollars for this order were already sent, ` +
@@ -720,7 +720,12 @@ function renderReturns(view) {
       // spending against the party that already paid them. That case needs a
       // person, not a button.
       $('returns-title').textContent = 'This order stopped';
-      if (view.payment) {
+      // Keyed on the journal, not on `view.payment`. Only one of the four
+      // failure writers that follow a journal claim records a payment on the
+      // order; the other three leave it null while the journal says the
+      // dollars may be gone. Reading `payment` here offered the form on
+      // exactly the failures the sweep withholds the promotion for.
+      if (view.fiat_may_have_left || view.payment) {
         $('returns-body').textContent =
           `${view.reason ? view.reason + ' ' : ''}The dollars for this order were already sent, ` +
           'so the refund is not yours to take on your own - zpay has to settle this one by hand. ' +

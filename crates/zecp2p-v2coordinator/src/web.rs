@@ -433,7 +433,31 @@ async fn read_order(
     // The height is best-effort: an order still reads when the node is down,
     // because the page needs the escrow's own details to build a refund.
     let height = state.chain_head().await.map(|(h, _)| h).unwrap_or(0);
-    Ok(Json(view::order_view(&order, height)))
+
+    // What the journal says about a payment having left, which is not what
+    // `order.payment` says. Three of the four `Failed` writers that follow a
+    // journal claim leave `payment` null while the journal holds an open
+    // `Paying` line, and the page hides its refund form on this answer - the
+    // sweep already withholds the promotion on it, and the two have to agree
+    // or the `failed` screen offers what the sweep refused.
+    //
+    // Erring towards "may have left" on an unreadable journal, for the same
+    // reason the sweep does: not knowing is not permission to offer a refund.
+    let fiat_may_have_left = match order.funding {
+        Some(f) => {
+            let work = crate::slot::work_id_for(&f.txid, f.vout);
+            crate::slot::fiat_may_have_left(&state.journal, &work).unwrap_or(true)
+        }
+        // No outpoint means no work id and so no journal line: nothing can have
+        // been claimed for an escrow the coordinator never saw funded.
+        None => false,
+    };
+
+    Ok(Json(view::order_view_with_journal(
+        &order,
+        height,
+        fiat_may_have_left,
+    )))
 }
 
 #[derive(Debug, Deserialize)]

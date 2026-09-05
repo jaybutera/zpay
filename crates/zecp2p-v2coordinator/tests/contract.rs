@@ -2173,6 +2173,54 @@ async fn an_order_nobody_ever_funded_is_not_offered_a_refund() {
 }
 
 #[tokio::test]
+async fn the_view_tells_the_page_what_the_journal_says() {
+    // R5-1. The page cannot decide this from `payment`: three of the four
+    // failure writers that follow a journal claim leave it null while the
+    // journal holds an open `Paying` line. The sweep already withholds the
+    // refund promotion on the journal's answer, and the view has to carry the
+    // same answer or the `failed` screen offers the form the sweep refused.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+    let state = coordinator_with_fiat(
+        dir.path(),
+        scanner.clone(),
+        &node,
+        &attestor,
+        Arc::new(PayErrorsRail),
+    );
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+    let user = TestUser::new();
+
+    let (order_id, _) = locked_order(&app, &state, &node, &scanner, &attestor, &user).await;
+
+    // Clean journal so far: nothing has been claimed for this escrow.
+    let (_, before) = get(&app, &format!("/escrow/orders/{order_id}")).await;
+    assert_eq!(
+        before["fiat_may_have_left"], false,
+        "nothing has been paid yet: {before}"
+    );
+
+    // The payment attempt errors after the claim.
+    for _ in 0..2 {
+        zecp2p_v2coordinator::driver::advance(&state, &order_id).await.ok();
+    }
+    let failed = state.store.get(&order_id).unwrap();
+    assert_eq!(failed.stage, Stage::Failed);
+    assert!(failed.payment.is_none(), "this writer records no payment");
+
+    let (_, after) = get(&app, &format!("/escrow/orders/{order_id}")).await;
+    assert_eq!(
+        after["fiat_may_have_left"], true,
+        "the view does not tell the page the journal says a payment may have left, so the \
+         page keys its refund form on `payment` and offers it here: {after}"
+    );
+    // And `payment` is still null, which is exactly why the page cannot use it.
+    assert!(after["payment"].is_null());
+}
+
+#[tokio::test]
 async fn a_venmo_leg_that_errored_is_not_steered_to_a_refund() {
     // R4-1. The R3-3 guard keys on `Order.payment`, and three of the driver's
     // four post-claim `Failed` writers never set it - only the release-failed
