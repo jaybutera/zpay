@@ -108,6 +108,18 @@ pub struct AppState {
     /// poll interval, so this is a within-sweep cache rather than a value that
     /// can go stale across them.
     mempool_cache: Arc<std::sync::Mutex<Option<(Arc<Vec<crate::funding::MempoolTx>>, std::time::Instant)>>>,
+    /// Held across a mempool read so concurrent orders share one.
+    ///
+    /// The cache alone is not enough. `run` spawns every order of a sweep on a
+    /// `JoinSet`, so they arrive together: each finds the slot empty, each
+    /// starts its own read, and the count is back to one per order. That is
+    /// worst exactly when it matters - a throttled provider makes every read
+    /// wait, so every order is still in flight when the next arrives.
+    ///
+    /// A `tokio::sync::Mutex` because it is held across `await`. It guards no
+    /// data; the cache above has its own lock. It exists so the second arrival
+    /// waits for the first read rather than starting another.
+    mempool_reading: Arc<tokio::sync::Mutex<()>>,
     /// The LP's key. Its public half is in every order and every capability
     /// answer, and the page checks that the two agree.
     l_priv: SecretKey,
@@ -217,6 +229,13 @@ impl AppState {
         secp.sign_ecdsa(&secp256k1::Message::from_digest(*digest), &key)
     }
 
+    /// The cached mempool, if one was read within [`MEMPOOL_TTL`].
+    fn cached_mempool(&self) -> Option<Arc<Vec<crate::funding::MempoolTx>>> {
+        let slot = self.mempool_cache.lock().ok()?;
+        let (txs, read_at) = slot.as_ref()?;
+        (read_at.elapsed() < MEMPOOL_TTL).then(|| txs.clone())
+    }
+
     /// The mempool for this sweep, read once and shared by every order in it.
     ///
     /// Returns an empty listing rather than an error when the node will not
@@ -224,12 +243,15 @@ impl AppState {
     /// collected, and losing it costs a block of latency rather than
     /// correctness.
     pub async fn sweep_mempool(&self) -> Arc<Vec<crate::funding::MempoolTx>> {
-        if let Ok(slot) = self.mempool_cache.lock() {
-            if let Some((txs, read_at)) = slot.as_ref() {
-                if read_at.elapsed() < MEMPOOL_TTL {
-                    return txs.clone();
-                }
-            }
+        if let Some(txs) = self.cached_mempool() {
+            return txs;
+        }
+
+        // Single-flight. Whoever gets here first does the read; everyone else
+        // waits on this and then finds the cache filled.
+        let _reading = self.mempool_reading.lock().await;
+        if let Some(txs) = self.cached_mempool() {
+            return txs;
         }
 
         let scanner = self.scanner.clone();
@@ -471,6 +493,7 @@ impl AppStateBuilder {
             http: reqwest::Client::new(),
             prices: crate::price::PriceCache::new(),
             mempool_cache: Arc::new(std::sync::Mutex::new(None)),
+            mempool_reading: Arc::new(tokio::sync::Mutex::new(())),
             l_priv,
             l_pub,
             lp_output_script,

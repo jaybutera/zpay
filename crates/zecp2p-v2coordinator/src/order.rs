@@ -72,6 +72,22 @@ impl Stage {
     ///
     /// `Locked` counts, because the journal entry is written before the click
     /// and a crash there cannot distinguish "about to pay" from "paid".
+    /// Whether this stage still owes the user a look at the refund deadline.
+    ///
+    /// `Unpaid` and `Failed` are terminal for the *trade* - nothing more will
+    /// be paid or released - but they are not terminal for the user's coin.
+    /// The escrow is still funded and the CLTV branch still pays out at `T`,
+    /// and the page offers its refund form on `Refundable` only. Left out of
+    /// the sweep, an order in either stage never reaches `Refundable`, so the
+    /// user is told the trade is over and shown no way back to their ZEC.
+    ///
+    /// `Refunded` and `Released` are excluded: the escrow output is spent, so
+    /// there is nothing left to refund. `Refundable` is excluded because it is
+    /// already the answer.
+    pub fn still_owes_a_refund_check(self) -> bool {
+        matches!(self, Stage::Unpaid | Stage::Failed)
+    }
+
     pub fn fiat_may_have_left(self) -> bool {
         matches!(self, Stage::Paid | Stage::Released)
     }

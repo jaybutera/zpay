@@ -54,3 +54,16 @@ from `zaddr.js`. They need `npm install jsqr qrcode` and the coordinator's
   nothing while looking like a QR code.
 - **The dark module overwritten** by the second copy of the format bits.
 - **EIP-55 where the server uses lowercase** in the Base-route session key.
+
+## The refund's outpoint
+
+`refund-outpoint.js` reads the precedence out of `app.js` and checks it against
+the case that matters: a funding transaction that expired unmined and was
+resent under a new txid. The record this page saved when it signed names the
+old outpoint; the coordinator's view names the one that confirmed. Building the
+refund from the record produces a transaction no node will accept, while the
+page says any node will take it.
+
+```
+node frontend/app/test/refund-outpoint.js
+```

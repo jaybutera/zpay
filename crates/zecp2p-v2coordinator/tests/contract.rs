@@ -2045,10 +2045,21 @@ async fn one_sweep_reads_the_mempool_once_however_many_orders_are_open() {
         ids.push(id);
     }
 
+    // Advanced CONCURRENTLY on a JoinSet, the way `run` sweeps. Driving them
+    // one after another hides the bug: the first read completes and fills the
+    // cache before the second order looks. Under the real sweep - and above
+    // all under the throttled provider this fix is for, where a read waits up
+    // to three times sixty seconds - every order arrives while the first read
+    // is still in flight.
     let before = scanner.mempool_reads();
-    for id in &ids {
-        zecp2p_v2coordinator::driver::advance(&state, id).await.ok();
+    let mut tasks = tokio::task::JoinSet::new();
+    for id in ids.clone() {
+        let state = state.clone();
+        tasks.spawn(async move {
+            zecp2p_v2coordinator::driver::advance(&state, &id).await.ok();
+        });
     }
+    while tasks.join_next().await.is_some() {}
     let reads = scanner.mempool_reads() - before;
 
     assert_eq!(
@@ -2056,6 +2067,57 @@ async fn one_sweep_reads_the_mempool_once_however_many_orders_are_open() {
         "three orders in one sweep listed the mempool {reads} times; it is the same \
          mempool for all of them"
     );
+}
+
+#[tokio::test]
+async fn an_unpaid_or_failed_order_becomes_refundable_once_the_chain_passes_t() {
+    // R2-1. Both stages are terminal - `is_open` excludes them, `open_orders`
+    // filters on it, and `advance` returns before `check_deadlines`, which is
+    // the only writer of `Refundable`. So an order whose LP never paid, for any
+    // reason, sat on a stage the page shows no refund form for, forever.
+    //
+    // The refund itself carries `nLockTime = T`, so nothing is broadcastable
+    // before T whatever the stage says. What has to be true is that once the
+    // chain passes T these orders reach `Refundable`, which is the stage the
+    // page offers the form on.
+    for terminal in [Stage::Unpaid, Stage::Failed] {
+        let dir = tempfile::tempdir().unwrap();
+        let node = FakeNode::spawn().await;
+        let scanner = Arc::new(FakeScanner::new());
+        let attestor = TestAttestor::new();
+        let state = coordinator_that_cannot_pay(dir.path(), scanner.clone(), &node, &attestor);
+        let app = zecp2p_v2coordinator::web::router(state.clone());
+        let user = TestUser::new();
+        let (order_id, amount_zat, stored) = opened_order(&app, &state, &user).await;
+
+        // Funded and confirmed, so there is real ZEC to refund.
+        let funding_txid = [0x91u8; 32];
+        scanner.pay(
+            &stored.script_pubkey,
+            FoundOutput { txid: funding_txid, vout: 0, amount_zat },
+        );
+        node.add_utxo(funding_txid, 0, stored.script_pubkey.clone(), amount_zat, 30)
+            .await;
+        zecp2p_v2coordinator::driver::advance(&state, &order_id).await.unwrap();
+
+        // Put it in the terminal stage, as `check_deadlines` or `fail` would.
+        let mut dead = state.store.get(&order_id).unwrap();
+        dead.stage = terminal;
+        state.store.put(&dead).unwrap();
+
+        // The chain passes T.
+        node.set_height(u32::try_from(stored.refund_height).unwrap() + 1).await;
+        for _ in 0..3 {
+            zecp2p_v2coordinator::driver::advance(&state, &order_id).await.ok();
+        }
+
+        assert_eq!(
+            state.store.get(&order_id).unwrap().stage,
+            Stage::Refundable,
+            "an order left at {terminal:?} past T never reaches the stage the page \
+             offers a refund on, so the user has no way back to their ZEC"
+        );
+    }
 }
 
 #[tokio::test]

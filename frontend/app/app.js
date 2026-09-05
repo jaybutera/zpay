@@ -534,7 +534,12 @@ function render(view) {
   }
 
   if (stage === 'needs_presignature' && state.key && state.presign === 'idle') presign(view);
-  if (['released', 'refunded', 'failed'].includes(stage)) stopPolling();
+  // `failed` keeps polling until T: the page has to notice when the refund
+  // becomes possible, and the coordinator moves the stage to `refundable` on
+  // the sweep that crosses it. Stopping here left a stopped order frozen on a
+  // screen that never offered the refund.
+  const pastT = (view.current_height || 0) >= view.escrow.refund_height;
+  if (['released', 'refunded'].includes(stage) || (stage === 'failed' && pastT)) stopPolling();
 }
 
 // ---------- the pre-signature ----------
@@ -639,12 +644,25 @@ function renderReturns(view) {
 
   switch (stage) {
     case 'unpaid':
-      $('returns-title').textContent = 'Your ZEC comes back to you';
-      $('returns-body').textContent =
-        `Nobody sent the dollars in time. Your coins are refundable at block ${T.toLocaleString()}, ` +
-        `about ${hours < 1 ? Math.ceil(hours * 60) + ' minutes' : hours.toFixed(1) + ' hours'} from now. ` +
-        'Only your key can take them, and it is in this page. Nothing to do until then.';
-      form.hidden = true;
+      // Past T the coordinator moves this to `refundable`, but the page must
+      // not depend on having seen that: it can be opened at any moment, and
+      // the chain is the authority on whether the timeout branch is spendable.
+      if (blocks === 0) {
+        $('returns-title').textContent = 'Where should your ZEC go?';
+        $('returns-body').textContent =
+          `Nobody sent the dollars, and block ${T.toLocaleString()} has passed. ` +
+          `${zec(view.escrow.amount_zat)} is in the escrow and this page signs the refund ` +
+          'with your key; no one else is involved.';
+        form.hidden = !state.key;
+        if (!state.key) $('returns-body').textContent += ' Open the link you kept so this page can sign.';
+      } else {
+        $('returns-title').textContent = 'Your ZEC comes back to you';
+        $('returns-body').textContent =
+          `Nobody sent the dollars in time. Your coins are refundable at block ${T.toLocaleString()}, ` +
+          `about ${hours < 1 ? Math.ceil(hours * 60) + ' minutes' : hours.toFixed(1) + ' hours'} from now. ` +
+          'Only your key can take them, and it is in this page. Nothing to do until then.';
+        form.hidden = true;
+      }
       break;
     case 'refundable':
       $('returns-title').textContent = 'Where should your ZEC go?';
@@ -660,9 +678,26 @@ function renderReturns(view) {
       form.hidden = true;
       break;
     default:
+      // `failed`, and anything else that stops the trade with the escrow still
+      // funded. The refund is owed exactly as it is on `unpaid`: the coin is
+      // the user's, the timeout branch pays it out at T, and hiding the form
+      // here is what left a stopped order with no way back to it.
       $('returns-title').textContent = 'This order stopped';
-      $('returns-body').textContent = view.reason || '';
-      form.hidden = true;
+      if (blocks === 0) {
+        $('returns-body').textContent =
+          `${view.reason ? view.reason + ' ' : ''}Block ${T.toLocaleString()} has passed, so ` +
+          `${zec(view.escrow.amount_zat)} can come back to you now. This page signs the refund ` +
+          'with your key.';
+        form.hidden = !state.key;
+        if (!state.key) $('returns-body').textContent += ' Open the link you kept so this page can sign.';
+      } else {
+        $('returns-body').textContent =
+          `${view.reason ? view.reason + ' ' : ''}Your ZEC is refundable at block ` +
+          `${T.toLocaleString()}, about ` +
+          `${hours < 1 ? Math.ceil(hours * 60) + ' minutes' : hours.toFixed(1) + ' hours'} from now. ` +
+          'Only your key can take it, and it is in this page.';
+        form.hidden = true;
+      }
   }
 }
 

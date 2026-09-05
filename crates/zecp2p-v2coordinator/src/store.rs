@@ -116,7 +116,11 @@ impl OrderStore {
             .lock()
             .expect("order store lock")
             .values()
-            .filter(|o| o.stage.is_open())
+            // `Unpaid` and `Failed` are swept too, so an order whose trade is
+            // over still reaches `Refundable` when the chain passes `T`. Their
+            // escrow is funded and the timeout branch still pays out; the page
+            // shows its refund form on `Refundable` and on nothing else.
+            .filter(|o| o.stage.is_open() || o.stage.still_owes_a_refund_check())
             .count()
     }
 

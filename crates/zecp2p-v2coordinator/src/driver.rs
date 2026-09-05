@@ -49,6 +49,13 @@ pub async fn advance(state: &Arc<AppState>, order_id: &str) -> Result<()> {
         return Ok(());
     };
     if !order.stage.is_open() {
+        // A finished trade whose escrow is still funded gets one thing done for
+        // it: the deadline check, so it becomes `Refundable` at `T` and the
+        // page can offer the refund. Nothing else in this function may run for
+        // such an order - it must not pay, announce or settle.
+        if order.stage.still_owes_a_refund_check() {
+            return check_deadlines(state, order).await;
+        }
         return Ok(());
     }
 
@@ -612,11 +619,18 @@ async fn settle(state: &Arc<AppState>, mut order: Order) -> Result<()> {
                  this escrow can never be released. It is almost always a funding transaction \
                  that expired and was resent under a new txid after the page had signed."
             );
-            order.fail(
+            // The message says "at block T" rather than "now". The refund
+            // spends the timeout branch and carries `nLockTime = T`, so no node
+            // accepts it before then whatever stage this order reports - an
+            // earlier version of this text promised a recovery the chain would
+            // not have allowed.
+            order.fail(format!(
                 "The Zcash transaction that funded this escrow was replaced after you signed, \
                  so the signature no longer matches it and zpay cannot release it. Nothing was \
-                 sent and nothing was taken: your ZEC is refundable from this page.",
-            );
+                 sent and nothing was taken: your ZEC comes back to you from this page at \
+                 block {}.",
+                order.refund_height
+            ));
             state.store.put(&order)?;
             return Ok(());
         }
