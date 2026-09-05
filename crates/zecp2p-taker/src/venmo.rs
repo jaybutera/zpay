@@ -91,12 +91,48 @@ pub struct PaymentRequest {
     pub note: String,
 }
 
+/// A live click that produced no evidence the payment posted.
+///
+/// Separated from every other failure because it is the only one whose right
+/// answer is "look at the tab", not "retry" and not "the money left". On
+/// 2026-09-05 order `esc_2c0cef0587c47bafd201e104` clicked through in three
+/// seconds against a page left filled by an earlier drive, and the rail wrote
+/// `paid` for $2.01 that never moved. A caller that cannot tell this apart from
+/// a network error has to guess, and both guesses lose money: treating it as
+/// sent strands the dollars, treating it as not-sent re-pays a payment that may
+/// have gone through on a slow render.
+#[derive(Debug)]
+pub struct Unconfirmed {
+    /// What we asked the page to do, for the operator who has to go look.
+    pub recipient: String,
+    pub amount: String,
+    /// Why we could not confirm it, in the page's own terms.
+    pub why: String,
+}
+
+impl std::fmt::Display for Unconfirmed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the Venmo page never confirmed the ${} payment to @{}: {}. \
+             The money may or may not have left; do not record this order paid \
+             and do not retry it until the tab has been looked at.",
+            self.amount, self.recipient, self.why
+        )
+    }
+}
+
+impl std::error::Error for Unconfirmed {}
+
 /// What happened when we tried.
 #[derive(Debug, Clone)]
 pub enum PaymentOutcome {
     /// Dry run: the page was reached and filled, nothing was sent.
     WouldHaveSent { recipient: String, amount: String },
-    /// Live: Venmo accepted the payment.
+    /// Live: Venmo accepted the payment *and the page said so*.
+    ///
+    /// Reached only through [`PaymentStep::RequireSendConfirmed`]. A click that
+    /// returned without error is not enough and never was.
     Sent { recipient: String, amount: String },
 }
 
@@ -415,6 +451,12 @@ impl VenmoBrowser {
             PaymentStep::ConfirmNamedAmount {
                 amount: req.amount.clone(),
             },
+            // The click is not the payment. Nothing above this line has asked
+            // Venmo whether it did anything, and until this step existed the
+            // function returned success the instant the click JS returned.
+            PaymentStep::RequireSendConfirmed {
+                amount: req.amount.clone(),
+            },
         ]
     }
 
@@ -455,7 +497,18 @@ impl VenmoBrowser {
                     "sending a real Venmo payment"
                 );
             }
-            self.execute(tab, step).await?;
+            // A failed confirmation carries the recipient the step itself does
+            // not know, so the operator reading the log is told who the money
+            // was for as well as how much.
+            self.execute(tab, step)
+                .await
+                .map_err(|e| match e.downcast::<Unconfirmed>() {
+                    Ok(u) => anyhow::Error::from(Unconfirmed {
+                        recipient: req.recipient.clone(),
+                        ..u
+                    }),
+                    Err(other) => other,
+                })?;
         }
 
         Ok(PaymentOutcome::Sent {
@@ -519,6 +572,32 @@ impl VenmoBrowser {
             }
 
             PaymentStep::WaitForButton { label } => self.wait_for_button(tab, label).await,
+
+            // The only step whose failure is neither "it worked" nor "it did
+            // not". It gets its own error type so the rail can route it to a
+            // human instead of to a retry or to the journal.
+            PaymentStep::RequireSendConfirmed { amount } => {
+                match self
+                    .wait_for_expression(
+                        tab,
+                        &step.to_expression(),
+                        &format!("the ${amount} confirmation to clear"),
+                    )
+                    .await
+                {
+                    Ok(()) => Ok(()),
+                    Err(_) => Err(Unconfirmed {
+                        recipient: String::new(),
+                        amount: amount.clone(),
+                        why: format!(
+                            "the confirmation button naming ${amount} was still on the \
+                             page {}s after the click, so the click did nothing",
+                            self.timeout.as_secs()
+                        ),
+                    }
+                    .into()),
+                }
+            }
 
             other => {
                 self.evaluate(tab, &other.to_expression()).await?;
@@ -710,6 +789,33 @@ pub enum PaymentStep {
     ConfirmSend {
         selector: String,
     },
+    /// Require the page to show that the payment actually posted.
+    ///
+    /// This is the step whose absence let order `esc_2c0cef0587c47bafd201e104`
+    /// be written `paid` for $2.01 that never moved. Every step before this one
+    /// answers a question about the *form*: is the recipient right, did the
+    /// amount take, is there a button, was it enabled. None of them asks the
+    /// only question that matters after the click, which is whether Venmo did
+    /// anything.
+    ///
+    /// It is stated as a *disappearance*, not an appearance, and that choice is
+    /// the whole point. A success banner is a race: it renders late, it is
+    /// worded differently on different accounts, and a check that waits for one
+    /// fails open the moment Venmo changes the copy. What Venmo does on every
+    /// successful payment, and cannot not do, is take the payment form away --
+    /// the amount field and the confirmation button both go, because the page
+    /// navigates to the feed or the story. So this answers `true` only when the
+    /// confirmation button naming this amount is *gone*.
+    ///
+    /// The stale-page failure is what makes the negative form necessary. The
+    /// tab that produced the false success still had a filled form and a live
+    /// confirmation button on it after both clicks; anything phrased as "find
+    /// the evidence" would have had to out-guess a page that was already
+    /// showing the wrong thing, and "the form is still sitting there" is
+    /// exactly the state we are trying to catch.
+    RequireSendConfirmed {
+        amount: String,
+    },
 }
 
 impl PaymentStep {
@@ -805,6 +911,22 @@ impl PaymentStep {
                 amt = json!(amount)
             ),
 
+            // True only when the confirmation button naming this amount is
+            // gone from the page. See the variant's own note for why this is
+            // phrased as a disappearance rather than as a success banner: the
+            // page that caused the incident still had the button on it.
+            PaymentStep::RequireSendConfirmed { amount } => format!(
+                "(() => {{ \
+                   const pre = {pre}; const amt = {amt}; \
+                   const still = [...document.querySelectorAll('button')] \
+                     .some(b => {{ const t=(b.innerText||'').trim(); \
+                                   return t.startsWith(pre) && t.includes(amt); }}); \
+                   return !still; \
+                 }})()",
+                pre = json!(CONFIRM_PREFIX),
+                amt = json!(amount)
+            ),
+
             PaymentStep::WaitForButton { label } => format!(
                 "(() => {{ \
                    const want = {lab}; \
@@ -839,6 +961,19 @@ impl PaymentStep {
         }
     }
 
+    /// The step's JavaScript, for a test that runs it against a page.
+    ///
+    /// `to_expression` stays private: it is an implementation detail of
+    /// `execute`, and a public one invites a caller to run a money step outside
+    /// the mode gate. This accessor exists because asserting over the *text* of
+    /// these expressions is not enough -- the 2026-09-05 false success was a
+    /// sequence whose every expression was correct and whose result was still
+    /// wrong -- so `tests/payment_page_test.rs` runs them against a mock page.
+    #[doc(hidden)]
+    pub fn expression_for_test(&self) -> String {
+        self.to_expression()
+    }
+
     /// One line for the dry-run report.
     pub fn describe(&self) -> String {
         match self {
@@ -862,6 +997,9 @@ impl PaymentStep {
             }
             PaymentStep::ConfirmSend { selector } => {
                 format!("click the {selector:?} button  <-- sends the money")
+            }
+            PaymentStep::RequireSendConfirmed { amount } => {
+                format!("require the ${amount} confirmation to be gone, proving the send posted")
             }
         }
     }
@@ -1056,19 +1194,110 @@ mod tests {
     /// Two clicks move money, because the live page has two: "Pay" opens a
     /// confirmation and "Confirm" completes it. Both are marked irreversible, so
     /// a dry run stops at the first and neither can be reached by accident.
+    ///
+    /// This used to also assert that the *last* step was a money step, on the
+    /// reasoning that nothing should follow the send. That was the wrong
+    /// invariant and it is the one the 2026-09-05 false success was written
+    /// under: if nothing may follow the click, then nothing can ever check that
+    /// the click worked. What must not follow the click is another *fill* or
+    /// another *click*; a read-only verification must.
     #[test]
     fn every_money_moving_step_is_marked_irreversible() {
         let steps = a_payment();
         let money: Vec<_> = steps.iter().filter(|s| s.is_irreversible()).collect();
         assert_eq!(money.len(), 2, "the live flow is Pay then Confirm");
-        // The last thing done is a money step; nothing follows the send.
-        assert!(steps.last().unwrap().is_irreversible());
-        // And every reversible step comes before the first irreversible one, so
-        // there is no check left stranded after the money has started moving.
-        let first_money = steps.iter().position(|s| s.is_irreversible()).unwrap();
+
+        let last_money = steps.iter().rposition(|s| s.is_irreversible()).unwrap();
+        // Nothing after the last click may touch the page. A `Fill` or a
+        // `Navigate` there would be acting on a payment that has already gone.
+        for step in &steps[last_money + 1..] {
+            assert!(
+                matches!(step, PaymentStep::RequireSendConfirmed { .. }),
+                "only a read-only confirmation may follow the send, found {step:?}"
+            );
+        }
+        // The two money steps are adjacent-or-separated only by waits, so no
+        // check is stranded between them where it could not act on the answer.
         assert!(
-            steps[..first_money].iter().all(|s| !s.is_irreversible()),
-            "a check must not sit after the first click"
+            steps[..last_money]
+                .iter()
+                .filter(|s| s.is_irreversible())
+                .count()
+                == 1
+        );
+    }
+
+    /// The step that closes the false-success hole: the sequence does not end
+    /// on a click.
+    ///
+    /// Order `esc_2c0cef0587c47bafd201e104` on 2026-09-05 ran every step above
+    /// this one without error, in about three seconds, against a page an
+    /// earlier drive had left filled -- and `pay` returned success for $2.01
+    /// that never left the account. Nothing in the sequence had ever asked
+    /// Venmo whether it did anything.
+    #[test]
+    fn the_sequence_ends_by_confirming_the_send_rather_than_by_clicking() {
+        let steps = a_payment();
+        assert!(
+            matches!(
+                steps.last().unwrap(),
+                PaymentStep::RequireSendConfirmed { .. }
+            ),
+            "the last step must be the confirmation, not the click: {:?}",
+            steps.last().unwrap()
+        );
+        match steps.last().unwrap() {
+            PaymentStep::RequireSendConfirmed { amount } => assert_eq!(amount, "25.00"),
+            other => panic!("expected RequireSendConfirmed, got {other:?}"),
+        }
+    }
+
+    /// The unconfirmed failure is its own type, and it survives being wrapped.
+    ///
+    /// The driver returns it through `anyhow`, and the coordinator downcasts it
+    /// back out to tell the operator that the form is probably still on screen.
+    /// If it stopped being downcastable that message would silently become a
+    /// generic browser fault, which is the message that was wrong before.
+    #[test]
+    fn an_unconfirmed_send_is_a_distinguishable_error() {
+        let err = anyhow::Error::from(Unconfirmed {
+            recipient: "jay-butera".into(),
+            amount: "2.01".into(),
+            why: "the confirmation button was still on the page".into(),
+        });
+        let found = err
+            .downcast_ref::<Unconfirmed>()
+            .expect("an Unconfirmed must survive the trip through anyhow");
+        assert_eq!(found.amount, "2.01");
+        assert_eq!(found.recipient, "jay-butera");
+
+        // And it must not read as either verdict. A message that says the money
+        // left strands it; one that says it did not invites a double payment.
+        let text = err.to_string();
+        assert!(text.contains("may or may not have left"), "{text}");
+        assert!(text.contains("do not record this order paid"), "{text}");
+    }
+
+    /// The confirmation must not itself be a money step.
+    ///
+    /// If it were marked irreversible a dry run would stop at it, which is
+    /// harmless, but it would also read as "this moves money" to every future
+    /// reader of `is_irreversible` -- and the point of the step is that it
+    /// moves nothing and only reads.
+    #[test]
+    fn the_confirmation_moves_no_money_and_clicks_nothing() {
+        let step = PaymentStep::RequireSendConfirmed {
+            amount: "2.01".to_string(),
+        };
+        assert!(!step.is_irreversible());
+        let js = step.to_expression();
+        assert!(
+            !js.contains("click"),
+            "the confirmation must not click: {js}"
+        );
+        assert!(
+            !js.contains("value") && !js.contains("location.href ="),
+            "the confirmation must not write to the page: {js}"
         );
     }
 
@@ -1183,10 +1412,11 @@ mod tests {
             if !js.contains("querySelector") {
                 continue;
             }
-            // A step that only tests for presence (`!!el && !el.disabled`)
-            // never dereferences, so it needs no guard. Everything that reaches
-            // through the handle does.
-            if js.contains("!!el") {
+            // A step that only tests for presence never dereferences, so it
+            // needs no guard: `!!el && !el.disabled` answers about a handle it
+            // never reaches through, and `.some(...)` never binds one at all.
+            // Everything that does reach through a handle is checked below.
+            if js.contains("!!el") || js.contains(".some(") {
                 continue;
             }
             // The confirmation step filters rather than finds, and guards on the

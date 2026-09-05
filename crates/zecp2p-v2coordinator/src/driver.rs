@@ -947,6 +947,26 @@ async fn settle(state: &Arc<AppState>, mut order: Order) -> Result<()> {
             // The payment may still have gone out: the browser is driven and
             // the failure could be anywhere in it. The journal already says
             // `Paying`, which is the ambiguous state a human resolves.
+            //
+            // One failure is worth naming separately in the log, though it
+            // takes the same path: `Unconfirmed` means the click landed and the
+            // page never showed the payment posting. Before 2026-09-05 that
+            // case did not fail at all -- it returned success and the order was
+            // written `paid` for $2.01 that never moved -- so the operator
+            // reading this needs to know it is the specific state where the
+            // form is probably still sitting on screen, rather than a generic
+            // browser fault.
+            if let Some(u) = e.downcast_ref::<zecp2p_taker::venmo::Unconfirmed>() {
+                tracing::error!(
+                    order = %order.order_id,
+                    recipient = %u.recipient,
+                    amount = %u.amount,
+                    why = %u.why,
+                    "the Venmo page never confirmed the send. Look at the tab before \
+                     retrying: if the form is still filled with the Pay button unpressed, \
+                     no money left."
+                );
+            }
             // R8-1: post-payment, so this must land - `record_outcome` tries
             // the compare-and-set first and, if another line is standing here,
             // writes anyway and names what it wrote over. Losing this line

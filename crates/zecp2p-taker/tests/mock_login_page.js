@@ -98,10 +98,13 @@ class Element {
     return selector.split(',').some((part) => {
       part = part.trim();
       if (!part) return false;
-      const m = part.match(/^([a-zA-Z]*)((\[[^\]]+\])*)$/);
+      // `#id` as well as `tag[attr=...]`: the note field is `#payment-note`
+      // on the live page and the payment steps ask for it that way.
+      const m = part.match(/^([a-zA-Z]*)(#[A-Za-z0-9_-]+)?((\[[^\]]+\])*)$/);
       if (!m) return false;
-      const [, tag, attrPart] = m;
+      const [, tag, id, attrPart] = m;
       if (tag && tag.toUpperCase() !== this.tagName) return false;
+      if (id && this.getAttribute('id') !== id.slice(1)) return false;
       const attrs = attrPart ? attrPart.match(/\[[^\]]+\]/g) || [] : [];
       return attrs.every((raw) => {
         const inner = raw.slice(1, -1);
@@ -116,9 +119,19 @@ class Element {
 }
 
 class Document {
-  constructor(elements) {
+  // `text` lets a page state body copy that is not just its buttons' labels;
+  // the payment page names the recipient in prose, not on a control.
+  constructor(elements, text) {
     this.elements = elements;
-    this.body = { innerText: elements.map((e) => e.innerText).join(' ') };
+    const self = this;
+    this.body = {
+      // A getter, not a snapshot: a page whose click removes a button must
+      // read differently afterwards, and the confirmation step is precisely a
+      // second read of the same page.
+      get innerText() {
+        return [text || '', ...self.elements.map((e) => e.innerText)].join(' ');
+      },
+    };
   }
 
   querySelector(selector) {
@@ -171,7 +184,65 @@ function accountPage() {
   };
 }
 
-const PAGES = { signin: signinPage, code: codePage, account: accountPage };
+/// The payment page, in the state that produced the 2026-09-05 false success.
+///
+/// Order `esc_2c0cef0587c47bafd201e104` drove a tab an earlier payment had
+/// already left sitting on a filled form with the confirmation open. Every
+/// check the driver had passed against it -- the recipient is named, the amount
+/// field reads $2.01, a "Pay Jay Butera $2.01" button is present and enabled --
+/// because all of them describe the *form*, and the form was right. Both clicks
+/// then landed on buttons that did nothing, the whole sequence finished in
+/// about three seconds, and the rail wrote the order paid.
+///
+/// So the buttons here are deliberately inert: `click()` is recorded and
+/// nothing else happens. That is the honest model of the failure. A page whose
+/// click removed the confirmation would be modelling a *working* payment, and
+/// the test would prove nothing.
+function stalePayPage() {
+  const amount = new Element('input', { 'aria-label': 'Amount', value: '2.01' });
+  // Already committed, the way a field an earlier drive filled would be.
+  amount.committed = '2.01';
+  amount._valueTracker.tracked = '2.01';
+  return {
+    url: 'https://account.venmo.com/pay?recipients=jay-butera',
+    elements: [
+      amount,
+      new Element('textarea', { id: 'payment-note', value: 'thanks 5df45b72' }),
+      new Element('button', {}, 'Pay'),
+      new Element('button', {}, 'Pay Jay Butera $2.01'),
+      // The decoy from the 2026-09-02 run: permanently disabled, belongs to
+      // something else, and waiting on it times out with the real
+      // confirmation open.
+      new Element('button', { disabled: true }, 'Confirm'),
+    ],
+    // The recipient has to be findable in the page text, as on the real page.
+    text: 'Pay jay-butera',
+  };
+}
+
+/// The same page, but where the confirmation click actually posts.
+///
+/// Venmo takes the payment form away when a payment goes through: the page
+/// moves to the feed and the confirmation button goes with it. That is what
+/// this models, and it is what the confirmation step keys on.
+function livePayPage() {
+  const page = stalePayPage();
+  const confirm = page.elements.find((e) => e.innerText.startsWith('Pay Jay Butera'));
+  confirm.onclick = () => {
+    // The send posted, so the form is gone. Removing the confirmation button
+    // is the observable half of that.
+    page.elements.splice(page.elements.indexOf(confirm), 1);
+  };
+  return page;
+}
+
+const PAGES = {
+  signin: signinPage,
+  code: codePage,
+  account: accountPage,
+  stalepay: stalePayPage,
+  livepay: livePayPage,
+};
 
 // ---------------------------------------------------------------------------
 // Run one expression against one page
@@ -198,8 +269,25 @@ function nativePrototype() {
   return proto;
 }
 
-const NATIVE_INPUT = { prototype: nativePrototype() };
-const NATIVE_TEXTAREA = { prototype: nativePrototype() };
+// Real constructors, not bare `{prototype}` objects: the payment page's fill
+// branches on `el instanceof HTMLTextAreaElement` to pick the right prototype,
+// and `instanceof` against a plain object throws. The login steps never took
+// that branch, which is why this went unnoticed until the payment steps ran
+// here.
+//
+// `Symbol.hasInstance` decides the answer from the element's own tag, which is
+// what the browser's real check comes down to for these two.
+function nativeClass(tag) {
+  const fn = function () {};
+  fn.prototype = nativePrototype();
+  Object.defineProperty(fn, Symbol.hasInstance, {
+    value: (el) => !!el && el.tagName === tag,
+  });
+  return fn;
+}
+
+const NATIVE_INPUT = nativeClass('INPUT');
+const NATIVE_TEXTAREA = nativeClass('TEXTAREA');
 
 function main() {
   const pageName = process.argv[2];
@@ -210,14 +298,13 @@ function main() {
   }
 
   const page = build();
-  const document = new Document(page.elements);
+  const document = new Document(page.elements, page.text);
   const location = { href: page.url };
-  const expression = require('fs').readFileSync(0, 'utf8');
+  const input = require('fs').readFileSync(0, 'utf8');
 
-  let result;
-  try {
+  function evaluate(expression) {
     // eslint-disable-next-line no-new-func
-    result = new Function('document', 'location', 'HTMLInputElement', 'HTMLTextAreaElement', 'Event', `return (${expression});`)(
+    return new Function('document', 'location', 'HTMLInputElement', 'HTMLTextAreaElement', 'Event', `return (${expression});`)(
       document,
       location,
       NATIVE_INPUT,
@@ -228,6 +315,41 @@ function main() {
         }
       },
     );
+  }
+
+  function snapshot() {
+    return page.elements.map((e) => ({
+      tag: e.tagName,
+      text: e.innerText,
+      value: e.value,
+      clicked: !!e.clicked,
+      events: e.events,
+    }));
+  }
+
+  // Sequence mode. One expression per process cannot express the payment flow:
+  // the whole failure is about what the page looks like *after* a click, so the
+  // steps have to run against one page that persists between them. A leading
+  // `@@sequence` marks a run of expressions separated by a line of `@@`.
+  if (input.startsWith('@@sequence')) {
+    const steps = input.slice('@@sequence'.length).split(/^@@$/m).map((s) => s.trim()).filter(Boolean);
+    const results = [];
+    for (const expression of steps) {
+      try {
+        const value = evaluate(expression);
+        results.push({ ok: true, value: value === undefined ? null : value });
+      } catch (e) {
+        results.push({ ok: false, error: String(e.message) });
+        break;
+      }
+    }
+    process.stdout.write(JSON.stringify({ ok: true, steps: results, href: location.href, state: snapshot() }));
+    return;
+  }
+
+  let result;
+  try {
+    result = evaluate(input);
   } catch (e) {
     process.stdout.write(JSON.stringify({ ok: false, error: String(e.message) }));
     return;
@@ -238,13 +360,7 @@ function main() {
       ok: true,
       value: result === undefined ? null : result,
       href: location.href,
-      state: page.elements.map((e) => ({
-        tag: e.tagName,
-        text: e.innerText,
-        value: e.value,
-        clicked: !!e.clicked,
-        events: e.events,
-      })),
+      state: snapshot(),
     }),
   );
 }

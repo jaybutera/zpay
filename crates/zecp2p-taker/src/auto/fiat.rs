@@ -35,7 +35,7 @@ use crate::{
         cookie::SessionMaterial,
         rail::FiatLeg,
     },
-    venmo::{PaymentRequest, SendMode, VenmoBrowser},
+    venmo::{PaymentOutcome, PaymentRequest, SendMode, VenmoBrowser},
 };
 
 /// What the browser did.
@@ -75,19 +75,17 @@ pub async fn pay(
         note: note.to_string(),
     };
 
-    browser.pay(&tab, &request, mode).await?;
-
-    Ok(if mode.is_dry_run() {
-        Sent::DryRun {
-            recipient: request.recipient,
-            amount: request.amount,
+    // The outcome decides this, not the mode. Reading `Sent::Live` off
+    // `mode != DryRun` is what let the 2026-09-05 order be written paid: the
+    // mode says what we were *allowed* to do, and only the browser can say what
+    // happened. `PaymentOutcome::Sent` is now reachable only through the
+    // page-side confirmation, so this reads the answer instead of assuming it.
+    match browser.pay(&tab, &request, mode).await? {
+        PaymentOutcome::WouldHaveSent { recipient, amount } => {
+            Ok(Sent::DryRun { recipient, amount })
         }
-    } else {
-        Sent::Live {
-            recipient: request.recipient,
-            amount: request.amount,
-        }
-    })
+        PaymentOutcome::Sent { recipient, amount } => Ok(Sent::Live { recipient, amount }),
+    }
 }
 
 /// Find the payment in the feed and get the enclave to attest it.
