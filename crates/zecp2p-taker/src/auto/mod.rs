@@ -21,6 +21,8 @@
 //! - [`journal`]: durable state across the one window where a crash costs money.
 //! - [`cookie`]: the stored Venmo session, and the check that runs before
 //!   anything is spent.
+//! - [`keeper`]: holding the Venmo session open and re-capturing it before the
+//!   age limit refuses it, and the alert for the one case a human must fix.
 //! - [`login`]: signing back in when the session has gone, and the 2FA split
 //!   that decides whether that can happen with nobody watching.
 //! - [`health`]: the timer that finds a dead session before a payment does, and
@@ -55,6 +57,7 @@ pub mod gating;
 pub mod health;
 pub mod intent;
 pub mod journal;
+pub mod keeper;
 pub mod login;
 pub mod money;
 pub mod pipeline;

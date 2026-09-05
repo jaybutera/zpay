@@ -252,9 +252,34 @@ impl VenmoBrowser {
                     Err(_) => tab.url.clone(),
                 };
                 if crate::auto::login::url_is_signed_out(&url) {
-                    SessionState::SignedOut { url }
-                } else {
-                    SessionState::Live { url }
+                    return SessionState::SignedOut { url };
+                }
+
+                // A signed-in-looking URL is not a signed-in session. On
+                // 2026-09-05 the hub's tab sat at `https://account.venmo.com/`
+                // titled "Venmo | Welcome Jay" for hours after Venmo had
+                // expired the session server-side: the page was a render left
+                // over from when it worked, and nothing had navigated since.
+                // A URL check calls that `Live`, the health loop goes back to
+                // sleep, and the expiry is discovered by a fill.
+                //
+                // So ask the session itself. `session_is_authenticated` makes
+                // one authenticated read; a 401 or a redirect to the sign-in
+                // host is the answer the URL could not give.
+                match self.session_is_authenticated(&tab).await {
+                    Ok(true) => SessionState::Live { url },
+                    Ok(false) => SessionState::SignedOut { url },
+                    // The probe itself failed, which is not evidence either
+                    // way. Reporting `SignedOut` here would trigger a re-login
+                    // against a healthy session on any transient network
+                    // blip, so the weaker URL answer stands.
+                    Err(e) => {
+                        tracing::debug!(
+                            "could not confirm the Venmo session by request ({e:#}); \
+                             falling back to the tab URL"
+                        );
+                        SessionState::Live { url }
+                    }
                 }
             }
             Err(e) => {
@@ -277,6 +302,47 @@ impl VenmoBrowser {
                     }
                 }
             }
+        }
+    }
+
+    /// Whether the session behind the page is actually authenticated.
+    ///
+    /// One same-origin authenticated read, from the page, with its cookies. A
+    /// 2xx means the session bearer is still good; a 401/403, or a redirect to
+    /// the sign-in host, means it is not, however the address bar reads.
+    ///
+    /// Deliberately a read. Nothing in this path may move money, which is the
+    /// same rule the rest of this impl follows.
+    async fn session_is_authenticated(&self, tab: &CdpTab) -> Result<bool> {
+        const PROBE: &str = r#"
+        (async () => {
+          try {
+            const r = await fetch('https://account.venmo.com/api/user', {
+              credentials: 'include',
+              headers: {'Accept': 'application/json'},
+            });
+            if (r.status === 401 || r.status === 403) return 'no';
+            if (/id\.venmo\.com|\/signin/.test(r.url)) return 'no';
+            if (r.ok) return 'yes';
+            return 'unknown';
+          } catch (e) { return 'unknown'; }
+        })()"#;
+
+        let value = self.evaluate(tab, PROBE).await?;
+        // `evaluate` already unwraps one level, so the value is at
+        // `result.value` -- the same path `wait_for_button` uses.
+        let answer = value
+            .get("result")
+            .and_then(|r| r.get("value"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+
+        match answer {
+            "yes" => Ok(true),
+            "no" => Ok(false),
+            // An inconclusive probe is an error, not a verdict: the caller
+            // falls back rather than acting on a guess.
+            _ => anyhow::bail!("the session probe was inconclusive"),
         }
     }
 
