@@ -76,6 +76,13 @@ pub struct AppState {
     pub rpc: RpcConfig,
     pub scanner: Arc<dyn FundingScanner>,
     pub http: reqwest::Client,
+    /// The ZEC/USD price, cached for [`crate::price::PRICE_TTL`].
+    ///
+    /// Shares the reasoning of `chain_head_cache` below: it holds a value that
+    /// was read, never one that was assumed, and it is empty until a real read
+    /// succeeds. An empty or expired cache means the coordinator refuses to
+    /// quote rather than pricing a trade on a guess.
+    pub prices: Arc<crate::price::PriceCache>,
     /// The LP's key. Its public half is in every order and every capability
     /// answer, and the page checks that the two agree.
     l_priv: SecretKey,
@@ -403,6 +410,7 @@ impl AppStateBuilder {
             rpc,
             scanner,
             http: reqwest::Client::new(),
+            prices: crate::price::PriceCache::new(),
             l_priv,
             l_pub,
             lp_output_script,

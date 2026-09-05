@@ -175,9 +175,29 @@ fn default_key_label() -> String {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct QuoteConfig {
-    /// USD per ZEC. A coordinator with no price cannot quote; there is no
-    /// default, because a wrong default prices every trade.
-    pub rate_usd_per_zec: f64,
+    /// USD per ZEC, fixed, when an operator deliberately pins one.
+    ///
+    /// Absent by default, and absent is the normal deployment: the rate comes
+    /// from the live market through [`crate::price`]. This exists for a
+    /// regtest or a rehearsal that must not depend on an exchange being up,
+    /// and it is logged loudly at startup because a pinned rate is wrong the
+    /// moment the market moves. `rate_usd_per_zec = 40.25` against a market
+    /// near $1,022 is what this field used to be, unconditionally.
+    #[serde(default)]
+    pub rate_usd_per_zec: Option<f64>,
+    /// The spread taken over the market price, in basis points.
+    ///
+    /// This is the LP's margin, and before it existed the LP captured none: a
+    /// quote converted at the bare rate and the platform earned only
+    /// `fee_bps`. The LP fronts dollars against a coin whose price moves while
+    /// the escrow is open, so 50 bps (0.5%) is the default - wider than ZEC
+    /// moves in the 45 s a price is cached, and narrower than the spread a
+    /// user would pay on an exchange with a withdrawal.
+    #[serde(default = "default_spread_bps")]
+    pub spread_bps: u64,
+    /// How long to wait on a price feed before giving up on it, in seconds.
+    #[serde(default = "default_price_timeout_seconds")]
+    pub price_timeout_seconds: u64,
     /// The platform fee in basis points. Zero disables the treasury output.
     #[serde(default = "default_fee_bps")]
     pub fee_bps: u64,
@@ -203,6 +223,12 @@ pub struct QuoteConfig {
     pub max_open_per_handle: usize,
 }
 
+fn default_spread_bps() -> u64 {
+    50
+}
+fn default_price_timeout_seconds() -> u64 {
+    10
+}
 fn default_fee_bps() -> u64 {
     zecp2p_escrow::treasury::PLATFORM_FEE_BPS
 }
@@ -514,8 +540,29 @@ impl CoordinatorConfig {
         if self.quote.max_open_orders == 0 || self.quote.max_open_per_handle == 0 {
             bail!("quote.max_open_orders and max_open_per_handle must be at least 1");
         }
-        if !(self.quote.rate_usd_per_zec.is_finite() && self.quote.rate_usd_per_zec > 0.0) {
-            bail!("quote.rate_usd_per_zec must be a positive number");
+        // A pinned rate is optional, but a pinned rate that is nonsense is not:
+        // it would price every trade and nothing downstream re-checks it.
+        if let Some(rate) = self.quote.rate_usd_per_zec {
+            if !(rate.is_finite() && rate > 0.0) {
+                bail!("quote.rate_usd_per_zec must be a positive number when it is set");
+            }
+            if !crate::price::is_plausible(rate) {
+                bail!(
+                    "quote.rate_usd_per_zec is {rate}, outside the plausible range {}-{}",
+                    crate::price::MIN_PLAUSIBLE_USD,
+                    crate::price::MAX_PLAUSIBLE_USD
+                );
+            }
+        }
+        // A spread at or above 100% would quote zero or a negative price.
+        if self.quote.spread_bps >= 10_000 {
+            bail!(
+                "quote.spread_bps is {}; a spread of 100% or more leaves the user nothing",
+                self.quote.spread_bps
+            );
+        }
+        if self.quote.price_timeout_seconds == 0 {
+            bail!("quote.price_timeout_seconds is zero; every price read would time out");
         }
         if self.quote.min_zat < zecp2p_escrow::client::MINIMUM_ESCROW_ZAT {
             bail!(
@@ -712,7 +759,9 @@ mod tests {
                 key_label: default_key_label(),
             },
             quote: QuoteConfig {
-                rate_usd_per_zec: 40.25,
+                rate_usd_per_zec: Some(40.25),
+                spread_bps: 50,
+                price_timeout_seconds: 10,
                 fee_bps: 20,
                 min_zat: 120_000,
                 max_zat: 5_000_000_000,
@@ -864,5 +913,51 @@ mod tests {
         c.quote.min_zat = 1000;
         let err = c.validate().expect_err("below the crate minimum");
         assert!(err.to_string().contains("min_zat"));
+    }
+
+    #[test]
+    fn no_pinned_rate_is_valid_because_the_feed_supplies_it() {
+        let mut c = base();
+        c.quote.rate_usd_per_zec = None;
+        c.validate()
+            .expect("an absent rate is the normal deployment, not an error");
+    }
+
+    #[test]
+    fn a_pinned_rate_must_still_be_a_plausible_number() {
+        for bad in [0.0, -1.0, f64::NAN, 1e12] {
+            let mut c = base();
+            c.quote.rate_usd_per_zec = Some(bad);
+            let err = c
+                .validate()
+                .expect_err("a nonsense pinned rate must be refused");
+            assert!(
+                err.to_string().contains("rate_usd_per_zec"),
+                "a pinned rate of {bad} gave {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_spread_of_a_hundred_percent_or_more_is_refused() {
+        // At 10,000 bps the user is quoted zero, and above it a negative
+        // price. Neither can reach a quote.
+        for bad in [10_000u64, 12_000] {
+            let mut c = base();
+            c.quote.spread_bps = bad;
+            let err = c.validate().expect_err("a spread that eats the trade");
+            assert!(err.to_string().contains("spread_bps"), "{bad} gave {err}");
+        }
+        let mut ok = base();
+        ok.quote.spread_bps = 9_999;
+        ok.validate().expect("just under 100% is still a number");
+    }
+
+    #[test]
+    fn a_zero_price_timeout_is_refused() {
+        let mut c = base();
+        c.quote.price_timeout_seconds = 0;
+        let err = c.validate().expect_err("a zero timeout refuses every read");
+        assert!(err.to_string().contains("price_timeout_seconds"));
     }
 }

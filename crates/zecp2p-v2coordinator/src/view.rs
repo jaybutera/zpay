@@ -29,7 +29,12 @@ pub struct Capabilities {
     pub block_seconds: u32,
     pub refund_delay_blocks: u32,
     pub limits: Limits,
-    pub rate_usd_per_zec: f64,
+    /// The live USD-per-ZEC rate the page displays, spread applied. `None`
+    /// when no price could be trusted, which the page must show as unavailable
+    /// rather than substituting one of its own.
+    pub rate_usd_per_zec: Option<f64>,
+    /// The spread in basis points, so the page can say what it is taking.
+    pub spread_bps: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

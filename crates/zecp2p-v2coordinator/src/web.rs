@@ -98,6 +98,40 @@ async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "ok": true }))
 }
 
+/// The USD-per-ZEC rate a quote is built on, spread already applied.
+///
+/// A pinned `quote.rate_usd_per_zec` wins, because an operator who set one
+/// meant it - that is the regtest and rehearsal path. Otherwise the rate comes
+/// from the market and the spread is taken off it.
+///
+/// There is deliberately no third branch. A feed that cannot be read, or that
+/// answers something implausible, returns an error and the caller refuses the
+/// quote: a service that holds user funds is better off not quoting than
+/// quoting a price it cannot stand behind. The old behaviour - a constant
+/// serving every request - is exactly what this removes.
+async fn rate_for_quote(state: &Arc<AppState>) -> Result<f64, ApiError> {
+    if let Some(pinned) = state.config.quote.rate_usd_per_zec {
+        return Ok(pinned);
+    }
+    let spot = crate::price::spot(
+        &state.http,
+        &state.prices,
+        std::time::Duration::from_secs(state.config.quote.price_timeout_seconds),
+    )
+    .await
+    .map_err(|e| {
+        tracing::warn!(error = %e, "refusing to quote: no trustworthy ZEC price");
+        ApiError::unavailable(
+            "zpay cannot price a trade right now: no ZEC/USD price it trusts. Try again shortly."
+                .to_string(),
+        )
+    })?;
+    Ok(crate::price::apply_spread(
+        spot.usd_per_zec,
+        state.config.quote.spread_bps,
+    ))
+}
+
 async fn capabilities(State(state): State<Arc<AppState>>) -> ApiResult<Json<view::Capabilities>> {
     // The branch id comes from the node, never from a constant: it changes at
     // every network upgrade, and a stale one produces a sighash nobody accepts.
@@ -134,7 +168,11 @@ async fn capabilities(State(state): State<Arc<AppState>>) -> ApiResult<Json<view
             min_zat: state.config.quote.min_zat,
             max_zat: state.config.quote.max_zat,
         },
-        rate_usd_per_zec: state.config.quote.rate_usd_per_zec,
+        // The rate the page displays. `None` when no price can be trusted,
+        // which the page shows as unavailable rather than as a number; the
+        // rest of capabilities is still true and the page needs it.
+        rate_usd_per_zec: rate_for_quote(&state).await.ok(),
+        spread_bps: state.config.quote.spread_bps,
     }))
 }
 
@@ -165,10 +203,13 @@ async fn quote(
         .map_err(|e| ApiError::unavailable(format!("zpay cannot reach its Zcash node: {e}")))?;
     let refund_height = u64::from(state.policy.proposed_refund_height(height));
 
+    let rate = rate_for_quote(&state).await?;
+
     let quote = crate::quote::quote_for(
         &amount,
         unit,
         &state.config.quote,
+        rate,
         state.addr_network(),
         refund_height,
         chrono::Utc::now(),

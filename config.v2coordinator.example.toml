@@ -62,7 +62,28 @@ key_env = "ZECP2P_LP_PRIV"
 key_label = "v2coordinator-lp"
 
 [quote]
-rate_usd_per_zec = 40.25
+# The ZEC/USD rate comes from the market, not from this file. Coinbase is asked
+# first and Kraken is the fallback; the answer is cached for 45 s, so the
+# exchanges see about one call a minute however busy the coordinator is.
+#
+# A price that cannot be read, or that is outside the plausible range, or that
+# has moved more than 50% from the last good one, means the coordinator
+# REFUSES to quote. It never falls back to a stale or default rate: a wrong
+# price on a service holding user funds costs more than an outage does.
+#
+# rate_usd_per_zec pins a fixed rate and switches the feed off. It is for a
+# regtest or a rehearsal that must not depend on an exchange. Leave it out in
+# any deployment that quotes real trades - a pinned rate is wrong the moment
+# the market moves, and a pinned 40.25 against a $1,022 market quoted about
+# $127 of ZEC for a $5 payout.
+# rate_usd_per_zec = 40.25
+#
+# The spread over the market price, in basis points, and the LP's margin. It
+# fronts dollars against a coin whose price moves while the escrow is open;
+# before this the LP captured no spread at all. 50 = 0.5%.
+spread_bps = 50
+# How long to wait on a price feed before giving up on it.
+price_timeout_seconds = 10
 # 15 bps, the rate treasury.rs carries and the 0.15% the launch page states.
 # Zero disables the treasury output. Left out entirely, this follows
 # treasury::PLATFORM_FEE_BPS, which is the safer thing to do: a number written

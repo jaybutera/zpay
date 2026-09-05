@@ -163,6 +163,48 @@ async fn main() -> Result<()> {
         }
     }
 
+    // A pinned rate is the one configuration mistake that cannot announce
+    // itself later: every quote it prices looks perfectly well formed. So it is
+    // said once, loudly, at the only moment an operator is reading the log.
+    match state.config.quote.rate_usd_per_zec {
+        Some(rate) => tracing::warn!(
+            rate,
+            "quote.rate_usd_per_zec is pinned: the live price feed is OFF and every trade \
+             is priced at this constant. Correct only for a regtest or a rehearsal - remove \
+             it before quoting real trades."
+        ),
+        None => {
+            // Read the price once at startup for the same reason the node and
+            // the attestor are checked here: an operator should learn the feed
+            // is unreachable now, not from a user whose quote was refused.
+            match zecp2p_v2coordinator::price::spot(
+                &state.http,
+                &state.prices,
+                std::time::Duration::from_secs(state.config.quote.price_timeout_seconds),
+            )
+            .await
+            {
+                Ok(spot) => {
+                    let quoted = zecp2p_v2coordinator::price::apply_spread(
+                        spot.usd_per_zec,
+                        state.config.quote.spread_bps,
+                    );
+                    tracing::info!(
+                        source = spot.source.label(),
+                        spot = spot.usd_per_zec,
+                        quoted,
+                        spread_bps = state.config.quote.spread_bps,
+                        "ZEC price feed reachable"
+                    );
+                }
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "the ZEC price feed could not be read: quotes will be refused until it can"
+                ),
+            }
+        }
+    }
+
     if !state.config.serve.live_payments {
         tracing::warn!(
             "serve.live_payments is false: this coordinator drives the browser and stops \

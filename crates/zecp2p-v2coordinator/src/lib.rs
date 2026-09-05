@@ -48,6 +48,7 @@ pub mod config;
 pub mod driver;
 pub mod funding;
 pub mod order;
+pub mod price;
 pub mod quote;
 #[cfg(feature = "test-rails")]
 pub mod simulated_rail;

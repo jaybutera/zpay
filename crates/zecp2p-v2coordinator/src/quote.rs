@@ -112,18 +112,30 @@ impl std::str::FromStr for Unit {
     }
 }
 
-/// Prices one escrow.
+/// Prices one escrow at a rate the caller has already established.
 ///
 /// `refund_height` is the height this order would use, which fixes the redeem
 /// script length and therefore the miner fee.
+///
+/// `rate_usd_per_zec` is passed in rather than read from `config` so that
+/// there is no path to a quote without a price: a caller must have obtained
+/// one, and `web::rate_for_quote` is the only thing that produces it. It is
+/// the *effective* rate, spread already applied.
 pub fn quote_for(
     amount: &str,
     unit: Unit,
     config: &QuoteConfig,
+    rate_usd_per_zec: f64,
     network: AddrNetwork,
     refund_height: u64,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Quote> {
+    // The rate reaches here from a feed or a pinned config value, and both are
+    // checked before this. Re-checking is cheap and this is the last point
+    // before it multiplies into every number in the quote.
+    if !(rate_usd_per_zec.is_finite() && rate_usd_per_zec > 0.0) {
+        bail!("No price is available right now. Try again in a moment.");
+    }
     let n: f64 = amount
         .trim()
         .parse()
@@ -136,7 +148,7 @@ pub fn quote_for(
 
     let amount_zat = match unit {
         Unit::Zec => (n * 1e8).round(),
-        Unit::Usd => ((n / config.rate_usd_per_zec) * 1e8).round(),
+        Unit::Usd => ((n / rate_usd_per_zec) * 1e8).round(),
     };
     if !(amount_zat >= 1.0 && amount_zat <= u64::MAX as f64) {
         bail!("Enter a number.");
@@ -170,9 +182,9 @@ pub fn quote_for(
         bail!("That is too small to cover the network fee.");
     }
 
-    let gross_cents = cents_of(amount_zat, config.rate_usd_per_zec);
-    let fee_cents = cents_of(fee.zat, config.rate_usd_per_zec);
-    let miner_cents = cents_of(miner_fee_zat, config.rate_usd_per_zec);
+    let gross_cents = cents_of(amount_zat, rate_usd_per_zec);
+    let fee_cents = cents_of(fee.zat, rate_usd_per_zec);
+    let miner_cents = cents_of(miner_fee_zat, rate_usd_per_zec);
     let net_cents = gross_cents
         .saturating_sub(fee_cents)
         .saturating_sub(miner_cents);
@@ -198,7 +210,7 @@ pub fn quote_for(
         usd_amount_6dec: net_cents * 10_000,
         platform_fee_zat: fee.zat,
         miner_fee_zat,
-        rate_usd_per_zec: config.rate_usd_per_zec,
+        rate_usd_per_zec,
         lines: vec![
             QuoteLine {
                 label: format!("zpay fee ({:.2}%)", config.fee_bps as f64 / 100.0),
@@ -236,7 +248,9 @@ mod tests {
 
     fn config() -> QuoteConfig {
         QuoteConfig {
-            rate_usd_per_zec: 40.25,
+            rate_usd_per_zec: Some(40.25),
+                spread_bps: 50,
+                price_timeout_seconds: 10,
             fee_bps: 20,
             min_zat: 120_000,
             max_zat: 5_000_000_000,
@@ -251,7 +265,7 @@ mod tests {
     fn the_miner_fee_is_the_conventional_one_the_page_recomputes() {
         // `prepareEscrow` refuses any other number, so a quote that invented
         // one would produce an order nobody can pre-sign.
-        let q = quote_for("0.05", Unit::Zec, &config(), AddrNetwork::Test, 3_472_000, chrono::Utc::now())
+        let q = quote_for("0.05", Unit::Zec, &config(), 40.25, AddrNetwork::Test, 3_472_000, chrono::Utc::now())
             .unwrap();
         let expected = release_fee_zat(redeem_script_len(3_472_000).unwrap(), 2);
         assert_eq!(q.miner_fee_zat, expected);
@@ -259,7 +273,7 @@ mod tests {
 
     #[test]
     fn a_testnet_quote_charges_the_fee_and_names_a_treasury() {
-        let q = quote_for("0.05", Unit::Zec, &config(), AddrNetwork::Test, 3_472_000, chrono::Utc::now())
+        let q = quote_for("0.05", Unit::Zec, &config(), 40.25, AddrNetwork::Test, 3_472_000, chrono::Utc::now())
             .unwrap();
         assert!(q.platform_fee_zat > 0, "testnet has a pinned treasury");
         assert_eq!(q.platform_fee_zat, treasury::platform_fee_zat(q.amount_zat, 20));
@@ -323,9 +337,62 @@ mod tests {
 
     #[test]
     fn an_escrow_below_the_minimum_is_refused_with_the_minimum_named() {
-        let err = quote_for("0.0001", Unit::Zec, &config(), AddrNetwork::Test, 3_472_000, chrono::Utc::now())
+        let err = quote_for("0.0001", Unit::Zec, &config(), 40.25, AddrNetwork::Test, 3_472_000, chrono::Utc::now())
             .expect_err("below the minimum");
         assert!(err.to_string().contains("smallest escrow"));
+    }
+
+    #[test]
+    fn a_quote_refuses_when_no_price_is_available() {
+        // The refuse-on-failure contract, at the last gate before the numbers
+        // are computed. `rate_for_quote` returns an error when no feed can be
+        // trusted and the handler never reaches here; this is the backstop for
+        // anything that calls `quote_for` directly.
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let err = quote_for(
+                "0.05",
+                Unit::Zec,
+                &config(),
+                bad,
+                AddrNetwork::Test,
+                3_472_000,
+                chrono::Utc::now(),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("No price is available"),
+                "a rate of {bad} produced {err:?} rather than a refusal"
+            );
+        }
+    }
+
+    #[test]
+    fn the_live_rate_reaches_the_quote_it_priced() {
+        // A quote built at a realistic ZEC price reports that price back, and
+        // the ZEC asked for is the dollars divided by it. At 40.25 this same
+        // request asked for 0.124 ZEC - about $127 of ZEC for a $5 payout,
+        // which is the bug the price feed exists to close.
+        let rate = 1022.0;
+        let q = quote_for(
+            "5",
+            Unit::Usd,
+            &config(),
+            rate,
+            AddrNetwork::Test,
+            3_472_000,
+            chrono::Utc::now(),
+        )
+        .unwrap();
+        assert_eq!(q.rate_usd_per_zec, rate);
+        // $5 at $1,022/ZEC is 0.00489 ZEC, near 489,236 zat.
+        let expected = ((5.0 / rate) * 1e8).round() as u64;
+        assert_eq!(q.amount_zat, expected);
+        assert!(
+            q.amount_zat < 1_000_000,
+            "a $5 quote asked for {} zat, which is more than 0.01 ZEC",
+            q.amount_zat
+        );
     }
 
     #[test]
@@ -333,7 +400,7 @@ mod tests {
         // The cap is the operator's ceiling on one payment. Refusing at the
         // quote means the user never sees an address for a trade that would
         // stall at the browser.
-        let err = quote_for("10", Unit::Zec, &config(), AddrNetwork::Test, 3_472_000, chrono::Utc::now())
+        let err = quote_for("10", Unit::Zec, &config(), 40.25, AddrNetwork::Test, 3_472_000, chrono::Utc::now())
             .expect_err("over the cap");
         assert!(err.to_string().contains("one payment"), "got: {err}");
     }
@@ -341,9 +408,9 @@ mod tests {
     #[test]
     fn usd_and_zec_agree_at_the_configured_rate() {
         let c = config();
-        let by_zec = quote_for("0.05", Unit::Zec, &c, AddrNetwork::Test, 3_472_000, chrono::Utc::now()).unwrap();
-        let usd = format!("{:.6}", 0.05 * c.rate_usd_per_zec);
-        let by_usd = quote_for(&usd, Unit::Usd, &c, AddrNetwork::Test, 3_472_000, chrono::Utc::now()).unwrap();
+        let by_zec = quote_for("0.05", Unit::Zec, &c, 40.25, AddrNetwork::Test, 3_472_000, chrono::Utc::now()).unwrap();
+        let usd = format!("{:.6}", 0.05 * c.rate_usd_per_zec.unwrap());
+        let by_usd = quote_for(&usd, Unit::Usd, &c, 40.25, AddrNetwork::Test, 3_472_000, chrono::Utc::now()).unwrap();
         // Rounding through the rate may move the last zatoshi; the point is
         // that the two paths land on the same escrow, not that they are bitwise
         // identical.
@@ -358,7 +425,7 @@ mod tests {
     #[test]
     fn a_non_number_is_refused_in_the_pages_own_words() {
         for bad in ["", "abc", "-1", "0", "NaN", "1e400"] {
-            let err = quote_for(bad, Unit::Zec, &config(), AddrNetwork::Test, 3_472_000, chrono::Utc::now())
+            let err = quote_for(bad, Unit::Zec, &config(), 40.25, AddrNetwork::Test, 3_472_000, chrono::Utc::now())
                 .expect_err("not a quotable amount");
             assert!(
                 err.to_string().contains("Enter a number")
@@ -372,7 +439,7 @@ mod tests {
     fn the_usd_leg_is_the_net_and_not_the_gross() {
         // The user is paid what the quote said lands, not what the escrow held.
         // Quoting the gross would have the LP send the fee back out as dollars.
-        let q = quote_for("0.05", Unit::Zec, &config(), AddrNetwork::Test, 3_472_000, chrono::Utc::now())
+        let q = quote_for("0.05", Unit::Zec, &config(), 40.25, AddrNetwork::Test, 3_472_000, chrono::Utc::now())
             .unwrap();
         assert_eq!(q.usd_amount_6dec, q.net_cents * 10_000);
         assert!(q.net_cents < q.gross_cents);

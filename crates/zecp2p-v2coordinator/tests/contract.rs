@@ -82,6 +82,19 @@ async fn capabilities_carries_every_field_the_page_reads() {
     ] {
         assert!(body.get(field).is_some(), "capabilities is missing {field}");
     }
+    // `rate_usd_per_zec` is nullable now, and `Value::get` returns Some(Null)
+    // for a null - so the presence loop above passes even with no price. The
+    // page must never render a null as a number, so the contract is that when
+    // a rate is present it is a positive number.
+    let rate = &body["rate_usd_per_zec"];
+    assert!(
+        rate.is_null() || rate.as_f64().is_some_and(|r| r > 0.0),
+        "rate_usd_per_zec must be null or a positive number, got {rate}"
+    );
+    // This harness pins a rate, so it must be the pinned one rather than null.
+    assert_eq!(rate.as_f64(), Some(40.25));
+    assert!(body.get("spread_bps").is_some(), "capabilities is missing spread_bps");
+
     assert_eq!(body["fee"]["bps"], 20);
     assert_eq!(body["network"], "test");
     assert_eq!(body["rails"][0]["id"], "venmo");
