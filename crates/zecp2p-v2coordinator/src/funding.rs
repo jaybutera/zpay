@@ -310,10 +310,19 @@ struct VerboseTx {
 #[derive(Debug, Deserialize)]
 struct VerboseVout {
     /// zcashd prints `valueZat`; some builds print `valueSat`. Either is the
-    /// exact integer, and preferring it avoids the float round-trip entirely.
-    #[serde(default, alias = "valueSat")]
-    #[serde(rename = "valueZat")]
+    /// exact integer, and preferring one avoids the float round-trip entirely.
+    ///
+    /// They are two fields rather than one field with an alias. An alias makes
+    /// both names write the same field, and serde rejects a second write as a
+    /// duplicate - so a node that prints BOTH (NOWNodes does, measured
+    /// 2026-09-05: `value`, `valueZat` and `valueSat` all present) fails to
+    /// deserialize every block it serves. The scan then skips every block,
+    /// never reports a cursor, and no funding is ever seen. A provider sending
+    /// one name or the other, or both, must all work.
+    #[serde(default, rename = "valueZat")]
     value_zat: Option<i64>,
+    #[serde(default, rename = "valueSat")]
+    value_sat: Option<i64>,
     /// The float form every node prints. Used only when no integer field is.
     #[serde(default)]
     value: Option<f64>,
@@ -332,7 +341,10 @@ struct VerboseScript {
 
 impl VerboseVout {
     fn zat(&self) -> Result<u64> {
-        if let Some(v) = self.value_zat {
+        // Integer first and in a fixed order, so a node printing both names
+        // gives the same answer as one printing either. They carry the same
+        // number; the order only decides which is read, never what is paid.
+        if let Some(v) = self.value_zat.or(self.value_sat) {
             if v < 0 {
                 anyhow::bail!("a negative output value");
             }
@@ -559,5 +571,191 @@ mod scan_cursor_tests {
             .expect("the fake scanner answers");
         assert_eq!(found.len(), 1);
         assert_eq!(cursor, None, "no cursor means the caller does not advance one");
+    }
+}
+
+#[cfg(test)]
+mod vout_value_shapes {
+    //! One vout, three providers, one answer.
+    //!
+    //! A block is refused whole if any vout in it will not deserialize, and a
+    //! refused block is a block the scan skips - so it reports no cursor, never
+    //! advances, and never sees the funding. That is not a parse detail: it is
+    //! the difference between a user's ZEC being noticed and sitting there.
+
+    use super::VerboseVout;
+
+    fn vout(body: &str) -> VerboseVout {
+        serde_json::from_str(body).expect("the vout should deserialize")
+    }
+
+    /// NOWNodes prints `value`, `valueZat` AND `valueSat` on every output.
+    ///
+    /// Captured from https://zec.nownodes.io on 2026-09-05 at mainnet block
+    /// 3,472,501. With `valueSat` aliased onto `valueZat` this was
+    /// `duplicate field valueZat` and every mainnet block was skipped.
+    #[test]
+    fn a_vout_carrying_both_integer_names_is_read() {
+        let v = vout(
+            r#"{"value":1.26245368,"valueZat":126245368,"valueSat":126245368,
+                "n":0,"scriptPubKey":{"hex":"76a914","addresses":["t1x"]}}"#,
+        );
+        assert_eq!(v.zat().unwrap(), 126_245_368);
+    }
+
+    /// zcashd's own name, alone.
+    #[test]
+    fn a_vout_with_only_value_zat_is_read() {
+        let v = vout(
+            r#"{"value":1.26245368,"valueZat":126245368,
+                "n":0,"scriptPubKey":{"hex":"76a914","addresses":["t1x"]}}"#,
+        );
+        assert_eq!(v.zat().unwrap(), 126_245_368);
+    }
+
+    /// The other build's name, alone - the case the alias existed to cover,
+    /// which must keep working now the alias is gone.
+    #[test]
+    fn a_vout_with_only_value_sat_is_read() {
+        let v = vout(
+            r#"{"value":1.26245368,"valueSat":126245368,
+                "n":0,"scriptPubKey":{"hex":"76a914","addresses":["t1x"]}}"#,
+        );
+        assert_eq!(v.zat().unwrap(), 126_245_368);
+    }
+
+    /// No integer at all: the float is the only source left.
+    #[test]
+    fn a_vout_with_only_the_float_falls_back_to_it() {
+        let v = vout(
+            r#"{"value":1.26245368,"n":0,
+                "scriptPubKey":{"hex":"76a914","addresses":["t1x"]}}"#,
+        );
+        assert_eq!(v.zat().unwrap(), 126_245_368);
+    }
+
+    /// Every shape must agree. A provider swap must not change what a user is
+    /// judged to have sent.
+    #[test]
+    fn every_provider_shape_yields_the_same_zatoshis() {
+        let both = vout(
+            r#"{"value":1.26245368,"valueZat":126245368,"valueSat":126245368,
+                "n":0,"scriptPubKey":{"hex":"76a914","addresses":["t1x"]}}"#,
+        );
+        let zat_only = vout(
+            r#"{"value":1.26245368,"valueZat":126245368,
+                "n":0,"scriptPubKey":{"hex":"76a914","addresses":["t1x"]}}"#,
+        );
+        let sat_only = vout(
+            r#"{"value":1.26245368,"valueSat":126245368,
+                "n":0,"scriptPubKey":{"hex":"76a914","addresses":["t1x"]}}"#,
+        );
+        let float_only = vout(
+            r#"{"value":1.26245368,"n":0,
+                "scriptPubKey":{"hex":"76a914","addresses":["t1x"]}}"#,
+        );
+        let want = 126_245_368u64;
+        for (name, v) in [
+            ("both", &both),
+            ("valueZat", &zat_only),
+            ("valueSat", &sat_only),
+            ("float", &float_only),
+        ] {
+            assert_eq!(v.zat().unwrap(), want, "{name} disagreed");
+        }
+    }
+
+    /// The integer wins over the float, whichever integer name carries it.
+    /// The float is the lossy one; reading it when an exact figure is present
+    /// would round a user's funding.
+    #[test]
+    fn the_integer_is_preferred_over_the_float() {
+        // A deliberately mismatched float proves which field was read.
+        let v = vout(
+            r#"{"value":9.99999999,"valueSat":126245368,
+                "n":0,"scriptPubKey":{"hex":"76a914","addresses":["t1x"]}}"#,
+        );
+        assert_eq!(v.zat().unwrap(), 126_245_368);
+    }
+
+    /// A whole NOWNodes-shaped block deserializes, which is what the scan
+    /// actually does - a vout that parses alone is no use if the block around
+    /// it does not.
+    #[test]
+    fn a_nownodes_shaped_block_deserializes_whole() {
+        let block: super::VerboseBlock = serde_json::from_str(
+            r#"{"hash":"0000","confirmations":7,"height":3472501,"tx":[
+                 {"txid":"aa","vout":[
+                   {"value":1.26245368,"valueZat":126245368,"valueSat":126245368,
+                    "n":0,"scriptPubKey":{"hex":"76a914","addresses":["t1x"]}},
+                   {"value":0.0001,"valueZat":10000,"valueSat":10000,
+                    "n":1,"scriptPubKey":{"hex":"a914","addresses":["t3y"]}}]}]}"#,
+        )
+        .expect("a NOWNodes block should deserialize");
+        assert_eq!(block.tx.len(), 1);
+        assert_eq!(block.tx[0].vout.len(), 2);
+        assert_eq!(block.tx[0].vout[0].zat().unwrap(), 126_245_368);
+        assert_eq!(block.tx[0].vout[1].zat().unwrap(), 10_000);
+    }
+
+    /// Two integer names carrying different numbers is a broken node. Which one
+    /// wins is fixed and documented rather than arbitrary - and it cannot
+    /// mis-settle either way, because this number is only ever a filter.
+    /// `choose_funding` demands the exact quoted amount, and `driver` then
+    /// re-derives the real value with `gettxout` before anything settles. So a
+    /// disagreement stalls the order, refundable, and never pays out a wrong
+    /// figure. This pins that, so a later change to the field order is a
+    /// deliberate one rather than a silent change to custody behaviour.
+    #[test]
+    fn disagreeing_integer_names_read_value_zat_and_cannot_mis_settle() {
+        let v = vout(
+            r#"{"value":1.26245368,"valueZat":1,"valueSat":126245368,
+                "n":0,"scriptPubKey":{"hex":"76a914","addresses":["t1x"]}}"#,
+        );
+        assert_eq!(v.zat().unwrap(), 1, "valueZat is the documented winner");
+
+        // 1 is not the quoted amount, so nothing is chosen and nothing settles.
+        let found = [super::FoundOutput {
+            txid: [0u8; 32],
+            vout: 0,
+            amount_zat: v.zat().unwrap(),
+        }];
+        assert_eq!(super::choose_funding(&found, 126_245_368), None);
+    }
+
+    /// A zero integer is a real reading, not a missing one.
+    ///
+    /// `Option::or` keeps `Some(0)`, which is what we want: a zero-value output
+    /// is legitimate (coinbase and nonstandard outputs carry one), and it can
+    /// never match a nonzero quote anyway.
+    #[test]
+    fn a_zero_integer_is_read_rather_than_falling_through_to_the_float() {
+        let v = vout(
+            r#"{"value":1.26245368,"valueZat":0,
+                "n":0,"scriptPubKey":{"hex":"76a914","addresses":["t1x"]}}"#,
+        );
+        assert_eq!(v.zat().unwrap(), 0);
+    }
+
+    /// An explicit JSON `null` is an absent integer, not a zero.
+    #[test]
+    fn an_explicit_null_integer_falls_through_to_the_float() {
+        let v = vout(
+            r#"{"value":1.26245368,"valueZat":null,
+                "n":0,"scriptPubKey":{"hex":"76a914","addresses":["t1x"]}}"#,
+        );
+        assert_eq!(v.zat().unwrap(), 126_245_368);
+    }
+
+    /// A negative integer is still refused, whichever name carries it.
+    #[test]
+    fn a_negative_value_is_refused_under_either_name() {
+        for body in [
+            r#"{"valueZat":-1,"n":0,"scriptPubKey":{"hex":"76a914","addresses":[]}}"#,
+            r#"{"valueSat":-1,"n":0,"scriptPubKey":{"hex":"76a914","addresses":[]}}"#,
+        ] {
+            let v = vout(body);
+            assert!(v.zat().is_err(), "a negative value must be refused: {body}");
+        }
     }
 }
