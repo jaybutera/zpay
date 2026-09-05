@@ -174,6 +174,39 @@ impl OrderStore {
             .count()
     }
 
+    /// Whether a handle already has an order in flight for this exact amount.
+    ///
+    /// Two escrows to the same Venmo account for the same number of cents are
+    /// the one thing `locate_payment` cannot resolve. It searches the feed for
+    /// a payment of that amount to that handle, and two identical entries are
+    /// indistinguishable: it refuses rather than guess, and the refusal lands
+    /// *after* the dollars have gone. Announcing from a mempool sighting made
+    /// that likelier by widening the window - the feed cut now sits at the
+    /// sighting rather than at ten confirmations, so it admits any same-amount
+    /// payment made in the minutes between.
+    ///
+    /// The cheap answer is not to create the ambiguity. One order per handle
+    /// per amount at a time; the second is refused at the door, before anyone
+    /// has sent any ZEC, which costs the user nothing but a wait.
+    ///
+    /// Counted over the stages this coordinator will still act on, the same
+    /// population as `awaiting_for_handle`. A `Refundable` order needs nothing
+    /// further from the coordinator and will never be paid, so it cannot
+    /// collide with anything; letting it block would lock a handle and amount
+    /// out for a day at no cost to whoever opened it.
+    pub fn has_in_flight_for(&self, handle: &str, amount_zat: u64) -> bool {
+        self.orders
+            .lock()
+            .expect("order store lock")
+            .values()
+            .any(|o| {
+                o.handle.eq_ignore_ascii_case(handle)
+                    && o.quote.amount_zat == amount_zat
+                    && o.stage.is_open()
+                    && o.stage != Stage::Refundable
+            })
+    }
+
     /// What one sweep works through.
     ///
     /// Open orders, plus the finished ones that still owe the user a look at

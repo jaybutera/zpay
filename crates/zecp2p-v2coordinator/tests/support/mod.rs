@@ -782,7 +782,9 @@ max_zat = 5000000000
 max_payment_cents = 2500
 
 [serve]
-handles = ["alice"]
+# `bob` exists so a test can show that a guard keyed on the handle really
+# is keyed on it, rather than passing because nothing else is served.
+handles = ["alice", "bob"]
 live_payments = true
 
 [zkp2p]

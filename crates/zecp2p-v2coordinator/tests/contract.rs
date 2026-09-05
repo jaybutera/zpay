@@ -817,7 +817,26 @@ async fn locked_order(
     attestor: &TestAttestor,
     user: &TestUser,
 ) -> (String, [u8; 32]) {
-    let (_, q) = get(app, "/escrow/quote?amount=0.05&unit=zec").await;
+    locked_order_for(app, state, node, scanner, attestor, user, "0.05").await
+}
+
+/// The same, at a chosen amount.
+///
+/// Two orders to one handle for the same amount are refused at creation, since
+/// two identical feed entries cannot be told apart. A test that wants two
+/// orders in flight together gives them different amounts, which is what a real
+/// pair of users would almost always have.
+#[allow(clippy::too_many_arguments)]
+async fn locked_order_for(
+    app: &axum::Router,
+    state: &Arc<AppState>,
+    node: &FakeNode,
+    scanner: &Arc<FakeScanner>,
+    attestor: &TestAttestor,
+    user: &TestUser,
+    amount: &str,
+) -> (String, [u8; 32]) {
+    let (_, q) = get(app, &format!("/escrow/quote?amount={amount}&unit=zec")).await;
     let (status, order) = post(
         app,
         "/escrow/orders",
@@ -1034,10 +1053,16 @@ async fn two_orders_advancing_together_never_overlap_a_payment() {
     let app = zecp2p_v2coordinator::web::router(state.clone());
 
     // Two orders, both locked, neither paid.
+    // Different amounts. Two orders to one handle for the same amount are
+    // refused at creation, because two identical feed entries cannot be told
+    // apart; the race these tests exercise is between two orders in flight,
+    // which is what a real pair of users looks like.
     let user_a = TestUser::new();
-    let (order_a, _) = locked_order(&app, &state, &node, &scanner, &attestor, &user_a).await;
+    let (order_a, _) =
+        locked_order_for(&app, &state, &node, &scanner, &attestor, &user_a, "0.05").await;
     let user_b = TestUser::new();
-    let (order_b, _) = locked_order(&app, &state, &node, &scanner, &attestor, &user_b).await;
+    let (order_b, _) =
+        locked_order_for(&app, &state, &node, &scanner, &attestor, &user_b, "0.06").await;
 
     // And the sweep, which now spawns each order on its own task, arriving on
     // both at the same moment.
@@ -1148,10 +1173,16 @@ async fn one_order_at_a_time_even_when_the_sweep_runs_them_together() {
     let state = coordinator_with_fiat(dir.path(), scanner.clone(), &node, &attestor, fiat.clone());
     let app = zecp2p_v2coordinator::web::router(state.clone());
 
+    // Different amounts. Two orders to one handle for the same amount are
+    // refused at creation, because two identical feed entries cannot be told
+    // apart; the race these tests exercise is between two orders in flight,
+    // which is what a real pair of users looks like.
     let user_a = TestUser::new();
-    let (order_a, _) = locked_order(&app, &state, &node, &scanner, &attestor, &user_a).await;
+    let (order_a, _) =
+        locked_order_for(&app, &state, &node, &scanner, &attestor, &user_a, "0.05").await;
     let user_b = TestUser::new();
-    let (order_b, _) = locked_order(&app, &state, &node, &scanner, &attestor, &user_b).await;
+    let (order_b, _) =
+        locked_order_for(&app, &state, &node, &scanner, &attestor, &user_b, "0.06").await;
 
     // Both advanced, back to back, the way the sweep does it. Each may already
     // have been settled by the task `presign` spawns; what must never happen is
@@ -2073,6 +2104,123 @@ async fn a_mempool_announced_order_pays_once_and_releases_the_sighted_outpoint()
     );
 }
 
+/// Opens an order for a named handle at the quoted ZEC amount, returning the
+/// HTTP status and body so a test can assert on a refusal.
+async fn open_for(
+    app: &axum::Router,
+    user: &TestUser,
+    handle: &str,
+    amount: &str,
+) -> (StatusCode, serde_json::Value) {
+    let (_, q) = get(app, &format!("/escrow/quote?amount={amount}&unit=zec")).await;
+    post(
+        app,
+        "/escrow/orders",
+        serde_json::json!({
+            "quote_id": q["quote_id"],
+            "u_pub": hex::encode(user.u_pub),
+            "destination": { "rail": "venmo", "handle": handle },
+        }),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_second_order_for_the_same_handle_and_amount_is_refused() {
+    // Pre-mainnet condition 3 from the round-6 audit, answered by policy rather
+    // than by measuring it with real money.
+    //
+    // Two escrows to the same Venmo account for the same number of cents are
+    // the one case `locate_payment` cannot resolve: two identical feed entries
+    // are indistinguishable, so it refuses - and that refusal lands after the
+    // dollars have gone. Announcing from a mempool sighting widened the window
+    // it can happen in, because the feed cut moved from ten confirmations to
+    // the sighting.
+    //
+    // Refused at the door it costs a wait. Refused later it costs an operator
+    // reading the feed by hand with a payment already out.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+    let state = coordinator_that_cannot_pay(dir.path(), scanner.clone(), &node, &attestor);
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+    let user = TestUser::new();
+
+    let (first, body) = open_for(&app, &user, "alice", "0.05").await;
+    assert_eq!(first, StatusCode::OK, "{body}");
+
+    let (second, body) = open_for(&app, &user, "alice", "0.05").await;
+    assert_eq!(
+        second,
+        StatusCode::BAD_REQUEST,
+        "a second identical order was accepted, so two indistinguishable payments \
+         can be put in the feed: {body}"
+    );
+    let text = body.to_string();
+    assert!(
+        text.contains("already have an escrow open") && text.contains("different amount"),
+        "the refusal has to tell the user what to do about it: {body}"
+    );
+}
+
+#[tokio::test]
+async fn the_duplicate_guard_lets_through_everything_that_is_not_ambiguous() {
+    // The guard must be narrow. Blocking more than the ambiguous case would
+    // lock a user out of their own handle, and there is no cost to the
+    // coordinator in any of these: `locate_payment` can tell them apart.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+    let state = coordinator_that_cannot_pay(dir.path(), scanner.clone(), &node, &attestor);
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+    let user = TestUser::new();
+
+    let (status, body) = open_for(&app, &user, "alice", "0.05").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Same handle, a different amount: two feed entries that differ.
+    let (status, body) = open_for(&app, &user, "alice", "0.06").await;
+    assert_eq!(status, StatusCode::OK, "a different amount is not ambiguous: {body}");
+
+    // Same amount, a different handle: two feed entries to different people.
+    let (status, body) = open_for(&app, &user, "bob", "0.05").await;
+    assert_eq!(status, StatusCode::OK, "a different handle is not ambiguous: {body}");
+}
+
+#[tokio::test]
+async fn a_refundable_order_does_not_block_the_same_handle_and_amount() {
+    // A `Refundable` escrow will never be paid - it needs nothing further from
+    // this coordinator and the user resolves it from their own page - so it can
+    // never collide in the feed. Counting it would lock a handle and amount out
+    // for a day at no cost to whoever opened it, which is the same mistake R2-5
+    // fixed for the per-handle bound.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+    let state = coordinator_that_cannot_pay(dir.path(), scanner.clone(), &node, &attestor);
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+    let user = TestUser::new();
+
+    let (status, body) = open_for(&app, &user, "alice", "0.05").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let first_id = body["order_id"].as_str().unwrap().to_string();
+
+    // It reaches the point where the user refunds it themselves.
+    let mut refundable = state.store.get(&first_id).unwrap();
+    refundable.stage = Stage::Refundable;
+    state.store.put(&refundable).unwrap();
+
+    let (status, body) = open_for(&app, &user, "alice", "0.05").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a refundable escrow, which will never be paid, blocked a new order: {body}"
+    );
+}
+
 #[tokio::test]
 async fn a_mempool_sighting_never_pays() {
     // The invariant: announcing from the mempool collects a signature early and
@@ -2145,10 +2293,12 @@ async fn one_sweep_reads_the_mempool_once_however_many_orders_are_open() {
     let app = zecp2p_v2coordinator::web::router(state.clone());
 
     // Three unfunded orders, none of them announced.
+    // Distinct amounts so the same-handle-same-amount guard does not refuse the
+    // second and third; this test is about how often the mempool is listed.
     let mut ids = Vec::new();
-    for _ in 0..3 {
+    for amount in ["0.05", "0.06", "0.07"] {
         let user = TestUser::new();
-        let (id, _, _) = opened_order(&app, &state, &user).await;
+        let (id, _, _) = opened_order_for(&app, &state, &user, amount).await;
         ids.push(id);
     }
 
@@ -2645,7 +2795,18 @@ async fn opened_order(
     state: &Arc<AppState>,
     user: &TestUser,
 ) -> (String, u64, zecp2p_v2coordinator::order::Order) {
-    let (_, q) = get(app, "/escrow/quote?amount=0.05&unit=zec").await;
+    opened_order_for(app, state, user, "0.05").await
+}
+
+/// The same, at a chosen amount, for tests that need several orders to the one
+/// handle without tripping the same-handle-same-amount guard.
+async fn opened_order_for(
+    app: &axum::Router,
+    state: &Arc<AppState>,
+    user: &TestUser,
+    amount: &str,
+) -> (String, u64, zecp2p_v2coordinator::order::Order) {
+    let (_, q) = get(app, &format!("/escrow/quote?amount={amount}&unit=zec")).await;
     let (status, order) = post(
         app,
         "/escrow/orders",
@@ -2823,9 +2984,13 @@ async fn open_orders_are_bounded_per_handle() {
     let app = zecp2p_v2coordinator::web::router(state.clone());
 
     let mut statuses = Vec::new();
-    for _ in 0..3 {
+    // Distinct amounts, so this exercises the per-handle bound rather than
+    // tripping the same-handle-same-amount guard first. That guard refuses a
+    // second order for an amount already in flight; this test is about the
+    // count, not the collision.
+    for amount in ["0.05", "0.06", "0.07"] {
         let user = TestUser::new();
-        let (_, q) = get(&app, "/escrow/quote?amount=0.05&unit=zec").await;
+        let (_, q) = get(&app, &format!("/escrow/quote?amount={amount}&unit=zec")).await;
         let (status, body) = post(
             &app,
             "/escrow/orders",
@@ -2916,9 +3081,11 @@ async fn a_refundable_order_stops_counting_against_the_handle_limit() {
     let app = zecp2p_v2coordinator::web::router(state.clone());
 
     let mut ids = Vec::new();
-    for _ in 0..2 {
+    // Distinct amounts: this test is about the per-handle count, and identical
+    // amounts would trip the same-handle-same-amount guard first.
+    for amount in ["0.05", "0.06"] {
         let user = TestUser::new();
-        let (_, q) = get(&app, "/escrow/quote?amount=0.05&unit=zec").await;
+        let (_, q) = get(&app, &format!("/escrow/quote?amount={amount}&unit=zec")).await;
         let (status, order) = post(
             &app,
             "/escrow/orders",
