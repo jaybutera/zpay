@@ -66,28 +66,6 @@ const PAY_BUTTON: &str = "Pay";
 /// waiting for that one times out while the real confirmation sits open.
 const CONFIRM_PREFIX: &str = "Pay ";
 
-/// The audience control on the pay form, and the value it has to end on.
-///
-/// Venmo defaults a personal account to Public, which the pay form states in
-/// as many words: "viewed by everyone on the internet". Every zpay fill writes
-/// a tagged note ("thanks" plus eight hex characters) into the note field, so a
-/// public payment publishes both the LP's counterparty and a per-fill
-/// fingerprint that links the fills to each other on a feed anyone can read.
-///
-/// The control is a button, not a `<select>`: Venmo renders it as a labelled
-/// toggle carrying the current audience, and the labels are the words in
-/// [`AUDIENCE_LABELS`]. It is therefore matched the same way the Pay and
-/// Confirm buttons are, on its text, rather than by a selector the live page
-/// does not offer.
-const AUDIENCE_PRIVATE: &str = "Private";
-
-/// The audience words Venmo uses, most public first.
-///
-/// Ordered because the check below is a comparison, not an equality test: any
-/// label that is not `Private` is a payment that would be published, and the
-/// list is what lets the failure name the audience the page was actually on.
-const AUDIENCE_LABELS: [&str; 3] = ["Public", "Friends", "Private"];
-
 /// JavaScript that answers whether the page still carries a given note.
 ///
 /// The note is how a confirmation is tied to *this* drive. It cannot be the
@@ -463,29 +441,16 @@ impl VenmoBrowser {
                 selector: NOTE_SELECTOR.to_string(),
                 value: req.note.clone(),
             },
-            // Private, before anything is sent. Venmo defaults this account to
-            // Public, and the note this run just filled carries a per-payment
-            // tag; a public payment publishes the payee and the tag together,
-            // which is a public fingerprint of every fill the rail makes.
+            // No audience step, by decision on 2026-09-05. The account
+            // default is Private and that is what a payment inherits, so
+            // driving the control per payment was dropped.
             //
-            // Reversible, so it belongs here with the fills rather than below
-            // the line: setting an audience moves no money, and a run that
-            // stops after it has changed nothing that matters.
-            PaymentStep::SetAudience {
-                audience: AUDIENCE_PRIVATE.to_string(),
-            },
-            // Read the audience back before the amount, not after it. Both are
-            // readbacks of a control a click may not have moved -- `SetAudience`
-            // clicks a menu Venmo can re-render underneath it, exactly as the
-            // amount field can silently revert -- but the amount readback is
-            // required to be the last thing before the click, so the audience
-            // check goes above it rather than between it and the money.
-            //
-            // Ordering costs nothing here: both run before anything
-            // irreversible, and neither writes to the page.
-            PaymentStep::RequireAudience {
-                audience: AUDIENCE_PRIVATE.to_string(),
-            },
+            // Nothing here *checks* the audience either, and that is the
+            // deliberate half: a readback is a refusal, and a payment blocked
+            // over a control the driver no longer touches stalls the rail for
+            // no gain -- the escrow stays locked, the in-flight slot is held,
+            // and an operator has to clear it. The per-payment steps are in
+            // git on `venmo-private-audience` if that trade ever changes.
             // Read the amount back out of the field, from the page, immediately
             // before the irreversible step. A React-controlled input can hold a
             // value the script never set, and this is the last moment the money
@@ -637,46 +602,6 @@ impl VenmoBrowser {
             // The only step whose failure is neither "it worked" nor "it did
             // not". It gets its own error type so the rail can route it to a
             // human instead of to a retry or to the journal.
-            // Reversible, and a click. Its answer is the audience the control
-            // reads afterwards, which is logged but not trusted: the check is
-            // the separate RequireAudience step below, for the same reason the
-            // amount is re-read rather than believed.
-            PaymentStep::SetAudience { audience } => {
-                let value = self.evaluate(tab, &step.to_expression()).await?;
-                let shown = value
-                    .get("result")
-                    .and_then(|r| r.get("value"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                tracing::info!(wanted = %audience, shown = %shown, "set the payment audience");
-                Ok(())
-            }
-
-            // The gate. A payment whose audience cannot be read, or reads as
-            // anything other than Private, does not reach the send button: the
-            // note carries a per-fill tag, and a public payment publishes it.
-            PaymentStep::RequireAudience { audience } => {
-                let value = self.evaluate(tab, &step.to_expression()).await?;
-                let shown = value
-                    .get("result")
-                    .and_then(|r| r.get("value"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                match shown.as_deref() {
-                    Some(seen) if seen == audience => Ok(()),
-                    Some(seen) => anyhow::bail!(
-                        "the Venmo pay form is on audience {seen:?}, not {audience:?}. \
-                         The note carries a per-payment tag, so sending this would \
-                         publish the payee and the tag on a feed anyone can read. \
-                         Refusing to send."
-                    ),
-                    None => anyhow::bail!(
-                        "could not read the audience off the Venmo pay form. \
-                         Refusing to send a tagged payment whose audience is unknown."
-                    ),
-                }
-            }
-
             PaymentStep::RequireSendConfirmed { amount } => {
                 // Polled here rather than through `wait_for_expression`,
                 // because the answer is a report and the failure text has to
@@ -999,35 +924,6 @@ pub enum PaymentStep {
     ConfirmSend {
         selector: String,
     },
-    /// Set the payment's audience to Private before anything is sent.
-    ///
-    /// Reversible, so it sits with the fills rather than with the clicks: it
-    /// opens the audience control and picks `Private`, and a page that is
-    /// already private is left alone rather than toggled into some other state.
-    ///
-    /// This is a *click*, and it is the only reversible step that is one. The
-    /// audience control has no input to fill: Venmo renders it as a menu, so
-    /// the only way to move it is to press it. It moves no money, and the two
-    /// buttons that do are still the only steps `is_irreversible` reports.
-    SetAudience {
-        audience: String,
-    },
-    /// Require the form to be on Private, immediately before the first click.
-    ///
-    /// [`PaymentStep::SetAudience`] clicks a menu, and a click that lands on a
-    /// menu Venmo re-renders underneath it leaves the form on its old audience
-    /// while the script believes it took. That is the same class of failure as
-    /// the React-controlled amount field in [`PaymentStep::RequireAmount`], and
-    /// it gets the same treatment: the value is read back off the page rather
-    /// than assumed.
-    ///
-    /// It is deliberately phrased as "the page says Private", not "the page
-    /// does not say Public". A control that rendered a word this code does not
-    /// know is not evidence of privacy, so an unrecognised label fails here
-    /// instead of passing by omission.
-    RequireAudience {
-        audience: String,
-    },
     /// Require the page to show that the payment actually posted.
     ///
     /// This is the step whose absence let order `esc_2c0cef0587c47bafd201e104`
@@ -1226,59 +1122,6 @@ impl PaymentStep {
                 lab = json!(label)
             ),
 
-            // Open the audience control and choose the wanted audience.
-            //
-            // Answers what the control reads *after* the choice, so the step
-            // reports rather than assumes. Venmo carries the current audience
-            // as the control's own text, which is why the search is over the
-            // audience words rather than over a selector: the live page gives
-            // the control no id, no test id and no aria-label, exactly as it
-            // gives none to Pay or Confirm.
-            //
-            // A control already showing the wanted audience is not clicked.
-            // Pressing it would open a menu over the form that the Pay click
-            // then has to land through.
-            PaymentStep::SetAudience { audience } => format!(
-                "(() => {{ \
-                   const want = {aud}; const words = {words}; \
-                   const reads = (el) => {{ const t = (el.innerText || '').trim(); \
-                     return words.find(w => t === w || t.startsWith(w + ' ') \
-                                          || t.endsWith(' ' + w)); }}; \
-                   const el = [...document.querySelectorAll('button, [role=\"button\"]')] \
-                     .find(reads); \
-                   if (!el) throw new Error('no audience control on this page'); \
-                   if (reads(el) === want) return want; \
-                   el.click(); \
-                   const option = [...document.querySelectorAll('button, [role=\"menuitem\"], [role=\"option\"]')] \
-                     .find(o => (o.innerText || '').trim() === want); \
-                   if (!option) throw new Error('the audience menu offers no ' + want); \
-                   option.click(); \
-                   const now = [...document.querySelectorAll('button, [role=\"button\"]')] \
-                     .find(reads); \
-                   return now ? reads(now) : null; \
-                 }})()",
-                aud = json!(audience),
-                words = json!(AUDIENCE_LABELS)
-            ),
-
-            // Read the audience back off the control, the way the amount is
-            // read back off its field. Returns the word the page shows so a
-            // mismatch can name the audience the payment would have gone out
-            // on, rather than only saying it was not Private.
-            PaymentStep::RequireAudience { .. } => format!(
-                "(() => {{ \
-                   const words = {words}; \
-                   const reads = (el) => {{ const t = (el.innerText || '').trim(); \
-                     return words.find(w => t === w || t.startsWith(w + ' ') \
-                                          || t.endsWith(' ' + w)); }}; \
-                   const el = [...document.querySelectorAll('button, [role=\"button\"]')] \
-                     .find(reads); \
-                   if (!el) throw new Error('the audience control is gone from the page'); \
-                   return reads(el); \
-                 }})()",
-                words = json!(AUDIENCE_LABELS)
-            ),
-
             // Found by exact button text, not by `querySelector`. The live page
             // has no id, test id or aria-label on either button, and the
             // `button[type='submit']` this used to fall back to resolves to the
@@ -1336,12 +1179,6 @@ impl PaymentStep {
             }
             PaymentStep::WaitForButton { label } => {
                 format!("wait for the {label:?} button to appear and be enabled")
-            }
-            PaymentStep::SetAudience { audience } => {
-                format!("set the payment audience to {audience}")
-            }
-            PaymentStep::RequireAudience { audience } => {
-                format!("require the form to be on audience {audience}")
             }
             PaymentStep::ConfirmSend { selector } => {
                 format!("click the {selector:?} button  <-- sends the money")

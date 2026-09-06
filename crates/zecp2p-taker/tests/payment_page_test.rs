@@ -375,103 +375,37 @@ fn the_recipient_check_does_not_read_the_url_we_navigated_to() {
     );
 }
 
-/// The audience is set to Private, on the page, before anything is sent.
+/// A payment never blocks on the audience control.
 ///
-/// Venmo defaults a personal account to Public, and the mock control starts
-/// there because that is what the live pay form showed on 2026-09-05. The
-/// sequence has to leave it reading Private by the time the readback runs.
-#[test]
-fn the_payment_is_set_private_before_the_send() {
-    if !node_available() {
-        return;
-    }
-    let steps = the_incident_payment();
-    let results = run_sequence("livepay", &expressions(&steps));
-
-    let readback = steps
-        .iter()
-        .position(|s| matches!(s, PaymentStep::RequireAudience { .. }))
-        .expect("the sequence must read the audience back");
-    assert!(
-        results[readback].ok,
-        "reading the audience back failed: {:?}",
-        results[readback].error
-    );
-    assert_eq!(
-        results[readback].value,
-        serde_json::json!("Private"),
-        "the form must be on Private before the money moves"
-    );
-}
-
-/// A menu click Venmo re-renders away does not pass as private.
+/// Decided on 2026-09-05: the account default is Private, so the driver
+/// inherits it and does not touch the control per payment. The point of
+/// pinning it here is the *refusal* rather than the setting -- a readback step
+/// stalls a locked escrow and a held in-flight slot over a menu, and the
+/// account default already covers what it was protecting.
 ///
-/// This is the amount-field failure in a different control: the option is
-/// clicked, nothing throws, and the form is still Public. The readback is what
-/// catches it, and it has to catch it *before* the first irreversible step.
+/// The note and its tag are unaffected and still identify the fill; they are
+/// simply not published by a payment the account already keeps private.
 #[test]
-fn an_audience_that_did_not_take_is_caught_before_the_click() {
-    if !node_available() {
-        return;
-    }
-    let steps = the_incident_payment();
-    let results = run_sequence("publicpay", &expressions(&steps));
-
-    let readback = steps
-        .iter()
-        .position(|s| matches!(s, PaymentStep::RequireAudience { .. }))
-        .expect("the sequence must read the audience back");
-    let first_click = steps
-        .iter()
-        .position(|s| s.is_irreversible())
-        .expect("a send step");
-
-    assert!(
-        readback < first_click,
-        "the audience check must run before any money moves"
-    );
-
-    // The expression itself succeeds; what it *returns* is the failure, and
-    // the driver's own arm turns that into a refusal.
-    assert!(
-        results[readback].ok,
-        "the readback predicate should report, not throw: {:?}",
-        results[readback].error
-    );
-    assert_eq!(
-        results[readback].value,
-        serde_json::json!("Public"),
-        "the control snapped back to Public, and the readback must say so"
-    );
-    assert_ne!(
-        results[readback].value,
-        serde_json::json!("Private"),
-        "a payment that would be published must not read as private"
-    );
-}
-
-/// Setting the audience moves no money.
-///
-/// It is the only reversible step that clicks, so the boundary matters: the two
-/// buttons that spend are still the only steps a dry run refuses to take.
-#[test]
-fn the_audience_steps_are_not_irreversible() {
+fn no_step_touches_or_refuses_over_the_audience() {
     let steps = the_incident_payment();
     for step in &steps {
-        if matches!(
-            step,
-            PaymentStep::SetAudience { .. } | PaymentStep::RequireAudience { .. }
-        ) {
-            assert!(
-                !step.is_irreversible(),
-                "{} must not count as a money step",
-                step.describe()
-            );
-        }
+        let described = step.describe();
+        assert!(
+            !described.contains("audience"),
+            "a payment must not drive or check the audience, found: {described}"
+        );
+        let js = step.expression_for_test();
+        assert!(
+            !js.contains("Public") && !js.contains("Friends"),
+            "no step may read Venmo's audience words: {js}"
+        );
     }
-    assert_eq!(
-        steps.iter().filter(|s| s.is_irreversible()).count(),
-        2,
-        "exactly the two clicks that spend remain irreversible"
+    // The note is still filled, because the tag is what identifies the fill.
+    assert!(
+        steps.iter().any(|s| matches!(
+            s,
+            PaymentStep::Fill { value, .. } if value.contains("5df45b72")
+        )),
+        "the tagged note must still be typed"
     );
 }

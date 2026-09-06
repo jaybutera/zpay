@@ -215,11 +215,6 @@ function stalePayPage() {
     elements: [
       amount,
       new Element('textarea', { id: 'payment-note', value: 'thanks 5df45b72' }),
-      // The audience control, on Venmo's default for a personal account. It
-      // carries the current audience as its own text, which is the only handle
-      // the live page gives it: no id, no test id, no aria-label, exactly like
-      // the Pay and Confirm buttons beside it.
-      audienceControl(),
       new Element('button', {}, 'Pay'),
       new Element('button', {}, 'Pay Jay Butera $2.01'),
       // The decoy from the 2026-09-02 run: permanently disabled, belongs to
@@ -229,72 +224,6 @@ function stalePayPage() {
     ],
     // The recipient has to be findable in the page text, as on the real page.
     text: 'Pay jay-butera',
-  };
-  // The control needs the page it lives on to open its menu into it.
-  page.elements[2].page = page;
-  return page;
-}
-
-/// Venmo's audience control, and the menu it opens.
-///
-/// Clicking it appends the three audience options to the page, the way a menu
-/// renders; choosing one sets the control's text and takes the menu away. The
-/// control starts on Public because that is what Venmo defaults a personal
-/// account to, and it is what the live pay form showed on 2026-09-05.
-function audienceControl(starting = 'Public') {
-  const control = new Element('button', {}, starting);
-  control.onclick = () => {
-    const host = control.page;
-    if (!host || control.menuOpen) return;
-    control.menuOpen = true;
-    for (const word of ['Public', 'Friends', 'Private']) {
-      const option = new Element('button', { role: 'menuitem' }, word);
-      option.onclick = () => {
-        // Choosing an option sets the control and closes the menu.
-        control.innerText = word;
-        control.menuOpen = false;
-        for (const o of host.menuOptions) {
-          const at = host.elements.indexOf(o);
-          if (at !== -1) host.elements.splice(at, 1);
-        }
-        host.menuOptions = [];
-      };
-      host.elements.push(option);
-      host.menuOptions = (host.menuOptions || []).concat(option);
-    }
-  };
-  return control;
-}
-
-/// The pay page whose audience menu does not take.
-///
-/// The failure this models is the audience version of the React-controlled
-/// amount field: the menu opens, the option is clicked, and Venmo re-renders
-/// the control underneath it so the form stays on Public while the script has
-/// every reason to believe it took. Nothing throws. A driver that trusts its
-/// own click here sends a tagged payment to the public feed.
-function publicPayPage() {
-  const page = stalePayPage();
-  const control = page.elements.find((e) => e.innerText === 'Public');
-  control.onclick = () => {
-    const host = control.page;
-    if (control.menuOpen) return;
-    control.menuOpen = true;
-    for (const word of ['Public', 'Friends', 'Private']) {
-      const option = new Element('button', { role: 'menuitem' }, word);
-      // The re-render: the menu closes and the control snaps back.
-      option.onclick = () => {
-        control.innerText = 'Public';
-        control.menuOpen = false;
-        for (const o of host.menuOptions) {
-          const at = host.elements.indexOf(o);
-          if (at !== -1) host.elements.splice(at, 1);
-        }
-        host.menuOptions = [];
-      };
-      host.elements.push(option);
-      host.menuOptions = (host.menuOptions || []).concat(option);
-    }
   };
   return page;
 }
@@ -361,8 +290,8 @@ function expiringPayPage() {
 /// matching finds it; the note on the sheet is the *previous* payment's. Item 4
 /// of the review: clicking this pays the earlier drive's recipient.
 function otherPayeeSheetPage() {
-  // Built from the stale page so it carries the same audience control and form
-  // the real one does; only the open sheet and its note differ.
+  // Built from the stale page so it carries the same form the real one does;
+  // only the open sheet and its note differ.
   const page = stalePayPage();
   const sheet = page.elements.find((e) => e.innerText.startsWith('Pay Jay Butera'));
   // A display name we do not pay, at the amount we do. Prefix-and-amount
@@ -405,7 +334,6 @@ const PAGES = {
   code: codePage,
   account: accountPage,
   stalepay: stalePayPage,
-  publicpay: publicPayPage,
   livepay: livePayPage,
   dismissingpay: dismissingPayPage,
   expiringpay: expiringPayPage,
