@@ -303,7 +303,59 @@ async fn open_order(
         ));
     }
 
+    // Everything from here can refuse, and a refusal must give the quote back.
+    //
+    // Taking it before the refusals run meant a submit refused for any reason -
+    // the duplicate guard, the curator, a node that would not answer, the fee
+    // moving - consumed the quote as well, so the second click was told "That
+    // quote has expired. Type the amount again." rather than the reason it was
+    // actually refused. The page re-quotes on input, so the user was a
+    // keystroke from recovering, but the message was about the wrong thing.
+    //
+    // Put back under the same lock that took it, which is what keeps the guard
+    // the take exists for. Both obvious repairs - returning it after the write,
+    // or taking it only once the order is written - leave a window where two
+    // requests hold one quote. This has none: the id is freshly minted per
+    // quote so nothing else can be at that key, and a race still ends with one
+    // winner holding the quote while the loser is correctly told it is gone.
+    //
+    // Written as one fallible block rather than a put-back at each refusal, so
+    // the next refusal added here cannot forget one.
+    let opened = open_order_with_quote(&state, &body, handle, quote.clone()).await;
+    let (order, height) = match opened {
+        Ok(opened) => opened,
+        Err(e) => {
+            state
+                .quotes
+                .lock()
+                .expect("quote lock")
+                .insert(body.quote_id.clone(), quote);
+            return Err(e);
+        }
+    };
 
+    tracing::info!(
+        order = %order.order_id,
+        address = %order.address,
+        amount_zat = order.quote.amount_zat,
+        handle = %order.handle,
+        "order opened"
+    );
+
+    Ok(Json(view::order_view(&order, height)))
+}
+
+/// The part of opening an order that can refuse, with the quote already taken.
+///
+/// Split out so the caller can put the quote back on any `Err` without a
+/// put-back at each refusal site. Returns the written order and the height it
+/// was derived against.
+async fn open_order_with_quote(
+    state: &Arc<AppState>,
+    body: &OpenOrderRequest,
+    handle: String,
+    quote: crate::order::Quote,
+) -> Result<(Order, u32), ApiError> {
     let u_pub_raw = hex::decode(body.u_pub.trim())
         .map_err(|_| ApiError::bad_request("The key this page sent is not hex."))?;
     let u_pub: [u8; 33] = u_pub_raw
@@ -433,15 +485,7 @@ async fn open_order(
         ));
     }
 
-    tracing::info!(
-        order = %order.order_id,
-        address = %order.address,
-        amount_zat = order.quote.amount_zat,
-        handle = %order.handle,
-        "order opened"
-    );
-
-    Ok(Json(view::order_view(&order, height)))
+    Ok((order, height))
 }
 
 async fn read_order(

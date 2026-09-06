@@ -4636,3 +4636,98 @@ async fn a_sighting_the_attestor_never_answered_for_still_reaches_its_deadline()
          their ZEC back"
     );
 }
+
+#[tokio::test]
+async fn a_refused_submit_leaves_the_quote_for_a_second_try() {
+    // The follow-up from the duplicate-order review. `open_order` takes the
+    // quote out of the map under the lock that finds it, so one quote_id mints
+    // one order - and two requests racing on a single id cannot both pass. It
+    // does that before the refusal paths run, though, so a submit refused for
+    // any other reason consumed the quote too, and the second click was told
+    // "That quote has expired. Type the amount again." rather than the reason
+    // it was actually refused.
+    //
+    // Both obvious repairs reintroduce the race the take was for: putting the
+    // quote back after the write, or taking it only once the order is written,
+    // both leave a window where two requests hold one quote. Putting it back
+    // under the same lock does not - the id is freshly minted per quote, so
+    // nothing else can be at that key, and a race still has exactly one winner
+    // holding the quote while the loser gets the expiry message, which is true
+    // for it.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+    let state = coordinator_that_cannot_pay(dir.path(), scanner.clone(), &node, &attestor);
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+    let user = TestUser::new();
+
+    // One order already open for this handle and amount.
+    let (first, body) = open_for(&app, &user, "alice", "0.05").await;
+    assert_eq!(first, StatusCode::OK, "{body}");
+
+    // A second, on a quote of its own. Refused by the duplicate guard.
+    let (_, q) = get(&app, "/escrow/quote?amount=0.05&unit=zec").await;
+    let quote_id = q["quote_id"].clone();
+    let submit = serde_json::json!({
+        "quote_id": quote_id,
+        "u_pub": hex::encode(user.u_pub),
+        "destination": { "rail": "venmo", "handle": "alice" },
+    });
+    let (status, body) = post(&app, "/escrow/orders", submit.clone()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body.to_string().contains("already have an escrow open"),
+        "the first refusal has to say what was wrong: {body}"
+    );
+
+    // The same quote again. It must still say what was wrong, not that the
+    // quote is gone - the user changed nothing, and neither did the coordinator.
+    let (status, body) = post(&app, "/escrow/orders", submit).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        !body.to_string().contains("has expired"),
+        "a refused submit burnt the quote, so the second click was told the quote \
+         expired instead of the reason it was actually refused: {body}"
+    );
+    assert!(
+        body.to_string().contains("already have an escrow open"),
+        "the second refusal lost the reason: {body}"
+    );
+}
+
+#[tokio::test]
+async fn one_quote_still_mints_only_one_order() {
+    // The guard the take exists for, which putting the quote back on a refusal
+    // must not weaken: two requests racing on one quote_id both used to find it,
+    // because it was only removed after the order was written, and both wrote an
+    // order. Only the request that gets as far as writing may keep the quote.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+    let state = coordinator_that_cannot_pay(dir.path(), scanner.clone(), &node, &attestor);
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+    let user = TestUser::new();
+
+    let (_, q) = get(&app, "/escrow/quote?amount=0.05&unit=zec").await;
+    let submit = serde_json::json!({
+        "quote_id": q["quote_id"],
+        "u_pub": hex::encode(user.u_pub),
+        "destination": { "rail": "venmo", "handle": "alice" },
+    });
+
+    let (first, body) = post(&app, "/escrow/orders", submit.clone()).await;
+    assert_eq!(first, StatusCode::OK, "{body}");
+    let (second, body) = post(&app, "/escrow/orders", submit).await;
+    assert_eq!(
+        second,
+        StatusCode::BAD_REQUEST,
+        "one quote minted two orders: {body}"
+    );
+    assert!(
+        body.to_string().contains("has expired"),
+        "a spent quote is gone, and the page re-quotes on input: {body}"
+    );
+    assert_eq!(state.store.open_orders().len(), 1, "one quote, one escrow");
+}
