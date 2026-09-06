@@ -98,10 +98,13 @@ class Element {
     return selector.split(',').some((part) => {
       part = part.trim();
       if (!part) return false;
-      const m = part.match(/^([a-zA-Z]*)((\[[^\]]+\])*)$/);
+      // `#id` as well as `tag[attr=...]`: the note field is `#payment-note`
+      // on the live page and the payment steps ask for it that way.
+      const m = part.match(/^([a-zA-Z]*)(#[A-Za-z0-9_-]+)?((\[[^\]]+\])*)$/);
       if (!m) return false;
-      const [, tag, attrPart] = m;
+      const [, tag, id, attrPart] = m;
       if (tag && tag.toUpperCase() !== this.tagName) return false;
+      if (id && this.getAttribute('id') !== id.slice(1)) return false;
       const attrs = attrPart ? attrPart.match(/\[[^\]]+\]/g) || [] : [];
       return attrs.every((raw) => {
         const inner = raw.slice(1, -1);
@@ -116,9 +119,19 @@ class Element {
 }
 
 class Document {
-  constructor(elements) {
+  // `text` lets a page state body copy that is not just its buttons' labels;
+  // the payment page names the recipient in prose, not on a control.
+  constructor(elements, text) {
     this.elements = elements;
-    this.body = { innerText: elements.map((e) => e.innerText).join(' ') };
+    const self = this;
+    this.body = {
+      // A getter, not a snapshot: a page whose click removes a button must
+      // read differently afterwards, and the confirmation step is precisely a
+      // second read of the same page.
+      get innerText() {
+        return [text || '', ...self.elements.map((e) => e.innerText)].join(' ');
+      },
+    };
   }
 
   querySelector(selector) {
@@ -171,7 +184,220 @@ function accountPage() {
   };
 }
 
-const PAGES = { signin: signinPage, code: codePage, account: accountPage };
+/// The payment page, in the state that produced the 2026-09-05 false success.
+///
+/// Order `esc_2c0cef0587c47bafd201e104` drove a tab an earlier payment had
+/// already left sitting on a filled form with the confirmation open. Every
+/// check the driver had passed against it -- the recipient is named, the amount
+/// field reads $2.01, a "Pay Jay Butera $2.01" button is present and enabled --
+/// because all of them describe the *form*, and the form was right. Both clicks
+/// then landed on buttons that did nothing, the whole sequence finished in
+/// about three seconds, and the rail wrote the order paid.
+///
+/// So the buttons here are deliberately inert: `click()` is recorded and
+/// nothing else happens. That is the honest model of the failure. A page whose
+/// click removed the confirmation would be modelling a *working* payment, and
+/// the test would prove nothing.
+function stalePayPage() {
+  const amount = new Element('input', { 'aria-label': 'Amount', value: '2.01' });
+  // Already committed, the way a field an earlier drive filled would be.
+  amount.committed = '2.01';
+  amount._valueTracker.tracked = '2.01';
+  const page = {
+    url: 'https://account.venmo.com/pay?recipients=jay-butera',
+    elements: [
+      amount,
+      new Element('textarea', { id: 'payment-note', value: 'thanks 5df45b72' }),
+      new Element('button', {}, 'Pay'),
+      new Element('button', {}, 'Pay Jay Butera $2.01'),
+      // The decoy from the 2026-09-02 run: permanently disabled, belongs to
+      // something else, and waiting on it times out with the real
+      // confirmation open.
+      new Element('button', { disabled: true }, 'Confirm'),
+    ],
+    // The recipient has to be findable in the page text, as on the real page.
+    text: 'Pay jay-butera',
+  };
+  return page;
+}
+
+/// A clean pay form: no confirmation open, the way a fresh navigation lands.
+///
+/// This is the starting state every honest drive begins from, and it is what
+/// `RequireNoOpenSheet` requires. Clicking the bare "Pay" opens a sheet for
+/// whatever the form currently holds, which is how the real page behaves and
+/// is what lets a test reach the post-click checks without the page having
+/// been stale to begin with.
+function cleanPayPage() {
+  const page = {
+    url: 'https://account.venmo.com/pay?recipients=jay-butera',
+    elements: [
+      new Element('input', { 'aria-label': 'Amount', value: '' }),
+      new Element('textarea', { id: 'payment-note', value: '' }),
+      new Element('button', {}, 'Pay'),
+    ],
+    text: 'Pay jay-butera',
+  };
+  page.location = { href: page.url };
+
+  const pay = page.elements.find((e) => e.innerText === 'Pay');
+  pay.onclick = () => {
+    if (page.sheetOpen) return;
+    page.sheetOpen = true;
+    const amount = page.elements.find((e) => e.getAttribute('aria-label') === 'Amount');
+    const note = page.elements.find((e) => e.getAttribute('id') === 'payment-note');
+    // The sheet states the payment it was opened for, and carries the note as
+    // rendered copy rather than as an input.
+    const sheet = new Element('button', {}, `Pay Jay Butera $${amount.value}`);
+    page.sheet = sheet;
+    page.elements.push(sheet);
+    // The sheet's own copy of the note, rendered as text. `carriesNote` now
+    // reads only rendered text, so this is what it sees -- never the field.
+    page.elements.push(new Element('div', {}, note.value));
+  };
+  return page;
+}
+
+/// A clean form whose confirm click does nothing.
+///
+/// The round-1 state, reached honestly: our own click opens the sheet, and
+/// pressing it has no effect. Every step up to the confirmation passes, which
+/// is what made the incident expensive, and only `RequireSendConfirmed`
+/// objects.
+function inertClickPayPage() {
+  const page = cleanPayPage();
+  const pay = page.elements.find((e) => e.innerText === 'Pay');
+  const open = pay.onclick;
+  pay.onclick = () => {
+    open();
+    // The sheet is there and its button does nothing at all.
+    page.sheet.onclick = () => {};
+  };
+  return page;
+}
+
+/// A clean form where confirming actually posts the payment.
+///
+/// Venmo takes the payment form away when a payment goes through: the page
+/// moves to the feed and the confirmation goes with it. Built on the clean
+/// page so the drive opens its own sheet, which is what `RequireNoOpenSheet`
+/// now requires of every honest payment.
+function livePayPage() {
+  const page = cleanPayPage();
+  const pay = page.elements.find((e) => e.innerText === 'Pay');
+  const open = pay.onclick;
+  pay.onclick = () => {
+    open();
+    page.sheet.onclick = () => {
+      // The send posted, so the whole form goes with it.
+      page.elements.length = 0;
+      page.elements.push(new Element('div', {}, 'You paid Jay Butera $2.01'));
+      page.location.href = 'https://account.venmo.com/';
+    };
+  };
+  return page;
+}
+
+/// The confirmation sheet dismisses on click without sending.
+///
+/// Venmo rejecting a confirmation does this: the sheet closes and the page
+/// drops back to the plain pay form, whose button reads "Pay" rather than
+/// "Pay Jay Butera $2.01". A check that only asked whether the amount-naming
+/// button was gone reported this as sent while the money sat in the account.
+function dismissingPayPage() {
+  const page = cleanPayPage();
+  const pay = page.elements.find((e) => e.innerText === 'Pay');
+  const open = pay.onclick;
+  pay.onclick = () => {
+    open();
+    page.sheet.onclick = () => {
+      // The sheet closes. The form, and its bare "Pay" button, remain.
+      const at = page.elements.indexOf(page.sheet);
+      if (at !== -1) page.elements.splice(at, 1);
+      page.sheetOpen = false;
+    };
+  };
+  return page;
+}
+
+/// The session expires at the confirm click and Venmo redirects to sign-in.
+///
+/// The form is gone, the sheet is gone, and no payment posted -- so every
+/// "is the button gone" question answers yes on a page where nothing could
+/// have been sent.
+function expiringPayPage() {
+  const page = cleanPayPage();
+  const pay = page.elements.find((e) => e.innerText === 'Pay');
+  const open = pay.onclick;
+  pay.onclick = () => {
+    open();
+    page.sheet.onclick = () => {
+      page.elements.length = 0;
+      page.elements.push(new Element('input', { type: 'password', name: 'password' }));
+      page.elements.push(new Element('button', {}, 'Sign In'));
+      page.location.href = 'https://id.venmo.com/signin';
+    };
+  };
+  return page;
+}
+
+/// A confirmation sheet left open by an earlier drive, for a different payee.
+///
+/// The label carries a display name and the amount, so prefix-and-amount
+/// matching finds it; the note on the sheet is the *previous* payment's. Item 4
+/// of the review: clicking this pays the earlier drive's recipient.
+function otherPayeeSheetPage() {
+  // Built from the stale page so it carries the same form the real one does;
+  // only the open sheet and its note differ.
+  const page = stalePayPage();
+  const sheet = page.elements.find((e) => e.innerText.startsWith('Pay Jay Butera'));
+  // A display name we do not pay, at the amount we do. Prefix-and-amount
+  // matching finds this; only the note tells it apart from ours.
+  sheet.innerText = 'Pay Someone Else $2.01';
+
+  // The note field behaves normally: this run's fill lands in it, exactly as
+  // it would on the live page. The earlier version froze it so the note check
+  // would discriminate, which encoded an unverified claim about Venmo -- the
+  // round-2 review flipped that one line and the wrong payee's sheet was
+  // clicked. The refusal must not depend on it, so the mock no longer offers
+  // it.
+
+  // The page still names our payee: the form under the sheet is for us. That
+  // is exactly the case `RequireRecipient` cannot catch and the note must.
+  page.text = 'Pay jay-butera';
+  return page;
+}
+
+/// A pay form for another payee, at a URL naming ours.
+///
+/// `RequireRecipient` used to include `location.href` in its haystack, so it
+/// confirmed the address `Navigate` had just written rather than anything the
+/// page rendered. Item 4 of the review.
+function wrongPayeeFormPage() {
+  return {
+    url: 'https://account.venmo.com/pay?recipients=jay-butera',
+    elements: [
+      new Element('input', { 'aria-label': 'Amount', value: '' }),
+      new Element('textarea', { id: 'payment-note', value: '' }),
+      new Element('button', {}, 'Pay'),
+    ],
+    text: 'Pay someone-else',
+  };
+}
+
+const PAGES = {
+  signin: signinPage,
+  code: codePage,
+  account: accountPage,
+  stalepay: stalePayPage,
+  cleanpay: cleanPayPage,
+  inertclickpay: inertClickPayPage,
+  livepay: livePayPage,
+  dismissingpay: dismissingPayPage,
+  expiringpay: expiringPayPage,
+  otherpayeesheet: otherPayeeSheetPage,
+  wrongpayeeform: wrongPayeeFormPage,
+};
 
 // ---------------------------------------------------------------------------
 // Run one expression against one page
@@ -198,8 +424,25 @@ function nativePrototype() {
   return proto;
 }
 
-const NATIVE_INPUT = { prototype: nativePrototype() };
-const NATIVE_TEXTAREA = { prototype: nativePrototype() };
+// Real constructors, not bare `{prototype}` objects: the payment page's fill
+// branches on `el instanceof HTMLTextAreaElement` to pick the right prototype,
+// and `instanceof` against a plain object throws. The login steps never took
+// that branch, which is why this went unnoticed until the payment steps ran
+// here.
+//
+// `Symbol.hasInstance` decides the answer from the element's own tag, which is
+// what the browser's real check comes down to for these two.
+function nativeClass(tag) {
+  const fn = function () {};
+  fn.prototype = nativePrototype();
+  Object.defineProperty(fn, Symbol.hasInstance, {
+    value: (el) => !!el && el.tagName === tag,
+  });
+  return fn;
+}
+
+const NATIVE_INPUT = nativeClass('INPUT');
+const NATIVE_TEXTAREA = nativeClass('TEXTAREA');
 
 function main() {
   const pageName = process.argv[2];
@@ -210,14 +453,16 @@ function main() {
   }
 
   const page = build();
-  const document = new Document(page.elements);
-  const location = { href: page.url };
-  const expression = require('fs').readFileSync(0, 'utf8');
+  const document = new Document(page.elements, page.text);
+  // The page owns its location, so a click handler can navigate the way a real
+  // one does: a session that expires at the confirm click redirects to sign-in,
+  // and the confirmation check has to see that rather than an unchanged URL.
+  const location = page.location || { href: page.url };
+  const input = require('fs').readFileSync(0, 'utf8');
 
-  let result;
-  try {
+  function evaluate(expression) {
     // eslint-disable-next-line no-new-func
-    result = new Function('document', 'location', 'HTMLInputElement', 'HTMLTextAreaElement', 'Event', `return (${expression});`)(
+    return new Function('document', 'location', 'HTMLInputElement', 'HTMLTextAreaElement', 'Event', `return (${expression});`)(
       document,
       location,
       NATIVE_INPUT,
@@ -228,6 +473,41 @@ function main() {
         }
       },
     );
+  }
+
+  function snapshot() {
+    return page.elements.map((e) => ({
+      tag: e.tagName,
+      text: e.innerText,
+      value: e.value,
+      clicked: !!e.clicked,
+      events: e.events,
+    }));
+  }
+
+  // Sequence mode. One expression per process cannot express the payment flow:
+  // the whole failure is about what the page looks like *after* a click, so the
+  // steps have to run against one page that persists between them. A leading
+  // `@@sequence` marks a run of expressions separated by a line of `@@`.
+  if (input.startsWith('@@sequence')) {
+    const steps = input.slice('@@sequence'.length).split(/^@@$/m).map((s) => s.trim()).filter(Boolean);
+    const results = [];
+    for (const expression of steps) {
+      try {
+        const value = evaluate(expression);
+        results.push({ ok: true, value: value === undefined ? null : value });
+      } catch (e) {
+        results.push({ ok: false, error: String(e.message) });
+        break;
+      }
+    }
+    process.stdout.write(JSON.stringify({ ok: true, steps: results, href: location.href, state: snapshot() }));
+    return;
+  }
+
+  let result;
+  try {
+    result = evaluate(input);
   } catch (e) {
     process.stdout.write(JSON.stringify({ ok: false, error: String(e.message) }));
     return;
@@ -238,13 +518,7 @@ function main() {
       ok: true,
       value: result === undefined ? null : result,
       href: location.href,
-      state: page.elements.map((e) => ({
-        tag: e.tagName,
-        text: e.innerText,
-        value: e.value,
-        clicked: !!e.clicked,
-        events: e.events,
-      })),
+      state: snapshot(),
     }),
   );
 }

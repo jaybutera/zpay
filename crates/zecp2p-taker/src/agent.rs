@@ -16,7 +16,7 @@ use crate::{
     discovery::{ClaimableDeposit, Discovery},
     payee,
     proof::{ProofRequest, ProofStatus},
-    venmo::{PaymentOutcome, PaymentRequest, SendMode, VenmoBrowser},
+    venmo::{PaymentOutcome, PaymentRequest, SendMode, Unconfirmed, VenmoBrowser},
 };
 
 /// How one deposit ended.
@@ -266,6 +266,36 @@ impl<P: alloy::providers::Provider + Clone> TakerAgent<P> {
 
         let outcome = match self.browser.pay(&tab, &request, self.mode).await {
             Ok(outcome) => outcome,
+
+            // The click landed and the page never showed the payment posting.
+            // Neither verdict is safe here, so neither is taken: cancelling
+            // the intent is a claim that no money left, and if it did leave --
+            // a post slower than the timeout, or a navigation that stopped us
+            // asking -- the cancel hands the deposit back while our dollars
+            // are gone, with no intent left to prove them against. That is the
+            // double-payment side of the same coin the coordinator's rail
+            // guards against by writing `NeedsOperator` instead of `paid`.
+            //
+            // So the intent is left standing and a human is told to read the
+            // feed. An intent nobody cancels expires on its own; dollars sent
+            // against a cancelled intent do not come back.
+            //
+            // This path only runs under `--dry-run` today (`main.rs` refuses a
+            // live ungated payment), and `Unconfirmed` cannot arise in a dry
+            // run because the run stops before the first click. It is written
+            // out anyway: the gate is one edit away from being lifted, and the
+            // wrong behaviour here is silent and expensive.
+            Err(e) if cancelling_would_be_a_guess(&e) => {
+                tracing::error!(
+                    error = %format!("{e:#}"),
+                    intent = %intent.intent_hash,
+                    "the Venmo page never confirmed the send. NOT cancelling the intent: \
+                     the money may have left. Read the Venmo feed for this amount and \
+                     recipient before anything else runs."
+                );
+                return Err(e);
+            }
+
             Err(e) => {
                 // We hold a claim we cannot honour. Give it back so the maker's
                 // USDC is not stranded and our stake unlocks.
@@ -538,9 +568,77 @@ pub fn require_secure_url(url: &str) -> Result<()> {
     }
 }
 
+/// Whether cancelling the intent on this error would be asserting something we
+/// do not know.
+///
+/// `cancel_intent` is a claim that no money left. It is right for a failure
+/// before the click -- no tab, a wrong recipient, an amount that did not take
+/// -- and wrong for [`Unconfirmed`], which is by definition the case where the
+/// click landed and the page never said what came of it. Cancelling there
+/// hands the deposit back while our dollars may already be gone, with no intent
+/// left to prove them against.
+fn cancelling_would_be_a_guess(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<Unconfirmed>().is_some()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::require_secure_url;
+    use super::{cancelling_would_be_a_guess, require_secure_url};
+    use crate::venmo::Unconfirmed;
+
+    /// An unconfirmed send must not cancel the intent.
+    ///
+    /// `cancel_intent` asserts that no money left. `Unconfirmed` is defined as
+    /// the case where nobody knows, and it is now the common post-click
+    /// failure. Cancelling there gives the deposit back while our dollars may
+    /// be gone and leaves no intent to prove them against -- the
+    /// double-payment side of the same coin the coordinator's rail avoids by
+    /// writing `NeedsOperator` rather than `paid`.
+    #[test]
+    fn an_unconfirmed_send_does_not_cancel_the_intent() {
+        let unconfirmed = anyhow::Error::from(Unconfirmed {
+            recipient: "jay-butera".into(),
+            amount: "2.01".into(),
+            why: "the confirmation is still on the page".into(),
+        });
+        assert!(cancelling_would_be_a_guess(&unconfirmed));
+    }
+
+    /// Every other failure still cancels, and must.
+    ///
+    /// These happen before the click -- no tab, a wrong recipient, an amount
+    /// the field discarded -- so no money left and holding the claim strands
+    /// the maker's USDC and our stake.
+    #[test]
+    fn a_failure_before_the_click_still_cancels() {
+        let before = anyhow::anyhow!("no logged-in Venmo tab to pay from");
+        assert!(!cancelling_would_be_a_guess(&before));
+
+        // Including one that has been given context on the way up, which is
+        // how these actually arrive.
+        let wrapped = anyhow::anyhow!("the amount field reads \"\"")
+            .context("could not drive the Venmo page");
+        assert!(!cancelling_would_be_a_guess(&wrapped));
+    }
+
+    /// And the distinction survives being wrapped in context.
+    ///
+    /// `pay` adds the recipient on the way out and callers add their own
+    /// context; if a wrap hid the type, the agent would silently go back to
+    /// cancelling on an unconfirmed send.
+    #[test]
+    fn an_unconfirmed_send_is_still_recognised_under_context() {
+        let wrapped = anyhow::Error::from(Unconfirmed {
+            recipient: "jay-butera".into(),
+            amount: "2.01".into(),
+            why: "the page could not be asked".into(),
+        })
+        .context("the fiat leg failed");
+        assert!(
+            cancelling_would_be_a_guess(&wrapped),
+            "a wrapped Unconfirmed must still be recognised"
+        );
+    }
 
     #[test]
     fn https_is_accepted() {

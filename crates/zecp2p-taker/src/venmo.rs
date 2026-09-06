@@ -66,6 +66,28 @@ const PAY_BUTTON: &str = "Pay";
 /// waiting for that one times out while the real confirmation sits open.
 const CONFIRM_PREFIX: &str = "Pay ";
 
+/// JavaScript that answers whether the page still carries a given note.
+///
+/// The note is how a confirmation is tied to *this* drive. It cannot be the
+/// payee: Venmo's confirmation label renders a display name ("Jay Butera")
+/// while the rail only ever knows the handle ("jay-butera"), so matching the
+/// payee on the button text is not possible from what a `FiatLeg` carries. The
+/// note is per-payment, this run typed it two steps earlier, and it is the same
+/// string `locate_payment` later searches the feed for.
+///
+/// Read from the page's rendered text only, never from the note field. Reading
+/// the field made this satisfiable by our own fill two steps earlier, so it
+/// discriminated between sheets only when the field rejected the write -- an
+/// assumption about Venmo nothing on record supports, and the round-2 review
+/// showed the mock was the only thing enforcing it.
+///
+/// So this is now a *second* layer behind [`PaymentStep::RequireNoOpenSheet`],
+/// which is the check that actually establishes the sheet is ours. If the live
+/// sheet turns out not to render the note at all this adds nothing, and it
+/// costs nothing either: the temporal check has already refused every sheet
+/// this drive did not open.
+const CARRIES_NOTE_JS: &str = "const carriesNote = (note) => {      const body = document.body ? document.body.innerText : '';      return body.includes(note);    };";
+
 /// Whether this run is allowed to move money.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendMode {
@@ -91,12 +113,48 @@ pub struct PaymentRequest {
     pub note: String,
 }
 
+/// A live click that produced no evidence the payment posted.
+///
+/// Separated from every other failure because it is the only one whose right
+/// answer is "look at the tab", not "retry" and not "the money left". On
+/// 2026-09-05 order `esc_2c0cef0587c47bafd201e104` clicked through in three
+/// seconds against a page left filled by an earlier drive, and the rail wrote
+/// `paid` for $2.01 that never moved. A caller that cannot tell this apart from
+/// a network error has to guess, and both guesses lose money: treating it as
+/// sent strands the dollars, treating it as not-sent re-pays a payment that may
+/// have gone through on a slow render.
+#[derive(Debug)]
+pub struct Unconfirmed {
+    /// What we asked the page to do, for the operator who has to go look.
+    pub recipient: String,
+    pub amount: String,
+    /// Why we could not confirm it, in the page's own terms.
+    pub why: String,
+}
+
+impl std::fmt::Display for Unconfirmed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the Venmo page never confirmed the ${} payment to @{}: {}. \
+             The money may or may not have left; do not record this order paid \
+             and do not retry it until the tab has been looked at.",
+            self.amount, self.recipient, self.why
+        )
+    }
+}
+
+impl std::error::Error for Unconfirmed {}
+
 /// What happened when we tried.
 #[derive(Debug, Clone)]
 pub enum PaymentOutcome {
     /// Dry run: the page was reached and filled, nothing was sent.
     WouldHaveSent { recipient: String, amount: String },
-    /// Live: Venmo accepted the payment.
+    /// Live: Venmo accepted the payment *and the page said so*.
+    ///
+    /// Reached only through [`PaymentStep::RequireSendConfirmed`]. A click that
+    /// returned without error is not enough and never was.
     Sent { recipient: String, amount: String },
 }
 
@@ -391,6 +449,16 @@ impl VenmoBrowser {
                 selector: NOTE_SELECTOR.to_string(),
                 value: req.note.clone(),
             },
+            // No audience step, by decision on 2026-09-05. The account
+            // default is Private and that is what a payment inherits, so
+            // driving the control per payment was dropped.
+            //
+            // Nothing here *checks* the audience either, and that is the
+            // deliberate half: a readback is a refusal, and a payment blocked
+            // over a control the driver no longer touches stalls the rail for
+            // no gain -- the escrow stays locked, the in-flight slot is held,
+            // and an operator has to clear it. The per-payment steps are in
+            // git on `venmo-private-audience` if that trade ever changes.
             // Read the amount back out of the field, from the page, immediately
             // before the irreversible step. A React-controlled input can hold a
             // value the script never set, and this is the last moment the money
@@ -406,13 +474,25 @@ impl VenmoBrowser {
             // so each is individually irreversible, individually logged, and
             // individually dropped by a dry run, rather than one step that
             // guesses how many buttons the flow has.
+            // The last check before anything irreversible, and the one that
+            // makes the sheet we later confirm demonstrably ours: it did not
+            // exist a moment ago.
+            PaymentStep::RequireNoOpenSheet,
             PaymentStep::ConfirmSend {
                 selector: PAY_BUTTON.to_string(),
             },
             PaymentStep::WaitForConfirm {
                 amount: req.amount.clone(),
+                note: req.note.clone(),
             },
             PaymentStep::ConfirmNamedAmount {
+                amount: req.amount.clone(),
+                note: req.note.clone(),
+            },
+            // The click is not the payment. Nothing above this line has asked
+            // Venmo whether it did anything, and until this step existed the
+            // function returned success the instant the click JS returned.
+            PaymentStep::RequireSendConfirmed {
                 amount: req.amount.clone(),
             },
         ]
@@ -455,7 +535,18 @@ impl VenmoBrowser {
                     "sending a real Venmo payment"
                 );
             }
-            self.execute(tab, step).await?;
+            // A failed confirmation carries the recipient the step itself does
+            // not know, so the operator reading the log is told who the money
+            // was for as well as how much.
+            self.execute(tab, step)
+                .await
+                .map_err(|e| match e.downcast::<Unconfirmed>() {
+                    Ok(u) => anyhow::Error::from(Unconfirmed {
+                        recipient: req.recipient.clone(),
+                        ..u
+                    }),
+                    Err(other) => other,
+                })?;
         }
 
         Ok(PaymentOutcome::Sent {
@@ -509,7 +600,38 @@ impl VenmoBrowser {
                 Ok(())
             }
 
-            PaymentStep::WaitForConfirm { amount } => {
+            // Refused, not waited on: a sheet that is open now will still be
+            // open in a second, and the answer does not improve with time.
+            PaymentStep::RequireNoOpenSheet => {
+                let value = self.evaluate(tab, &step.to_expression()).await?;
+                let report = value.get("result").and_then(|r| r.get("value"));
+                let ok = report
+                    .and_then(|v| v.get("ok"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if !ok {
+                    let sheets = report
+                        .and_then(|v| v.get("sheets"))
+                        .and_then(|v| v.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|v| v.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        })
+                        .unwrap_or_default();
+                    anyhow::bail!(
+                        "a Venmo confirmation sheet is already open on this page ({sheets}). \
+                         It was not opened by this payment, so nothing here has checked what \
+                         it would send -- its amount, its payee and its audience were fixed \
+                         before this run started. Close it in the browser and let the next \
+                         attempt start from a clean form. Not clicking Pay."
+                    );
+                }
+                Ok(())
+            }
+
+            PaymentStep::WaitForConfirm { amount, .. } => {
                 self.wait_for_expression(
                     tab,
                     &step.to_expression(),
@@ -520,8 +642,122 @@ impl VenmoBrowser {
 
             PaymentStep::WaitForButton { label } => self.wait_for_button(tab, label).await,
 
-            other => {
-                self.evaluate(tab, &other.to_expression()).await?;
+            // The only step whose failure is neither "it worked" nor "it did
+            // not". It gets its own error type so the rail can route it to a
+            // human instead of to a retry or to the journal.
+            PaymentStep::RequireSendConfirmed { amount } => {
+                // Polled here rather than through `wait_for_expression`,
+                // because the answer is a report and the failure text has to
+                // name what was actually seen. The old arm mapped *every*
+                // error to "the button was still on the page", including the
+                // one that happens after a real send: a cross-document
+                // navigation destroys the execution context, `evaluate`
+                // fails, and the operator was told the click did nothing while
+                // the money was gone.
+                let expression = step.to_expression();
+                let deadline = std::time::Instant::now() + self.timeout;
+                // Overwritten every pass on purpose: what the operator needs is
+                // what the page looked like when we gave up, not when we
+                // started. Declared without an initialiser, because every path
+                // through the loop body assigns it before the deadline check
+                // reads it and a placeholder would be dead on the first pass.
+                let mut last_seen: String;
+
+                loop {
+                    match self.evaluate(tab, &expression).await {
+                        Ok(value) => {
+                            let report = value.get("result").and_then(|r| r.get("value"));
+                            let flag = |name: &str| {
+                                report
+                                    .and_then(|v| v.get(name))
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false)
+                            };
+                            if flag("ok") {
+                                return Ok(());
+                            }
+                            // What the page is showing right now, in its own
+                            // terms, for the operator who has to go and look.
+                            let url = report
+                                .and_then(|v| v.get("url"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("(unknown)");
+                            last_seen = if flag("signedOut") {
+                                format!(
+                                    "the tab is on {url}, a signed-out page, so the session \
+                                     expired at the click and the payment did not post"
+                                )
+                            } else if flag("sheet") {
+                                format!(
+                                    "the confirmation naming ${amount} is still on the page, \
+                                     so the click did nothing"
+                                )
+                            } else if flag("payBtn") || flag("form") {
+                                format!(
+                                    "the pay form is still on the page at {url} with no \
+                                     confirmation open, which is what Venmo shows when it \
+                                     dismisses a confirmation without sending"
+                                )
+                            } else {
+                                format!("the page at {url} did not look like a completed payment")
+                            };
+                        }
+                        // Could not ask the page at all. This is the honest
+                        // "neither verdict" case: a context destroyed by
+                        // navigation looks exactly like this, and so does a
+                        // closed tab, so it must not claim the click failed.
+                        Err(e) => {
+                            last_seen = format!(
+                                "the page could not be asked whether the payment posted ({e:#}); \
+                                 a navigation right after a successful send looks like this, \
+                                 and so does a closed tab"
+                            );
+                        }
+                    }
+
+                    if std::time::Instant::now() >= deadline {
+                        return Err(Unconfirmed {
+                            recipient: String::new(),
+                            amount: amount.clone(),
+                            why: format!("{last_seen} (checked for {}s)", self.timeout.as_secs()),
+                        }
+                        .into());
+                    }
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+            }
+
+            // Explicitly listed, not a catch-all, and that is the point.
+            //
+            // This arm used to read `other => { evaluate; Ok(()) }`, which
+            // meant any step not named above had its answer thrown away. The
+            // review's revert C deleted the `RequireSendConfirmed` arm and
+            // every test stayed green: the check still ran, its `false` was
+            // discarded, and `pay` returned `Sent` -- the incident exactly,
+            // reintroduced by a refactor with no compiler complaint and no red
+            // test. A catch-all over a match whose arms decide whether money
+            // moved is a silent failure waiting for the next edit.
+            //
+            // So the steps whose answer genuinely carries no verdict are named
+            // one by one. Adding a variant to `PaymentStep` now fails to
+            // compile until someone decides, here, what its answer means.
+            PaymentStep::Navigate { .. } | PaymentStep::Fill { .. } => {
+                self.evaluate(tab, &step.to_expression()).await?;
+                Ok(())
+            }
+
+            // Both clicks. Their JavaScript throws on a missing or disabled
+            // button, so `evaluate` surfacing the exception is the check; the
+            // returned label is for the log. What they cannot tell us is
+            // whether the payment posted, which is `RequireSendConfirmed`.
+            PaymentStep::ConfirmSend { .. } | PaymentStep::ConfirmNamedAmount { .. } => {
+                let value = self.evaluate(tab, &step.to_expression()).await?;
+                let label = value
+                    .get("result")
+                    .and_then(|r| r.get("value"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("(no label)");
+                tracing::info!(clicked = %label, "clicked a money button");
                 Ok(())
             }
         }
@@ -679,23 +915,66 @@ pub enum PaymentStep {
         selector: String,
         expected: String,
     },
-    /// Wait for the confirmation button that names this amount.
+    /// Refuse to click `Pay` while a confirmation sheet is already open.
+    ///
+    /// The rule is temporal and needs no assumption about Venmo's DOM: a
+    /// confirmation that exists *before* our own click was not opened by this
+    /// drive, whatever it says, and the sheet our click opens is the only one
+    /// `WaitForConfirm` should ever find.
+    ///
+    /// This replaces binding the sheet to this payment by its note. That
+    /// binding read the note field, which this run had filled two steps
+    /// earlier, so it only discriminated when the field rejected the write --
+    /// an "already-open sheets detach from the form beneath them" claim about
+    /// Venmo that nothing on record supports. The round-2 review flipped the
+    /// one line in the mock that hard-coded it and the wrong payee's sheet was
+    /// clicked, which showed the test was proving the mock rather than the
+    /// page.
+    ///
+    /// A pre-existing sheet is a refusal even when it is this order's own,
+    /// from an earlier attempt. Its terms were fixed when it opened, before
+    /// this drive ran a single readback, so a drive that clicked it would be
+    /// sending something none of its own checks looked at. There is no
+    /// automatic retry -- every `fiat.pay` failure writes `NeedsOperator` and
+    /// fails the order -- so this is only ever reached after a human has seen
+    /// the tab, and the right instruction to that human is to close the sheet
+    /// and let the retry start from a clean form.
+    RequireNoOpenSheet,
+    /// Wait for the confirmation button that names this amount, on a sheet
+    /// that carries this payment's own note.
     ///
     /// Venmo renders it as "Pay Jay Butera $1.00" once the confirmation opens.
     /// The page also holds a permanently disabled button labelled "Confirm"
     /// that belongs to something else; waiting on that one times out while the
     /// real confirmation is sitting open, which is exactly what happened on the
     /// first live attempt.
+    ///
+    /// The `note` is what makes this *this drive's* sheet. The label carries a
+    /// display name ("Jay Butera") while the rail only knows the handle
+    /// ("jay-butera"), so the payee cannot be matched on the button text. The
+    /// note can: it is per-payment, it carries the tag `locate_payment` later
+    /// searches the feed for, and this run typed it into the form two steps
+    /// ago. A confirmation sheet left open by an earlier drive shows that
+    /// drive's note, so it no longer satisfies this.
     WaitForConfirm {
         amount: String,
+        note: String,
     },
-    /// Click the confirmation button, having checked it names this amount.
+    /// Click the confirmation button, having checked it names this amount and
+    /// sits on a sheet carrying this payment's note.
     ///
     /// The label is the last statement the page makes about what it is about to
     /// do, so it is read rather than trusted: a button that says a different
     /// number is not clicked.
+    ///
+    /// Amount alone was not enough. A confirmation sheet an earlier drive left
+    /// open, for a different payee at the same amount, matched the prefix and
+    /// the amount and would have been clicked -- paying the previous drive's
+    /// recipient. The note is checked with it, for the reason
+    /// [`PaymentStep::WaitForConfirm`] gives.
     ConfirmNamedAmount {
         amount: String,
+        note: String,
     },
     /// Wait for a button with this exact text to appear and become enabled.
     ///
@@ -709,6 +988,33 @@ pub enum PaymentStep {
     /// The click that moves money.
     ConfirmSend {
         selector: String,
+    },
+    /// Require the page to show that the payment actually posted.
+    ///
+    /// This is the step whose absence let order `esc_2c0cef0587c47bafd201e104`
+    /// be written `paid` for $2.01 that never moved. Every step before this one
+    /// answers a question about the *form*: is the recipient right, did the
+    /// amount take, is there a button, was it enabled. None of them asks the
+    /// only question that matters after the click, which is whether Venmo did
+    /// anything.
+    ///
+    /// It is stated as a *disappearance*, not an appearance, and that choice is
+    /// the whole point. A success banner is a race: it renders late, it is
+    /// worded differently on different accounts, and a check that waits for one
+    /// fails open the moment Venmo changes the copy. What Venmo does on every
+    /// successful payment, and cannot not do, is take the payment form away --
+    /// the amount field and the confirmation button both go, because the page
+    /// navigates to the feed or the story. So this answers `true` only when the
+    /// confirmation button naming this amount is *gone*.
+    ///
+    /// The stale-page failure is what makes the negative form necessary. The
+    /// tab that produced the false success still had a filled form and a live
+    /// confirmation button on it after both clicks; anything phrased as "find
+    /// the evidence" would have had to out-guess a page that was already
+    /// showing the wrong thing, and "the form is still sitting there" is
+    /// exactly the state we are trying to catch.
+    RequireSendConfirmed {
+        amount: String,
     },
 }
 
@@ -754,10 +1060,17 @@ impl PaymentStep {
                 val = json!(value)
             ),
             // Returns the rendered recipient text so a mismatch can name it.
+            //
+            // The page's own text, and **not** `location.href`. The URL used to
+            // be part of the haystack, which made this check answer yes to the
+            // address `Navigate` had just written: we were asking the page to
+            // confirm a claim we had made ourselves one step earlier. A pay
+            // form left open for another payee, at a URL naming ours, passed.
+            // Only what the document renders is evidence about who it pays.
             PaymentStep::RequireRecipient { recipient } => format!(
                 "(() => {{ \
                    const wanted = {want}; \
-                   const hay = (document.body ? document.body.innerText : '') + ' ' + location.href; \
+                   const hay = document.body ? document.body.innerText : ''; \
                    return {{ ok: hay.toLowerCase().includes(wanted.toLowerCase()), \
                              url: location.href }}; \
                  }})()",
@@ -775,21 +1088,47 @@ impl PaymentStep {
             // Matches on the prefix, then requires the label to carry the
             // amount. Both halves matter: the prefix finds it, and the amount
             // is the page telling us what it will do.
-            PaymentStep::WaitForConfirm { amount } => format!(
+            // Any confirmation sheet at all, whatever it names. Matched on the
+            // prefix plus a dollar amount rather than on *our* amount, because
+            // the point is that a sheet opened before our click is not ours no
+            // matter what it says -- a stale sheet for the same amount is
+            // exactly the dangerous case.
+            PaymentStep::RequireNoOpenSheet => format!(
                 "(() => {{ \
-                   const pre = {pre}; const amt = {amt}; \
+                   const pre = {pre}; \
+                   const open = [...document.querySelectorAll('button')] \
+                     .map(b => (b.innerText||'').trim()) \
+                     .filter(t => t.startsWith(pre) && /\\$[0-9]/.test(t)); \
+                   return {{ ok: open.length === 0, sheets: open }}; \
+                 }})()",
+                pre = json!(CONFIRM_PREFIX)
+            ),
+
+            // The note has to be on the page as well as the amount on the
+            // button. Both halves are about identity: the amount says what the
+            // sheet will do, the note says which drive it belongs to.
+            PaymentStep::WaitForConfirm { amount, note } => format!(
+                "(() => {{ \
+                   {helper} \
+                   const pre = {pre}; const amt = {amt}; const note = {note}; \
+                   if (note && !carriesNote(note)) return false; \
                    const el = [...document.querySelectorAll('button')] \
                      .find(b => {{ const t=(b.innerText||'').trim(); \
                                   return t.startsWith(pre) && t.includes(amt); }}); \
                    return !!el && !el.disabled; \
                  }})()",
                 pre = json!(CONFIRM_PREFIX),
-                amt = json!(amount)
+                amt = json!(amount),
+                note = json!(note),
+                helper = CARRIES_NOTE_JS
             ),
 
-            PaymentStep::ConfirmNamedAmount { amount } => format!(
+            PaymentStep::ConfirmNamedAmount { amount, note } => format!(
                 "(() => {{ \
-                   const pre = {pre}; const amt = {amt}; \
+                   {helper} \
+                   const pre = {pre}; const amt = {amt}; const note = {note}; \
+                   if (note && !carriesNote(note)) \
+                     throw new Error('the confirmation does not carry this payment\\'s note'); \
                    const hits = [...document.querySelectorAll('button')] \
                      .filter(b => {{ const t=(b.innerText||'').trim(); \
                                      return t.startsWith(pre) && t.includes(amt); }}); \
@@ -802,7 +1141,63 @@ impl PaymentStep {
                    return label; \
                  }})()",
                 pre = json!(CONFIRM_PREFIX),
-                amt = json!(amount)
+                amt = json!(amount),
+                note = json!(note),
+                helper = CARRIES_NOTE_JS
+            ),
+
+            // True only when the confirmation button naming this amount is
+            // gone from the page. See the variant's own note for why this is
+            // phrased as a disappearance rather than as a success banner: the
+            // page that caused the incident still had the button on it.
+            // The whole pay form has to be gone, and the page has to still be
+            // a signed-in Venmo page.
+            //
+            // "The named button vanished" was too weak on its own: it is also
+            // true of the sign-in page a session expiry redirects to, and of
+            // Venmo dismissing the confirmation sheet on an error and dropping
+            // back to the plain form (whose button reads "Pay", not
+            // "Pay ... $2.01"). Both are the incident again with a different
+            // page shape: no payment posted, and the check says sent.
+            //
+            // What a posted payment actually does is take the *form* away --
+            // the amount field goes with the sheet. So all of these must hold:
+            // no amount field, no bare "Pay" button, no confirmation naming
+            // this amount, and a URL that is not one of Venmo's signed-out
+            // pages. The bare-"Pay" clause is what catches the dismissed sheet.
+            //
+            // **What this still does not catch**, stated plainly because
+            // 51795d6's message wrongly claimed otherwise: any *signed-in*
+            // Venmo page with no form and no sheet answers `ok: true`. That is
+            // the account home, a DataDome interstitial at the pay URL, a 5xx,
+            // or Venmo unmounting the form to show an error panel. This proves
+            // a negative and always will. The positive signal is the feed --
+            // `fiat::attest` already searches it for the tagged note -- and
+            // gating `Stage::Paid` on that story is the recorded follow-up,
+            // conditioned on the rail running without an operator watching.
+            //
+            // Returns a report rather than a bool so the caller can say what it
+            // saw instead of asserting a reason it never observed.
+            PaymentStep::RequireSendConfirmed { amount } => format!(
+                "(() => {{ \
+                   const pre = {pre}; const amt = {amt}; const bare = {bare}; \
+                   const sel = {sel}; const out = {out}; \
+                   const href = (location.href || '').toLowerCase(); \
+                   const signedOut = out.some(m => href.includes(m)); \
+                   const labels = [...document.querySelectorAll('button')] \
+                     .map(b => (b.innerText||'').trim()); \
+                   const sheet = labels.some(t => t.startsWith(pre) && t.includes(amt)); \
+                   const form = document.querySelector(sel) !== null; \
+                   const payBtn = labels.some(t => t === bare); \
+                   return {{ ok: !sheet && !form && !payBtn && !signedOut, \
+                             sheet: sheet, form: form, payBtn: payBtn, \
+                             signedOut: signedOut, url: location.href }}; \
+                 }})()",
+                pre = json!(CONFIRM_PREFIX),
+                amt = json!(amount),
+                bare = json!(PAY_BUTTON),
+                sel = json!(AMOUNT_SELECTOR),
+                out = json!(crate::auto::login::SIGNED_OUT_MARKERS)
             ),
 
             PaymentStep::WaitForButton { label } => format!(
@@ -839,6 +1234,19 @@ impl PaymentStep {
         }
     }
 
+    /// The step's JavaScript, for a test that runs it against a page.
+    ///
+    /// `to_expression` stays private: it is an implementation detail of
+    /// `execute`, and a public one invites a caller to run a money step outside
+    /// the mode gate. This accessor exists because asserting over the *text* of
+    /// these expressions is not enough -- the 2026-09-05 false success was a
+    /// sequence whose every expression was correct and whose result was still
+    /// wrong -- so `tests/payment_page_test.rs` runs them against a mock page.
+    #[doc(hidden)]
+    pub fn expression_for_test(&self) -> String {
+        self.to_expression()
+    }
+
     /// One line for the dry-run report.
     pub fn describe(&self) -> String {
         match self {
@@ -851,10 +1259,13 @@ impl PaymentStep {
             PaymentStep::RequireAmount { selector, expected } => {
                 format!("read {selector} back and require it to be {expected:?}")
             }
-            PaymentStep::WaitForConfirm { amount } => {
+            PaymentStep::RequireNoOpenSheet => {
+                "require no confirmation sheet to be open before clicking Pay".to_string()
+            }
+            PaymentStep::WaitForConfirm { amount, .. } => {
                 format!("wait for the confirmation button naming ${amount}")
             }
-            PaymentStep::ConfirmNamedAmount { amount } => {
+            PaymentStep::ConfirmNamedAmount { amount, .. } => {
                 format!("click the confirmation naming ${amount}  <-- sends the money")
             }
             PaymentStep::WaitForButton { label } => {
@@ -862,6 +1273,9 @@ impl PaymentStep {
             }
             PaymentStep::ConfirmSend { selector } => {
                 format!("click the {selector:?} button  <-- sends the money")
+            }
+            PaymentStep::RequireSendConfirmed { amount } => {
+                format!("require the ${amount} confirmation to be gone, proving the send posted")
             }
         }
     }
@@ -980,7 +1394,11 @@ fn to_cents(text: &str) -> Option<u128> {
         1 => frac.parse::<u128>().ok()? * 10,
         _ => frac.parse().ok()?,
     };
-    let whole: u128 = if whole.is_empty() { 0 } else { whole.parse().ok()? };
+    let whole: u128 = if whole.is_empty() {
+        0
+    } else {
+        whole.parse().ok()?
+    };
 
     whole.checked_mul(100)?.checked_add(cents)
 }
@@ -1056,32 +1474,137 @@ mod tests {
     /// Two clicks move money, because the live page has two: "Pay" opens a
     /// confirmation and "Confirm" completes it. Both are marked irreversible, so
     /// a dry run stops at the first and neither can be reached by accident.
+    ///
+    /// This used to also assert that the *last* step was a money step, on the
+    /// reasoning that nothing should follow the send. That was the wrong
+    /// invariant and it is the one the 2026-09-05 false success was written
+    /// under: if nothing may follow the click, then nothing can ever check that
+    /// the click worked. What must not follow the click is another *fill* or
+    /// another *click*; a read-only verification must.
     #[test]
     fn every_money_moving_step_is_marked_irreversible() {
         let steps = a_payment();
         let money: Vec<_> = steps.iter().filter(|s| s.is_irreversible()).collect();
         assert_eq!(money.len(), 2, "the live flow is Pay then Confirm");
-        // The last thing done is a money step; nothing follows the send.
-        assert!(steps.last().unwrap().is_irreversible());
-        // And every reversible step comes before the first irreversible one, so
-        // there is no check left stranded after the money has started moving.
-        let first_money = steps.iter().position(|s| s.is_irreversible()).unwrap();
+
+        let last_money = steps.iter().rposition(|s| s.is_irreversible()).unwrap();
+        // Nothing after the last click may touch the page. A `Fill` or a
+        // `Navigate` there would be acting on a payment that has already gone.
+        for step in &steps[last_money + 1..] {
+            assert!(
+                matches!(step, PaymentStep::RequireSendConfirmed { .. }),
+                "only a read-only confirmation may follow the send, found {step:?}"
+            );
+        }
+        // The two money steps are adjacent-or-separated only by waits, so no
+        // check is stranded between them where it could not act on the answer.
         assert!(
-            steps[..first_money].iter().all(|s| !s.is_irreversible()),
-            "a check must not sit after the first click"
+            steps[..last_money]
+                .iter()
+                .filter(|s| s.is_irreversible())
+                .count()
+                == 1
         );
     }
 
-    /// The amount readback is the last thing before the first click. This is the
-    /// ordering NEW-3 was about, and the two-button flow must not have moved it.
+    /// The step that closes the false-success hole: the sequence does not end
+    /// on a click.
+    ///
+    /// Order `esc_2c0cef0587c47bafd201e104` on 2026-09-05 ran every step above
+    /// this one without error, in about three seconds, against a page an
+    /// earlier drive had left filled -- and `pay` returned success for $2.01
+    /// that never left the account. Nothing in the sequence had ever asked
+    /// Venmo whether it did anything.
+    #[test]
+    fn the_sequence_ends_by_confirming_the_send_rather_than_by_clicking() {
+        let steps = a_payment();
+        assert!(
+            matches!(
+                steps.last().unwrap(),
+                PaymentStep::RequireSendConfirmed { .. }
+            ),
+            "the last step must be the confirmation, not the click: {:?}",
+            steps.last().unwrap()
+        );
+        match steps.last().unwrap() {
+            PaymentStep::RequireSendConfirmed { amount } => assert_eq!(amount, "25.00"),
+            other => panic!("expected RequireSendConfirmed, got {other:?}"),
+        }
+    }
+
+    /// The unconfirmed failure is its own type, and it survives being wrapped.
+    ///
+    /// The driver returns it through `anyhow`, and the coordinator downcasts it
+    /// back out to tell the operator that the form is probably still on screen.
+    /// If it stopped being downcastable that message would silently become a
+    /// generic browser fault, which is the message that was wrong before.
+    #[test]
+    fn an_unconfirmed_send_is_a_distinguishable_error() {
+        let err = anyhow::Error::from(Unconfirmed {
+            recipient: "jay-butera".into(),
+            amount: "2.01".into(),
+            why: "the confirmation button was still on the page".into(),
+        });
+        let found = err
+            .downcast_ref::<Unconfirmed>()
+            .expect("an Unconfirmed must survive the trip through anyhow");
+        assert_eq!(found.amount, "2.01");
+        assert_eq!(found.recipient, "jay-butera");
+
+        // And it must not read as either verdict. A message that says the money
+        // left strands it; one that says it did not invites a double payment.
+        let text = err.to_string();
+        assert!(text.contains("may or may not have left"), "{text}");
+        assert!(text.contains("do not record this order paid"), "{text}");
+    }
+
+    /// The confirmation must not itself be a money step.
+    ///
+    /// If it were marked irreversible a dry run would stop at it, which is
+    /// harmless, but it would also read as "this moves money" to every future
+    /// reader of `is_irreversible` -- and the point of the step is that it
+    /// moves nothing and only reads.
+    #[test]
+    fn the_confirmation_moves_no_money_and_clicks_nothing() {
+        let step = PaymentStep::RequireSendConfirmed {
+            amount: "2.01".to_string(),
+        };
+        assert!(!step.is_irreversible());
+        let js = step.to_expression();
+        assert!(
+            !js.contains("click"),
+            "the confirmation must not click: {js}"
+        );
+        assert!(
+            !js.contains("value") && !js.contains("location.href ="),
+            "the confirmation must not write to the page: {js}"
+        );
+    }
+
+    /// The amount readback is the last thing that *reads the form* before the
+    /// first click. This is the ordering NEW-3 was about.
+    ///
+    /// `RequireNoOpenSheet` now sits between it and the click. That is allowed
+    /// and only that: it reads no form control, writes nothing, and refuses on
+    /// a condition the amount cannot change. What must never appear here is a
+    /// step that touches the amount or the note after the readback, because
+    /// then the value clicked would not be the value checked.
     #[test]
     fn the_readback_is_the_last_step_before_any_money_moves() {
         let steps = a_payment();
         let first_money = steps.iter().position(|s| s.is_irreversible()).unwrap();
-        assert!(
-            matches!(steps[first_money - 1], PaymentStep::RequireAmount { .. }),
-            "expected the amount readback immediately before the first click"
-        );
+        let verify = steps
+            .iter()
+            .position(|s| matches!(s, PaymentStep::RequireAmount { .. }))
+            .expect("the amount must be verified");
+        assert!(verify < first_money, "the readback comes before the click");
+        for step in &steps[verify + 1..first_money] {
+            assert!(
+                matches!(step, PaymentStep::RequireNoOpenSheet),
+                "only a read-only refusal may sit between the readback and the \
+                 click, found {step:?}"
+            );
+        }
     }
 
     fn a_payment() -> Vec<PaymentStep> {
@@ -1121,7 +1644,15 @@ mod tests {
             .expect("a fill");
 
         assert!(last_fill < verify, "the check has to come after the fills");
-        assert_eq!(verify + 1, confirm, "and nothing may come between it and the click");
+        // Nothing that touches the form may come between the readback and the
+        // click. `RequireNoOpenSheet` may, because it reads no form control:
+        // see `the_readback_is_the_last_step_before_any_money_moves`.
+        for step in &steps[verify + 1..confirm] {
+            assert!(
+                matches!(step, PaymentStep::RequireNoOpenSheet),
+                "unexpected step between the amount readback and the click: {step:?}"
+            );
+        }
 
         match &steps[verify] {
             PaymentStep::RequireAmount { expected, .. } => assert_eq!(expected, "25.00"),
@@ -1147,7 +1678,10 @@ mod tests {
             .position(|s| matches!(s, PaymentStep::Fill { .. }))
             .expect("a fill");
 
-        assert!(check < first_fill, "check who we are paying before typing an amount");
+        assert!(
+            check < first_fill,
+            "check who we are paying before typing an amount"
+        );
 
         match &steps[check] {
             PaymentStep::RequireRecipient { recipient } => assert_eq!(recipient, "test-payee"),
@@ -1166,9 +1700,18 @@ mod tests {
         }
         .to_expression();
 
-        assert!(js.contains("_valueTracker"), "must reset React's value tracker: {js}");
-        assert!(js.contains("getOwnPropertyDescriptor"), "must use the native setter: {js}");
-        assert!(js.contains("HTMLTextAreaElement"), "the note field is a textarea: {js}");
+        assert!(
+            js.contains("_valueTracker"),
+            "must reset React's value tracker: {js}"
+        );
+        assert!(
+            js.contains("getOwnPropertyDescriptor"),
+            "must use the native setter: {js}"
+        );
+        assert!(
+            js.contains("HTMLTextAreaElement"),
+            "the note field is a textarea: {js}"
+        );
         assert!(js.contains("new Event('input'"), "React listens for input");
         assert!(js.contains("new Event('change'"));
     }
@@ -1183,10 +1726,13 @@ mod tests {
             if !js.contains("querySelector") {
                 continue;
             }
-            // A step that only tests for presence (`!!el && !el.disabled`)
-            // never dereferences, so it needs no guard. Everything that reaches
-            // through the handle does.
-            if js.contains("!!el") {
+            // A step that never binds an element handle cannot dereference a
+            // missing one. `!!el && !el.disabled` answers about a handle it
+            // does not reach through; `.some(...)` binds none at all; and a
+            // `.map(...)` over a NodeList reads each node's text without ever
+            // holding a lookup result that could be null. Everything that does
+            // reach through a handle is checked below.
+            if js.contains("!!el") || js.contains(".some(") || js.contains(".map(b =>") {
                 continue;
             }
             // The confirmation step filters rather than finds, and guards on the
@@ -1210,6 +1756,7 @@ mod tests {
     fn the_confirmation_is_matched_by_the_amount_it_names() {
         let js = PaymentStep::ConfirmNamedAmount {
             amount: "1.00".to_string(),
+            note: "thanks abcd1234".to_string(),
         }
         .to_expression();
         assert!(js.contains("startsWith"), "{js}");
@@ -1219,6 +1766,11 @@ mod tests {
         assert!(js.contains("el.disabled"), "{js}");
         // It must not be looking for the decoy.
         assert!(!js.contains("=== 'Confirm'"), "{js}");
+        // And the amount alone does not identify a sheet: the note this run
+        // typed has to be on it, or an earlier drive's confirmation for
+        // another payee at the same amount would be clicked.
+        assert!(js.contains("carriesNote"), "{js}");
+        assert!(js.contains("thanks abcd1234"), "{js}");
     }
 
     /// And a disabled send button is not a click worth making.
@@ -1245,7 +1797,10 @@ mod tests {
         for shown in ["25.00", "$25.00", "25", "25.0", "$25", " 25.00 "] {
             assert!(amount_matches(shown, "25.00"), "{shown:?} is 25.00");
         }
-        assert!(amount_matches("$1,250.00", "1250.00"), "thousands separator");
+        assert!(
+            amount_matches("$1,250.00", "1250.00"),
+            "thousands separator"
+        );
     }
 
     /// The failures this exists to catch: a field that kept a stale value, or
@@ -1258,7 +1813,10 @@ mod tests {
         assert!(!amount_matches("250.00", "25.00"), "ten times too much");
         assert!(!amount_matches("25.01", "25.00"), "a cent out is still out");
         assert!(!amount_matches("abc", "25.00"), "not a number");
-        assert!(!amount_matches("25.000", "25.00"), "more precision than cents");
+        assert!(
+            !amount_matches("25.000", "25.00"),
+            "more precision than cents"
+        );
         assert!(!amount_matches("2.5.0", "25.00"), "not a number either");
     }
 
@@ -1266,7 +1824,15 @@ mod tests {
     /// to agree across the range the taker actually pays.
     #[test]
     fn every_amount_the_taker_renders_verifies_against_itself() {
-        for units in [1u64, 9_999, 50_000, 1_000_001, 5_009_999, 25_999_999, 999_990_001] {
+        for units in [
+            1u64,
+            9_999,
+            50_000,
+            1_000_001,
+            5_009_999,
+            25_999_999,
+            999_990_001,
+        ] {
             let rendered = usdc_to_dollars(U256::from(units));
             assert!(
                 amount_matches(&rendered, &rendered),
@@ -1283,10 +1849,7 @@ mod tests {
     #[test]
     fn the_dry_run_still_stops_at_the_click_but_checks_first() {
         let steps = a_payment();
-        let up_to_the_click: Vec<_> = steps
-            .iter()
-            .take_while(|s| !s.is_irreversible())
-            .collect();
+        let up_to_the_click: Vec<_> = steps.iter().take_while(|s| !s.is_irreversible()).collect();
 
         assert!(up_to_the_click
             .iter()
