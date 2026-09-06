@@ -172,6 +172,12 @@ fn fresh_txid() -> [u8; 32] {
 ///
 /// One type so the guard can be bound to a single variable and dropped at the
 /// end of the iteration whichever kind it is.
+//
+// The guards are never read, and must not be: the whole of their job is to be
+// held and then dropped. `dead_code` sees the unread field and suggests
+// replacing it with `()`, which would release the lease at the moment it was
+// taken and quietly restore the interference this exists to prevent.
+#[allow(dead_code)]
 enum ClockLease<'a> {
     Shared(tokio::sync::RwLockReadGuard<'a, ()>),
     Exclusive(tokio::sync::RwLockWriteGuard<'a, ()>),
@@ -381,6 +387,7 @@ async fn run_inner(
     // payment - and is what a real deployment does every tick.
     let t = Instant::now();
     let deadline = Instant::now() + sweep_timeout;
+    let mut backoff = Duration::from_millis(10);
     let final_stage = loop {
         let stored = env
             .state
@@ -400,7 +407,18 @@ async fn run_inner(
         // is frequently correct - another order holds the slot - so they are
         // not fatal to the iteration.
         let _ = zecp2p_v2coordinator::driver::advance(&env.state, &order_id).await;
-        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Back off rather than hammer. Every sweep is node calls, and an order
+        // queued behind the one payment slot can be queued for a long time: at
+        // a flat 20 ms this loop spent four cores' worth of CPU re-asking a
+        // question whose answer could not change until another order finished,
+        // and it made `getblockchaininfo` most of the node traffic a run
+        // produced. A real deployment sweeps on a tick of seconds, so backing
+        // off is both cheaper and a better model of it. The ceiling is 100 ms:
+        // higher was cheaper still, but it added its own latency to every slot
+        // handoff and so moved the throughput number the run exists to report.
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_millis(100));
     };
     timings.settle = t.elapsed();
     outcome.final_stage = Some(final_stage.as_str().to_string());
