@@ -140,3 +140,36 @@ A `/health` that reported the journal's open lines, or an operator alert on the
 first `NeedsOperator` write, would turn a silent halt into a page. That is a
 coordinator change and is deliberately not made here; the harness's job was to
 find it.
+
+## What grows, and what does not
+
+Orders are never evicted, and that is deliberate: an order the coordinator
+forgets is an escrow whose release nobody can assemble, leaving the user only
+the refund at `T`. So a long-lived deployment accumulates them, and two things
+grow with the total rather than with what is open.
+
+**The state directory.** One JSON file per order, ~2.9 KB measured, written
+under the store lock on every stage change. 2,000 orders is about 5.8 MB in
+2,000 files, and the whole directory is read back at startup to rebuild the
+store.
+
+**The store scans.** `awaiting_count`, `awaiting_for_handle`,
+`put_unless_in_flight` and `open_orders` each walk every order ever created,
+under one mutex. Opening an order does three of those walks.
+
+Neither is urgent. Across 2,000 orders the `open` step's p50 moved from 0 ms to
+1 ms and its p99 from 8 ms to 11 ms, and the driver's sweep already filters to
+`open_orders()` before spawning, so per-sweep work is bounded by what is open
+rather than by the total. The measured latency growth over that run - p50 2,506
+to 3,219 ms, p99 4,808 to 8,040 ms - is queueing for the payment slot, not the
+scans.
+
+What this does mean is that the cost is linear in lifetime order count, so it is
+worth re-measuring before a deployment expects to hold tens of thousands.
+
+## The open-order cap refuses cleanly
+
+4,000 orders that never fund, against `max_open_orders = 512`: exactly 512
+opened and 3,488 were refused with a 503 and a message naming the reason.
+Unfunded orders stay open, so they accumulate against the cap; the refusal is
+the intended behaviour under overload and it is exact.
