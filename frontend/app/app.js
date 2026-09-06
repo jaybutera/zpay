@@ -696,6 +696,27 @@ function renderReturns(view) {
       // view carries the answer for every stage, and a branch that ignores it
       // is the one that will be wrong when the set of writers changes.
       if (needsAPerson(view)) { sayItNeedsAPerson(view, '.'); break; }
+      // R5-2's page half. The coordinator has asked the chain what became of
+      // this escrow's only evidence of funding - a transaction seen in the
+      // mempool - and been told nothing is there: it expired unmined and no
+      // wallet resent it, so the coins never left the user's own wallet.
+      //
+      // Without this the screen below says "N ZEC is in the escrow" over an
+      // empty one and shows the form. The builder then makes a refund spending
+      // an outpoint no block holds, taken from the view or from this page's own
+      // record of the signing, the endpoint refuses it for want of a funding it
+      // never learned, and the page tells the user any node will accept bytes
+      // no node will. There is nothing to refund and nothing to wait for; the
+      // only honest thing to say is that the payment never arrived.
+      if (view.escrow_is_empty) {
+        $('returns-title').textContent = 'Your ZEC never arrived';
+        $('returns-body').textContent =
+          'The transaction that would have funded this escrow never confirmed, so nothing ' +
+          'was ever sent to it and there is nothing here to come back. Your coins are still ' +
+          'in your own wallet. Start again whenever you like.';
+        form.hidden = true;
+        break;
+      }
       // Past T the coordinator moves this to `refundable`, but the page must
       // not depend on having seen that: it can be opened at any moment, and
       // the chain is the authority on whether the timeout branch is spendable.

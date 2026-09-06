@@ -598,14 +598,6 @@ async fn check_refund_deadline_only(state: &Arc<AppState>, mut order: Order) -> 
         }
     }
 
-    // R5-2 and finding 7: an order whose only evidence of funding is a mempool
-    // sighting must not be promoted before the chain is asked what became of
-    // it. See `settle_sighted_funding`.
-    match settle_sighted_funding(state, &mut order).await {
-        SightedFunding::InEscrow => {}
-        SightedFunding::NothingThere | SightedFunding::Unknown => return Ok(()),
-    }
-
     let (height, _) = match state.chain_head_uncached().await {
         Ok(h) => h,
         Err(e) => {
@@ -617,6 +609,22 @@ async fn check_refund_deadline_only(state: &Arc<AppState>, mut order: Order) -> 
         return Ok(());
     };
     if state.policy.may_refund_at(refund_height, height) && order.stage != Stage::Refundable {
+        // R5-2 and finding 7: an order whose only evidence of funding is a
+        // mempool sighting must not be promoted before the chain is asked what
+        // became of it. See `settle_sighted_funding`.
+        //
+        // **Below the height check, not above it.** R5-2 is one `gettxout` *at
+        // `T`*, and this function is reached the sweep after an order goes
+        // `Unpaid`, which is `pay_deadline_blocks` - sixty on mainnet - earlier.
+        // A null answer is recorded and stops the order being listed, so asking
+        // early writes off a transaction that is merely still unmined at the pay
+        // deadline and can confirm in the sixty blocks that remain. Nothing then
+        // asks again, and the refund over the outpoint the escrow really holds
+        // is refused for want of a `funding` this call could have recorded.
+        match settle_sighted_funding(state, &mut order).await {
+            SightedFunding::InEscrow => {}
+            SightedFunding::NothingThere | SightedFunding::Unknown => return Ok(()),
+        }
         // The reason is kept. The page shows it beside the refund form, so a
         // user who was told the funding was replaced still sees why.
         order.stage = Stage::Refundable;
@@ -771,14 +779,17 @@ async fn check_deadlines(state: &Arc<AppState>, mut order: Order) -> Result<()> 
             SightedFunding::InEscrow => {}
             SightedFunding::Unknown => return Ok(()),
             SightedFunding::NothingThere => {
-                // Nothing is at the address and the pay deadline is long past,
-                // so this order is over. Falling through to the `Unpaid` clause
-                // below is what takes it out of the sweep list; returning here
-                // would leave it `Locked` and listed for the life of the store,
-                // which is the cost R4-2 was raised about.
+                // Nothing is at the address and `T` has passed, so this order
+                // is over. It is written `Unpaid` here rather than left where
+                // it is, because `Unpaid` is what takes it out of the sweep
+                // list: returning without writing would leave it `Locked` and
+                // listed for the life of the store, which is the cost R4-2 was
+                // raised about.
                 //
-                // `Unpaid` is the honest stage: nobody sent the dollars, and
-                // there is no coin to come back either.
+                // `Unpaid` is also the honest stage. Nobody sent the dollars,
+                // and there is no coin to come back either - `Refundable` would
+                // put a refund form in front of the user over an empty escrow,
+                // which is the whole of R5-2.
                 if !order.stage.fiat_may_have_left() && order.stage != Stage::Unpaid {
                     order.stage = Stage::Unpaid;
                     order.touch();

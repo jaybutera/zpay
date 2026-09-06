@@ -135,6 +135,24 @@ pub struct OrderView {
     /// release the LP may already hold.
     #[serde(default)]
     pub fiat_may_have_left: bool,
+    /// Whether the chain has been asked what became of this escrow's only
+    /// evidence of funding, and answered that nothing is there.
+    ///
+    /// R5-2's page half. `funding` still carries the sighted outpoint, because
+    /// the page needs an outpoint to sign over and the ordinary case is a
+    /// sighting that confirms. Once the sighting has been disowned there is
+    /// nothing to sign and nothing to refund, and the page must stop saying the
+    /// ZEC is in the escrow: the refund it would build spends an outpoint no
+    /// block holds, and the endpoint refuses it while the page says any node
+    /// will take the bytes.
+    ///
+    /// Only ever set from `Order::sighting_never_confirmed`, which the sweep
+    /// writes on a definite null from `gettxout` at `T`. A node that would not
+    /// answer leaves it false, so "not asked" reads the same as "in escrow" -
+    /// the direction that offers a refund the user may be owed rather than
+    /// withholding one they are.
+    #[serde(default)]
+    pub escrow_is_empty: bool,
     pub release: Option<TxidView>,
     pub refund: Option<TxidView>,
     /// Only set when the stage is `failed`; the page shows it as the reason.
@@ -303,6 +321,7 @@ pub fn order_view_with_journal(
             received_at: at.to_rfc3339(),
         }),
         fiat_may_have_left,
+        escrow_is_empty: order.sighting_never_confirmed && order.funding.is_none(),
         payment: order.payment.as_ref().map(|p| PaymentView {
             sent_at: p.sent_at.to_rfc3339(),
             cents: p.cents,

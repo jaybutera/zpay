@@ -203,5 +203,55 @@ for (const stage of ['failed', 'refundable', 'unpaid']) {
     `said: ${r.body.textContent.slice(0, 160)}`);
 }
 
+// 8. Review finding 2: R5-2's page half.
+//
+// The coordinator asks the chain what became of a mempool sighting that never
+// confirmed, and sends the order `Unpaid` rather than `Refundable`. Everything
+// after that sentence in R5-2 still happened on the page: the view served the
+// sighting under `funding`, the `unpaid` screen past T said the ZEC was in the
+// escrow and showed the form, the builder built a refund over an outpoint no
+// block holds, and the endpoint refused while the page said any node would
+// take the bytes.
+//
+// The view now says the sighting was disowned. The screen has to read it.
+{
+  const r = run({ stage: 'unpaid', escrow, current_height: 1004, payment: null,
+                  fiat_may_have_left: false, escrow_is_empty: true,
+                  funding: { txid: 'aa'.repeat(32), vout: 0, confirmations: 0,
+                             required: 10, mempool: true } }, true);
+  check('a disowned sighting past T does not offer the form', r.form.hidden === true,
+    `form.hidden=${r.form.hidden} body=${r.body.textContent.slice(0, 160)}`);
+  check('  and does not claim the ZEC is in the escrow',
+    !/is in the escrow/.test(r.body.textContent),
+    `said: ${r.body.textContent.slice(0, 200)}`);
+  check('  and says the funding never arrived',
+    /never (arrived|confirmed)|did not arrive/.test(r.body.textContent),
+    `said: ${r.body.textContent.slice(0, 200)}`);
+}
+
+// An ordinary unpaid order past T is untouched: nothing says its escrow is
+// empty, so the form is exactly what the user needs.
+{
+  const r = run({ stage: 'unpaid', escrow, current_height: 1004, payment: null,
+                  fiat_may_have_left: false }, true);
+  check('an unpaid order with no such flag still offers the form',
+    r.form.hidden === false, `form.hidden=${r.form.hidden}`);
+  check('  and still says the ZEC is in the escrow',
+    /is in the escrow/.test(r.body.textContent),
+    `said: ${r.body.textContent}`);
+}
+
+// Before T the disowned order says why it is waiting for nothing, rather than
+// promising a refund at T that will not be there.
+{
+  const r = run({ stage: 'unpaid', escrow, current_height: 900, payment: null,
+                  fiat_may_have_left: false, escrow_is_empty: true }, true);
+  check('before T a disowned sighting does not promise a refund',
+    r.form.hidden === true, `form.hidden=${r.form.hidden}`);
+  check('  and does not say the coins are refundable at T',
+    !/refundable at block/.test(r.body.textContent),
+    `said: ${r.body.textContent.slice(0, 200)}`);
+}
+
 console.log(`\n${failures === 0 ? 'all checks passed' : failures + ' check(s) failed'}`);
 process.exit(failures === 0 ? 0 : 1);

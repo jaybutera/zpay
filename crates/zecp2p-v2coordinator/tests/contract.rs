@@ -4731,3 +4731,146 @@ async fn one_quote_still_mints_only_one_order() {
     );
     assert_eq!(state.store.open_orders().len(), 1, "one quote, one escrow");
 }
+
+#[tokio::test]
+async fn a_sighting_is_written_off_at_t_and_not_sixty_blocks_before_it() {
+    // Follow-ups review finding 1. R5-2 was specified as one `gettxout` for the
+    // sighted outpoint at `T`, and the field's own doc says an old order is
+    // asked on its next sweep past `T`. `check_deadlines` does that - it asks
+    // inside the `may_refund_at` branch. `check_refund_deadline_only` asked
+    // before it read the head, so a finished order was asked the sweep after it
+    // went `Unpaid`, which is `pay_deadline_blocks` - sixty on mainnet - before
+    // `T`.
+    //
+    // A null answer there is made sticky: the flag is recorded, the predicate
+    // stops listing the order, and nothing asks again. A transaction still
+    // unmined at the pay deadline that confirms in the next sixty blocks is
+    // therefore written off while its coin is on the way, and the refund over
+    // the outpoint the escrow really holds is refused for want of a `funding`
+    // the branch could have recorded.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+    let state = coordinator_that_cannot_pay(dir.path(), scanner.clone(), &node, &attestor);
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+    let user = TestUser::new();
+    let (order_id, amount_zat, stored) = opened_order(&app, &state, &user).await;
+    let refund_height = u32::try_from(stored.refund_height).unwrap();
+
+    let funding_txid = [0x73u8; 32];
+    scanner.pay_mempool(
+        &stored.script_pubkey,
+        FoundOutput { txid: funding_txid, vout: 0, amount_zat },
+    );
+    zecp2p_v2coordinator::driver::advance(&state, &order_id).await.unwrap();
+    sign_it(&app, &state, &attestor, &user, &order_id).await;
+
+    // Past the pay deadline, still unmined. The order goes `Unpaid`, which is
+    // right: nobody can be paid from here. What must not happen is the sighting
+    // being written off, because `T` is still twenty blocks away and the
+    // transaction can still confirm.
+    node.set_height(refund_height - 20).await;
+    for _ in 0..3 {
+        for o in state.store.open_orders() {
+            zecp2p_v2coordinator::driver::advance(&state, &o.order_id).await.ok();
+        }
+    }
+    assert!(
+        state.store.open_orders().iter().any(|o| o.order_id == order_id),
+        "the sighting was written off before T, so nothing will ask again once \
+         the transaction confirms"
+    );
+
+    // It confirms, and the chain passes T. The coin is in the escrow.
+    node.add_utxo(funding_txid, 0, stored.script_pubkey.clone(), amount_zat, 30)
+        .await;
+    node.set_height(refund_height + 1).await;
+    for _ in 0..3 {
+        for o in state.store.open_orders() {
+            zecp2p_v2coordinator::driver::advance(&state, &o.order_id).await.ok();
+        }
+    }
+
+    let end = state.store.get(&order_id).unwrap();
+    assert_eq!(
+        end.stage,
+        Stage::Refundable,
+        "the coin is in the escrow past T and the user was not offered it"
+    );
+
+    // And the refund completes, which is the whole point of recording the
+    // outpoint rather than writing the sighting off.
+    let raw = user.sign_refund(&end, &funding_txid, 0);
+    let (status, body) = post(
+        &app,
+        &format!("/escrow/orders/{order_id}/refund"),
+        serde_json::json!({ "raw_tx": hex::encode(&raw) }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the refund over the outpoint the escrow actually holds was refused: {body}"
+    );
+}
+
+#[tokio::test]
+async fn the_view_tells_the_page_its_escrow_is_empty() {
+    // Follow-ups review finding 2: R5-2's page half. The driver half sends a
+    // sighting that never confirmed to `Unpaid` rather than `Refundable`, and
+    // everything after that sentence in R5-2 still happened on the page - the
+    // view served the sighted outpoint under `funding`, the `unpaid` screen
+    // past `T` said the ZEC was in the escrow and showed the form, and the
+    // refund built over an outpoint no block holds was refused while the page
+    // said any node would take the bytes.
+    //
+    // The outpoint stays in the view: the page needs one to sign over, and the
+    // ordinary case is a sighting that confirms. What the view now also carries
+    // is that the chain has been asked and answered null.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+    let state = coordinator_that_cannot_pay(dir.path(), scanner.clone(), &node, &attestor);
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+    let user = TestUser::new();
+    let (order_id, amount_zat, stored) = opened_order(&app, &state, &user).await;
+
+    let funding_txid = [0x74u8; 32];
+    scanner.pay_mempool(
+        &stored.script_pubkey,
+        FoundOutput { txid: funding_txid, vout: 0, amount_zat },
+    );
+    zecp2p_v2coordinator::driver::advance(&state, &order_id).await.unwrap();
+    sign_it(&app, &state, &attestor, &user, &order_id).await;
+
+    // While the sighting could still confirm, the view says nothing of the kind.
+    let (_, view) = get(&app, &format!("/escrow/orders/{order_id}")).await;
+    assert_eq!(
+        view["escrow_is_empty"], false,
+        "an escrow whose funding may still confirm was called empty: {view}"
+    );
+
+    // It expires unmined, and the chain passes T.
+    node.set_height(u32::try_from(stored.refund_height).unwrap() + 1).await;
+    for _ in 0..3 {
+        for o in state.store.open_orders() {
+            zecp2p_v2coordinator::driver::advance(&state, &o.order_id).await.ok();
+        }
+    }
+
+    let (_, view) = get(&app, &format!("/escrow/orders/{order_id}")).await;
+    assert_eq!(view["stage"], "unpaid", "{view}");
+    assert_eq!(
+        view["escrow_is_empty"], true,
+        "the chain said nothing is in this escrow and the page was not told, so it \
+         offers a refund over an outpoint no block holds: {view}"
+    );
+    // The outpoint is still served: the page needs one to sign over, and the
+    // page's own record is the fallback if it were dropped.
+    assert!(
+        view["funding"].is_object(),
+        "the sighted outpoint was dropped from the view: {view}"
+    );
+}
