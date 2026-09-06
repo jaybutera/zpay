@@ -307,6 +307,50 @@ enum Commands {
         assume_presigned: bool,
     },
 
+    /// Retire a stuck `needs_operator` fill after reading the Venmo feed.
+    ///
+    /// The exit the journal did not have. A fiat leg that fails writes
+    /// `needs_operator`, which holds the single payment slot against both
+    /// daemons, and nothing automatic ever clears it: the states past it are
+    /// only reached by the same fill making progress, and a fill the rail
+    /// refused never will. On 2026-09-06 one refused payment held the ZEC rail
+    /// for the 22 hours until its escrow's refund height.
+    ///
+    /// This releases the slot and records who released it. It does **not**
+    /// touch the order store, so it cannot declare a trade settled, and it
+    /// refuses any line that is not currently `needs_operator` - a `paying`
+    /// line belongs to whichever process is driving the browser right now.
+    ///
+    /// Run `rails` first: it prints the work id and what the fill was doing.
+    ResolveFill {
+        /// The work id, exactly as `rails` prints it (e.g. `zec:<txid>:0`).
+        #[arg(long)]
+        work: String,
+
+        /// Who is making this call. A name, a handle, an email - whatever can
+        /// be matched to a person when somebody asks about it later.
+        #[arg(long)]
+        operator: String,
+
+        /// What the Venmo feed showed: the balance, the entries found or not
+        /// found, a transaction id. This is the basis for releasing the slot,
+        /// so it is required and it is kept verbatim.
+        #[arg(long)]
+        evidence: String,
+
+        /// The feed showed the payment: the dollars are gone.
+        ///
+        /// Without this the record says no payment was sent. The two are kept
+        /// apart because they mean opposite things for the escrow, and neither
+        /// is inferred from the other.
+        #[arg(long)]
+        payment_was_sent: bool,
+
+        /// Print what would be written and stop.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Report an intent's terms as the daemon reads them, and stop.
     ///
     /// Touches no cookie and sends nothing. Useful for checking what the
@@ -371,6 +415,22 @@ async fn main() -> Result<()> {
     }
     if let Commands::ZecWatch { .. } = &cli.command {
         return run_zec_watch(&config, &cli.command).await;
+    }
+
+    // Retiring a stuck fill needs no key and touches no chain: it is one
+    // append to the journal. It deliberately runs before the provider is
+    // built, because the situation it exists for is a coordinator that cannot
+    // pay - and an operator clearing that block should not also need a funded
+    // signer to do it.
+    if let Commands::ResolveFill {
+        work,
+        operator,
+        evidence,
+        payment_was_sent,
+        dry_run,
+    } = &cli.command
+    {
+        return run_resolve_fill(&config, work, operator, evidence, *payment_was_sent, *dry_run);
     }
 
     if let Commands::FindPayment {
@@ -455,7 +515,8 @@ async fn main() -> Result<()> {
         | Commands::TestPay { .. }
         | Commands::FindPayment { .. }
         | Commands::Rails { .. }
-        | Commands::ZecWatch { .. } => {
+        | Commands::ZecWatch { .. }
+        | Commands::ResolveFill { .. } => {
             unreachable!("handled above")
         }
 
@@ -542,6 +603,115 @@ async fn main() -> Result<()> {
         }
 
         Commands::Terms { .. } | Commands::Attest { .. } => unreachable!("handled above"),
+    }
+
+    Ok(())
+}
+
+/// Retire a `needs_operator` fill after a human has read the Venmo feed.
+///
+/// The command the 2026-09-06 incident needed and did not have. One refused
+/// fiat leg wrote `needs_operator`, that line held the single payment slot
+/// against both daemons, and the only exits were the escrow's refund height or
+/// editing the journal by hand. Editing by hand is what this replaces: it is
+/// the same append, taken under the journal's own lock, checked against the
+/// state it is allowed to write over, and stamped with who did it.
+///
+/// Deliberately narrow. It releases the slot and records the operator's
+/// finding; it does not move an order's stage, cancel an intent, broadcast a
+/// refund or attest a payment. Each of those is a decision about somebody's
+/// money and each has its own command with its own evidence.
+fn run_resolve_fill(
+    config: &TakerConfig,
+    work: &str,
+    operator: &str,
+    evidence: &str,
+    payment_was_sent: bool,
+    dry_run: bool,
+) -> Result<()> {
+    use zecp2p_taker::auto::journal::{Finding, Resolution};
+
+    let journal = Journal::open(config.taker.journal_path())?;
+    let latest = journal.latest()?;
+
+    // Matched on the printed form, which is what `rails` shows and what an
+    // operator has in front of them. Anything else would ask them to
+    // reconstruct a key from its parts while under time pressure.
+    let Some(record) = latest.iter().find(|r| r.work_id().to_string() == work) else {
+        println!("no fill in the journal is called {work}.");
+        println!();
+        if latest.is_empty() {
+            println!("the journal at {} is empty.", config.taker.journal_path());
+        } else {
+            println!("the journal holds:");
+            for r in &latest {
+                println!("  {:<40} {:?}", r.work_id().to_string(), r.state);
+            }
+        }
+        anyhow::bail!("nothing to retire");
+    };
+
+    let finding = if payment_was_sent {
+        Finding::PaymentWasSent
+    } else {
+        Finding::NoPaymentWasSent
+    };
+
+    println!("fill      : {}", record.work_id());
+    println!("state     : {:?}", record.state);
+    println!("recipient : @{}", record.recipient);
+    println!("amount    : {} (6-decimal USD units)", record.amount);
+    if let Some(paid) = &record.paid {
+        println!("paid      : ${paid}");
+    }
+    if let Some(note) = &record.note {
+        println!("note      : {note}");
+    }
+    println!("last write: {}", record.updated_at);
+    println!();
+    println!("operator  : {operator}");
+    println!("evidence  : {evidence}");
+    println!("finding   : {}", finding.as_str());
+    println!();
+
+    if dry_run {
+        println!("--dry-run: nothing written. The journal is unchanged and the slot is still held.");
+        return Ok(());
+    }
+
+    // The finding is the operator's, and the two answers have opposite
+    // consequences, so the one that says money left is stated back before it is
+    // written. Nothing here acts on it - the escrow's recovery is a separate
+    // decision - but a record saying the dollars are gone is not a thing to
+    // write past without reading.
+    if payment_was_sent {
+        println!(
+            "recording that the payment WAS sent. This releases the slot and nothing else: \n\
+             it does not attest the payment, and it does not release the escrow. If this \n\
+             fill's escrow is still recoverable, that is a separate step and it has a \n\
+             deadline."
+        );
+        println!();
+    }
+
+    let written = journal
+        .resolve_needs_operator(record, Resolution {
+            operator: operator.to_string(),
+            feed_evidence: evidence.to_string(),
+            finding,
+            resolved_at: chrono::Utc::now(),
+        })
+        .context("could not retire this fill")?;
+
+    println!("retired {} as {:?}.", written.work_id(), written.state);
+
+    match journal.in_flight()? {
+        Some(holder) => println!(
+            "the payment slot is still held by {} ({:?}).",
+            holder.describe(),
+            holder.state
+        ),
+        None => println!("the payment slot is free; either rail may start work."),
     }
 
     Ok(())

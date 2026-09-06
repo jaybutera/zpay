@@ -75,6 +75,22 @@ pub enum FillState {
     Cancelled,
     /// Stopped and handed to a human, with the reason recorded.
     NeedsOperator,
+    /// A human read the Venmo feed and retired a [`FillState::NeedsOperator`]
+    /// line, releasing the slot.
+    ///
+    /// Deliberately not `Cancelled`. That state is a machine's claim that
+    /// nothing was sent, reached only through a compare-and-set on a
+    /// pre-payment line; this one is a person's judgement about an ambiguous
+    /// one, and the two must not be readable as the same fact. A journal that
+    /// collapsed them would let "somebody looked" pass for "the code proved
+    /// it", which is the whole thing an operator override has to stay
+    /// distinguishable from.
+    ///
+    /// It closes the fill for slot purposes and for nothing else. The order
+    /// store is not touched: a resolved line says the payment question is
+    /// settled, never that the trade completed. See
+    /// [`Journal::resolve_needs_operator`].
+    Resolved,
 }
 
 impl FillState {
@@ -82,7 +98,7 @@ impl FillState {
     pub fn is_open(self) -> bool {
         !matches!(
             self,
-            FillState::Fulfilled | FillState::Cancelled
+            FillState::Fulfilled | FillState::Cancelled | FillState::Resolved
         )
     }
 
@@ -135,7 +151,66 @@ pub struct FillRecord {
     pub paid: Option<String>,
     #[serde(default)]
     pub note: Option<String>,
+    /// Who retired this line, what they saw, and when.
+    ///
+    /// Set only by [`Journal::resolve_needs_operator`] and never by any
+    /// automatic path. Its own field rather than prose in `note`, because a
+    /// note is free text several writers append to and the one thing an
+    /// override must not lose is the evidence behind it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<Resolution>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// A person's account of why a stuck fill could be retired.
+///
+/// The audit trail an operator override leaves behind. Every field is required
+/// because the point of the record is that somebody can be asked about it
+/// later: an override with no name on it and no statement of what was read is
+/// indistinguishable from the daemon having quietly cleared its own block,
+/// which is the thing this must never be mistaken for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Resolution {
+    /// Who made the call. Whatever the operator gives - a name, an email, a
+    /// handle - kept verbatim so it can be matched against a person.
+    pub operator: String,
+    /// What the Venmo feed showed. The evidence, in the operator's words: the
+    /// balance they read, the entries they found or did not find, a
+    /// transaction id.
+    pub feed_evidence: String,
+    /// What they concluded about the money.
+    pub finding: Finding,
+    /// When they recorded it, which is not when they looked. The gap between
+    /// this and the `NeedsOperator` line's own `updated_at` is how long the
+    /// slot was held.
+    pub resolved_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// What the operator found in the feed.
+///
+/// The two answers have different consequences for the escrow, so the record
+/// states which one was reached rather than leaving it to be inferred from
+/// prose. A resolution says the *slot* may be released either way; it never
+/// says the trade completed, and neither variant moves the order store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Finding {
+    /// The feed shows no payment for this fill. The dollars are still in the
+    /// account and the escrow refunds to the user at `T`.
+    NoPaymentWasSent,
+    /// The feed shows the payment. The dollars are gone, and the escrow is the
+    /// LP's to recover through an attestation - which this does not perform and
+    /// does not stand in for.
+    PaymentWasSent,
+}
+
+impl Finding {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Finding::NoPaymentWasSent => "no payment was sent",
+            Finding::PaymentWasSent => "the payment was sent",
+        }
+    }
 }
 
 fn default_rail() -> Rail {
@@ -158,6 +233,7 @@ impl FillRecord {
             recipient,
             paid: None,
             note: None,
+            resolution: None,
             updated_at: chrono::Utc::now(),
         }
     }
@@ -188,6 +264,7 @@ impl FillRecord {
             recipient,
             paid: None,
             note: None,
+            resolution: None,
             updated_at: chrono::Utc::now(),
         }
     }
@@ -257,6 +334,29 @@ pub fn may_already_have_paid(state: FillState) -> bool {
             | FillState::Paid
             | FillState::NeedsOperator
     )
+}
+
+/// The same question asked of a whole record rather than a bare state.
+///
+/// `Resolved` is why this exists. The state alone cannot answer it: an operator
+/// retires a `NeedsOperator` line either way, and the two findings mean
+/// opposite things about the dollars. Read as a state, `Resolved` is closed and
+/// therefore not `may_already_have_paid` - which is right when the feed showed
+/// nothing and **wrong** when it showed the payment, because the caller that
+/// asks this hardest is the refund endpoint, and a refund broadcast against a
+/// payment that already left races the LP's release for money the user has been
+/// paid.
+///
+/// So the finding is read. Everything else defers to
+/// [`may_already_have_paid`], so the rule stays in one place for every state
+/// that carries no operator judgement.
+pub fn record_may_already_have_paid(record: &FillRecord) -> bool {
+    if let Some(resolution) = &record.resolution {
+        if record.state == FillState::Resolved {
+            return matches!(resolution.finding, Finding::PaymentWasSent);
+        }
+    }
+    may_already_have_paid(record.state)
 }
 
 /// Whether an own open line may be displaced by a fresh attempt at the same
@@ -1121,6 +1221,139 @@ impl Journal {
             }
         }
         Ok(flagged.into_values().collect())
+    }
+
+    /// Retires a `NeedsOperator` line after a human has read the Venmo feed.
+    ///
+    /// The exit the journal did not have. Every other way out of
+    /// `NeedsOperator` is automatic and none of them fires: `record_outcome`
+    /// only writes over it when the *same* fill reaches a later state, and a
+    /// fill the rail refused never will. So one refused fiat leg held the
+    /// single payment slot until the escrow's refund height - 22 hours on
+    /// 2026-09-06 - with no command to clear it and nothing safe to do by hand.
+    ///
+    /// What this is allowed to do, and what it is not:
+    ///
+    /// - It writes `Resolved` **only over a line that is currently
+    ///   `NeedsOperator`**, checked under the same lock as the write. Not over
+    ///   `Paying`, which is a payment in flight right now and belongs to
+    ///   whichever process is driving the browser; not over `Paid`, which is an
+    ///   attestation this operator has not performed; not over a line already
+    ///   closed. An operator arriving at a fill the daemon has since moved on
+    ///   gets a refusal naming the state, which is the correct answer - the
+    ///   thing they read the feed about is no longer the thing in the journal.
+    ///
+    /// - It records who said so and what they saw, in [`Resolution`], and
+    ///   refuses to write without both. An override whose evidence is empty is
+    ///   not an override, it is a `rm` with extra steps.
+    ///
+    /// - It **does not touch the order store.** The slot is a claim on one
+    ///   Venmo balance; the order's stage is a claim about an escrow. A command
+    ///   that wrote both would let an operator clearing a block also declare a
+    ///   trade settled, and the second is the one that moves somebody's coin.
+    ///   An order that needs its stage changed gets that through the
+    ///   coordinator, on its own evidence.
+    ///
+    /// The compare-and-set is on the whole `NeedsOperator` line's state and
+    /// timestamp, so a daemon that wrote a *new* `NeedsOperator` between the
+    /// operator reading the journal and running this is not overwritten
+    /// silently either: `held` is the record they were shown.
+    pub fn resolve_needs_operator(
+        &self,
+        held: &FillRecord,
+        resolution: Resolution,
+    ) -> Result<FillRecord> {
+        if resolution.operator.trim().is_empty() {
+            anyhow::bail!(
+                "refusing to retire a stuck fill with no operator name on it. This record is \
+                 what somebody is asked about later, and an anonymous one answers nothing."
+            );
+        }
+        if resolution.feed_evidence.trim().is_empty() {
+            anyhow::bail!(
+                "refusing to retire a stuck fill with no feed evidence. The whole basis for \
+                 releasing the slot is that a human read the Venmo feed; say what it showed."
+            );
+        }
+
+        let work = held.work_id();
+        let mut refused = None;
+        let written = self.claim_if(|existing| {
+            let Some(latest) = existing.iter().find(|r| r.work_id() == work) else {
+                refused = Some(format!(
+                    "the journal has no line for {work}, so there is nothing to retire. \
+                     Resolving work the journal has never seen would open a fill through \
+                     the back door."
+                ));
+                return None;
+            };
+            if latest.state != FillState::NeedsOperator {
+                refused = Some(format!(
+                    "{work} is {:?}, not NeedsOperator. Only a line handed to a human may \
+                     be retired by one: {:?} is either a fill somebody is driving right \
+                     now or one that is already closed, and writing over it would take a \
+                     payment out of the record.",
+                    latest.state, latest.state
+                ));
+                return None;
+            }
+            if latest.updated_at != held.updated_at {
+                refused = Some(format!(
+                    "{work} has been written again since the line you were shown \
+                     ({} then, {} now). Read it again before retiring it: the daemon has \
+                     recorded something about this fill in the meantime.",
+                    held.updated_at, latest.updated_at
+                ));
+                return None;
+            }
+
+            let mut resolved = latest.clone();
+            resolved.state = FillState::Resolved;
+            // Kept alongside the previous note rather than replacing it: the
+            // reason the fill stopped is half of what the next reader needs,
+            // and the operator's account is the other half.
+            resolved.note = Some(match &latest.note {
+                Some(existing) => format!(
+                    "{existing} [retired by {}: {}]",
+                    resolution.operator,
+                    resolution.finding.as_str()
+                ),
+                None => format!(
+                    "[retired by {}: {}]",
+                    resolution.operator,
+                    resolution.finding.as_str()
+                ),
+            });
+            resolved.resolution = Some(resolution.clone());
+            Some(resolved)
+        })?;
+
+        match (written, refused) {
+            (Some(record), _) => Ok(record),
+            (None, Some(why)) => anyhow::bail!("{why}"),
+            (None, None) => anyhow::bail!("the stuck fill could not be retired"),
+        }
+    }
+
+    /// Every fill a human has retired, newest write last.
+    ///
+    /// The audit trail, read back. Every line rather than `latest`, for the
+    /// same reason [`Self::uncancelled_intents`] reads every line: an override
+    /// is a fact about what a person did, and a later write for the same work
+    /// must not be able to erase it from the record.
+    pub fn resolutions(&self) -> Result<Vec<FillRecord>> {
+        let contents = match std::fs::read_to_string(&self.path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => {
+                return Err(e).with_context(|| format!("could not read {}", self.path.display()))
+            }
+        };
+        Ok(contents
+            .lines()
+            .filter_map(|line| serde_json::from_str::<FillRecord>(line).ok())
+            .filter(|r| r.resolution.is_some())
+            .collect())
     }
 
     /// Every open fill, whatever state it is in.

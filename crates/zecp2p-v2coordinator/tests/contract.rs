@@ -4874,3 +4874,221 @@ async fn the_view_tells_the_page_its_escrow_is_empty() {
         "the sighted outpoint was dropped from the view: {view}"
     );
 }
+
+#[tokio::test]
+async fn a_refusal_before_the_form_was_filled_ends_the_order_unpaid_and_frees_the_slot() {
+    // The 2026-09-06 incident, driven through the real coordinator.
+    //
+    // Order `esc_c30ec31ce82148d6b7e3bbd2` reached `Locked`, its `Paying` line
+    // went down, and the recipient guard refused one second later - before an
+    // amount was typed. The driver could not tell that from a browser dying
+    // mid-click, so it wrote `NeedsOperator` and failed the order, and that
+    // line held the single payment slot until the escrow's refund height about
+    // 22 hours away.
+    //
+    // The guard runs before the first `Fill`, so it can prove the dollars did
+    // not move. That proof has to reach the journal.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+    let state = coordinator_with_fiat(
+        dir.path(),
+        scanner.clone(),
+        &node,
+        &attestor,
+        Arc::new(RefusesBeforeFillingRail),
+    );
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+    let user = TestUser::new();
+
+    let (order_id, funding_txid) =
+        locked_order(&app, &state, &node, &scanner, &attestor, &user).await;
+
+    for _ in 0..2 {
+        zecp2p_v2coordinator::driver::advance(&state, &order_id).await.ok();
+    }
+
+    let after = state.store.get(&order_id).unwrap();
+    assert_eq!(
+        after.stage,
+        Stage::Unpaid,
+        "a refusal that proves no money moved must not park the order in `Failed`, \
+         which is the stage that means a human has to read the feed: got {:?}",
+        after.stage
+    );
+    assert!(
+        after.payment.is_none(),
+        "nothing was sent, so no payment may be recorded"
+    );
+    assert!(
+        after
+            .reason
+            .as_deref()
+            .is_some_and(|r| r.contains("before anything was typed")),
+        "the operator still needs to know why the rail would not pay: {:?}",
+        after.reason
+    );
+
+    // The slot is what the incident actually cost. Nothing may be holding it.
+    assert!(
+        state.journal.in_flight().unwrap().is_none(),
+        "the payment slot is still held after a refusal that moved no money: {:?}",
+        state.journal.in_flight().unwrap()
+    );
+    assert!(
+        state.journal.needs_operator().unwrap().is_empty(),
+        "no human has anything to read here: nothing was typed and nothing was clicked"
+    );
+
+    // And the journal says so in its own terms rather than by being empty.
+    let work = zecp2p_v2coordinator::slot::work_id_for(&funding_txid, 0);
+    let line = state
+        .journal
+        .latest()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.work_id() == work)
+        .expect("the fill is still recorded; it is closed, not erased");
+    assert_eq!(line.state, zecp2p_taker::auto::journal::FillState::Cancelled);
+    assert!(
+        !zecp2p_v2coordinator::slot::fiat_may_have_left(&state.journal, &work).unwrap(),
+        "nothing stands between the user and their refund"
+    );
+}
+
+#[tokio::test]
+async fn an_order_refused_before_the_form_still_reaches_its_refund() {
+    // `Unpaid` is terminal for the trade and not for the user's coin. The
+    // escrow is funded, untouched, and the timeout branch still pays out at
+    // `T`, so the sweep has to carry this order to `Refundable` like any other
+    // unpaid one - otherwise the fix trades a held slot for a stranded escrow,
+    // which is the worse of the two.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+    let state = coordinator_with_fiat(
+        dir.path(),
+        scanner.clone(),
+        &node,
+        &attestor,
+        Arc::new(RefusesBeforeFillingRail),
+    );
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+    let user = TestUser::new();
+
+    let (order_id, _) = locked_order(&app, &state, &node, &scanner, &attestor, &user).await;
+    for _ in 0..2 {
+        zecp2p_v2coordinator::driver::advance(&state, &order_id).await.ok();
+    }
+    assert_eq!(state.store.get(&order_id).unwrap().stage, Stage::Unpaid);
+
+    // Past `T`.
+    let stored = state.store.get(&order_id).unwrap();
+    node.set_height(u32::try_from(stored.refund_height).unwrap() + 1)
+        .await;
+    for _ in 0..3 {
+        zecp2p_v2coordinator::driver::advance(&state, &order_id).await.ok();
+    }
+
+    let end = state.store.get(&order_id).unwrap();
+    assert_eq!(
+        end.stage,
+        Stage::Refundable,
+        "an order nobody paid must reach the user's refund form, got {:?}",
+        end.stage
+    );
+}
+
+#[tokio::test]
+async fn an_ambiguous_pay_failure_still_parks_for_an_operator() {
+    // The control. `PayErrorsRail` dies inside the drive with no statement
+    // about how far it got, and that case must be untouched by this change: the
+    // journal claim stands, the order fails, and a human reads the feed. If
+    // both rails ended `Unpaid` the change would have made the coordinator
+    // cheerful about ambiguity, which is the failure mode that wrote `paid` for
+    // $2.01 that never moved.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+    let state = coordinator_with_fiat(
+        dir.path(),
+        scanner.clone(),
+        &node,
+        &attestor,
+        Arc::new(PayErrorsRail),
+    );
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+    let user = TestUser::new();
+
+    let (order_id, _) = locked_order(&app, &state, &node, &scanner, &attestor, &user).await;
+    for _ in 0..2 {
+        zecp2p_v2coordinator::driver::advance(&state, &order_id).await.ok();
+    }
+
+    assert_eq!(state.store.get(&order_id).unwrap().stage, Stage::Failed);
+    assert!(
+        !state.journal.needs_operator().unwrap().is_empty(),
+        "an ambiguous failure must still reach a human"
+    );
+}
+
+#[tokio::test]
+async fn baseline_a_parked_order_starves_every_later_one() {
+    // Establishes what is actually broken, before anything is built to fix it.
+    //
+    // One order's fiat leg fails ambiguously and parks at `needs_operator`.
+    // A second, unrelated order then funds, confirms and locks - intake is not
+    // closed, and this asserts that - but it can never be paid, because
+    // `needs_operator` is an open journal line and every open line holds the
+    // one payment slot against everybody else.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+    let state = coordinator_with_fiat(
+        dir.path(),
+        scanner.clone(),
+        &node,
+        &attestor,
+        Arc::new(PayErrorsRail),
+    );
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+    let user = TestUser::new();
+
+    // The order that parks.
+    let (parked, _) =
+        locked_order_for(&app, &state, &node, &scanner, &attestor, &user, "0.05").await;
+    for _ in 0..2 {
+        zecp2p_v2coordinator::driver::advance(&state, &parked).await.ok();
+    }
+    assert_eq!(state.store.get(&parked).unwrap().stage, Stage::Failed);
+    assert_eq!(
+        state.journal.needs_operator().unwrap().len(),
+        1,
+        "the parked order must be holding the slot for this test to mean anything"
+    );
+
+    // A later order, at a different amount so the duplicate guard is not what
+    // stops it. Intake is open: it is accepted, funded and locked.
+    let (later, _) =
+        locked_order_for(&app, &state, &node, &scanner, &attestor, &user, "0.07").await;
+    assert_eq!(
+        state.store.get(&later).unwrap().stage,
+        Stage::Locked,
+        "intake and the escrow legs are not what the parked order blocks"
+    );
+
+    // And now it starves. Not refused, not failed - it simply never pays.
+    for _ in 0..5 {
+        zecp2p_v2coordinator::driver::advance(&state, &later).await.ok();
+    }
+    assert_eq!(
+        state.store.get(&later).unwrap().stage,
+        Stage::Locked,
+        "this is the bug: an unrelated order sits at `locked` behind somebody \
+         else's parked fill, with no way through until a human intervenes"
+    );
+}

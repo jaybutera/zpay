@@ -140,6 +140,15 @@ pub fn next(context: &Context) -> Step {
 
         FillState::Fulfilled | FillState::Cancelled => Step::Done,
 
+        // A human read the feed and retired this line. There is nothing left
+        // for the pipeline to drive: the operator either found no payment, in
+        // which case the escrow refunds at `T`, or found one, in which case
+        // recovering it is a decision they took with the evidence in front of
+        // them and not something to restart automatically here. Resuming a fill
+        // an operator deliberately closed is how an override becomes a second
+        // payment.
+        FillState::Resolved => Step::Done,
+
         FillState::Seen | FillState::Signalling => {
             if context.other_in_flight {
                 return Step::Halt(
@@ -393,6 +402,9 @@ mod tests {
     fn a_finished_fill_is_done() {
         assert_eq!(next(&context(FillState::Fulfilled, Approval::Auto)), Step::Done);
         assert_eq!(next(&context(FillState::Cancelled, Approval::Auto)), Step::Done);
+        // An operator retired this line after reading the feed. Picking it back
+        // up is how an override becomes a second payment.
+        assert_eq!(next(&context(FillState::Resolved, Approval::Auto)), Step::Done);
     }
 
     /// Both corrections from the live fill are carried, and the rate is the

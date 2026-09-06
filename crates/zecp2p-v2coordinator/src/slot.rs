@@ -44,7 +44,11 @@ use zecp2p_taker::auto::rail::WorkId;
 // an own-work guard in round 5 that the taker did not get until round 6, and
 // the taker's `Signalled` case was missing from this one. Two daemons sharing
 // one Venmo balance need one definition of "may I pay".
-use zecp2p_taker::auto::journal::may_already_have_paid;
+//
+// The record form rather than the bare-state one: an operator-retired line
+// carries a human's finding about the dollars, and a state alone cannot report
+// it. The refund endpoint is the caller that must not get this wrong.
+use zecp2p_taker::auto::journal::record_may_already_have_paid;
 
 /// Why a payment may not start.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,7 +121,7 @@ pub fn fiat_may_have_left(journal: &Journal, work: &WorkId) -> Result<bool> {
 pub fn fiat_may_have_left_in(latest: &[FillRecord], work: &WorkId) -> bool {
     latest
         .iter()
-        .any(|r| &r.work_id() == work && may_already_have_paid(r.state))
+        .any(|r| &r.work_id() == work && record_may_already_have_paid(r))
 }
 
 /// Takes the slot, deciding and claiming under one file lock.

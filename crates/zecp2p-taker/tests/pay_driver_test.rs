@@ -21,7 +21,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
 
-use zecp2p_taker::venmo::{PaymentRequest, SendMode, Unconfirmed, VenmoBrowser};
+use zecp2p_taker::venmo::{NothingWasSent, PaymentRequest, SendMode, Unconfirmed, VenmoBrowser};
 
 /// How the fake page answers the confirmation step.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -670,5 +670,111 @@ async fn a_payee_that_resolves_to_another_account_is_refused() {
             .iter()
             .any(|e| e.contains("location.href =")),
         "a payee resolving to someone else must not open a pay page"
+    );
+}
+
+/// Every refusal that happens before the form is filled says so in its type.
+///
+/// The 2026-09-06 incident, from the coordinator's side. The recipient guard
+/// refused `esc_c30ec31ce82148d6b7e3bbd2` one second after the journal's
+/// `Paying` line went down, and the caller could not tell that refusal apart
+/// from a browser that died mid-click. So it recorded `NeedsOperator`, which
+/// held the single payment slot for the ~22 hours until the escrow's refund
+/// height - for a payment the guard's own position in the step list proves was
+/// never attempted.
+///
+/// A string match on the error would be a second copy of that reasoning, and
+/// the wrong copy the first time somebody rewords a message. The claim is
+/// structural instead: `pay` wraps errors only while it has not executed a
+/// `Fill`, so the type is the proof.
+#[tokio::test]
+async fn a_refusal_before_the_form_is_filled_reports_that_nothing_was_sent() {
+    for confirmation in [
+        Confirmation::WrongPayeeOnThePage,
+        Confirmation::PayeeDoesNotResolve,
+        Confirmation::PayeeResolvesToSomeoneElse,
+    ] {
+        let fake = FakeBrowser::start(confirmation).await;
+        let browser = VenmoBrowser::new(fake.cdp_url(), 5);
+        let tab = browser.find_venmo_tab().await.expect("the fake tab");
+
+        let error = browser
+            .pay(&tab, &request(), SendMode::Live)
+            .await
+            .expect_err("this payee must stop the payment");
+
+        assert!(
+            error.downcast_ref::<NothingWasSent>().is_some(),
+            "a refusal before the form was filled must be typed as one, so the caller can \
+             free the payment slot instead of parking the rail: {error:#}"
+        );
+
+        // And the type's claim is true of the page: nothing typed, nothing
+        // clicked. Asserted here as well as in the per-case tests, because it
+        // is what makes the type honest rather than merely convenient.
+        assert!(
+            !fake.evaluated().iter().any(|e| e.contains("_valueTracker")),
+            "nothing may be filled in"
+        );
+        assert!(
+            !fake.evaluated().iter().any(|e| e.contains(".click()")),
+            "nothing may be clicked"
+        );
+    }
+}
+
+/// The other half, and the one that keeps the first honest.
+///
+/// A failure *after* the form was filled stays ambiguous. `Unconfirmed` is the
+/// stale-page case: both clicks went in and the page never showed the payment
+/// posting, so the money may or may not have left. If that could come back as
+/// `NothingWasSent` the coordinator would free the slot and let the next order
+/// pay into an unreconciled feed, which is worse than the stall this change
+/// exists to fix.
+#[tokio::test]
+async fn a_failure_after_the_click_is_never_reported_as_nothing_sent() {
+    let fake = FakeBrowser::start(Confirmation::SheetStillUp).await;
+    let browser = VenmoBrowser::new(fake.cdp_url(), 5);
+    let tab = browser.find_venmo_tab().await.expect("the fake tab");
+
+    let error = browser
+        .pay(&tab, &request(), SendMode::Live)
+        .await
+        .expect_err("an unconfirmed send must not report success");
+
+    assert!(
+        error.downcast_ref::<Unconfirmed>().is_some(),
+        "this is the ambiguous case and must stay ambiguous: {error:#}"
+    );
+    assert!(
+        error.downcast_ref::<NothingWasSent>().is_none(),
+        "a failure past the click must never claim no money moved: {error:#}"
+    );
+}
+
+/// A sheet left open by an earlier drive is refused, and it is refused *after*
+/// the form was filled in.
+///
+/// `RequireNoOpenSheet` sits between the amount readback and the first click,
+/// so by then this drive has typed an amount and a note into the page. Nothing
+/// has been clicked, but the honest answer is still the ambiguous one: the
+/// sheet that is standing there was opened by something, and this run does not
+/// know by what. The boundary is the first `Fill` rather than the first click
+/// precisely so this case falls on the cautious side.
+#[tokio::test]
+async fn a_pre_existing_sheet_is_not_reported_as_nothing_sent() {
+    let fake = FakeBrowser::start(Confirmation::SheetOpenBeforeWeClicked).await;
+    let browser = VenmoBrowser::new(fake.cdp_url(), 5);
+    let tab = browser.find_venmo_tab().await.expect("the fake tab");
+
+    let error = browser
+        .pay(&tab, &request(), SendMode::Live)
+        .await
+        .expect_err("a pre-existing sheet must stop the payment");
+
+    assert!(
+        error.downcast_ref::<NothingWasSent>().is_none(),
+        "the form was already filled in by this drive, so this is not a provable \
+         no-payment: {error:#}"
     );
 }

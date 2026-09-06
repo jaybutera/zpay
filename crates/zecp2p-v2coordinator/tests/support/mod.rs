@@ -440,6 +440,41 @@ impl FiatRail for PayErrorsRail {
     }
 }
 
+/// A rail that gets past preflight and then refuses before filling the form.
+///
+/// The 2026-09-06 shape. `preflight` passes - the session is good, the browser
+/// is up - and the refusal comes from a guard that runs before an amount is
+/// typed: the payee does not resolve, or the loaded page names somebody else.
+/// The distinction from [`PayErrorsRail`] is the whole point of the change: the
+/// browser reached a decision rather than dying in the middle of one, so the
+/// dollars are provably still in the account.
+pub struct RefusesBeforeFillingRail;
+
+#[async_trait::async_trait]
+impl FiatRail for RefusesBeforeFillingRail {
+    async fn preflight(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn pay(&self, leg: &zecp2p_taker::auto::rail::FiatLeg) -> anyhow::Result<PaidFiat> {
+        // The real type the real rail produces, not a look-alike: the driver
+        // downcasts to it, so a test that bailed with a similar message would
+        // pass while the production path took the other branch.
+        Err(anyhow::Error::from(zecp2p_taker::venmo::NothingWasSent {
+            recipient: leg.recipient.clone(),
+            amount: leg.payment.to_venmo_string(),
+            why: "the pay page does not name @jay-butera; it renders @Jay-Butera-2".into(),
+        }))
+    }
+
+    async fn attest(
+        &self,
+        _leg: &zecp2p_taker::auto::rail::FiatLeg,
+    ) -> anyhow::Result<zecp2p_escrow::lp_client::WireAttestation> {
+        anyhow::bail!("nothing to attest")
+    }
+}
+
 /// A coordinator whose rail cannot pay at all.
 pub fn coordinator_that_cannot_pay(
     dir: &std::path::Path,

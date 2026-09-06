@@ -172,6 +172,49 @@ impl std::fmt::Display for Unconfirmed {
 
 impl std::error::Error for Unconfirmed {}
 
+/// A payment that stopped before the form was ever filled in.
+///
+/// The other side of [`Unconfirmed`]. That type exists because a click with no
+/// posted payment behind it is genuinely ambiguous; this one exists because the
+/// steps that run *before* the first [`PaymentStep::Fill`] are not ambiguous at
+/// all. They navigate, wait for a form, and read who the page is bound to.
+/// None of them types a character, none of them clicks anything, and Venmo has
+/// no way to send money nobody asked it to send.
+///
+/// So a failure there is a refusal, and the escrow behind it never had a
+/// payment attempted against it. Recording that as "a payment may have left"
+/// costs a full refund window: on 2026-09-06 order
+/// `esc_c30ec31ce82148d6b7e3bbd2` was refused by the recipient guard one second
+/// after its `Paying` line went down, with the Venmo balance unchanged at
+/// $60.49 either side, and the resulting `NeedsOperator` held the single
+/// payment slot for the ~22 hours until the escrow's refund height.
+///
+/// The proof is structural rather than textual. [`VenmoBrowser::pay`] tracks
+/// whether it has executed a `Fill` yet, and only wraps errors from before the
+/// first one. A caller therefore cannot get this type for a failure that
+/// happened after the form was touched, whatever the error says.
+#[derive(Debug)]
+pub struct NothingWasSent {
+    /// Who the order meant to pay, for the operator reading the log.
+    pub recipient: String,
+    pub amount: String,
+    /// Which step refused, in its own words.
+    pub why: String,
+}
+
+impl std::fmt::Display for NothingWasSent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the ${} payment to @{} was refused before the form was filled in: {}. \
+             No amount was typed and no button was clicked, so no money moved.",
+            self.amount, self.recipient, self.why
+        )
+    }
+}
+
+impl std::error::Error for NothingWasSent {}
+
 /// What happened when we tried.
 #[derive(Debug, Clone)]
 pub enum PaymentOutcome {
@@ -718,15 +761,22 @@ impl VenmoBrowser {
         // pay page cannot answer it: it renders the recipient as a display
         // name, and the only `@handle` on it is the logged-in account's own.
         // The 2026-09-06 writeup is the measurement.
+        // A failure here is `NothingWasSent` by construction: the browser has
+        // not been pointed at a pay page yet, so there is not even a form to
+        // fill in. This is also the step the 2026-09-06 recipient fix added,
+        // and the step that refuses a handle Venmo resolves to somebody else.
         let payee = self
             .resolve_payee(tab, &req.recipient)
             .await
-            .with_context(|| {
-                format!(
-                    "could not establish who @{} is, so nothing was navigated to \
-                     and no money moved",
-                    req.recipient
-                )
+            .map_err(|e| {
+                anyhow::Error::from(NothingWasSent {
+                    recipient: req.recipient.clone(),
+                    amount: req.amount.clone(),
+                    why: format!(
+                        "could not establish who @{} is, so nothing was navigated to: {e:#}",
+                        req.recipient
+                    ),
+                })
             })?;
 
         tracing::info!(
@@ -738,6 +788,21 @@ impl VenmoBrowser {
         );
 
         let steps = self.payment_steps(req, &payee);
+
+        // Has any character been typed into the form yet?
+        //
+        // Everything before the first `Fill` is a navigation, a wait, or a
+        // readback. None of them can move money, so a refusal there is a
+        // provable "nothing was sent" rather than the ambiguity the journal's
+        // `Paying` line assumes. Tracking it here, off the step actually
+        // executed, is what makes that claim structural: a step reordered into
+        // the prefix carries the guarantee with it, and a step added after the
+        // first `Fill` cannot claim it by accident.
+        //
+        // `Fill` itself is the boundary and is deliberately on the far side of
+        // it. It is the first step that changes the page, and a failure *inside*
+        // one leaves a form in a state this function did not read back.
+        let mut form_untouched = true;
 
         for step in &steps {
             if step.is_irreversible() {
@@ -761,7 +826,8 @@ impl VenmoBrowser {
             // A failed confirmation carries the recipient the step itself does
             // not know, so the operator reading the log is told who the money
             // was for as well as how much.
-            self.execute(tab, step)
+            let outcome = self
+                .execute(tab, step)
                 .await
                 .map_err(|e| match e.downcast::<Unconfirmed>() {
                     Ok(u) => anyhow::Error::from(Unconfirmed {
@@ -769,7 +835,25 @@ impl VenmoBrowser {
                         ..u
                     }),
                     Err(other) => other,
-                })?;
+                });
+
+            if let Err(e) = outcome {
+                // Only while the form is still untouched. Past the first
+                // `Fill` the honest answer is the ambiguous one, and this
+                // function does not get to soften it.
+                if form_untouched {
+                    return Err(anyhow::Error::from(NothingWasSent {
+                        recipient: req.recipient.clone(),
+                        amount: req.amount.clone(),
+                        why: format!("{e:#}"),
+                    }));
+                }
+                return Err(e);
+            }
+
+            if matches!(step, PaymentStep::Fill { .. }) {
+                form_untouched = false;
+            }
         }
 
         Ok(PaymentOutcome::Sent {

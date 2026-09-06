@@ -1178,6 +1178,54 @@ async fn settle(state: &Arc<AppState>, mut order: Order) -> Result<()> {
 
     let paid = match fiat.pay(&leg).await {
         Ok(p) => p,
+
+        // The rail refused before it filled the form in. Nothing was typed and
+        // nothing was clicked, so this is not the ambiguous case the `Paying`
+        // line was written for: the guard can prove the money is still in the
+        // account.
+        //
+        // Treating it as ambiguous cost a full refund window on 2026-09-06. The
+        // recipient guard refused `esc_c30ec31ce82148d6b7e3bbd2` one second
+        // after its claim went down, the order went `Failed` and the journal
+        // went `NeedsOperator`, and that line held the single payment slot for
+        // the ~22 hours until the escrow's refund height - with the Venmo
+        // balance unchanged at $60.49 either side, which the guard's own
+        // position in the step list had already established.
+        //
+        // So the slot goes back and the order ends `Unpaid`, which is the
+        // stage that already means "the deadline passed with nothing sent".
+        // `Unpaid` is not open, so it holds nothing, and it stays in the sweep
+        // that carries an order to `Refundable` - the user's ZEC is still
+        // theirs and still reaches the refund form at `T`.
+        Err(e) if e.downcast_ref::<zecp2p_taker::venmo::NothingWasSent>().is_some() => {
+            tracing::warn!(
+                order = %order.order_id,
+                error = %format!("{e:#}"),
+                "the fiat rail refused before filling the form in; no money moved, so the \
+                 payment slot goes back and this order ends unpaid rather than failed"
+            );
+
+            // `retract`, not a forced write. It is a compare-and-set against
+            // the `Paying` line this run wrote, so if another instance has
+            // moved this fill on since, nothing is written and the slot stays
+            // held - which is the safe direction and the same rule every other
+            // give-back follows.
+            crate::slot::retract(&state.journal, record, "refused before the form was filled in");
+
+            // Not `fail`. The reason is kept because the operator still wants
+            // to know why the rail would not pay - a handle the allowlist
+            // should not have, a session that resolves nobody - but the stage
+            // says what is true about the money.
+            order.stage = Stage::Unpaid;
+            order.reason = Some(format!(
+                "the payment was refused before anything was typed, so no money moved: {e}. \
+                 The escrow is untouched and refunds at T."
+            ));
+            order.touch();
+            state.store.put(&order)?;
+            return Ok(());
+        }
+
         Err(e) => {
             // The payment may still have gone out: the browser is driven and
             // the failure could be anywhere in it. The journal already says
