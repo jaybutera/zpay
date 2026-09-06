@@ -5,6 +5,10 @@
 #   ZECP2P_ATTESTOR_TOKEN the attestor's bearer token.
 
 [server]
+# What this coordinator calls itself in an alert and in /health. Set it when you
+# run more than one - a mainnet instance and a testnet one, or two hosts - so a
+# message says which. Empty falls back to the network name.
+instance_name = ""
 host = "127.0.0.1"
 port = 3000
 state_dir = "~/.zecp2p/v2coordinator"
@@ -45,6 +49,38 @@ block_seconds = 75
 # needs zcashd with addressindex=1.
 scanner = "block_scan"
 scan_lookback_blocks = 200
+
+# How long to keep retrying an unreachable node at startup before giving up.
+#
+# Exiting on the first failure turned a provider incident during a restart into
+# a restart loop, and a coordinator that is not running does not offer anybody
+# the refund they are owed. Every deadline this serves is tens of minutes wide,
+# so waiting is strictly better. Zero restores the old fail-fast behaviour;
+# `--check` never waits.
+startup_retry_seconds = 600
+
+# Further endpoints to fall back to, in order, when `rpc_url` does not answer.
+#
+# One provider is one incident away from a coordinator that cannot read a
+# height, and the height is what decides when a user is offered their refund.
+# Each entry is a whole endpoint with its own credentials, because providers do
+# not share an auth scheme and running your own node beside a hosted one is the
+# case this exists for. Order is your preference; `rpc_url` is always tried
+# first.
+#
+# Only an unreachable node fails over. A node that answers "rejected" has
+# answered, and asking another until one agrees is how a transaction gets
+# broadcast twice.
+#
+# [[zec.fallback_rpc]]
+# rpc_url = "http://127.0.0.1:8232"
+# rpc_user = "zcashrpc"
+# rpc_password = "set-in-the-environment-instead"
+#
+# [[zec.fallback_rpc]]
+# rpc_url = "https://another-provider.example/zcash"
+# rpc_api_key_header = "x-api-key"
+# rpc_api_key_env = "ZECP2P_RPC_API_KEY_2"
 
 [attestor]
 url = "http://127.0.0.1:8480"
@@ -126,3 +162,132 @@ api_url = "https://api.zkp2p.xyz"
 [attestation]
 service_url = "https://attestation-service.zkp2p.xyz"
 # repo_root = "~/src/zecp2p"   # where scripts/proof/prove_payment_pinned.mjs lives
+
+# ---------------------------------------------------------------------------
+# Everything below is per-LP-instance operating policy. None of it changes what
+# the escrow protocol does; all of it changes what this coordinator does when
+# something is slow, missing, empty or broken.
+# ---------------------------------------------------------------------------
+
+[timeouts]
+# Hard deadlines on the steps that can otherwise block for as long as they like.
+#
+# Before these, one wedged browser held the whole sweep - so no other order's
+# funding was noticed, no deadline checked and no refund offered while it sat
+# there. Each number bounds a call into something this process does not control.
+
+# The watchdog on one whole `advance` for one order. Longer than the sum of the
+# specific budgets below, deliberately: it catches a path with no bound of its
+# own, and firing it means a bug rather than a slow trade.
+order_advance_seconds = 900
+
+# The fiat rail's `pay`. The one number here not to tighten casually:
+# interrupting a payment mid-flight produces the ambiguous state a person has to
+# resolve. Set longer than the rail's own internal waits so the rail's specific
+# error wins the race and the operator gets a reason.
+pay_seconds = 420
+
+# Getting a payment attested, which includes the enclave. Safe to cut short:
+# it is a read, no money moves either way, and the next sweep retries.
+attest_seconds = 180
+
+# One attempt at broadcasting a release. The escrow's own broadcast deadline
+# still bounds the whole effort; this bounds one attempt so the sweep can move on.
+broadcast_seconds = 120
+
+# Any single node call.
+node_call_seconds = 30
+
+# How many orders the sweep advances at once. Unbounded fan-out over the
+# open-order cap is what a hosted provider answers with a 429, whose backoff is
+# minutes and is taken inside the sweep.
+sweep_concurrency = 8
+
+[limits]
+# What a caller who has funded nothing can consume.
+#
+# Opening an order is free and used to hold capacity for a refund window. Five
+# requests locked a handle out for a day; two hundred closed intake entirely.
+
+# How long an order with no funding sighted holds a place. After this it stops
+# counting against every intake guard. The record stays readable and still
+# refunds, so a user who funded late is answered rather than 404'd.
+unfunded_order_minutes = 45
+
+# Open orders one client address may hold. The per-handle cap cannot be this
+# bound: the handle is the payee, chosen by whoever opens the order. Zero
+# disables.
+max_open_per_client = 5
+
+# Order-opening attempts per client per window, including refused ones - each
+# still costs a quote, a curator call and a store scan. Zero disables.
+open_rate_per_client = 10
+
+# The backstop the per-client limit cannot see: many callers, or one caller
+# behind many addresses. Zero disables.
+open_rate_global = 120
+
+rate_window_seconds = 60
+
+# A header carrying the real client address, for a coordinator behind a proxy.
+#
+# Leave this unset unless your own relay actually rewrites the header. A caller
+# can set any header they like, so trusting one nothing overwrites hands them
+# the key they are limited on - which is worse than no limit, because it looks
+# like one.
+# client_ip_header = "x-forwarded-for"
+
+[float]
+# What the fiat rail must hold before this coordinator commits to a payment.
+#
+# Nothing here names a payment provider: the rail reports cents, and this is the
+# policy applied to that number. Before it, running out presented as a payment
+# that failed partway through rather than as a refusal at intake.
+
+# Cents kept back beyond the payment itself. A reserve rather than a floor at
+# zero, because the balance read is a snapshot and a payment authorised on a
+# balance that exactly covers it can still fail.
+reserve_cents = 0
+
+# Alert when the balance falls below this, while trades are still being served,
+# so you top up before the refusals start. Zero disables.
+low_balance_cents = 0
+
+# Whether to pay when the rail cannot report a balance. True by default: a rail
+# with no balance concept is a perfectly good rail, and refusing would make this
+# check a requirement on every future one. Set false if your rail can report and
+# you want a failed read treated as an empty account.
+pay_when_balance_unknown = true
+
+balance_cache_seconds = 120
+
+[alerts]
+# How an operator hears that something is stuck.
+#
+# One hook, run as a subprocess with no shell, handed a JSON alert on stdin.
+# Not a built-in client for any one messaging service: where an alert should go
+# is yours to decide. The program and its arguments, not a command line - the
+# body carries a handle a caller chose.
+#
+# The JSON is `{schema, instance, network, build, sent_at, key, severity,
+# summary, action, detail}`. A hook that reads argv and ignores stdin is fine.
+#
+# notify_command = ["/home/YOU/.zecp2p/bin/notify.sh"]
+notify_command = []
+
+notify_timeout_seconds = 20
+
+# The shortest gap between two alerts with the same key, so one stuck order is a
+# message and a reminder rather than one per sweep.
+repeat_minutes = 30
+
+# How long the payment slot may be held before it is worth saying so.
+slot_age_minutes = 20
+
+# How long an order may sit paid-but-unreleased. The most expensive state on the
+# board: the dollars have gone and the escrow has not released.
+paid_age_minutes = 20
+
+# How long since a sweep last finished. A sweep that has not completed leaves no
+# log line at all, which is what a wedged browser looked like.
+sweep_age_minutes = 10

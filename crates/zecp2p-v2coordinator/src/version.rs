@@ -33,8 +33,21 @@ pub const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// A marker string `strings` finds in a stripped binary.
 ///
 /// Deliberately one contiguous literal with a distinctive prefix: a deploy
-/// script greps for `zecp2p-build:` and reads the rest of the line. Splitting it
+/// script greps for `zecp2p-build:` and reads to the terminator. Splitting it
 /// across a `format!` would put nothing findable in `.rodata`.
+///
+/// # The terminator
+///
+/// `;` at the end, and it is load-bearing. Rust packs string literals into
+/// `.rodata` back to back with no separator, so `strings` returns the stamp in
+/// the middle of a run of unrelated messages: without a terminator the obvious
+/// `grep -o 'zecp2p-build:[^ ]*'` swallows whatever literal the linker happened
+/// to place next, and the extracted hash quietly grows a suffix. A deploy script
+/// then compares that against the tree's hash and refuses every deploy, or - if
+/// it compares loosely - accepts a stamp it never really parsed.
+///
+/// [`STAMP_END`] is the character to read up to. `deploy-coordinator.sh` greps
+/// `zecp2p-build:[^;]*`.
 pub const STAMP: &str = concat!(
     "zecp2p-build:",
     env!("CARGO_PKG_NAME"),
@@ -46,7 +59,11 @@ pub const STAMP: &str = concat!(
     env!("ZECP2P_GIT_DIRTY"),
     ":",
     env!("ZECP2P_BUILD_TIME"),
+    ";",
 );
+
+/// What terminates [`STAMP`]. See its note on why one is needed.
+pub const STAMP_END: char = ';';
 
 /// One line naming this build, for a log or `--version`.
 pub fn describe() -> String {
@@ -81,10 +98,37 @@ mod tests {
     #[test]
     fn stamp_is_greppable_and_carries_the_hash() {
         assert!(STAMP.starts_with("zecp2p-build:zecp2p-v2coordinator:"));
-        let fields: Vec<&str> = STAMP.split(':').collect();
+        let body = STAMP.strip_suffix(STAMP_END).expect("the stamp is terminated");
+        let fields: Vec<&str> = body.split(':').collect();
         assert_eq!(fields.len(), 6, "stamp is prefix, pkg, version, hash, dirty, time: {STAMP}");
         assert_eq!(fields[3], GIT_HASH);
         assert!(fields[4] == "0" || fields[4] == "1", "dirty is a flag: {}", fields[4]);
+    }
+
+    /// The terminator is what makes the stamp extractable from a stripped
+    /// binary at all.
+    ///
+    /// Rust packs `.rodata` literals with no separator, so a `strings` line
+    /// carrying the stamp also carries whatever the linker placed next to it.
+    /// Without a terminator, extraction reads past the end of the stamp and the
+    /// hash grows a suffix - which the deploy script then compares against the
+    /// tree and refuses. This asserts the property a shell `grep -o
+    /// 'zecp2p-build:[^;]*'` relies on.
+    #[test]
+    fn the_stamp_can_be_cut_out_of_a_run_of_adjacent_literals() {
+        // What `strings` actually returns: the stamp with neighbours either side.
+        let packed = format!("some earlier message{STAMP}node reachable");
+        let start = packed.find("zecp2p-build:").expect("the prefix is findable");
+        let rest = &packed[start..];
+        let end = rest.find(STAMP_END).expect("the terminator is findable");
+        let extracted = &rest[..end + 1];
+        assert_eq!(extracted, STAMP, "extraction must recover the stamp exactly");
+
+        let hash = extracted.split(':').nth(3).unwrap();
+        assert_eq!(
+            hash, GIT_HASH,
+            "the extracted hash must be the hash, with nothing appended"
+        );
     }
 
     /// `describe` is what goes in the startup log, so it must name the commit
