@@ -17,6 +17,11 @@ arguments are on the record:
     ZECP2P_RPC_API_KEY_HEADER=api-key ZECP2P_RPC_API_KEY=... \
       python3 scripts/e2e/run_e2e.py
 
+`ZPAY_FUND_TXID`, `ZPAY_FUND_VOUT` and `ZPAY_FUND_VALUE` each take a
+comma-separated list of the same length when the funding has to spend more than
+one output, which is what a key holding its balance as change from past releases
+needs.
+
 Exits 0 only when the page reached `done`. Every other ending, including a
 refusal the page states in its own words, exits non-zero and says which.
 

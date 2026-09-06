@@ -7,7 +7,7 @@
 //! end-to-end test can send the ZEC itself instead of asking a person to open a
 //! wallet.
 //!
-//! It spends one P2PKH outpoint into the escrow's scriptPubKey and returns the
+//! It spends P2PKH outpoints into the escrow's scriptPubKey and returns the
 //! change to the same P2PKH. Nothing in the escrow protocol reads the funding
 //! transaction's inputs, so a transparent funder changes no spend-side
 //! property; the release and the refund spend a P2SH outpoint either way.
@@ -21,6 +21,20 @@
 //!     <label> <txid> <vout> <value_zat> <escrow_address> <amount_zat> \
 //!     <u_pub_hex> <l_pub_hex> <refund_height>
 //! ```
+//!
+//! One key funds the escrow, but its coin need not sit in a single output. A
+//! run that has been paying escrows holds its balance as change from each
+//! release, so the largest single output shrinks below the next escrow long
+//! before the balance does. The txid, vout and value arguments therefore each
+//! accept a comma-separated list of the same length, and every listed outpoint
+//! must pay the funding key:
+//!
+//! ```text
+//!   ... <label> <txid_a>,<txid_b> <vout_a>,<vout_b> <value_a>,<value_b> ...
+//! ```
+//!
+//! The fee is ZIP 317's floor for the resulting shape rather than a constant,
+//! since a spend of several inputs is a larger transaction than a spend of one.
 //!
 //! The escrow is named by the address the page shows, not by a scriptPubKey
 //! hex: `script_pubkey_for` decodes it against the configured network, so an
@@ -58,8 +72,18 @@ use zecp2p_escrow::keystore::Keystore;
 use zecp2p_escrow::rpc::{txid_from_display, Network, RpcChainClient, RpcConfig};
 use zecp2p_escrow::tx::encode_signature;
 
-/// ZIP 317's grace minimum for a 1-in 2-out transparent spend.
-const FEE_ZAT: u64 = 10_000;
+/// ZIP 317's marginal fee, and the grace number of logical actions it does not
+/// charge for. A transparent spend's logical action count is the greater of its
+/// input and output counts, so a 1-in 2-out funding sits inside the grace and
+/// costs the 10,000 zat floor, while a 3-in 2-out funding costs one marginal
+/// fee more.
+const MARGINAL_FEE_ZAT: u64 = 5_000;
+const GRACE_ACTIONS: u64 = 2;
+
+fn zip317_fee(inputs: usize, outputs: usize) -> u64 {
+    let actions = std::cmp::max(inputs as u64, outputs as u64);
+    MARGINAL_FEE_ZAT * std::cmp::max(GRACE_ACTIONS, actions)
+}
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
@@ -71,9 +95,49 @@ fn main() {
         std::process::exit(2);
     }
     let label = a[1].trim().to_string();
-    let txid = txid_from_display(a[2].trim()).expect("txid, as an explorer prints it");
-    let vout: u32 = a[3].parse().expect("vout");
-    let value_zat: u64 = a[4].parse().expect("input value in zat");
+    // Each of the three is a list, and a single outpoint is the one-element
+    // case, so the old command line still means what it did.
+    let txids: Vec<_> = a[2].split(',').map(str::trim).collect();
+    let vouts: Vec<_> = a[3].split(',').map(str::trim).collect();
+    let values: Vec<_> = a[4].split(',').map(str::trim).collect();
+    if txids.len() != vouts.len() || txids.len() != values.len() {
+        eprintln!(
+            "REFUSING: {} txids, {} vouts and {} values. They name one outpoint each \
+             and must be the same length. Nothing was signed.",
+            txids.len(),
+            vouts.len(),
+            values.len()
+        );
+        std::process::exit(2);
+    }
+    let inputs: Vec<(OutPoint, u64)> = txids
+        .iter()
+        .zip(vouts.iter())
+        .zip(values.iter())
+        .map(|((t, v), val)| {
+            (
+                OutPoint::new(
+                    txid_from_display(t).expect("txid, as an explorer prints it"),
+                    v.parse().expect("vout"),
+                ),
+                val.parse::<u64>().expect("input value in zat"),
+            )
+        })
+        .collect();
+    // Spending the same outpoint twice would build a transaction the network
+    // rejects, and the arithmetic below would have counted its value twice.
+    for i in 0..inputs.len() {
+        for j in (i + 1)..inputs.len() {
+            if inputs[i].0 == inputs[j].0 {
+                eprintln!(
+                    "REFUSING: outpoint {}:{} is listed twice. Nothing was signed.",
+                    txids[i], vouts[i]
+                );
+                std::process::exit(2);
+            }
+        }
+    }
+    let value_zat: u64 = inputs.iter().map(|(_, v)| *v).sum();
     let escrow_address = a[5].trim().to_string();
     let amount_zat: u64 = a[6].parse().expect("escrow amount in zat");
 
@@ -149,9 +213,30 @@ fn main() {
     p2pkh.extend_from_slice(&hash);
     p2pkh.extend_from_slice(&[0x88, 0xac]);
 
-    let change = value_zat
-        .checked_sub(amount_zat + FEE_ZAT)
-        .expect("input does not cover the escrow plus fee");
+    // The fee depends on the output count and the output count depends on
+    // whether there is change, so the two-output shape is priced first and the
+    // no-change shape only considered if that does not fit.
+    let fee_zat = zip317_fee(inputs.len(), 2);
+    let (fee_zat, change) = match value_zat.checked_sub(amount_zat + fee_zat) {
+        Some(change) => (fee_zat, change),
+        None => {
+            // No room for change. A one-output spend is cheaper, so try it
+            // before giving up: the remainder over the escrow becomes fee.
+            let bare = zip317_fee(inputs.len(), 1);
+            match value_zat.checked_sub(amount_zat + bare) {
+                Some(_) => (value_zat - amount_zat, 0),
+                None => {
+                    eprintln!(
+                        "REFUSING: {} input zat across {} outpoint(s) does not cover {amount_zat} \
+                         zat to the escrow plus a {bare} zat fee. Nothing was signed.",
+                        value_zat,
+                        inputs.len()
+                    );
+                    std::process::exit(2);
+                }
+            }
+        }
+    };
 
     let mut vout_list = vec![TxOut::new(
         Zatoshis::const_from_u64(amount_zat),
@@ -167,12 +252,19 @@ fn main() {
     // Everything the spend commits to, before it is signed. A wrong amount or a
     // wrong escrow script is cheaper to see here than on the chain.
     println!("network     : {network:?}");
-    println!("input       : {}:{vout} worth {value_zat} zat", a[2].trim());
+    for (i, (op, value)) in inputs.iter().enumerate() {
+        println!(
+            "input {i}     : {}:{} worth {value} zat",
+            zecp2p_escrow::rpc::txid_to_rpc_hex(op.hash()),
+            op.n()
+        );
+    }
+    println!("input total : {value_zat} zat");
     println!("funding key : {label} -> hash160 {}", hex::encode(hash));
     println!("escrow      : {escrow_address}");
     println!("escrow spk  : {}", hex::encode(&escrow_spk));
     println!("to escrow   : {amount_zat} zat");
-    println!("fee         : {FEE_ZAT} zat");
+    println!("fee         : {fee_zat} zat");
     println!("change      : {change} zat");
 
     let url = std::env::var("ZECP2P_RPC_URL").expect("set ZECP2P_RPC_URL");
@@ -189,30 +281,42 @@ fn main() {
     let chain = RpcChainClient::new(cfg).expect("rpc");
     let branch = chain.consensus_branch_id().expect("branch id");
 
-    let unsigned = zecp2p_escrow::funding::p2pkh_sighash(
-        branch,
-        &OutPoint::new(txid, vout),
-        &p2pkh,
-        value_zat,
-        &vout_list,
-    )
-    .expect("sighash");
+    // Every input pays the same key, so each carries the same scriptPubKey. The
+    // digest still differs per input: ZIP 244 commits to the whole input set
+    // and to which member of it is being signed.
+    let sighash_inputs: Vec<(OutPoint, Vec<u8>, u64)> = inputs
+        .iter()
+        .map(|(op, value)| (op.clone(), p2pkh.clone(), *value))
+        .collect();
 
-    let sig = secp.sign_ecdsa(&Message::from_digest(unsigned), &sk);
-    let der = encode_signature(&sig);
+    let mut vin = Vec::with_capacity(inputs.len());
+    for (index, (op, _)) in inputs.iter().enumerate() {
+        let unsigned = zecp2p_escrow::funding::p2pkh_sighash_multi(
+            branch,
+            &sighash_inputs,
+            index,
+            &vout_list,
+        )
+        .expect("sighash");
 
-    let mut script_sig = Vec::new();
-    script_sig.push(der.len() as u8);
-    script_sig.extend_from_slice(&der);
-    script_sig.push(pk.len() as u8);
-    script_sig.extend_from_slice(&pk);
+        let sig = secp.sign_ecdsa(&Message::from_digest(unsigned), &sk);
+        let der = encode_signature(&sig);
 
-    let bundle = Bundle::<TAuthorized> {
-        vin: vec![TxIn::from_parts(
-            OutPoint::new(txid, vout),
+        let mut script_sig = Vec::new();
+        script_sig.push(der.len() as u8);
+        script_sig.extend_from_slice(&der);
+        script_sig.push(pk.len() as u8);
+        script_sig.extend_from_slice(&pk);
+
+        vin.push(TxIn::from_parts(
+            op.clone(),
             Script(Code(script_sig)),
             0xffff_ffff,
-        )],
+        ));
+    }
+
+    let bundle = Bundle::<TAuthorized> {
+        vin,
         vout: vout_list,
         authorization: TAuthorized,
     };

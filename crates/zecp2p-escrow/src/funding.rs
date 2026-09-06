@@ -138,15 +138,22 @@ fn base58check(prefix: &[u8; 2], hash: &[u8]) -> String {
 }
 
 
-/// The ZIP 244 sighash for a P2PKH input, for the regtest funding helper.
+/// The ZIP 244 sighash for one P2PKH input of a transaction that may spend
+/// several, for the funding helpers.
 ///
 /// Not part of the protocol: the escrow never spends P2PKH. It exists so a
-/// regtest run can move mined coin into an escrow address without a wallet.
-pub fn p2pkh_sighash(
+/// funding run can move coin into an escrow address without a wallet.
+///
+/// ZIP 244 commits to every input's outpoint, value and scriptPubKey, so a
+/// transaction spending more than one output cannot be signed an input at a
+/// time from single-input sighashes: each signature has to be taken over the
+/// whole input set. `inputs` is therefore the complete set, in the order the
+/// transaction will carry them, and `index` says which of them is being
+/// signed.
+pub fn p2pkh_sighash_multi(
     branch_id: u32,
-    outpoint: &zcash_transparent::bundle::OutPoint,
-    script_pubkey: &[u8],
-    value_zat: u64,
+    inputs: &[(zcash_transparent::bundle::OutPoint, Vec<u8>, u64)],
+    index: usize,
     vout: &[zcash_transparent::bundle::TxOut],
 ) -> Result<[u8; 32], String> {
     use zcash_primitives::transaction::sighash::{signature_hash, SignableInput};
@@ -159,14 +166,28 @@ pub fn p2pkh_sighash(
     use zcash_transparent::bundle::{Bundle, TxIn, TxOut};
     use zcash_transparent::sighash::{SighashType, SignableInput as TSignable};
 
-    let prev = TxOut::new(
-        Zatoshis::const_from_u64(value_zat),
-        Script(Code(script_pubkey.to_vec())),
-    );
+    if inputs.is_empty() {
+        return Err("no inputs to sign".to_string());
+    }
+    let (_, spk_signed, value_signed) = inputs.get(index).ok_or("input index out of range")?;
+
+    let prevouts: Vec<TxOut> = inputs
+        .iter()
+        .map(|(_, spk, value)| {
+            TxOut::new(
+                Zatoshis::const_from_u64(*value),
+                Script(Code(spk.clone())),
+            )
+        })
+        .collect();
+    let vin: Vec<TxIn<crate::tx::EscrowEffects>> = inputs
+        .iter()
+        .map(|(outpoint, _, _)| TxIn::from_parts(outpoint.clone(), (), 0xffff_ffff))
+        .collect();
     let bundle = Bundle::<crate::tx::EscrowEffects> {
-        vin: vec![TxIn::from_parts(outpoint.clone(), (), 0xffff_ffff)],
+        vin,
         vout: vout.to_vec(),
-        authorization: crate::tx::EscrowEffects::for_inputs(vec![prev]),
+        authorization: crate::tx::EscrowEffects::for_inputs(prevouts),
     };
     let data = TransactionData::<crate::tx::EscrowUnauthorized>::from_parts(
         TxVersion::V5,
@@ -179,17 +200,36 @@ pub fn p2pkh_sighash(
         None,
     );
     let b = data.transparent_bundle().ok_or("no transparent bundle")?;
-    let code = Script(Code(script_pubkey.to_vec()));
-    let spk = Script(Code(script_pubkey.to_vec()));
+    let code = Script(Code(spk_signed.clone()));
+    let spk = Script(Code(spk_signed.clone()));
     let input = TSignable::from_parts(
         b,
         SighashType::ALL,
-        0,
+        index,
         &code,
         &spk,
-        Zatoshis::const_from_u64(value_zat),
+        Zatoshis::const_from_u64(*value_signed),
     )
     .map_err(|_| "bad input index".to_string())?;
     let parts = data.digest(TxIdDigester);
     Ok(*signature_hash(&data, &SignableInput::Transparent(input), &parts).as_ref())
+}
+
+/// The ZIP 244 sighash for a transaction spending a single P2PKH input.
+///
+/// A thin wrapper over [`p2pkh_sighash_multi`] for the one-input case, which is
+/// what the regtest funding helper spends.
+pub fn p2pkh_sighash(
+    branch_id: u32,
+    outpoint: &zcash_transparent::bundle::OutPoint,
+    script_pubkey: &[u8],
+    value_zat: u64,
+    vout: &[zcash_transparent::bundle::TxOut],
+) -> Result<[u8; 32], String> {
+    p2pkh_sighash_multi(
+        branch_id,
+        &[(outpoint.clone(), script_pubkey.to_vec(), value_zat)],
+        0,
+        vout,
+    )
 }
