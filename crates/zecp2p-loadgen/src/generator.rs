@@ -227,6 +227,34 @@ pub async fn run(env: Arc<Env>, plan: Plan) -> Result<Stats> {
     let plan = Arc::new(plan);
     let mut tasks = Vec::new();
 
+    // A soak run that says nothing for half an hour is indistinguishable from a
+    // hung one. This reports what has finished, once a minute, and stops when
+    // the run does.
+    let ticker = {
+        let outcomes = outcomes.clone();
+        let issued = issued.clone();
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(Duration::from_secs(60));
+            every.tick().await;
+            loop {
+                every.tick().await;
+                let done = outcomes.lock().await;
+                let finished = done.len();
+                let failed = done.iter().filter(|o: &&Outcome| !o.ok).count();
+                drop(done);
+                let elapsed = started.elapsed().as_secs_f64();
+                tracing::info!(
+                    finished,
+                    failed,
+                    started = issued.load(Ordering::SeqCst),
+                    per_sec = format!("{:.2}", finished as f64 / elapsed.max(1.0)),
+                    elapsed_s = elapsed as u64,
+                    "progress"
+                );
+            }
+        })
+    };
+
     loop {
         // Take the sequence number first, so two workers cannot draw the same
         // amount and handle and collide on the store's in-flight rule.
@@ -298,6 +326,8 @@ pub async fn run(env: Arc<Env>, plan: Plan) -> Result<Stats> {
             tokio::time::sleep(plan.arrival_gap).await;
         }
     }
+
+    ticker.abort();
 
     for task in tasks {
         // A panicking iteration should not take the run's report with it.
