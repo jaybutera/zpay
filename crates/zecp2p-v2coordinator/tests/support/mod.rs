@@ -36,6 +36,13 @@ type NodeUtxo = (String, u64, u32);
 
 struct NodeInner {
     height: Mutex<u32>,
+    /// Every method this node was asked, in order.
+    ///
+    /// Finding 6: the assertion "one sweep reads the head once" needs the node
+    /// to be counting, or the test proves only that the sweep finished.
+    calls: Mutex<Vec<String>>,
+    /// When set, every call answers as an unreachable node would.
+    offline: Mutex<bool>,
     /// Settable, so a test can upgrade the network mid-escrow.
     branch_id: Mutex<u32>,
     utxos: Mutex<HashMap<Outpoint, NodeUtxo>>,
@@ -46,6 +53,8 @@ impl FakeNode {
     pub async fn spawn() -> Self {
         let inner = Arc::new(NodeInner {
             height: Mutex::new(3_470_700),
+            calls: Mutex::new(Vec::new()),
+            offline: Mutex::new(false),
             branch_id: Mutex::new(BRANCH_ID),
             utxos: Mutex::new(HashMap::new()),
             broadcasts: Mutex::new(Vec::new()),
@@ -101,6 +110,27 @@ impl FakeNode {
     }
 
     /// A network upgrade, which is what changes the ZIP 244 sighash.
+    /// How many RPC calls this node has answered.
+    pub async fn rpc_calls(&self) -> usize {
+        self.inner.calls.lock().await.len()
+    }
+
+    /// How many times one method was called.
+    pub async fn calls_named(&self, method: &str) -> usize {
+        self.inner
+            .calls
+            .lock()
+            .await
+            .iter()
+            .filter(|m| m.as_str() == method)
+            .count()
+    }
+
+    /// Makes every later call fail the way an unreachable endpoint does.
+    pub async fn go_offline(&self) {
+        *self.inner.offline.lock().await = true;
+    }
+
     pub async fn set_branch_id(&self, branch_id: u32) {
         *self.inner.branch_id.lock().await = branch_id;
     }
@@ -111,12 +141,25 @@ struct RpcCall {
     method: String,
     #[serde(default)]
     params: serde_json::Value,
+    #[serde(default)]
+    id: serde_json::Value,
 }
 
 async fn node_rpc(
     axum::extract::State(inner): axum::extract::State<Arc<NodeInner>>,
     axum::Json(call): axum::Json<RpcCall>,
 ) -> axum::Json<serde_json::Value> {
+    inner.calls.lock().await.push(call.method.clone());
+    if *inner.offline.lock().await {
+        // The shape a hosted endpoint's failure takes: an error object rather
+        // than a result. The client reads this as the node being unusable,
+        // which is what the failover and the health check are asserted against.
+        return axum::Json(serde_json::json!({
+            "result": serde_json::Value::Null,
+            "error": { "code": -1, "message": "this fake node is offline" },
+            "id": call.id,
+        }));
+    }
     let result = match call.method.as_str() {
         "getblockchaininfo" => {
             let branch = *inner.branch_id.lock().await;
@@ -899,4 +942,259 @@ fn build(
         builder = builder.with_fiat(f);
     }
     builder.build().expect("the test coordinator builds")
+}
+
+/// A rail with a balance a test can set, and a spend it applies itself.
+///
+/// Finding 5. The property to demonstrate is that the coordinator refuses to
+/// reserve the payment slot when the float will not cover the payment plus the
+/// reserve, and that the refusal happens *before* anything is committed. So
+/// this rail counts payments and reports a balance, and a test can watch both.
+pub struct FundedRail {
+    balance_cents: Arc<std::sync::atomic::AtomicU64>,
+    /// When set, `balance_cents` answers `Unknown`, standing in for a rail with
+    /// no balance to report or one whose read failed.
+    reports: Arc<std::sync::atomic::AtomicBool>,
+    payments: Arc<std::sync::atomic::AtomicUsize>,
+    /// How many times the balance was actually read, so a test can show the
+    /// cache does its job.
+    reads: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl FundedRail {
+    pub fn with_cents(cents: u64) -> Self {
+        Self {
+            balance_cents: Arc::new(std::sync::atomic::AtomicU64::new(cents)),
+            reports: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            payments: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    /// A rail that cannot say what it holds.
+    pub fn that_cannot_report() -> Self {
+        let rail = Self::with_cents(0);
+        rail.reports.store(false, std::sync::atomic::Ordering::SeqCst);
+        rail
+    }
+
+    pub fn payments(&self) -> usize {
+        self.payments.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn balance_reads(&self) -> usize {
+        self.reads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn set_cents(&self, cents: u64) {
+        self.balance_cents
+            .store(cents, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn cents(&self) -> u64 {
+        self.balance_cents.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl FiatRail for FundedRail {
+    async fn pay(&self, leg: &zecp2p_taker::auto::rail::FiatLeg) -> anyhow::Result<PaidFiat> {
+        let cents = u64::try_from(leg.payment.cents())?;
+        // The money actually leaves, so a test asserting "it stopped before the
+        // float went negative" is asserting something real.
+        self.balance_cents
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |have| Some(have.saturating_sub(cents)),
+            )
+            .ok();
+        self.payments
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(PaidFiat {
+            cents,
+            fiat_left: true,
+            note: Some(note_a_rail_would_type(leg)),
+        })
+    }
+
+    async fn attest(
+        &self,
+        leg: &zecp2p_taker::auto::rail::FiatLeg,
+    ) -> anyhow::Result<zecp2p_escrow::lp_client::WireAttestation> {
+        Ok(zecp2p_escrow::lp_client::WireAttestation {
+            intent_hash: hex::encode(leg.intent_hash.0),
+            release_amount: leg.intent_amount_6dec.to_string(),
+            data_hash: hex::encode([0u8; 32]),
+            signature: hex::encode([0u8; 65]),
+            encoded_payment_details: hex::encode(vec![0u8; 448]),
+        })
+    }
+
+    async fn balance_cents(&self) -> zecp2p_v2coordinator::state::RailBalance {
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if !self.reports.load(std::sync::atomic::Ordering::SeqCst) {
+            return zecp2p_v2coordinator::state::RailBalance::Unknown(
+                "this test rail does not report a balance".into(),
+            );
+        }
+        zecp2p_v2coordinator::state::RailBalance::Known(
+            self.balance_cents.load(std::sync::atomic::Ordering::SeqCst),
+        )
+    }
+}
+
+/// A rail whose `pay` never returns, for the watchdog and the pay timeout.
+///
+/// Finding 3. The sweep used to inherit whatever a browser did, and a browser
+/// with four independently timed waits plus a 120 s budget on every evaluate
+/// can hold a task for eight minutes. This is that, made instant to test.
+pub struct HangingRail {
+    started: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl HangingRail {
+    pub fn new() -> Self {
+        Self {
+            started: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    /// How many payments were begun. It is never more than one at a time, and
+    /// none of them finish.
+    pub fn started(&self) -> usize {
+        self.started.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl FiatRail for HangingRail {
+    async fn pay(&self, _leg: &zecp2p_taker::auto::rail::FiatLeg) -> anyhow::Result<PaidFiat> {
+        self.started
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // Longer than any timeout a test configures, and finite so a leaked
+        // task cannot outlive the test binary.
+        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        unreachable!("the pay timeout should have fired long before this")
+    }
+
+    async fn attest(
+        &self,
+        _leg: &zecp2p_taker::auto::rail::FiatLeg,
+    ) -> anyhow::Result<zecp2p_escrow::lp_client::WireAttestation> {
+        anyhow::bail!("this rail never attests")
+    }
+}
+
+/// A rail that pays and then never attests.
+///
+/// Finding 3's attestation timeout: the enclave is a `node` child process
+/// awaited with no timeout at all, and it runs after the dollars have gone.
+pub struct PaysThenHangsRail {
+    paid: Arc<std::sync::atomic::AtomicUsize>,
+    attempts: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl PaysThenHangsRail {
+    pub fn new() -> Self {
+        Self {
+            paid: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    pub fn payments(&self) -> usize {
+        self.paid.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn attestation_attempts(&self) -> usize {
+        self.attempts.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl FiatRail for PaysThenHangsRail {
+    async fn pay(&self, leg: &zecp2p_taker::auto::rail::FiatLeg) -> anyhow::Result<PaidFiat> {
+        self.paid.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(PaidFiat {
+            cents: u64::try_from(leg.payment.cents())?,
+            fiat_left: true,
+            note: Some(note_a_rail_would_type(leg)),
+        })
+    }
+
+    async fn attest(
+        &self,
+        _leg: &zecp2p_taker::auto::rail::FiatLeg,
+    ) -> anyhow::Result<zecp2p_escrow::lp_client::WireAttestation> {
+        self.attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        unreachable!("the attestation timeout should have fired")
+    }
+}
+
+
+/// A coordinator built from a config whose `rpc_url` is left exactly as given.
+///
+/// `coordinator_from_config` overwrites the URL with the fake node's, which is
+/// what almost every test wants. The failover test does not: it needs a primary
+/// that does not answer and a fallback that does, so it sets both itself.
+pub fn coordinator_from_config_keeping_rpc(
+    config: CoordinatorConfig,
+    scanner: Arc<dyn FundingScanner>,
+    fiat: Option<Arc<dyn FiatRail>>,
+) -> Arc<AppState> {
+    std::env::set_var("ZECP2P_LP_PRIV", hex::encode([0x22u8; 32]));
+    let curator = FakeCurator::spawn_blocking_new();
+    let mut config = config;
+    config.zkp2p.api_url = curator.url.clone();
+    std::mem::forget(curator);
+
+    let mut builder = AppStateBuilder::new(config).with_scanner(scanner);
+    if let Some(f) = fiat {
+        builder = builder.with_fiat(f);
+    }
+    builder.build().expect("the test coordinator builds")
+}
+
+/// Rebuilds a coordinator with the test attestor's URL configured.
+///
+/// `coordinator_from_config` takes a config the caller has already shaped, and
+/// the attestor is spawned separately, so this puts the two together without a
+/// second builder function per test.
+pub fn with_attestor(state: Arc<AppState>, attestor: &TestAttestor) -> Arc<AppState> {
+    let mut config = state.config.clone();
+    config.attestor.url = attestor.url.clone();
+    config.attestor.pubkey = None;
+    let scanner = state.scanner.clone();
+    let fiat = state.fiat.clone();
+    std::env::set_var("ZECP2P_LP_PRIV", hex::encode([0x22u8; 32]));
+    let mut builder = AppStateBuilder::new(config).with_scanner(scanner);
+    if let Some(f) = fiat {
+        builder = builder.with_fiat(f);
+    }
+    builder.build().expect("the test coordinator rebuilds")
+}
+
+/// Writes a `NeedsOperator` line, standing in for a fill a person has to
+/// retire.
+///
+/// The state finding 7 alerts on and finding 2 is about. Written directly
+/// rather than by driving a failing payment, because what is under test here is
+/// what an operator is *told*, not how the line came to exist.
+pub fn stage_needs_operator_line(state: &Arc<AppState>) {
+    let stranded = zecp2p_v2coordinator::slot::work_id_for(&[0xf1u8; 32], 0);
+    let mut record = zecp2p_taker::auto::journal::FillRecord::new_zec(
+        stranded.local.clone(),
+        alloy::primitives::U256::from(700_000u64),
+        alloy::primitives::U256::from(1_000_000_000_000_000_000u128),
+        "alice".into(),
+    );
+    record.state = zecp2p_taker::auto::journal::FillState::NeedsOperator;
+    record.note = Some("the fiat leg failed after the form was filled in".into());
+    state
+        .journal
+        .append_unchecked(&record)
+        .expect("the test journal takes a staged line");
 }

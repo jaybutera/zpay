@@ -161,10 +161,29 @@ async fn watch_funding(state: &Arc<AppState>, order: Order) -> Result<()> {
     if order.funding.is_some() {
         return advance_funded(state, order).await;
     }
-    if let Some(expired) = expire_if_never_funded(state, &order).await? {
+    // Scan first, expire second.
+    //
+    // The other order is a bug, and it is the expensive one: an order whose
+    // funding transaction is already in a block this coordinator has not
+    // scanned yet has no outpoint recorded, so expiring on that alone takes an
+    // order out from under a user whose coin is already on chain. `find_funding`
+    // writes the outpoint when it finds one, so asking it first means expiry
+    // only ever sees orders where the chain really has nothing.
+    //
+    // The cost is one scan per expiring order, once. `find_funding` resumes
+    // from its cursor, so that scan is over the blocks since the last sweep
+    // rather than the whole window.
+    find_funding(state, order.clone()).await?;
+
+    // Re-read: `find_funding` may have moved the order on, and an order that
+    // now has funding or a sighting is not expirable.
+    let Some(after) = state.store.get(&order.order_id) else {
+        return Ok(());
+    };
+    if let Some(expired) = expire_if_never_funded(state, &after).await? {
         return expired;
     }
-    find_funding(state, order).await
+    Ok(())
 }
 
 /// Retires an order nobody ever sent coin to. Finding 4.

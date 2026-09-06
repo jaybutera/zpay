@@ -251,6 +251,9 @@ pub struct AppState {
     pub rate_limiter: Arc<crate::ratelimit::RateLimiter>,
     /// The rail's last reported balance, and when it was read. Finding 5.
     balance_cache: Arc<std::sync::Mutex<Option<(RailBalance, std::time::Instant)>>>,
+    /// How many head reads this coordinator has decided to make. See
+    /// [`AppState::head_reads`].
+    head_reads: Arc<std::sync::atomic::AtomicUsize>,
     pub secp: Secp256k1<secp256k1_zkp::All>,
     /// One advance at a time per order.
     ///
@@ -600,6 +603,8 @@ impl AppState {
     /// they are asked inside one `try_each`, so a failover between them cannot
     /// pair a height from one chain view with a branch id from another.
     pub async fn chain_head_uncached(&self) -> Result<(u32, u32)> {
+        self.head_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let nodes = self.nodes.clone();
         tokio::task::spawn_blocking(move || {
             nodes.try_each(|chain| {
@@ -687,6 +692,41 @@ impl AppState {
         }
         if let Ok(mut slot) = self.last_sweep_done.lock() {
             *slot = Some(std::time::Instant::now());
+        }
+    }
+
+    /// How many times this coordinator has actually asked a node for the head.
+    ///
+    /// The number finding 6 is about. Counting node *calls* at the socket does
+    /// not answer it: the RPC client makes a one-off network check per client
+    /// it builds, which is per connection rather than per order per sweep. This
+    /// counts the reads the coordinator decided to make.
+    pub fn head_reads(&self) -> usize {
+        self.head_reads.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Drops the cached head, so the next read asks the node.
+    ///
+    /// Public because a test needs to show `/health` noticing a node that has
+    /// gone away, and the cache is what stands between the two. Harmless in
+    /// production - it costs one node read - and `refresh_chain_head` fills it
+    /// again on the next sweep.
+    pub fn forget_chain_head(&self) {
+        if let Ok(mut slot) = self.chain_head_cache.lock() {
+            *slot = None;
+        }
+    }
+
+    /// Backdates the last completed sweep, for a test.
+    ///
+    /// The sweep-age check is the one signal that cannot be produced by doing
+    /// less work: a wedged sweep leaves nothing behind, which is the whole
+    /// finding. So a test makes time pass rather than waiting for it.
+    #[doc(hidden)]
+    pub fn pretend_last_sweep_was_minutes_ago(&self, minutes: u64) {
+        if let Ok(mut slot) = self.last_sweep_done.lock() {
+            *slot = std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(minutes * 60));
         }
     }
 
@@ -962,6 +1002,7 @@ impl AppStateBuilder {
             alerts: Arc::new(crate::alert::AlertHistory::default()),
             rate_limiter: Arc::new(crate::ratelimit::RateLimiter::new()),
             balance_cache: Arc::new(std::sync::Mutex::new(None)),
+            head_reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             sweep_head: Arc::new(std::sync::Mutex::new(None)),
             sweep_head_reading: Arc::new(tokio::sync::Mutex::new(())),
             sweep_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
