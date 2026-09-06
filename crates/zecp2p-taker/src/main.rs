@@ -680,8 +680,19 @@ async fn run_test_pay(
         note: config.venmo.note.clone(),
     };
 
+    // The lookup the live path runs first, run here for the same reason: it is
+    // a read, and it is what says whether @claimed is the account the operator
+    // thinks it is. `test-pay` is where an operator checks a handle before it
+    // reaches an allowlist, so the answer is printed in full.
+    let payee = browser
+        .resolve_payee(&tab, &claimed)
+        .await
+        .context("Venmo would not resolve this handle, so there are no steps to show")?;
+    println!("resolves to: @{} ({})", payee.handle, payee.display_name);
+    println!("venmo id   : {}", payee.id);
+
     println!("\nsteps this would run for ${amount} to @{claimed}:");
-    for step in browser.payment_steps(&request) {
+    for step in browser.payment_steps(&request, &payee) {
         println!("  {}", step.describe());
     }
 

@@ -16,7 +16,7 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-use zecp2p_taker::venmo::{PaymentRequest, PaymentStep, VenmoBrowser};
+use zecp2p_taker::venmo::{PaymentRequest, PaymentStep, ResolvedPayee, VenmoBrowser};
 
 /// Skip rather than fail when node is not installed, as the login page test
 /// does: a suite that goes red for a missing tool trains people to ignore red.
@@ -98,11 +98,24 @@ fn run_sequence(page: &str, expressions: &[String]) -> Vec<StepResult> {
 
 /// The steps of the payment that was falsely reported sent.
 fn the_incident_payment() -> Vec<PaymentStep> {
-    VenmoBrowser::new("http://127.0.0.1:9222", 60).payment_steps(&PaymentRequest {
-        recipient: "jay-butera".to_string(),
-        amount: "2.01".to_string(),
-        note: "thanks 5df45b72".to_string(),
-    })
+    VenmoBrowser::new("http://127.0.0.1:9222", 60).payment_steps(
+        &PaymentRequest {
+            recipient: "jay-butera".to_string(),
+            amount: "2.01".to_string(),
+            note: "thanks 5df45b72".to_string(),
+        },
+        &the_resolved_payee(),
+    )
+}
+
+/// What `resolve_payee` answered for `jay-butera` against the live session on
+/// 2026-09-06. Real values: the id is the one Venmo returned.
+fn the_resolved_payee() -> ResolvedPayee {
+    ResolvedPayee {
+        handle: "Jay-Butera".to_string(),
+        id: JAY_BUTERA_ID.to_string(),
+        display_name: "Jay Butera".to_string(),
+    }
 }
 
 /// Whether the confirmation report says the payment posted.
@@ -434,113 +447,268 @@ fn a_stale_sheet_for_another_payee_is_refused_before_the_click() {
     );
 }
 
+// ===========================================================================
+// The recipient check, rebuilt 2026-09-06.
+//
+// The old check scraped every `@handle` out of `document.body.innerText` and
+// required one to equal the payee. The live pay page renders the recipient
+// only as a display name under "To", and the sole `@handle` on it is the
+// logged-in account's own, from the chrome at the top of every page. So the
+// set it searched never held the recipient and always held the sender: every
+// legitimate payment failed closed, and a payment to the LP's own account was
+// the one case that would have passed.
+//
+// It now reads `__NEXT_DATA__.props.pageProps.txnUserDetails`, the page's own
+// state for the form, and requires exactly one payee carrying the numeric id
+// `VenmoBrowser::resolve_payee` got from `GET /api/user/<handle>`. The
+// fixtures below are the page states that endpoint and the live pay page
+// actually produced on 2026-09-06; the ids are Venmo's real ones.
+// ===========================================================================
+
+/// Venmo's id for `jay-butera`, from the live per-user read.
+const JAY_BUTERA_ID: &str = "2041148646359040020";
+
+/// Whether the driver would accept this page as a payment to this account.
+///
+/// Runs the real expression against the page and hands the answer to the real
+/// comparison, `venmo::page_pays_only`. Nothing here re-implements the check:
+/// the 2026-09-05 false success was a sequence whose every expression was
+/// correct and whose result was still wrong, and a test that mirrors the logic
+/// instead of calling it cannot catch that.
+fn page_pays(page: &str, payee_id: &str) -> Result<(), String> {
+    let step = PaymentStep::RequireRecipient {
+        recipient: "jay-butera".to_string(),
+        payee_id: payee_id.to_string(),
+    };
+    let results = run_sequence(page, &[step.expression_for_test()]);
+    assert!(
+        results[0].ok,
+        "the recipient check must answer rather than throw, got {:?}",
+        results[0].error
+    );
+    zecp2p_taker::venmo::page_pays_only(&results[0].value, payee_id)
+}
+
+/// The ordinary case still passes.
+///
+/// This is the payment that was blocked on 2026-09-06 with the escrow funded:
+/// a correct form for the right payee that the old check could not read.
+#[test]
+fn the_payee_the_page_is_addressed_to_is_accepted() {
+    if !node_available() {
+        return;
+    }
+    assert_eq!(
+        page_pays("cleanpay", JAY_BUTERA_ID),
+        Ok(()),
+        "the live pay form for @jay-butera must pass"
+    );
+}
+
 /// Item 4: the recipient check reads the page, not the URL we just wrote.
 ///
 /// `RequireRecipient` used to fold `location.href` into its haystack, so it
 /// confirmed the address `Navigate` had assigned one step earlier rather than
-/// anything the document rendered. A pay form left open for someone else, at a
-/// URL naming our payee, passed it.
+/// anything the document carried.
+///
+/// Measured again on the live page 2026-09-06 and the reason is sharper than
+/// it was: a `pushState` to a different handle moved the URL while the page
+/// state and the rendered "To" field both stayed on the original payee. The
+/// URL is the half that can lie about who a loaded form pays.
 #[test]
 fn the_recipient_check_does_not_read_the_url_we_navigated_to() {
     if !node_available() {
         return;
     }
+    let refusal = page_pays("wrongpayeeform", JAY_BUTERA_ID)
+        .expect_err("a form for Jordan Bryant at our payee's URL must be refused");
     assert!(
-        !recipient_matches("wrongpayeeform", "jay-butera"),
-        "the page names @someone-else and only the URL names jay-butera"
+        refusal.contains("2261773692436480899"),
+        "the refusal must name who the page would have paid, got {refusal:?}"
     );
 }
 
-/// Whether the driver would accept this page as a payment to this handle.
+/// The self-payment hole, closed.
 ///
-/// Mirrors the comparison in `execute`'s `RequireRecipient` arm: the page
-/// returns the handles it renders and the caller requires one of them to equal
-/// ours once both are normalised.
-fn recipient_matches(page: &str, recipient: &str) -> bool {
-    use zecp2p_taker::payee::normalize_venmo_username;
-
-    let step = PaymentStep::RequireRecipient {
-        recipient: recipient.to_string(),
-    };
-    let results = run_sequence(page, &[step.expression_for_test()]);
-    let handles = results[0]
-        .value
-        .get("handles")
-        .and_then(|v| v.as_array())
-        .expect("the recipient check answers the handles it found")
-        .iter()
-        .filter_map(|h| h.as_str())
-        .map(|h| h.to_string())
-        .collect::<Vec<_>>();
-
-    let wanted = normalize_venmo_username(recipient);
-    handles
-        .iter()
-        .any(|h| normalize_venmo_username(h).eq_ignore_ascii_case(wanted))
-}
-
-/// The prefix collision, closed.
+/// The old check's only passing case. `@Jay-Butera-2` is the logged-in
+/// account, its handle is on every page, so "does the page name our payee"
+/// reduced to "am I paying myself?" and answered yes for exactly the recipient
+/// it should refuse.
 ///
-/// The round-3 review read the live account page and found it renders the
-/// header handle `@Jay-Butera-2`. Lowercased, that *contains* `jay-butera`, so
-/// the substring check this replaces would have passed on a form for a
-/// different account. Whole-handle equality does not.
+/// Venmo's own answer helps: it will not let an account pay itself, so the
+/// form comes back with no payee. Either way this refuses, and it must refuse
+/// whichever id it is asked about.
 #[test]
-fn a_handle_that_merely_starts_with_ours_is_not_ours() {
+fn a_form_for_our_own_account_is_refused() {
     if !node_available() {
         return;
     }
     assert!(
-        !recipient_matches("prefixcollision", "jay-butera"),
-        "@Jay-Butera-2 is a different account from @jay-butera"
+        page_pays("selfpayment", JAY_BUTERA_ID).is_err(),
+        "a form that pays nobody is not a form that pays our payee"
     );
-    // And the substring test really would have passed, which is what makes
-    // this worth a test rather than a comment.
-    let results = run_sequence(
-        "prefixcollision",
-        &[PaymentStep::RequireRecipient {
-            recipient: "jay-butera".to_string(),
-        }
-        .expression_for_test()],
-    );
-    let rendered = results[0]
-        .value
-        .get("handles")
-        .and_then(|v| v.as_array())
-        .expect("handles")
-        .iter()
-        .filter_map(|h| h.as_str())
-        .collect::<Vec<_>>()
-        .join(" ");
+    // And asked about the LP's own id, which is the id the old check was in
+    // effect matching on, it still refuses.
     assert!(
-        rendered.to_lowercase().contains("jay-butera"),
-        "the old substring check would have passed on {rendered:?}"
+        page_pays("selfpayment", "4676038579717835818").is_err(),
+        "the sender's own handle being on the page is not a payee"
     );
+}
+
+/// A handle Venmo cannot resolve gets a pay form and no payee.
+///
+/// The form renders, so `WaitFor` on the amount field passes and the run
+/// carries on to this step. There is nothing to match, and a check with no
+/// input must refuse rather than shrug.
+#[test]
+fn a_form_for_an_unresolvable_handle_is_refused() {
+    if !node_available() {
+        return;
+    }
+    let refusal = page_pays("unresolvedpayee", JAY_BUTERA_ID)
+        .expect_err("a form naming no payee must be refused");
+    assert!(
+        refusal.contains("no payee"),
+        "the refusal must say the page named nobody, got {refusal:?}"
+    );
+}
+
+/// One hyphen away is a different person.
+///
+/// `jaybutera` resolves to `JayButera` -- Joseph Butera, id
+/// 3457650285086115910 -- on the live session. The pay page for him is
+/// well-formed and renders "Joseph Butera" under "To". Nothing about the page
+/// distinguishes it from the right one except the id.
+#[test]
+fn a_near_miss_handle_is_a_different_account() {
+    if !node_available() {
+        return;
+    }
+    let refusal =
+        page_pays("nearmisspayee", JAY_BUTERA_ID).expect_err("@JayButera is not @Jay-Butera");
+    assert!(
+        refusal.contains("3457650285086115910"),
+        "the refusal must name the id the page carries, got {refusal:?}"
+    );
+}
+
+/// Our payee plus a stranger is not our payee.
+///
+/// Venmo's pay form takes several recipients and splits the amount among them.
+/// A check asking "is ours on the page" answers yes here and sends half the
+/// money to an account the order never named.
+#[test]
+fn a_form_that_also_pays_someone_else_is_refused() {
+    if !node_available() {
+        return;
+    }
+    let refusal = page_pays("splitpayee", JAY_BUTERA_ID)
+        .expect_err("a split payment is not the payment this order authorised");
+    assert!(
+        refusal.contains("2261773692436480899"),
+        "the refusal must name the extra payee, got {refusal:?}"
+    );
+}
+
+/// The state this reads is not a documented API, so its absence is a refusal.
+///
+/// `__NEXT_DATA__` is Venmo's build detail and it can disappear. When it does,
+/// there is no weaker reading of the page to fall back to: the display name
+/// under "To" is not a resolution and the only handle rendered is the
+/// sender's. Falling back to either is how the guard got into this state.
+#[test]
+fn a_page_that_cannot_say_who_it_pays_is_refused() {
+    if !node_available() {
+        return;
+    }
+    for page in ["nopagestate", "brokenpagestate", "nopayeekey"] {
+        let refusal = page_pays(page, JAY_BUTERA_ID)
+            .expect_err(&format!("{page} must be refused, not accepted"));
+        assert!(
+            refusal.contains("cannot say who it pays"),
+            "{page} must refuse for the reason it actually has, got {refusal:?}"
+        );
+    }
 }
 
 /// Case is presentation, not identity.
 ///
-/// Venmo renders a handle in whatever case its owner set; the string we pay
+/// Venmo echoes a handle in whatever case its owner set; the string we pay
 /// comes from the curator. A payment must not turn on that difference, or the
 /// rail fails closed on every order for a payee who capitalised their name.
+/// The id is what is compared, so the case never enters into it.
 #[test]
 fn a_handle_in_another_case_is_still_ours() {
     if !node_available() {
         return;
     }
-    assert!(
-        recipient_matches("mixedcase", "jay-butera"),
-        "@Jay-Butera is the same account as @jay-butera"
+    assert_eq!(
+        page_pays("mixedcase", JAY_BUTERA_ID),
+        Ok(()),
+        "@JAY-BUTERA is the same account as @jay-butera"
     );
 }
 
-/// The ordinary case still passes.
+/// The check no longer has any way to be satisfied by the account chrome.
+///
+/// The failure was not that the old comparison was too loose; it was that its
+/// *input* was the wrong part of the page. Every pay page carries the LP's own
+/// handle, so any check reading `document.body.innerText` is reading a string
+/// that is present whoever is being paid. This pins the expression away from
+/// it: a future edit that reaches for the body text again fails here rather
+/// than in production with an escrow funded.
 #[test]
-fn the_payee_the_page_names_is_accepted() {
-    if !node_available() {
-        return;
+fn the_recipient_check_does_not_read_the_rendered_page_text() {
+    let js = PaymentStep::RequireRecipient {
+        recipient: "jay-butera".to_string(),
+        payee_id: JAY_BUTERA_ID.to_string(),
     }
-    assert!(recipient_matches("cleanpay", "jay-butera"));
+    .expression_for_test();
+
+    assert!(
+        !js.contains("innerText"),
+        "the pay page renders no recipient handle; reading its text is what broke \
+         this check: {js}"
+    );
+    assert!(
+        !js.contains("location.href") || js.contains("url: location.href"),
+        "the URL may be reported for the operator, never matched on: {js}"
+    );
+    assert!(
+        js.contains("txnUserDetails"),
+        "the recipient must come from the page's own payee state: {js}"
+    );
+}
+
+/// Display names are not a resolution, and nothing may compare them.
+///
+/// Casper's requirement, pinned: the pay page shows "Jay Butera" and that is
+/// not evidence about which account gets the money. Two people share a name;
+/// `casper` and `jay-butera` both render initials "JB". The display name is
+/// carried for the operator's log and never compared.
+#[test]
+fn no_step_resolves_a_payee_by_display_name() {
+    let steps = the_incident_payment();
+    for step in &steps {
+        let js = step.expression_for_test();
+        assert!(
+            !js.contains("displayName") || step_is_recipient_check(step),
+            "only the recipient check may even read a display name: {js}"
+        );
+    }
+    // And the recipient check reads it to report it, not to decide. The
+    // comparison is over ids: a page carrying the right name and the wrong id
+    // is refused.
+    if node_available() {
+        assert!(
+            page_pays("nearmisspayee", JAY_BUTERA_ID).is_err(),
+            "\"Joseph Butera\" renders as plausibly as \"Jay Butera\" and is not him"
+        );
+    }
+}
+
+fn step_is_recipient_check(step: &PaymentStep) -> bool {
+    matches!(step, PaymentStep::RequireRecipient { .. })
 }
 
 /// A payment never blocks on the audience control.
@@ -576,4 +744,74 @@ fn no_step_touches_or_refuses_over_the_audience() {
         )),
         "the tagged note must still be typed"
     );
+}
+
+/// The refusals and the pass, against what the live page actually answered.
+///
+/// The fixtures above model the pay page; this is the pay page. Each value
+/// below is the verbatim output of the real `RequireRecipient` expression run
+/// in the LP's own logged-in Chrome on 2026-09-06, one navigation per handle,
+/// captured over CDP. The comparison they are fed is the same
+/// `page_pays_only` that decides a live payment.
+///
+/// A mock can be wrong about Venmo in a way no assertion catches -- the
+/// round-2 review found exactly that, a test proving the mock rather than the
+/// page. These five rows cannot be, because nothing in this repository
+/// produced them.
+#[test]
+fn the_live_pages_answer_the_way_the_fixtures_do() {
+    // The id `GET /api/user/jay-butera` answered in the same session.
+    let resolved = JAY_BUTERA_ID;
+
+    let live = |json: &str| -> Result<(), String> {
+        zecp2p_taker::venmo::page_pays_only(
+            &serde_json::from_str::<serde_json::Value>(json).expect("recorded answer"),
+            resolved,
+        )
+    };
+
+    // ?recipients=jay-butera -- the order that was blocked with the escrow
+    // funded. It passes.
+    assert_eq!(
+        live(
+            r#"{"found":true,"why":"","url":"https://account.venmo.com/pay?recipients=jay-butera",
+                "payees":[{"id":"2041148646359040020","username":"Jay-Butera",
+                           "displayName":"Jay Butera"}]}"#
+        ),
+        Ok(())
+    );
+
+    // ?recipients=casper -- an allowlisted handle that is not the operator.
+    // Venmo resolves it to Jordan Bryant, a stranger.
+    assert!(live(
+        r#"{"found":true,"why":"","url":"https://account.venmo.com/pay?recipients=casper",
+            "payees":[{"id":"2261773692436480899","username":"casper",
+                       "displayName":"Jordan Bryant"}]}"#
+    )
+    .is_err());
+
+    // ?recipients=jaybutera -- one hyphen out, a different real person.
+    assert!(live(
+        r#"{"found":true,"why":"","url":"https://account.venmo.com/pay?recipients=jaybutera",
+            "payees":[{"id":"3457650285086115910","username":"JayButera",
+                       "displayName":"Joseph Butera"}]}"#
+    )
+    .is_err());
+
+    // ?recipients=zz-no-such-handle-91731 -- a pay form renders, with no payee.
+    assert!(live(
+        r#"{"found":true,"why":"",
+            "url":"https://account.venmo.com/pay?recipients=zz-no-such-handle-91731",
+            "payees":[]}"#
+    )
+    .is_err());
+
+    // ?recipients=Jay-Butera-2 -- the LP's own account, and the only page the
+    // old check ever passed. Venmo will not pay you yourself, so there is no
+    // payee to match.
+    assert!(live(
+        r#"{"found":true,"why":"","url":"https://account.venmo.com/pay?recipients=Jay-Butera-2",
+            "payees":[]}"#
+    )
+    .is_err());
 }

@@ -121,8 +121,15 @@ class Element {
 class Document {
   // `text` lets a page state body copy that is not just its buttons' labels;
   // the payment page names the recipient in prose, not on a control.
-  constructor(elements, text) {
+  //
+  // `nextData` is the page's server-rendered state, which is where the pay
+  // page keeps the one thing it does not render: the payee's canonical handle
+  // and numeric id. A page that declares it as `undefined` gets a real
+  // `__NEXT_DATA__` element; a page that declares it `null` gets none at all,
+  // which is a state the recipient check has to refuse rather than crash on.
+  constructor(elements, text, nextData) {
     this.elements = elements;
+    this.nextData = nextData;
     const self = this;
     this.body = {
       // A getter, not a snapshot: a page whose click removes a button must
@@ -134,6 +141,21 @@ class Document {
     };
   }
 
+  // The one id the payment steps ask for. Answers a `<script>`-shaped object
+  // whose `textContent` is the serialised state, exactly as the live page's
+  // is: the step parses it, so handing back a pre-parsed object would skip the
+  // parse the real expression has to do.
+  getElementById(id) {
+    if (id !== '__NEXT_DATA__') return null;
+    if (this.nextData === null || this.nextData === undefined) return null;
+    return {
+      id: '__NEXT_DATA__',
+      tagName: 'SCRIPT',
+      textContent:
+        typeof this.nextData === 'string' ? this.nextData : JSON.stringify(this.nextData),
+    };
+  }
+
   querySelector(selector) {
     return this.elements.find((e) => e.matches(selector)) || null;
   }
@@ -141,6 +163,50 @@ class Document {
   querySelectorAll(selector) {
     return this.elements.filter((e) => e.matches(selector));
   }
+}
+
+// ---------------------------------------------------------------------------
+// The pay page's own state
+// ---------------------------------------------------------------------------
+
+/// Venmo's real user ids, as the live session answered them on 2026-09-06.
+///
+/// Real values rather than invented ones, because the interesting cases are
+/// about accounts that genuinely exist and genuinely are not each other.
+const IDS = {
+  // The payee: `?recipients=jay-butera` resolves here.
+  jayButera: '2041148646359040020',
+  // The LP's own account, whose handle is the only `@handle` the pay page
+  // renders. The check that this replaced matched on exactly this.
+  ownAccount: '4676038579717835818',
+  // `?recipients=casper` resolves here. Not the operator.
+  jordanBryant: '2261773692436480899',
+  // `?recipients=jaybutera`, one hyphen from the payee, resolves here.
+  josephButera: '3457650285086115910',
+};
+
+/// The `__NEXT_DATA__` a pay page carries for a given set of payees.
+///
+/// Shaped as the live page's is, down to the wrapper keys: the step walks
+/// `props.pageProps.txnUserDetails`, so a flatter mock would let a step that
+/// walks the wrong path pass.
+function payPageState(payees) {
+  return {
+    props: {
+      pageProps: {
+        txnUserDetails: payees,
+        txnAmount: '0',
+        txnAudience: 'private',
+        venmoBalance: '60.49',
+      },
+    },
+    page: '/pay',
+  };
+}
+
+/// One payee entry, as `txnUserDetails` holds it.
+function payee(id, username, displayName) {
+  return { id, displayName, profilePictureUrl: '', initials: '', username, identityType: 'personal' };
 }
 
 // ---------------------------------------------------------------------------
@@ -236,7 +302,12 @@ function cleanPayPage() {
       new Element('textarea', { id: 'payment-note', value: '' }),
       new Element('button', {}, 'Pay'),
     ],
-    text: 'Pay @jay-butera',
+    // What the live pay page actually renders: the payee as a display name
+    // under "To", and the *sender's* own handle in the account chrome. There
+    // is no `@jay-butera` anywhere on it, which is the finding of 2026-09-06
+    // and the reason the recipient check no longer reads this.
+    text: "JB Jay @Jay-Butera-2 $60.49 Pay & Request To Jay Butera What's this for? Private",
+    nextData: payPageState([payee(IDS.jayButera, 'Jay-Butera', 'Jay Butera')]),
   };
   page.location = { href: page.url };
 
@@ -373,44 +444,109 @@ function otherPayeeSheetPage() {
 /// `RequireRecipient` used to include `location.href` in its haystack, so it
 /// confirmed the address `Navigate` had just written rather than anything the
 /// page rendered. Item 4 of the review.
+///
+/// Measured on the live page 2026-09-06 and sharper than it was: driving a
+/// `pushState` to a different handle moved the URL while both the page state
+/// and the rendered "To" field stayed on the original payee. The URL is the
+/// half that lies. So this page's URL names our payee and every reading of the
+/// document says Jordan Bryant.
 function wrongPayeeFormPage() {
-  return {
-    url: 'https://account.venmo.com/pay?recipients=jay-butera',
-    elements: [
-      new Element('input', { 'aria-label': 'Amount', value: '' }),
-      new Element('textarea', { id: 'payment-note', value: '' }),
-      new Element('button', {}, 'Pay'),
-    ],
-    text: 'Pay @someone-else',
-  };
+  const page = cleanPayPage();
+  page.url = 'https://account.venmo.com/pay?recipients=jay-butera';
+  page.location = { href: page.url };
+  page.text = "JB Jay @Jay-Butera-2 $60.49 Pay & Request To Jordan Bryant What's this for?";
+  page.nextData = payPageState([payee(IDS.jordanBryant, 'casper', 'Jordan Bryant')]);
+  return page;
 }
 
-/// A pay form for `@Jay-Butera-2`, a different account whose handle has ours
-/// as a prefix.
+/// The pay form Venmo serves for the LP's own handle.
 ///
-/// This is the collision the round-3 review found on the live account page,
-/// which renders the header handle `@Jay-Butera-2`. A substring check asking
-/// whether the body contains "jay-butera" answers yes here and pays the wrong
-/// account; whole-handle equality answers no.
-function prefixCollisionFormPage() {
-  return {
-    url: 'https://account.venmo.com/pay?recipients=jay-butera',
-    elements: [
-      new Element('input', { 'aria-label': 'Amount', value: '' }),
-      new Element('textarea', { id: 'payment-note', value: '' }),
-      new Element('button', {}, 'Pay'),
-    ],
-    text: 'Pay @Jay-Butera-2',
-  };
+/// `?recipients=Jay-Butera-2` from that account's own session renders a form
+/// and answers an empty `txnUserDetails`: Venmo will not pay you yourself.
+///
+/// This is the page the old check *passed*. It scraped every `@handle` out of
+/// `document.body.innerText`, and the account chrome puts the logged-in
+/// handle on every page, so the one recipient it could ever match was the
+/// sender. Its one passing case is now the case with no payee at all.
+function selfPaymentFormPage() {
+  const page = cleanPayPage();
+  page.url = 'https://account.venmo.com/pay?recipients=Jay-Butera-2';
+  page.location = { href: page.url };
+  page.nextData = payPageState([]);
+  return page;
 }
 
-/// The same payee, rendered in the case its owner chose.
+/// The form for a handle Venmo cannot resolve.
 ///
-/// Venmo shows a handle however the owner set it while the string we pay comes
-/// from the curator, so case must not decide a payment.
+/// `?recipients=zz-no-such-handle-91731` still renders a pay form -- the
+/// amount field is there, so `WaitFor` passes -- and carries no payee.
+function unresolvedPayeeFormPage() {
+  const page = cleanPayPage();
+  page.url = 'https://account.venmo.com/pay?recipients=zz-no-such-handle-91731';
+  page.location = { href: page.url };
+  page.nextData = payPageState([]);
+  return page;
+}
+
+/// A form for `@JayButera`, one hyphen away from the payee.
+///
+/// Joseph Butera, a real and different person: the live session resolves
+/// `jaybutera` straight to him. The pay page renders "Joseph Butera" under
+/// "To" and nothing else distinguishes it from the right form.
+function nearMissPayeeFormPage() {
+  const page = cleanPayPage();
+  page.text = "JB Jay @Jay-Butera-2 $60.49 Pay & Request To Joseph Butera What's this for?";
+  page.nextData = payPageState([payee(IDS.josephButera, 'JayButera', 'Joseph Butera')]);
+  return page;
+}
+
+/// A form addressed to our payee *and* somebody else.
+///
+/// Venmo's pay form takes several recipients and splits the amount among them.
+/// Ours being on the page is not enough when a stranger is on it too.
+function splitPayeeFormPage() {
+  const page = cleanPayPage();
+  page.nextData = payPageState([
+    payee(IDS.jayButera, 'Jay-Butera', 'Jay Butera'),
+    payee(IDS.jordanBryant, 'casper', 'Jordan Bryant'),
+  ]);
+  return page;
+}
+
+/// A pay page carrying no `__NEXT_DATA__` at all.
+///
+/// The state the check reads is not a documented API and Venmo may stop
+/// shipping it. When that happens the answer has to be a refusal: there is no
+/// weaker reading of the page to fall back to, because the display name under
+/// "To" is not a resolution and the only handle is the sender's.
+function noPageStatePage() {
+  const page = cleanPayPage();
+  page.nextData = null;
+  return page;
+}
+
+/// A pay page whose `__NEXT_DATA__` will not parse.
+function brokenPageStatePage() {
+  const page = cleanPayPage();
+  page.nextData = '{"props": {"pageProps": ';
+  return page;
+}
+
+/// A pay page whose state carries no `txnUserDetails` key.
+function noPayeeKeyPage() {
+  const page = cleanPayPage();
+  page.nextData = { props: { pageProps: { txnAmount: '0' } }, page: '/pay' };
+  return page;
+}
+
+/// The same payee, echoed in the case its owner chose.
+///
+/// Venmo returns a handle however the owner set it while the string we pay
+/// comes from the curator. The id settles it either way, which is the point:
+/// case cannot decide a payment because case is not what is compared.
 function mixedCaseFormPage() {
   const page = cleanPayPage();
-  page.text = 'Pay @Jay-Butera';
+  page.nextData = payPageState([payee(IDS.jayButera, 'JAY-BUTERA', 'Jay Butera')]);
   return page;
 }
 
@@ -426,7 +562,13 @@ const PAGES = {
   expiringpay: expiringPayPage,
   otherpayeesheet: otherPayeeSheetPage,
   wrongpayeeform: wrongPayeeFormPage,
-  prefixcollision: prefixCollisionFormPage,
+  selfpayment: selfPaymentFormPage,
+  unresolvedpayee: unresolvedPayeeFormPage,
+  nearmisspayee: nearMissPayeeFormPage,
+  splitpayee: splitPayeeFormPage,
+  nopagestate: noPageStatePage,
+  brokenpagestate: brokenPageStatePage,
+  nopayeekey: noPayeeKeyPage,
   mixedcase: mixedCaseFormPage,
 };
 
@@ -484,7 +626,7 @@ function main() {
   }
 
   const page = build();
-  const document = new Document(page.elements, page.text);
+  const document = new Document(page.elements, page.text, page.nextData);
   // The page owns its location, so a click handler can navigate the way a real
   // one does: a session that expires at the confirm click redirects to sign-in,
   // and the confirmation check has to see that rather than an unchanged URL.

@@ -20,6 +20,32 @@
 //! fixed it did so in a way React silently discards. Before that the sequence
 //! ran Navigate, WaitFor, Fill, Fill, ConfirmSend with nothing read back at all:
 //! the money left first and the amount was learned afterwards.
+//!
+//! # Who gets paid, and why the page cannot answer it
+//!
+//! A payment now begins with [`VenmoBrowser::resolve_payee`], one authenticated
+//! `GET /api/user/<handle>` made before the browser is pointed anywhere. It is
+//! the "per-user read" `1a168fa` named and the thing the pay page cannot
+//! substitute for: the pay page renders the recipient as a **display name**
+//! under "To", and the only `@handle` anywhere on it is the logged-in account's
+//! own, from the chrome at the top of every page.
+//!
+//! That is not a detail. Until 2026-09-06 `RequireRecipient` scraped handles out
+//! of `document.body.innerText`, so the set it searched never held the recipient
+//! and always held the sender: it refused every legitimate payment and would
+//! have approved a payment to the LP's own account. `docs/status/
+//! venmo-recipient-guard-blocks-all-payments.md` is the measurement.
+//!
+//! So the recipient is established in two places that have to agree, and both
+//! compare Venmo's numeric user id rather than a handle or a name:
+//!
+//! 1. the lookup resolves the ordered handle to an id, refusing a handle nobody
+//!    owns (500) and a handle that comes back under a different canonical name;
+//! 2. [`PaymentStep::RequireRecipient`] requires the loaded pay page's own state
+//!    to name that id, and only that id.
+//!
+//! A display name is never compared anywhere. Two people share a name, and the
+//! name is the one thing about a payee the page will happily show for anybody.
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -156,6 +182,29 @@ pub enum PaymentOutcome {
     /// Reached only through [`PaymentStep::RequireSendConfirmed`]. A click that
     /// returned without error is not enough and never was.
     Sent { recipient: String, amount: String },
+}
+
+/// Who Venmo says a handle is.
+///
+/// Produced only by [`VenmoBrowser::resolve_payee`], which is what makes it
+/// evidence rather than a struct anyone can fill in: a `ResolvedPayee` in hand
+/// means the live session was asked and answered, the canonical handle came
+/// back equal to the one being paid, and the account is active. The steps that
+/// check the pay page take one of these, so a payment cannot be built without
+/// the lookup having run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedPayee {
+    /// The canonical handle, in Venmo's own casing.
+    pub handle: String,
+    /// Venmo's numeric user id, as a decimal string.
+    ///
+    /// The thing the pay page is bound to. It is not re-assignable and not
+    /// case-sensitive, and it is the field `txnUserDetails` carries.
+    pub id: String,
+    /// The name the pay page will render under "To", for the log and the
+    /// operator. Never compared against anything: a display name is not
+    /// unique and is not a resolution.
+    pub display_name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -421,15 +470,165 @@ impl VenmoBrowser {
             .to_string())
     }
 
+    /// Ask Venmo who a handle is, before the browser is pointed at a pay form.
+    ///
+    /// `GET /api/user/<handle>` is the per-user read `1a168fa`'s message named
+    /// as the real fix, chosen over the alternatives by probing the live
+    /// session on 2026-09-06 rather than by guessing:
+    ///
+    /// | path | answer for `jay-butera` |
+    /// |---|---|
+    /// | `/api/user/<h>` | 200, `{"username":"Jay-Butera","id":"2041148646359040020",...}` |
+    /// | `/api/users/<h>` | 404, the Next.js shell |
+    /// | `/api/users?username=<h>` | 404, empty |
+    /// | `/api/search/users?query=<h>` | 404, the Next.js shell |
+    /// | `api.venmo.com/v1/users/<h>` | blocked cross-origin |
+    ///
+    /// It fails closed on a handle nobody owns: `zz-no-such-handle-91731`
+    /// answers 500 `Something went wrong`, which is a refusal here rather than
+    /// a fallback. And it does not fuzzy-match, which is the property that
+    /// makes it worth anything: `jaybutera`, one hyphen away from the payee,
+    /// resolves to `JayButera` -- Joseph Butera, a different person -- and the
+    /// canonical-username check below refuses it.
+    ///
+    /// The numeric `id` is the value that matters downstream. A handle is
+    /// re-assignable and Venmo renders it in whatever case its owner set; the
+    /// id is neither, and it is the field the pay page carries in its own
+    /// state, so it is what [`PaymentStep::RequireRecipient`] compares.
+    ///
+    /// Run from the page, with the session's cookies, exactly as
+    /// [`Self::session_is_authenticated`] is. A signed-out session cannot
+    /// resolve anybody and the empty answer is a refusal, so this is also the
+    /// last liveness check before a payment.
+    pub async fn resolve_payee(&self, tab: &CdpTab, handle: &str) -> Result<ResolvedPayee> {
+        // Shape-checked before it reaches a URL, the same gate the pay address
+        // goes through. Without it a handle carrying a slash or a `?` would be
+        // a different path or a different query, and this function would report
+        // on an account nobody asked about.
+        let wanted = crate::payee::validate_username_shape(handle)
+            .context("the handle to resolve is not shaped like a Venmo username")?;
+
+        let expression = format!(
+            "(async () => {{ \
+               try {{ \
+                 const r = await fetch('https://account.venmo.com/api/user/' + \
+                   encodeURIComponent({handle}), \
+                   {{credentials: 'include', headers: {{'Accept': 'application/json'}}}}); \
+                 const text = await r.text(); \
+                 if (!r.ok) return {{ok: false, status: r.status, \
+                                     body: text.slice(0, 200)}}; \
+                 let parsed; \
+                 try {{ parsed = JSON.parse(text); }} \
+                 catch (e) {{ return {{ok: false, status: r.status, \
+                                       body: 'not JSON: ' + text.slice(0, 200)}}; }} \
+                 return {{ok: true, id: String(parsed.id || ''), \
+                          username: String(parsed.username || ''), \
+                          displayName: String(parsed.displayName || ''), \
+                          isActive: parsed.isActive === true}}; \
+               }} catch (e) {{ return {{ok: false, status: 0, body: String(e)}}; }} \
+             }})()",
+            handle = json!(wanted)
+        );
+
+        let value = self.evaluate(tab, &expression).await?;
+        let report = value
+            .get("result")
+            .and_then(|r| r.get("value"))
+            .ok_or_else(|| anyhow::anyhow!("the payee lookup answered nothing"))?;
+
+        let ok = report.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+        if !ok {
+            let status = report.get("status").and_then(|v| v.as_i64()).unwrap_or(0);
+            let body = report
+                .get("body")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(no body)");
+            anyhow::bail!(
+                "Venmo would not resolve @{wanted}: the per-user read answered {status} \
+                 ({body}). A handle nobody owns answers 500 here, so this is a refusal \
+                 and not a reason to try the pay page anyway. Nothing was navigated to \
+                 and no money moved."
+            );
+        }
+
+        let username = report
+            .get("username")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let id = report
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let display_name = report
+            .get("displayName")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+
+        // An account with no id is not an account we can bind the pay page to,
+        // and the binding is the whole point.
+        if id.trim().is_empty() {
+            anyhow::bail!(
+                "Venmo resolved @{wanted} to an account with no id. Without one there is \
+                 nothing to check the pay page against, so this refuses rather than \
+                 falling back to the handle."
+            );
+        }
+
+        // The canonical username Venmo answered has to *be* the one we were
+        // told to pay. This is what catches `jaybutera` -> `JayButera`: the
+        // lookup succeeds, the account is real, and it belongs to someone else.
+        //
+        // Case-insensitive because Venmo echoes a handle in its owner's chosen
+        // case while the string we pay comes from the curator. Case is
+        // presentation; the handle is not.
+        if !crate::payee::normalize_venmo_username(&username).eq_ignore_ascii_case(wanted) {
+            anyhow::bail!(
+                "Venmo resolved @{wanted} to @{username} ({display_name}), which is a \
+                 different account. The per-user read does not fuzzy-match, so a handle \
+                 that comes back under another name is another person. Refusing before \
+                 the pay page is opened."
+            );
+        }
+
+        if !report
+            .get("isActive")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            anyhow::bail!(
+                "Venmo says @{wanted} ({display_name}) is not an active account. \
+                 Refusing to pay it."
+            );
+        }
+
+        Ok(ResolvedPayee {
+            handle: username,
+            id,
+            display_name,
+        })
+    }
+
     /// Build the sequence of CDP steps a payment needs.
     ///
     /// Returned rather than executed so the dry run can print exactly what the
     /// live run would do, and so the irreversible step is a separate, explicit
     /// element the caller has to opt into.
-    pub fn payment_steps(&self, req: &PaymentRequest) -> Vec<PaymentStep> {
+    ///
+    /// `payee` is what [`Self::resolve_payee`] answered for `req.recipient`.
+    /// It is a parameter rather than something built here because resolving is
+    /// a network read against the live session and the steps have to stay a
+    /// pure description the dry run can print.
+    pub fn payment_steps(&self, req: &PaymentRequest, payee: &ResolvedPayee) -> Vec<PaymentStep> {
         vec![
+            // Navigated to by the canonical handle Venmo itself answered, not
+            // by the string the coordinator sent. They differ in case whenever
+            // the owner set one, and using the resolved form means the page is
+            // asked for the account the lookup actually checked.
             PaymentStep::Navigate {
-                url: format!("https://account.venmo.com/pay?recipients={}", req.recipient),
+                url: format!("https://account.venmo.com/pay?recipients={}", payee.handle),
             },
             PaymentStep::WaitFor {
                 selector: AMOUNT_SELECTOR.to_string(),
@@ -440,6 +639,7 @@ impl VenmoBrowser {
             // straight on into the fills and the click.
             PaymentStep::RequireRecipient {
                 recipient: req.recipient.clone(),
+                payee_id: payee.id.clone(),
             },
             PaymentStep::Fill {
                 selector: AMOUNT_SELECTOR.to_string(),
@@ -514,7 +714,30 @@ impl VenmoBrowser {
             );
         }
 
-        let steps = self.payment_steps(req);
+        // Who is this? Asked before the browser is pointed anywhere, because a
+        // pay page cannot answer it: it renders the recipient as a display
+        // name, and the only `@handle` on it is the logged-in account's own.
+        // The 2026-09-06 writeup is the measurement.
+        let payee = self
+            .resolve_payee(tab, &req.recipient)
+            .await
+            .with_context(|| {
+                format!(
+                    "could not establish who @{} is, so nothing was navigated to \
+                     and no money moved",
+                    req.recipient
+                )
+            })?;
+
+        tracing::info!(
+            asked = %req.recipient,
+            resolved = %payee.handle,
+            id = %payee.id,
+            name = %payee.display_name,
+            "Venmo resolved the payee"
+        );
+
+        let steps = self.payment_steps(req, &payee);
 
         for step in &steps {
             if step.is_irreversible() {
@@ -561,51 +784,22 @@ impl VenmoBrowser {
 
             // The two assertions are the point of NEW-3: their return values are
             // read, and a wrong answer stops the run before the click.
-            PaymentStep::RequireRecipient { recipient } => {
+            PaymentStep::RequireRecipient {
+                recipient,
+                payee_id,
+            } => {
                 let value = self.evaluate(tab, &step.to_expression()).await?;
-                let result = value.get("result").and_then(|r| r.get("value"));
-                let url = result
-                    .and_then(|v| v.get("url"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("(unknown)");
-                let handles: Vec<String> = result
-                    .and_then(|v| v.get("handles"))
-                    .and_then(|v| v.as_array())
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|h| h.as_str())
-                            .map(|h| h.to_string())
-                            .collect()
-                    })
-                    .unwrap_or_default();
-
-                // Whole-handle equality, not "the page text contains this
-                // string". Both sides go through the same normaliser the
-                // coordinator and the curator use, so `@Alice` and ` alice `
-                // are the one handle they name -- and `jay-butera` no longer
-                // matches a page whose only handle is `Jay-Butera-2`.
-                //
-                // Case-insensitive because Venmo renders a handle in whatever
-                // case the owner set, while the string we are paying comes
-                // from the curator. Case is presentation; the handle is not.
-                let wanted = crate::payee::normalize_venmo_username(recipient);
-                let matched = handles.iter().any(|h| {
-                    crate::payee::normalize_venmo_username(h).eq_ignore_ascii_case(wanted)
-                });
-
-                if !matched {
-                    let seen = if handles.is_empty() {
-                        "no handles at all".to_string()
-                    } else {
-                        format!("@{}", handles.join(", @"))
-                    };
-                    anyhow::bail!(
-                        "the Venmo page at {url} does not name @{wanted}; it renders {seen}. \
-                         Refusing to fill in an amount and click send on a payment to \
-                         someone else."
-                    );
-                }
-                Ok(())
+                let report = value
+                    .get("result")
+                    .and_then(|r| r.get("value"))
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                page_pays_only(&report, payee_id).map_err(|why| {
+                    anyhow::anyhow!(
+                        "{why} This order pays @{recipient}. Refusing to fill in an amount \
+                         and click send."
+                    )
+                })
             }
 
             PaymentStep::RequireAmount { expected, .. } => {
@@ -928,8 +1122,14 @@ pub enum PaymentStep {
     /// `WaitFor` on the amount field says a payment form is on screen, not whose
     /// it is. A navigation that landed somewhere else, or on a payment the
     /// operator had already part-filled, would otherwise be filled in and sent.
+    ///
+    /// `payee_id` is the numeric id [`VenmoBrowser::resolve_payee`] got from
+    /// the per-user read, and it is what the page is required to name.
+    /// `recipient` is carried only so the refusal can say which order was
+    /// stopped; nothing compares against it here.
     RequireRecipient {
         recipient: String,
+        payee_id: String,
     },
     /// Read the amount back out of the field and require it to be what we set.
     ///
@@ -1085,36 +1285,62 @@ impl PaymentStep {
                 sel = json!(selector),
                 val = json!(value)
             ),
-            // Returns the handles the page renders, so the caller compares them
-            // whole rather than as substrings.
+            // Returns the payees the pay page itself is addressed to, by
+            // Venmo's own numeric id.
             //
-            // The page's own text, and **not** `location.href`. The URL used to
-            // be part of the haystack, which made this check answer yes to the
-            // address `Navigate` had just written: we were asking the page to
-            // confirm a claim we had made ourselves one step earlier. A pay
-            // form left open for another payee, at a URL naming ours, passed.
-            // Only what the document renders is evidence about who it pays.
+            // **Not** `document.body.innerText`, which is what this read
+            // before 2026-09-06 and what made the guard useless. The pay page
+            // renders the recipient only as a display name under "To"; the
+            // sole `@handle` anywhere on it is the logged-in account's own,
+            // from the chrome at the top of every page. So the handle set
+            // never contained the recipient and always contained the sender,
+            // and the check reduced to "am I paying myself?" answering yes for
+            // exactly the case it should refuse.
             //
-            // And a *whole* handle, not a substring of the page text. Asking
-            // whether the body contains "jay-butera" is true of a page whose
-            // only handle is `@Jay-Butera-2`, a different account -- the
-            // round-3 review found exactly that string on the live account
-            // page. Every handle Venmo can render is a candidate; the caller
-            // requires one of them to equal ours once both are normalised.
+            // `__NEXT_DATA__.props.pageProps.txnUserDetails` is the page's own
+            // server-rendered state for this form, and it carries the payee's
+            // canonical handle and numeric id. Read off the live session on
+            // 2026-09-06, it tracks the resolution exactly:
             //
-            // Handles are extracted by their `@` prefix over Venmo's own
-            // character set (alphanumerics, `_`, `-`), which is the set
-            // `payee::validate_username_shape` already enforces on the string
-            // we are about to pay.
-            PaymentStep::RequireRecipient { .. } => format!(
-                "(() => {{ \
-                   const hay = document.body ? document.body.innerText : ''; \
-                   const found = hay.match({pat}) || []; \
-                   return {{ handles: found.map(h => h.slice(1)), \
-                             url: location.href }}; \
-                 }})()",
-                pat = "/@[A-Za-z0-9_-]+/g"
-            ),
+            // | `?recipients=` | `txnUserDetails` |
+            // |---|---|
+            // | `jay-butera` | `Jay-Butera`, id 2041148646359040020 |
+            // | `casper` | `casper`, id 2261773692436480899, Jordan Bryant |
+            // | `jaybutera` | `JayButera`, id 3457650285086115910, Joseph Butera |
+            // | `zz-no-such-handle-91731` | `[]` |
+            // | `Jay-Butera-2` (our own) | `[]` -- Venmo will not pay yourself |
+            //
+            // The empty answers are the point: an unresolvable payee gives the
+            // caller nothing to match, and it refuses.
+            //
+            // Still **not** `location.href`, and for a sharper reason than
+            // before. Driving a `pushState` to a different handle on the live
+            // page moved the URL and left both `txnUserDetails` and the
+            // rendered "To" field on the original payee: the URL is the half
+            // that can lie about who a loaded form pays, and the page state is
+            // the half that agrees with what is rendered.
+            //
+            // The whole array is returned rather than a verdict, so the caller
+            // compares and the refusal can name who the page was actually for.
+            PaymentStep::RequireRecipient { .. } => "(() => { \
+                   const el = document.getElementById('__NEXT_DATA__'); \
+                   if (!el) return {found: false, why: 'the page carries no __NEXT_DATA__', \
+                                    payees: [], url: location.href}; \
+                   let data; \
+                   try { data = JSON.parse(el.textContent); } \
+                   catch (e) { return {found: false, why: '__NEXT_DATA__ is not JSON', \
+                                       payees: [], url: location.href}; } \
+                   const props = data && data.props && data.props.pageProps; \
+                   const details = props && props.txnUserDetails; \
+                   if (!Array.isArray(details)) \
+                     return {found: false, why: 'the page state carries no txnUserDetails', \
+                             payees: [], url: location.href}; \
+                   return {found: true, why: '', url: location.href, \
+                           payees: details.map(u => ({id: String(u && u.id || ''), \
+                                                      username: String(u && u.username || ''), \
+                                                      displayName: String(u && u.displayName || '')}))}; \
+                 })()"
+            .to_string(),
             // Returns what the field actually holds, so the caller compares.
             PaymentStep::RequireAmount { selector, .. } => format!(
                 "(() => {{ \
@@ -1292,8 +1518,11 @@ impl PaymentStep {
             PaymentStep::Navigate { url } => format!("open {url}"),
             PaymentStep::WaitFor { selector } => format!("wait for {selector}"),
             PaymentStep::Fill { selector, value } => format!("type {value:?} into {selector}"),
-            PaymentStep::RequireRecipient { recipient } => {
-                format!("check the page is a payment to @{recipient}")
+            PaymentStep::RequireRecipient {
+                recipient,
+                payee_id,
+            } => {
+                format!("check the page's own state pays @{recipient}, Venmo user id {payee_id}")
             }
             PaymentStep::RequireAmount { selector, expected } => {
                 format!("read {selector} back and require it to be {expected:?}")
@@ -1391,6 +1620,116 @@ pub fn usdc_to_dollars(amount: alloy::primitives::U256) -> String {
     let cents = units.div_ceil(10_000);
 
     format!("{}.{:02}", cents / 100, cents % 100)
+}
+
+/// Whether the loaded pay page pays exactly the account we resolved, and nobody
+/// else.
+///
+/// Takes the report `PaymentStep::RequireRecipient`'s expression answers and
+/// the numeric id [`VenmoBrowser::resolve_payee`] established. Returns the
+/// refusal text on any answer that is not one payee with that id.
+///
+/// Split out of `execute` so a test can run the real comparison against the
+/// real expression's real output. The 2026-09-05 false success was a sequence
+/// whose every expression was correct and whose result was still wrong, and
+/// asserting over the text of the JavaScript would not have caught it.
+///
+/// Three ways to refuse, and each is a page state observed on the live site:
+///
+/// - **no payee.** `txnUserDetails` is `[]` for a handle Venmo cannot resolve,
+///   and also for the logged-in account's own handle, because Venmo will not
+///   let you pay yourself. Nothing to match, so nothing is paid.
+/// - **the wrong payee.** The id on the page is not the id we resolved. This
+///   is the case the old check could never see: `?recipients=casper` loads a
+///   perfectly valid form that pays Jordan Bryant.
+/// - **more than one payee.** Venmo's pay form takes multiple recipients and
+///   splits the amount among them. A second payee is money leaving to someone
+///   this order never named, so a page carrying one is refused even when ours
+///   is among them.
+///
+/// Compared on the id alone. The handle is carried into the message for the
+/// operator but is not what decides: a handle can be released and re-registered
+/// by somebody else, and the id cannot.
+pub fn page_pays_only(
+    report: &serde_json::Value,
+    payee_id: &str,
+) -> std::result::Result<(), String> {
+    let url = report
+        .get("url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("(unknown)");
+
+    if !report
+        .get("found")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        let why = report
+            .get("why")
+            .and_then(|v| v.as_str())
+            .unwrap_or("the page answered nothing about who it pays");
+        return Err(format!(
+            "the Venmo page at {url} cannot say who it pays: {why}. The rendered form is \
+             not evidence -- it shows the recipient as a display name only -- so this \
+             refuses rather than reading one."
+        ));
+    }
+
+    let payees: Vec<(String, String)> = report
+        .get("payees")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .map(|u| {
+                    let field = |name: &str| {
+                        u.get(name)
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string()
+                    };
+                    (field("id"), field("username"))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Rendered for the operator: who the page would actually have paid.
+    let describe = |list: &[(String, String)]| {
+        if list.is_empty() {
+            "nobody".to_string()
+        } else {
+            list.iter()
+                .map(|(id, handle)| {
+                    if handle.is_empty() {
+                        format!("id {id}")
+                    } else {
+                        format!("@{handle} (id {id})")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    };
+
+    match payees.as_slice() {
+        [(id, _)] if id == payee_id => Ok(()),
+        [] => Err(format!(
+            "the Venmo page at {url} names no payee at all. Venmo answers an empty payee \
+             list for a handle it cannot resolve, and for the logged-in account's own \
+             handle, because it will not pay you yourself."
+        )),
+        [_] => Err(format!(
+            "the Venmo page at {url} pays {}, but the payee resolved for this order is id \
+             {payee_id}. The page loaded a valid form for a different account.",
+            describe(&payees)
+        )),
+        many => Err(format!(
+            "the Venmo page at {url} carries {} payees ({}). Venmo splits the amount among \
+             them, so some of this money would go to an account this order never named.",
+            many.len(),
+            describe(&payees)
+        )),
+    }
 }
 
 /// Whether the amount Venmo's field is showing is the amount we mean to send.
@@ -1646,12 +1985,29 @@ mod tests {
         }
     }
 
+    /// What `resolve_payee` would have answered for `test-payee`.
+    ///
+    /// Constructed directly here because these tests are about the *shape* of
+    /// the step list, which does not depend on the lookup having run. Every
+    /// test that is about the check itself goes through the real expression
+    /// and the real comparison in `tests/payment_page_test.rs`.
+    fn a_resolved_payee() -> ResolvedPayee {
+        ResolvedPayee {
+            handle: "test-payee".to_string(),
+            id: "2041148646359040020".to_string(),
+            display_name: "Test Payee".to_string(),
+        }
+    }
+
     fn a_payment() -> Vec<PaymentStep> {
-        VenmoBrowser::new("http://127.0.0.1:9222", 60).payment_steps(&PaymentRequest {
-            recipient: "test-payee".to_string(),
-            amount: "25.00".to_string(),
-            note: "thanks".to_string(),
-        })
+        VenmoBrowser::new("http://127.0.0.1:9222", 60).payment_steps(
+            &PaymentRequest {
+                recipient: "test-payee".to_string(),
+                amount: "25.00".to_string(),
+                note: "thanks".to_string(),
+            },
+            &a_resolved_payee(),
+        )
     }
 
     // ================================================================
@@ -1723,7 +2079,14 @@ mod tests {
         );
 
         match &steps[check] {
-            PaymentStep::RequireRecipient { recipient } => assert_eq!(recipient, "test-payee"),
+            PaymentStep::RequireRecipient {
+                recipient,
+                payee_id,
+            } => {
+                assert_eq!(recipient, "test-payee");
+                // The id, not the handle, is what the page is checked against.
+                assert_eq!(payee_id, "2041148646359040020");
+            }
             other => panic!("expected a RequireRecipient, got {other:?}"),
         }
     }

@@ -32,9 +32,15 @@ enum Confirmation {
     SheetStillUp,
     /// A sheet was already open before the drive clicked anything.
     SheetOpenBeforeWeClicked,
-    /// The page renders `@Jay-Butera-2`, a different account whose handle has
-    /// ours as a prefix.
-    PrefixCollidingPayee,
+    /// The pay page loads a valid form for a different account: Jordan
+    /// Bryant, who is who `?recipients=casper` resolves to on the live site.
+    WrongPayeeOnThePage,
+    /// The per-user read refuses: Venmo answers 500 for a handle nobody owns.
+    /// The payment must stop here, before anything is navigated to.
+    PayeeDoesNotResolve,
+    /// The per-user read succeeds and answers a *different* canonical handle,
+    /// which is what `jaybutera` -> `JayButera` does on the live site.
+    PayeeResolvesToSomeoneElse,
 }
 
 /// A fake browser: an HTTP `/json/list` and a websocket that answers
@@ -244,10 +250,13 @@ fn answer_for(expression: &str, confirmation: Confirmation) -> serde_json::Value
             // check, long before anything is clicked. Answered rather than
             // `todo!()`ed so a future step reordering surfaces as a failed
             // assertion instead of a panic in the fake.
-            // Unreachable: this mode refuses at the recipient check, long
-            // before anything is clicked. Answered rather than `todo!()`ed so
-            // a reordering surfaces as a failed assertion, not a panic.
-            Confirmation::PrefixCollidingPayee => serde_json::json!({
+            // Unreachable: these three refuse at the lookup or the recipient
+            // check, long before anything is clicked. Answered rather than
+            // `todo!()`ed so a reordering surfaces as a failed assertion, not
+            // a panic in the fake.
+            Confirmation::WrongPayeeOnThePage
+            | Confirmation::PayeeDoesNotResolve
+            | Confirmation::PayeeResolvesToSomeoneElse => serde_json::json!({
                 "ok": false, "sheet": true, "form": true,
                 "payBtn": true, "signedOut": false,
                 "url": "https://account.venmo.com/pay?recipients=jay-butera"
@@ -269,17 +278,45 @@ fn answer_for(expression: &str, confirmation: Confirmation) -> serde_json::Value
             _ => serde_json::json!({ "ok": true, "sheets": [] }),
         };
     }
-    // The recipient check answers the handles the page renders. A healthy pay
-    // form names the payee we asked for.
-    if expression.contains("handles:") {
+    // The per-user read, which is the first thing `pay` does and the reason
+    // there is a payee id to check the page against at all. Matched on the
+    // endpoint rather than on a fragment of the wrapper, so a rewrite of the
+    // surrounding JavaScript does not silently stop being answered.
+    if expression.contains("/api/user/") {
         return match confirmation {
-            Confirmation::PrefixCollidingPayee => serde_json::json!({
-                "handles": ["Jay-Butera-2"],
-                "url": "https://account.venmo.com/pay?recipients=jay-butera"
+            // What Venmo answers for a handle nobody owns: 500, and a body
+            // that is not JSON.
+            Confirmation::PayeeDoesNotResolve => serde_json::json!({
+                "ok": false, "status": 500, "body": "Something went wrong"
+            }),
+            // What it answers for `jaybutera`: a real account, a different
+            // person, under a canonical handle that is not the one we asked
+            // for.
+            Confirmation::PayeeResolvesToSomeoneElse => serde_json::json!({
+                "ok": true, "id": "3457650285086115910", "username": "JayButera",
+                "displayName": "Joseph Butera", "isActive": true
             }),
             _ => serde_json::json!({
-                "handles": ["jay-butera"],
-                "url": "https://account.venmo.com/pay?recipients=jay-butera"
+                "ok": true, "id": JAY_BUTERA_ID, "username": "Jay-Butera",
+                "displayName": "Jay Butera", "isActive": true
+            }),
+        };
+    }
+    // The recipient check answers the payees the page's own state carries.
+    // A healthy pay form is addressed to the account the lookup resolved.
+    if expression.contains("txnUserDetails") {
+        return match confirmation {
+            Confirmation::WrongPayeeOnThePage => serde_json::json!({
+                "found": true, "why": "",
+                "url": "https://account.venmo.com/pay?recipients=jay-butera",
+                "payees": [{"id": "2261773692436480899", "username": "casper",
+                            "displayName": "Jordan Bryant"}]
+            }),
+            _ => serde_json::json!({
+                "found": true, "why": "",
+                "url": "https://account.venmo.com/pay?recipients=jay-butera",
+                "payees": [{"id": JAY_BUTERA_ID, "username": "Jay-Butera",
+                            "displayName": "Jay Butera"}]
             }),
         };
     }
@@ -301,6 +338,12 @@ fn answer_for(expression: &str, confirmation: Confirmation) -> serde_json::Value
     }
     serde_json::json!(true)
 }
+
+/// Venmo's real id for `jay-butera`, from the live per-user read on
+/// 2026-09-06. The fake answers it from the lookup and carries it on the pay
+/// page, so the two halves of the check agree exactly as they do in
+/// production.
+const JAY_BUTERA_ID: &str = "2041148646359040020";
 
 fn request() -> PaymentRequest {
     PaymentRequest {
@@ -538,8 +581,8 @@ async fn a_sheet_open_before_our_click_refuses_without_ambiguity() {
 /// Lowercased it contains `jay-butera`, so the old check would have filled in
 /// an amount and clicked send on a payment to a different account.
 #[tokio::test]
-async fn the_driver_refuses_a_payee_whose_handle_only_starts_with_ours() {
-    let fake = FakeBrowser::start(Confirmation::PrefixCollidingPayee).await;
+async fn the_driver_refuses_a_form_addressed_to_a_different_account() {
+    let fake = FakeBrowser::start(Confirmation::WrongPayeeOnThePage).await;
     let browser = VenmoBrowser::new(fake.cdp_url(), 5);
     let tab = browser.find_venmo_tab().await.expect("the fake tab");
 
@@ -549,9 +592,10 @@ async fn the_driver_refuses_a_payee_whose_handle_only_starts_with_ours() {
         .expect_err("a different account must stop the payment");
 
     let text = format!("{error:#}");
-    assert!(text.contains("does not name @jay-butera"), "{text}");
-    // It says what the page actually renders, so the operator can see why.
-    assert!(text.contains("Jay-Butera-2"), "{text}");
+    // It names who the page would actually have paid, so the operator can see
+    // why, and the id rather than the name because the id is what decided.
+    assert!(text.contains("2261773692436480899"), "{text}");
+    assert!(text.contains("jay-butera"), "{text}");
 
     // Refused before anything was typed, let alone clicked: the recipient
     // check is the first thing after the form appears.
@@ -562,5 +606,69 @@ async fn the_driver_refuses_a_payee_whose_handle_only_starts_with_ours() {
     assert!(
         !fake.evaluated().iter().any(|e| e.contains("_valueTracker")),
         "no field may be filled when the payee does not match"
+    );
+}
+
+/// A handle Venmo cannot resolve stops the payment before the browser moves.
+///
+/// This is the fail-closed half of the fix. `GET /api/user/<handle>` answers
+/// 500 for a handle nobody owns, and that is a refusal rather than a reason to
+/// open the pay page and look at it: the pay page renders a form for an
+/// unresolvable handle too.
+#[tokio::test]
+async fn a_payee_that_does_not_resolve_stops_before_any_navigation() {
+    let fake = FakeBrowser::start(Confirmation::PayeeDoesNotResolve).await;
+    let browser = VenmoBrowser::new(fake.cdp_url(), 5);
+    let tab = browser.find_venmo_tab().await.expect("the fake tab");
+
+    let error = browser
+        .pay(&tab, &request(), SendMode::Live)
+        .await
+        .expect_err("an unresolvable payee must stop the payment");
+
+    let text = format!("{error:#}");
+    assert!(text.contains("would not resolve @jay-butera"), "{text}");
+
+    // Nothing was navigated to. The lookup runs before the step list, so the
+    // browser never left whatever page it was on.
+    assert!(
+        !fake
+            .evaluated()
+            .iter()
+            .any(|e| e.contains("location.href =")),
+        "a payee that will not resolve must not open a pay page"
+    );
+    assert!(
+        !fake.evaluated().iter().any(|e| e.contains(".click()")),
+        "nothing may be clicked"
+    );
+}
+
+/// A lookup that succeeds for the wrong account is still a refusal.
+///
+/// `jaybutera` is one hyphen from the payee and resolves to `JayButera`,
+/// Joseph Butera, on the live site. A 200 is not the answer -- the canonical
+/// username coming back equal to the one being paid is.
+#[tokio::test]
+async fn a_payee_that_resolves_to_another_account_is_refused() {
+    let fake = FakeBrowser::start(Confirmation::PayeeResolvesToSomeoneElse).await;
+    let browser = VenmoBrowser::new(fake.cdp_url(), 5);
+    let tab = browser.find_venmo_tab().await.expect("the fake tab");
+
+    let error = browser
+        .pay(&tab, &request(), SendMode::Live)
+        .await
+        .expect_err("a handle that resolves to someone else must stop the payment");
+
+    let text = format!("{error:#}");
+    assert!(text.contains("JayButera"), "{text}");
+    assert!(text.contains("Joseph Butera"), "{text}");
+
+    assert!(
+        !fake
+            .evaluated()
+            .iter()
+            .any(|e| e.contains("location.href =")),
+        "a payee resolving to someone else must not open a pay page"
     );
 }

@@ -200,12 +200,42 @@ impl<P: alloy::providers::Provider + Clone> TakerAgent<P> {
                 free_stake = %free,
                 "dry run: would signal, then pay ${dollars} to @{recipient}"
             );
-            for step in self.browser.payment_steps(&PaymentRequest {
-                recipient: recipient.clone(),
-                amount: dollars.clone(),
-                note: self.config.venmo.note.clone(),
-            }) {
-                tracing::info!("  would: {}", step.describe());
+            // Resolved for real, not stubbed. A dry run exists to show the
+            // operator what the live run would do, and the live run's first act
+            // is this lookup: it is a read, it moves no money, and if it
+            // refuses then the dry run has found the thing worth finding
+            // before an intent is ever signalled.
+            match self.browser.find_venmo_tab().await {
+                Ok(tab) => match self.browser.resolve_payee(&tab, &recipient).await {
+                    Ok(payee) => {
+                        tracing::info!(
+                            "  Venmo resolves @{recipient} to @{} ({}), id {}",
+                            payee.handle,
+                            payee.display_name,
+                            payee.id
+                        );
+                        for step in self.browser.payment_steps(
+                            &PaymentRequest {
+                                recipient: recipient.clone(),
+                                amount: dollars.clone(),
+                                note: self.config.venmo.note.clone(),
+                            },
+                            &payee,
+                        ) {
+                            tracing::info!("  would: {}", step.describe());
+                        }
+                    }
+                    // Reported, not returned. The dry run's job is to say what
+                    // it found, and a payee that will not resolve is the most
+                    // useful thing it can say.
+                    Err(e) => {
+                        tracing::warn!("  would REFUSE: @{recipient} does not resolve ({e:#})")
+                    }
+                },
+                Err(e) => tracing::warn!(
+                    "  cannot show the payment steps: no Venmo tab to resolve @{recipient} \
+                     against ({e:#})"
+                ),
             }
             return Ok(Handled::DryRun {
                 deposit_id: deposit.deposit_id,
