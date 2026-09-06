@@ -384,6 +384,7 @@ async fn open_order(
         scanned_through: None,
         mempool_announced_txid: None,
         mempool_announced_vout: None,
+        sighting_never_confirmed: false,
         network: state.network_name().to_string(),
         consensus_branch_id: branch,
         u_pub,

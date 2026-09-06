@@ -1957,11 +1957,18 @@ async fn a_mempool_announced_order_still_completes_when_the_tx_confirms() {
 }
 
 #[tokio::test]
-async fn a_mempool_announced_order_that_never_confirms_becomes_refundable() {
+async fn a_mempool_announced_order_that_never_confirms_leaves_locked() {
     // The other half of the deadlock. `settle` bailing with `?` on a missing
-    // outpoint skips the deadline check, so the order never reaches
-    // `Refundable` and the page - which asks the stage, not the chain - never
-    // offers the refund the user's ZEC is already entitled to.
+    // outpoint skips the deadline check, so the order never left `Locked` and
+    // the page - which asks the stage, not the chain - showed "locked" for ever
+    // over a trade that was over.
+    //
+    // It used to end at `Refundable`, and R5-2 ruled that wrong: the sighted
+    // transaction expired unmined and no wallet resent it, so nothing ever
+    // reached the address. `Refundable` is the stage that puts the refund form
+    // in front of the user, and there is no coin behind it. `Unpaid` is what
+    // the chain supports - nobody sent the dollars, and nobody sent the ZEC
+    // either - and it takes the order off the sweep list the way R4-2 wants.
     let dir = tempfile::tempdir().unwrap();
     let node = FakeNode::spawn().await;
     let scanner = Arc::new(FakeScanner::new());
@@ -1991,10 +1998,16 @@ async fn a_mempool_announced_order_that_never_confirms_becomes_refundable() {
         zecp2p_v2coordinator::driver::advance(&state, &order_id).await.ok();
     }
 
+    let end = state.store.get(&order_id).unwrap();
+    assert_ne!(
+        end.stage,
+        Stage::Locked,
+        "the order deadlocked at locked and the page would say so for ever"
+    );
     assert_eq!(
-        state.store.get(&order_id).unwrap().stage,
-        Stage::Refundable,
-        "the user was never offered the refund their ZEC was already entitled to"
+        end.stage,
+        Stage::Unpaid,
+        "nothing ever reached the escrow, so there is no refund to offer"
     );
 }
 
@@ -4180,5 +4193,124 @@ async fn a_coordinator_killed_mid_reservation_heals_and_pays_once() {
     assert!(
         state.journal.open_fills().unwrap().is_empty(),
         "the finished trade is still holding the slot"
+    );
+}
+
+#[tokio::test]
+async fn a_sighting_that_expired_unmined_is_not_offered_a_refund() {
+    // R5-2. `still_owes_a_refund_check` admits a mempool sighting because the
+    // coin is usually on its way. When the funding transaction expires unmined
+    // and no wallet resends it, nothing ever reaches the address - and the
+    // order is still promoted at `T` over an escrow no block holds. The page
+    // then says "your ZEC is in the escrow", shows the form, and builds a
+    // refund over an outpoint that never confirmed; the endpoint refuses on the
+    // unknown funding while the page says any node will take the bytes.
+    //
+    // One `gettxout` for the sighted outpoint tells this case from finding 7,
+    // where the transaction did confirm and the scan cursor merely overtook it.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+    let state = coordinator_that_cannot_pay(dir.path(), scanner.clone(), &node, &attestor);
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+    let user = TestUser::new();
+    let (order_id, amount_zat, stored) = opened_order(&app, &state, &user).await;
+
+    // Sighted in the mempool, announced, signed while unconfirmed.
+    let funding_txid = [0x71u8; 32];
+    scanner.pay_mempool(
+        &stored.script_pubkey,
+        FoundOutput { txid: funding_txid, vout: 0, amount_zat },
+    );
+    zecp2p_v2coordinator::driver::advance(&state, &order_id).await.unwrap();
+    sign_it(&app, &state, &attestor, &user, &order_id).await;
+
+    // It expires. Nothing is added to the node, so `gettxout` on the sighted
+    // outpoint answers null: no coin ever left the user's wallet.
+    node.set_height(u32::try_from(stored.refund_height).unwrap() + 1).await;
+    for _ in 0..3 {
+        for o in state.store.open_orders() {
+            zecp2p_v2coordinator::driver::advance(&state, &o.order_id).await.ok();
+        }
+    }
+
+    let end = state.store.get(&order_id).unwrap();
+    assert!(end.funding.is_none(), "nothing confirmed, so there is no funding outpoint");
+    assert_ne!(
+        end.stage,
+        Stage::Refundable,
+        "an escrow nothing was ever paid into was offered a refund form"
+    );
+    assert!(
+        !state.store.open_orders().iter().any(|o| o.order_id == order_id),
+        "an order over an empty escrow is swept for ever"
+    );
+}
+
+#[tokio::test]
+async fn a_sighting_the_cursor_overtook_is_still_offered_a_refund() {
+    // Finding 7, the case R5-2's check must not break. The funding did confirm,
+    // but the scan cursor passed its block before the scan found it - a reorg
+    // that moved the funding into a height already searched - so `order.funding`
+    // is never set. The coin is genuinely in the escrow and the user is owed the
+    // refund at `T`.
+    //
+    // The mempool sighting holds the correct outpoint, and `gettxout` answers
+    // with a live output, which is what tells this case from R5-2's.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+    let state = coordinator_that_cannot_pay(dir.path(), scanner.clone(), &node, &attestor);
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+    let user = TestUser::new();
+    let (order_id, amount_zat, stored) = opened_order(&app, &state, &user).await;
+
+    let funding_txid = [0x72u8; 32];
+    scanner.pay_mempool(
+        &stored.script_pubkey,
+        FoundOutput { txid: funding_txid, vout: 0, amount_zat },
+    );
+    zecp2p_v2coordinator::driver::advance(&state, &order_id).await.unwrap();
+    sign_it(&app, &state, &attestor, &user, &order_id).await;
+
+    // It confirmed - the node holds the output - but no block scan ever
+    // reports it, so `funding` stays unset the way finding 7 describes.
+    node.add_utxo(funding_txid, 0, stored.script_pubkey.clone(), amount_zat, 30).await;
+    node.set_height(u32::try_from(stored.refund_height).unwrap() + 1).await;
+    for _ in 0..3 {
+        for o in state.store.open_orders() {
+            zecp2p_v2coordinator::driver::advance(&state, &o.order_id).await.ok();
+        }
+    }
+
+    let end = state.store.get(&order_id).unwrap();
+    assert_eq!(
+        end.stage,
+        Stage::Refundable,
+        "the coin is in the escrow and past T, and the user was not offered it"
+    );
+
+    // Finding 7 proper: the stage says refundable, and the refund the page
+    // builds over the sighted outpoint - the only one it has - is refused,
+    // because the coordinator never wrote a funding outpoint to check it
+    // against. The mempool record held the right one the whole time.
+    let raw = user.sign_refund(&end, &funding_txid, 0);
+    let (status, body) = post(
+        &app,
+        &format!("/escrow/orders/{order_id}/refund"),
+        serde_json::json!({ "raw_tx": hex::encode(&raw) }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the refund over the outpoint the escrow actually holds was refused: {body}"
+    );
+    assert_eq!(
+        state.store.get(&order_id).unwrap().stage,
+        Stage::Refunded,
+        "the refund broadcast but the order did not record it"
     );
 }

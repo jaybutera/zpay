@@ -364,6 +364,7 @@ mod tests {
             scanned_through: None,
             mempool_announced_txid: None,
             mempool_announced_vout: None,
+            sighting_never_confirmed: false,
             network: "test".into(),
             consensus_branch_id: 0x37a5_165b,
             u_pub: [2u8; 33],

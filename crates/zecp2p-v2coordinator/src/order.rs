@@ -170,6 +170,25 @@ pub struct Order {
     pub mempool_announced_txid: Option<[u8; 32]>,
     #[serde(default)]
     pub mempool_announced_vout: Option<u32>,
+    /// Set once the chain has been asked what became of the sighted funding and
+    /// answered that nothing is there.
+    ///
+    /// R5-2. A sighting is admitted as evidence of funding because in the usual
+    /// case the coin is on its way, and until `T` there is no way to tell a
+    /// transaction still waiting for a block from one that will never get one.
+    /// At `T` there is: `gettxout` on the sighted outpoint. A null answer means
+    /// the transaction expired unmined and nothing ever reached the address, so
+    /// there is no escrow to refund and nothing further to sweep for.
+    ///
+    /// Recorded rather than re-derived so the answer costs one chain read
+    /// rather than one per sweep for the life of the store. Only written on a
+    /// definite null - a node that will not answer leaves it unset and the
+    /// question is asked again.
+    ///
+    /// Absent on orders written before this field existed, which read as "not
+    /// asked yet" and are asked on their next sweep past `T`.
+    #[serde(default)]
+    pub sighting_never_confirmed: bool,
     pub network: String,
     pub consensus_branch_id: u32,
 
@@ -260,11 +279,20 @@ impl Order {
     /// decrypt onto the confirmed one - `verify_pre_signature` re-derives the
     /// digest and refuses. That is the correct outcome: nothing is paid and the
     /// escrow refunds at T.
+    /// The outpoint a mempool sighting named, if one was ever recorded.
+    ///
+    /// Distinct from `funding`, which only a block scan writes. This is what
+    /// the sweep re-reads at `T` to tell a transaction that confirmed behind
+    /// the scan cursor from one that expired unmined.
+    pub fn mempool_outpoint(&self) -> Option<([u8; 32], u32)> {
+        Some((self.mempool_announced_txid?, self.mempool_announced_vout?))
+    }
+
     fn bound_outpoint(&self) -> Option<([u8; 32], u32)> {
         if let Some(f) = self.funding {
             return Some((f.txid, f.vout));
         }
-        Some((self.mempool_announced_txid?, self.mempool_announced_vout?))
+        self.mempool_outpoint()
     }
 
     /// The full canonical terms, once the escrow has locked.
@@ -361,7 +389,14 @@ impl Order {
             // builder cannot fill, and keeps the order in the sweep list for
             // good. A mempool sighting counts - the coin is on its way even if
             // no block holds it yet.
-            && (self.funding.is_some() || self.mempool_announced_txid.is_some())
+            //
+            // R5-2: unless the chain has since been asked and said the sighted
+            // transaction never confirmed. Then the sighting is evidence of
+            // nothing, and an order kept on the strength of it is the same
+            // never-funded order R4-2 took off the list, reached by a different
+            // route.
+            && (self.funding.is_some()
+                || (self.mempool_announced_txid.is_some() && !self.sighting_never_confirmed))
     }
 
     /// The tag written into the Venmo note, so this payment is distinguishable
@@ -595,6 +630,7 @@ mod tests {
             scanned_through: None,
             mempool_announced_txid: None,
             mempool_announced_vout: None,
+            sighting_never_confirmed: false,
             network: "test".into(),
             consensus_branch_id: 0x37a5_165b,
             u_pub: [2u8; 33],
