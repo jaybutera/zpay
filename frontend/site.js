@@ -1,6 +1,7 @@
 /* zpay front door: live numbers, the quote widget, the platform picker.
-   Plain ES2020, no build step. Read-only against the coordinator: GET /stats,
-   GET /health, GET /quote. Nothing here ever posts. */
+   Plain ES2020, no build step. Read-only: GET /api/stats for the counters,
+   GET /escrow/capabilities for the rate, GET /escrow/quote for the card.
+   Nothing here ever posts. */
 
 'use strict';
 
@@ -12,16 +13,12 @@ const SITE = {
   // Placeholder until the fee is fixed. Rendered everywhere as data-fee.
   feePercent: '0.15',
 
-  // OfframpGlue on Base mainnet (chain 8453). /stats overrides this when the
-  // coordinator answers, so a redeploy needs no page edit.
-  glueContract: '0x617544CC688F7f742cA68B5d9106890500b6C689',
-  chainId: 8453,
-
   // Repositories do not exist yet. Swap these when they do.
   links: {
     github: 'https://github.com/zpay-cash/zpay',
     githubTaker: 'https://github.com/zpay-cash/auto-taker',
     zkp2p: 'https://zkp2p.xyz',
+    zcash: 'https://z.cash',
     nearIntents: 'https://near-intents.org',
     escrow: 'https://basescan.org/address/0x777777779d229cdF3110e9de47943791c26300Ef',
     orchestrator: 'https://basescan.org/address/0x014025fDE093f8701d86e9f38e2C3a9b779cb5c7',
@@ -60,17 +57,20 @@ const API = (() => {
   }
   // Same origin, behind CloudFront's /api/* behaviour. Same-origin means no
   // preflight, and it keeps the read API on the one hostname the page already
-  // trusts. It answers /stats and /quote in the coordinator's shapes; it is a
-  // snapshot for the counters and a live 1Click call for the quote, until the
-  // coordinator itself gets a public host.
+  // trusts. It answers /stats from a snapshot.
   return '/api';
 })();
+
+// The escrow coordinator's read endpoints. Same origin in production, where
+// CloudFront routes /escrow/* to the coordinator; the loopback coordinator
+// serves both in a dev setup.
+const ESCROW = API === '/api' ? '' : API;
 
 const $ = (id) => document.getElementById(id);
 const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 
-async function api(path) {
-  const res = await fetch(API + path, { headers: { Accept: 'application/json' } });
+async function api(path, base = API) {
+  const res = await fetch(base + path, { headers: { Accept: 'application/json' } });
   const body = await res.json().catch(() => ({}));
   if (!res.ok) {
     const m = body && (body.error || body.message);
@@ -87,16 +87,6 @@ function applySite() {
     const href = SITE.links[el.dataset.link];
     if (href) el.href = href;
   });
-  setContract(SITE.glueContract, SITE.chainId);
-}
-
-function setContract(addr, chainId) {
-  if (!addr) return;
-  $$('[data-contract]').forEach((el) => { el.textContent = addr; });
-  $$('[data-contract-link]').forEach((el) => {
-    el.href = 'https://basescan.org/address/' + addr;
-  });
-  $$('[data-chain]').forEach((el) => { el.textContent = 'Base ' + chainId; });
 }
 
 // ---------- number formatting ----------
@@ -142,29 +132,36 @@ async function refreshStats() {
     if ($('s-open-sub')) $('s-open-sub').textContent = (s.in_flight ?? 0) + ' in flight';
     if ($('s-last')) $('s-last').textContent = s.last_fulfilled_at ? ago(s.last_fulfilled_at) : 'none yet';
     if ($('s-last-sub')) $('s-last-sub').textContent = "from the coordinator's log";
-    if (s.glue_contract) setContract(s.glue_contract, s.chain_id || SITE.chainId);
   } catch (e) {
     setState(conn, 'down', 'coordinator down');
     ['s-fills', 's-settled', 's-open', 's-last'].forEach((id) => { if ($(id)) $(id).textContent = '—'; });
   }
 }
 
-function money(decimalStr) {
-  // "48.123456" -> "48.12". The API already formats these as decimal strings.
-  const n = Number(decimalStr);
+function money(n) {
+  // 1140.274975 -> "1,140.27". The escrow API sends numbers.
+  n = Number(n);
   if (!Number.isFinite(n)) return null;
   return n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+function cents(c) {
+  // 518 -> "5.18". Integer cents from the escrow quote.
+  return money(Number(c) / 100);
 }
 
 async function refreshRate() {
   if (!$('s-rate')) return;
   try {
-    const q = await api('/quote?zec_amount=1');
-    const r = money(q.rate);
+    const c = await api('/escrow/capabilities', ESCROW);
+    const r = money(c.rate_usd_per_zec);
     if (r) {
       $('s-rate').textContent = r;
-      if ($('s-rate-sub')) $('s-rate-sub').textContent = 'USDC per ZEC, live from 1Click';
-      if ($('q-head')) $('q-head').textContent = '1 ZEC = ' + r + ' USDC';
+      if ($('s-rate-sub')) $('s-rate-sub').textContent = 'USD per ZEC, market less spread';
+      if ($('q-head')) $('q-head').textContent = '1 ZEC = $' + r;
+    }
+    if (Number.isFinite(c.spread_bps)) {
+      $$('[data-spread]').forEach((el) => { el.textContent = (c.spread_bps / 100) + '%'; });
     }
   } catch (_) {
     $('s-rate').textContent = '—';
@@ -227,22 +224,23 @@ async function getQuote() {
     note.className = 'quote-note err';
     return;
   }
-  note.textContent = 'asking 1Click for a route…';
+  note.textContent = 'pricing…';
   try {
-    const q = await api('/quote?zec_amount=' + encodeURIComponent(v));
+    const q = await api('/escrow/quote?amount=' + encodeURIComponent(v) + '&unit=zec', ESCROW);
     if (seq !== quoteSeq) return; // a newer keystroke owns the card now
-    $('q-usdc').textContent = money(q.usdc_amount) + ' USDC';
+    const feeCents = (q.lines || []).reduce((t, l) => t + Number(l.cents || 0), 0);
+    $('q-fees').textContent = '$' + cents(feeCents);
     $('q-venmo').innerHTML = '';
     const cur = document.createElement('span');
     cur.className = 'cur';
     cur.textContent = '$';
-    $('q-venmo').append(cur, document.createTextNode(money(q.venmo_amount) || '—'));
-    $('q-rate').textContent = money(q.rate) || '—';
+    $('q-venmo').append(cur, document.createTextNode(cents(q.net_cents) || '—'));
+    $('q-rate').textContent = money(q.rate_usd_per_zec) || '—';
     $('q-out').hidden = false;
     const exp = q.expires_at ? Date.parse(q.expires_at) : NaN;
     note.textContent = Number.isNaN(exp)
-      ? 'route found'
-      : 'route quoted until ' + new Date(exp).toLocaleTimeString();
+      ? 'priced'
+      : 'price held until ' + new Date(exp).toLocaleTimeString();
     note.className = 'quote-note ok';
   } catch (e) {
     if (seq !== quoteSeq) return;

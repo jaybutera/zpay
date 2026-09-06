@@ -3,16 +3,16 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>zpay: pay a Venmo handle with shielded ZEC</title>
-<meta name="description" content="Type someone's Venmo handle, send shielded Zcash, and dollars land in their Venmo. An immutable escrow on Base, a payment proof from zk-p2p's enclave, no exchange account on either end.">
-<meta property="og:title" content="zpay: pay a Venmo handle with shielded ZEC">
-<meta property="og:description" content="Type their Venmo handle and send ZEC to one address. A taker pays their Venmo, proves it, and the escrow releases. They never touch crypto. No custodian holding the dollars.">
+<title>zpay: send dollars to a Venmo handle, pay in ZEC</title>
+<meta name="description" content="Type their Venmo handle, send ZEC to one address, and the dollars land in their Venmo in minutes. Your coins wait in an escrow on Zcash that only you can refund. No swap, no bridge, no token.">
+<meta property="og:title" content="zpay: send dollars to a Venmo handle, pay in ZEC">
+<meta property="og:description" content="Type their Venmo handle and send ZEC to one address. The coins sit in an escrow on Zcash that only you can refund until zpay pays their Venmo and proves it. They never touch crypto.">
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://zpay.cash/">
 <meta property="og:image" content="https://zpay.cash/og.png">
 <meta name="twitter:card" content="summary_large_image">
-<meta name="twitter:title" content="zpay: pay a Venmo handle with shielded ZEC">
-<meta name="twitter:description" content="Type their Venmo handle and send ZEC to one address. A taker pays their Venmo, proves it, and the escrow releases. They never touch crypto. No custodian holding the dollars.">
+<meta name="twitter:title" content="zpay: send dollars to a Venmo handle, pay in ZEC">
+<meta name="twitter:description" content="Type their Venmo handle and send ZEC to one address. The coins sit in an escrow on Zcash that only you can refund until zpay pays their Venmo and proves it. They never touch crypto.">
 <meta name="twitter:image" content="https://zpay.cash/og.png">
 <link rel="canonical" href="https://zpay.cash/">
 <meta name="theme-color" content="#0d0e10">
@@ -42,31 +42,26 @@
 <section class="hero">
   <div class="wrap">
     <div>
-      <span class="label blue">Zcash &rarr; Base &rarr; Venmo</span>
-      <h1>Send shielded ZEC.<br>They get Venmo <span class="blue">dollars.</span></h1>
+      <span class="label blue">Zcash &rarr; Venmo, in minutes</span>
+      <h1>Send them dollars.<br>Pay in <span class="blue">ZEC.</span></h1>
       <p class="lede">
-        Type their Venmo handle and send ZEC to one address. Your coins wait as
-        USDC in an <b>immutable escrow on Base</b> until a taker pays that Venmo
-        and proves it through zk-p2p's enclave. They never touch crypto. No
-        exchange account on either end. No custodian holding the dollars.
+        Type their Venmo handle and send ZEC to one address. Your coins wait in
+        an <b>escrow on Zcash that only you can refund</b> while zpay pays their
+        Venmo and proves it. Under $50, the dollars go out after ten
+        confirmations, about twelve minutes. They never touch crypto. No swap,
+        no bridge, no token, and no account on either end.
       </p>
 
       <div class="facts">
-        <span>non-custodial escrow</span>
+        <span>escrow on Zcash</span>
         <span><span data-fee>0.15%</span> fee</span>
-        <span data-chain>Base 8453</span>
-        <span>open source</span>
-        <span>mainnet since 2026-09-01</span>
-      </div>
-
-      <div class="contract">
-        <span class="label">contract</span>
-        <span class="addr" data-contract>0x617544CC688F7f742cA68B5d9106890500b6C689</span>
-        <a data-contract-link href="https://basescan.org/address/0x617544CC688F7f742cA68B5d9106890500b6C689" target="_blank" rel="noopener">BaseScan &nearr;</a>
+        <span>refund needs nobody</span>
+        <span>Venmo today</span>
+        <span>mainnet since 2026-09-05</span>
       </div>
 
       <div class="hero-cta">
-        <a class="btn primary" href="app/">Pay a Venmo handle</a>
+        <a class="btn primary" href="app/">Send to a Venmo handle</a>
         <a class="btn" href="#how">See how it settles</a>
       </div>
     </div>
@@ -74,13 +69,13 @@
     <div class="card quote-card">
       <div class="head">
         <span class="label">quote</span>
-        <span class="label mute" id="q-head">live route via 1Click</span>
+        <span class="label mute" id="q-head">live rate</span>
       </div>
 
       <div class="field">
         <label class="label" for="q-zec">you send</label>
         <div class="input">
-          <input id="q-zec" inputmode="decimal" placeholder="0.5" autocomplete="off" spellcheck="false">
+          <input id="q-zec" inputmode="decimal" placeholder="0.005" autocomplete="off" spellcheck="false">
           <span class="unit">ZEC</span>
         </div>
       </div>
@@ -97,13 +92,13 @@
 
       <div class="quote-out" id="q-out" hidden>
         <div class="stat wide"><span class="k label">lands in their venmo</span><span class="v big" id="q-venmo">&mdash;</span></div>
-        <div class="stat"><span class="k label">usdc in escrow</span><span class="v" id="q-usdc">&mdash;</span></div>
-        <div class="stat"><span class="k label">rate usdc/zec</span><span class="v" id="q-rate">&mdash;</span></div>
+        <div class="stat"><span class="k label">fees</span><span class="v" id="q-fees">&mdash;</span></div>
+        <div class="stat"><span class="k label">rate usd/zec</span><span class="v" id="q-rate">&mdash;</span></div>
       </div>
       <div class="quote-note" id="q-note">type an amount to see what lands in their Venmo</div>
 
       <a class="btn primary" id="q-start" href="app/">Continue in the app</a>
-      <p class="quote-fine">Quoted by 1Click, net of the <span data-fee>0.15%</span> fee. A fresh quote is taken when you start.</p>
+      <p class="quote-fine">Net of the <span data-fee>0.15%</span> fee and the Zcash network fee. The app holds a fresh price for five minutes once you start.</p>
     </div>
   </div>
 </section>
@@ -112,18 +107,17 @@
 <section class="strip" aria-label="live numbers">
   <div class="wrap">
     <div class="grid">
-    <div class="cell"><span class="k label">rate</span><span class="v blue" id="s-rate">&mdash;</span><span class="sub" id="s-rate-sub">USDC per ZEC</span></div>
-    <div class="cell"><span class="k label">fills completed</span><span class="v" id="s-fills">&mdash;</span><span class="sub">paid on Venmo, proven on chain</span></div>
+    <div class="cell"><span class="k label">rate</span><span class="v blue" id="s-rate">&mdash;</span><span class="sub" id="s-rate-sub">USD per ZEC</span></div>
+    <div class="cell"><span class="k label">payments completed</span><span class="v" id="s-fills">&mdash;</span><span class="sub">paid on Venmo, proven, released</span></div>
     <div class="cell"><span class="k label">settled</span><span class="v" id="s-settled">&mdash;</span><span class="sub">US dollars released from escrow</span></div>
-    <div class="cell"><span class="k label">open orders</span><span class="v" id="s-open">&mdash;</span><span class="sub" id="s-open-sub">waiting for a taker</span></div>
-    <div class="cell"><span class="k label">last fill</span><span class="v" id="s-last">&mdash;</span><span class="sub" id="s-last-sub">first one on 2026-09-02</span></div>
+    <div class="cell"><span class="k label">open orders</span><span class="v" id="s-open">&mdash;</span><span class="sub" id="s-open-sub">waiting for ZEC</span></div>
+    <div class="cell"><span class="k label">last payment</span><span class="v" id="s-last">&mdash;</span><span class="sub" id="s-last-sub">first one on 2026-09-05</span></div>
     </div>
     <div class="stack">
       <span class="label">runs on</span>
-      <a data-link="nearIntents" href="#" target="_blank" rel="noopener">NEAR Intents 1Click</a>
-      <a data-link="escrow" href="#" target="_blank" rel="noopener">zk-p2p EscrowV2</a>
-      <a data-link="verifier" href="#" target="_blank" rel="noopener">Nitro enclave verifier</a>
-      <a data-contract-link href="#" target="_blank" rel="noopener">zpay contract on Base</a>
+      <a data-link="zcash" href="#" target="_blank" rel="noopener">Zcash script</a>
+      <a data-link="zkp2p" href="#" target="_blank" rel="noopener">zk-p2p enclave attestation</a>
+      <a data-link="github" href="#" rel="noopener">zpay on GitHub</a>
     </div>
   </div>
 </section>
@@ -132,88 +126,91 @@
 <section class="block" id="how">
   <div class="wrap">
     <span class="label blue">how it works</span>
-    <h2>Two legs, one contract, one proof</h2>
+    <h2>Two keys, one address, one proof</h2>
     <p class="intro">
-      The swap leg turns ZEC into USDC on Base. The payment leg turns that USDC
-      into a Venmo transfer to the handle you typed. zpay's contract sits between
-      them and only ever pays out against a proof. Cashing out to yourself is the
-      same flow with your own handle.
+      Your ZEC goes to one Zcash address that is a script, not a contract. Two
+      keys release it: yours and zpay's. After a deadline, your key alone
+      refunds it. zpay pays the Venmo, proves it, and only then can the
+      release be signed. Paying your own handle is the same flow.
     </p>
 
     <div class="steps">
       <div class="step">
         <span class="n">01</span>
         <h3>Type their handle, get an address</h3>
-        <p>Enter the recipient's Venmo username and a ZEC amount. zpay registers the handle with zk-p2p's curator and opens a session whose payee is fixed to that hash. One Zcash deposit address comes back, and that is where you send.</p>
-        <div class="rail"><span class="tok">@handle</span><span class="arr">&rarr;</span><span class="tok">payee hash</span><span class="arr">&rarr;</span><span class="tok">session</span></div>
+        <p>Enter the recipient's Venmo username and an amount. The page makes a key in your browser and never sends it anywhere. zpay answers with the escrow address, and the page rebuilds that address from your key, zpay's key and the refund height, and refuses the order if it differs.</p>
+        <div class="rail"><span class="tok">@handle</span><span class="arr">&rarr;</span><span class="tok">your key</span><span class="arr">&rarr;</span><span class="tok zec">escrow address</span></div>
       </div>
       <div class="step">
         <span class="n">02</span>
-        <h3>Send ZEC, it lands as USDC</h3>
-        <p>NEAR Intents' 1Click route swaps your ZEC to USDC on Base and delivers it to the zpay contract, which posts it as a sell order on zk-p2p's escrow. The order pays only the handle from step one; the contract reverts on any other payee.</p>
-        <div class="rail"><span class="tok zec">ZEC</span><span class="arr">&rarr;</span><span class="tok usdc">USDC</span><span class="arr">&rarr;</span><span class="tok">escrow</span></div>
+        <h3>Send ZEC, then close the tab</h3>
+        <p>Send the quoted amount from any Zcash wallet. As soon as your transaction is in the mempool, the page signs its half of the release: a signature that only completes once the dollars are proven paid. Leave the page open until it says locked, then close it. At ten confirmations for anything under $50, zpay sends the dollars from its own Venmo to the handle you typed.</p>
+        <div class="rail"><span class="tok zec">ZEC</span><span class="arr">&rarr;</span><span class="tok">10 confirmations</span><span class="arr">&rarr;</span><span class="tok venmo">Venmo</span></div>
       </div>
       <div class="step">
         <span class="n">03</span>
-        <h3>A taker pays them, then proves it</h3>
-        <p>A taker stakes, sends the dollars from the taker's own Venmo account to the handle you typed, and asks zk-p2p's Nitro enclave to attest the payment. The on-chain verifier checks that signature and releases the USDC to the taker. By then the dollars are already in the recipient's Venmo.</p>
-        <div class="rail"><span class="tok venmo">Venmo</span><span class="arr">&rarr;</span><span class="tok">enclave attestation</span><span class="arr">&rarr;</span><span class="tok usdc">release</span></div>
+        <h3>The payment is proven, the escrow releases</h3>
+        <p>zpay asks zk-p2p's enclave to attest the Venmo payment: amount, payee and time, read from the Venmo feed. The attestor checks that attestation and signs the outcome. That signature completes the one you made in step two, and zpay broadcasts the release. If nobody proves a payment before the deadline, your key refunds the ZEC and no one else needs to sign.</p>
+        <div class="rail"><span class="tok venmo">Venmo</span><span class="arr">&rarr;</span><span class="tok">enclave attestation</span><span class="arr">&rarr;</span><span class="tok zec">release</span></div>
       </div>
     </div>
 
     <div class="flow" aria-label="settlement diagram">
       <svg viewBox="0 0 1000 250" role="img" aria-labelledby="flow-title">
-        <title id="flow-title">ZEC leaves a shielded wallet, is swapped to USDC on Base by 1Click, is posted to zk-p2p escrow by the zpay contract with the payee fixed to the recipient's Venmo handle, and is released to the taker who paid that Venmo and presented an enclave attestation.</title>
+        <title id="flow-title">ZEC leaves a shielded wallet into a Zcash escrow address that two keys release and the sender alone refunds after a deadline. zpay pays the recipient's Venmo, zk-p2p's enclave attests the payment, the attestor signs the outcome, and that signature completes the sender's pre-signature so the release can be broadcast.</title>
         <!-- you, the sender -->
         <rect class="box zec" x="20" y="60" width="150" height="70" rx="4"/>
         <text x="95" y="90" text-anchor="middle" font-size="14" font-weight="700">you</text>
         <text class="t-dim" x="95" y="112" text-anchor="middle" font-size="11">shielded wallet</text>
 
-        <!-- 1click -->
-        <rect class="box" x="230" y="60" width="170" height="70" rx="4"/>
-        <text x="315" y="90" text-anchor="middle" font-size="14" font-weight="700">1Click</text>
-        <text class="t-dim" x="315" y="112" text-anchor="middle" font-size="11">NEAR Intents swap</text>
-
-        <!-- glue -->
-        <rect class="box blue" x="460" y="60" width="180" height="70" rx="4"/>
-        <text x="550" y="90" text-anchor="middle" font-size="14" font-weight="700">zpay contract</text>
-        <text class="t-dim" x="550" y="112" text-anchor="middle" font-size="11">immutable, no admin</text>
-
         <!-- escrow -->
-        <rect class="box" x="700" y="60" width="170" height="70" rx="4"/>
-        <text x="785" y="90" text-anchor="middle" font-size="14" font-weight="700">zk-p2p escrow</text>
-        <text class="t-dim" x="785" y="112" text-anchor="middle" font-size="11">EscrowV2 on Base</text>
+        <rect class="box blue" x="230" y="60" width="170" height="70" rx="4"/>
+        <text x="315" y="90" text-anchor="middle" font-size="14" font-weight="700">escrow address</text>
+        <text class="t-dim" x="315" y="112" text-anchor="middle" font-size="11">2 keys; yours after T</text>
+
+        <!-- zpay -->
+        <rect class="box" x="460" y="60" width="180" height="70" rx="4"/>
+        <text x="550" y="90" text-anchor="middle" font-size="14" font-weight="700">zpay</text>
+        <text class="t-dim" x="550" y="112" text-anchor="middle" font-size="11">waits, then pays Venmo</text>
+
+        <!-- their venmo -->
+        <rect class="box blue" x="700" y="60" width="170" height="70" rx="4"/>
+        <text class="t-blue" x="785" y="90" text-anchor="middle" font-size="14" font-weight="700">their Venmo</text>
+        <text class="t-dim" x="785" y="112" text-anchor="middle" font-size="11">dollars arrive here</text>
 
         <!-- arrows top row -->
         <line class="line" x1="170" y1="95" x2="228" y2="95" stroke-width="1.5"/>
         <text class="t-dim" x="199" y="83" text-anchor="middle" font-size="10">ZEC</text>
         <line class="line" x1="400" y1="95" x2="458" y2="95" stroke-width="1.5"/>
-        <text class="t-dim" x="429" y="83" text-anchor="middle" font-size="10">USDC</text>
-        <line class="line" x1="640" y1="95" x2="698" y2="95" stroke-width="1.5"/>
-        <text class="t-dim" x="669" y="83" text-anchor="middle" font-size="10">sell order</text>
+        <text class="t-dim" x="429" y="83" text-anchor="middle" font-size="10">confirmed</text>
+        <line class="line blue" x1="640" y1="95" x2="698" y2="95" stroke-width="1.5"/>
+        <text class="t-blue" x="669" y="83" text-anchor="middle" font-size="10">pays</text>
 
-        <!-- taker row -->
+        <!-- proof row -->
         <rect class="box" x="700" y="170" width="170" height="60" rx="4"/>
-        <text x="785" y="196" text-anchor="middle" font-size="14" font-weight="700">taker</text>
-        <text class="t-dim" x="785" y="216" text-anchor="middle" font-size="11">stakes, pays, proves</text>
+        <text x="785" y="196" text-anchor="middle" font-size="14" font-weight="700">enclave</text>
+        <text class="t-dim" x="785" y="216" text-anchor="middle" font-size="11">attests the payment</text>
 
-        <rect class="box blue" x="460" y="170" width="180" height="60" rx="4"/>
-        <text class="t-blue" x="550" y="196" text-anchor="middle" font-size="14" font-weight="700">their Venmo</text>
-        <text class="t-dim" x="550" y="216" text-anchor="middle" font-size="11">dollars arrive here</text>
+        <rect class="box" x="460" y="170" width="180" height="60" rx="4"/>
+        <text x="550" y="196" text-anchor="middle" font-size="14" font-weight="700">attestor</text>
+        <text class="t-dim" x="550" y="216" text-anchor="middle" font-size="11">checks it, signs outcome</text>
 
-        <rect class="box" x="230" y="170" width="170" height="60" rx="4"/>
-        <text x="315" y="196" text-anchor="middle" font-size="14" font-weight="700">enclave</text>
-        <text class="t-dim" x="315" y="216" text-anchor="middle" font-size="11">signs the attestation</text>
+        <rect class="box zec" x="230" y="170" width="170" height="60" rx="4"/>
+        <text x="315" y="196" text-anchor="middle" font-size="14" font-weight="700">release</text>
+        <text class="t-dim" x="315" y="216" text-anchor="middle" font-size="11">your half completes</text>
 
-        <!-- taker pays them -->
-        <line class="line blue" x1="700" y1="200" x2="642" y2="200" stroke-width="1.5"/>
-        <text class="t-blue" x="671" y="190" text-anchor="middle" font-size="10">pays</text>
         <!-- venmo -> enclave -->
+        <line class="line" x1="785" y1="130" x2="785" y2="168" stroke-width="1.5"/>
+        <text class="t-dim" x="805" y="153" text-anchor="start" font-size="10">replayed</text>
+        <!-- enclave -> attestor -->
+        <line class="line" x1="700" y1="200" x2="642" y2="200" stroke-width="1.5"/>
+        <text class="t-dim" x="671" y="190" text-anchor="middle" font-size="10">attests</text>
+        <!-- attestor -> release -->
         <line class="line" x1="460" y1="200" x2="402" y2="200" stroke-width="1.5"/>
-        <text class="t-dim" x="431" y="190" text-anchor="middle" font-size="10">replayed</text>
-        <!-- enclave -> escrow release -->
-        <path class="line" d="M315 170 V150 H785 V132" stroke-width="1.5"/>
-        <text class="t-dim" x="550" y="146" text-anchor="middle" font-size="10">attestation verified on chain; USDC released to taker</text>
+        <text class="t-dim" x="431" y="190" text-anchor="middle" font-size="10">signs</text>
+        <!-- release -> escrow -->
+        <line class="line" x1="315" y1="168" x2="315" y2="132" stroke-width="1.5"/>
+        <text class="t-dim" x="325" y="153" text-anchor="start" font-size="10">spends it; with no proof by the deadline, your key refunds</text>
       </svg>
     </div>
   </div>
@@ -225,27 +222,28 @@
     <span class="label blue">custody</span>
     <h2>Who holds what, and for how long</h2>
     <p class="intro">
-      Three parties touch value between your wallet and their Venmo. What each
-      one can and cannot do is read off the contract and the deploy, not off a
+      Three things stand between your wallet and their Venmo. What each one can
+      and cannot do is read off the script and the pinned keys, not off a
       promise.
     </p>
 
     <div class="trust">
       <div class="card">
-        <h3><span class="ic"></span>The contract</h3>
-        <p>Deployed once, no proxy, no upgrade path. The only privileged action its owner has is naming the keeper, and the keeper can only open sessions and post your credited USDC to escrow. It cannot change the payee, and it cannot pay itself.</p>
-        <p>Your own key can pull the USDC back at any point before a taker claims it. Nobody else's signature is needed. The recipient signs nothing and needs no wallet.</p>
-        <div class="who"><b>Holds:</b> USDC between arrival and the escrow deposit. <b>Escape hatch:</b> rescue and withdraw, signed by you.</div>
+        <h3><span class="ic"></span>The escrow</h3>
+        <p>A transparent Zcash address whose script has two branches. Before the deadline it spends only with your signature and zpay's together. After the deadline, 1,152 blocks from the lock, about 24 hours, it spends with your signature alone. There is no third key, no admin and no upgrade.</p>
+        <p>The refund is signed in your browser by your key. If zpay is unreachable, any Zcash node will broadcast it. The recipient signs nothing and needs no wallet.</p>
+        <div class="who"><b>Holds:</b> your ZEC until release or refund. <b>Escape hatch:</b> the refund branch, yours alone after the deadline.</div>
       </div>
       <div class="card">
-        <h3><span class="ic"></span>The swap</h3>
-        <p>1Click custodies your ZEC from the moment it leaves your wallet until USDC lands on the contract. That window is not trustless. If the route fails, 1Click refunds to the transparent Zcash address you gave on the quote's deadline.</p>
-        <div class="who"><b>Holds:</b> ZEC in flight, minutes. <b>Escape hatch:</b> the refund address on the quote.</div>
+        <h3><span class="ic"></span>zpay, the payer</h3>
+        <p>zpay fronts the dollars from its own Venmo and is repaid in ZEC out of the escrow. Its key is one of the two on the release, so it can never spend your ZEC by itself, and it never holds your coins before or after the trade. What it does hold is your pre-signature, which is inert until the attestor signs a payment.</p>
+        <div class="who"><b>Holds:</b> nothing of yours. <b>Trusted for:</b> sending the dollars. If it does not, you refund.</div>
       </div>
       <div class="card">
         <h3><span class="ic"></span>The proof</h3>
-        <p>A Venmo payment is not an on-chain event, so the escrow releases only against a signature from zk-p2p's Nitro enclave, which replays the taker's Venmo feed and attests the amount, the payee hash and the timestamp. The verifier contract checks that signature during release.</p>
-        <div class="who"><b>Holds:</b> nothing. <b>Trusted for:</b> saying a payment happened. Without it, no release.</div>
+        <p>A Venmo payment is not a chain event, so the release needs two signatures from outside it: zk-p2p's Nitro enclave attests the amount, payee and time from the Venmo feed, and an attestor whose key is pinned in the app checks that attestation and signs the outcome. Without both, the release cannot be completed.</p>
+        <p>What this does not protect against: the attestor and zpay together signing a payment that never happened. Today one operator runs both. The attestor holds no key over the funds and no escrow secret; it signs statements.</p>
+        <div class="who"><b>Holds:</b> nothing. <b>Trusted for:</b> saying a payment happened.</div>
       </div>
     </div>
   </div>
@@ -256,7 +254,7 @@
   <div class="wrap">
     <span class="label blue">fees</span>
     <h2>What comes out of what they receive</h2>
-    <p class="intro">The quote above already nets these. Nothing is added after you send.</p>
+    <p class="intro">Type a dollar amount in the app and that is what they receive; the fees are added to the ZEC you send. Type a ZEC amount and the fees come out of it. Either way the quote shows every line before you send.</p>
 
     <table class="fees">
       <thead><tr><th>line</th><th>amount</th><th>who takes it</th></tr></thead>
@@ -264,22 +262,22 @@
         <tr>
           <td>zpay fee</td>
           <td class="num blue" data-fee>0.15%</td>
-          <td class="who">Taken from the USDC as it is posted to escrow.</td>
+          <td class="who">A share of the escrow, paid to zpay's treasury as an output of the release transaction.</td>
         </tr>
         <tr>
-          <td>swap spread</td>
-          <td class="num">in the quote</td>
-          <td class="who">1Click's rate for ZEC to USDC. Shown as the rate line before you start.<span class="fn">Varies with the route; there is no separate charge.</span></td>
+          <td>Zcash network fee</td>
+          <td class="num">15,000 zatoshi</td>
+          <td class="who">The ZIP 317 fee for the release transaction. Fixed by the transaction's shape, not by zpay.<span class="fn">Around $0.17 at $1,140 per ZEC. On small amounts this is the larger of the two.</span></td>
         </tr>
         <tr>
-          <td>taker margin</td>
-          <td class="num">set by you</td>
-          <td class="who">The floor rate your order is posted at. Default is one dollar per USDC. A lower floor fills faster because the taker keeps the difference.</td>
+          <td>rate</td>
+          <td class="num">market less <span data-spread>0.5%</span></td>
+          <td class="who">The ZEC price is read from Coinbase and Kraken together, and the lower one wins when they disagree. zpay's margin is the spread, shown as the rate line before you start.</td>
         </tr>
         <tr>
           <td>gas</td>
           <td class="num">$0</td>
-          <td class="who">The coordinator pays for the session and the escrow deposit. Takers pay for their own claim and release.</td>
+          <td class="who">There is no second chain. The one Zcash fee above is the whole cost of settlement.</td>
         </tr>
       </tbody>
     </table>
@@ -296,30 +294,30 @@
     <div class="limits">
       <div class="limit">
         <h3>Venmo only, for now</h3>
-        <p>The coordinator registers Venmo payees. The enclave that signs proofs knows eleven platforms, and each one needs its own payee registration and payment driver before it turns on here.</p>
+        <p>zpay pays Venmo. The enclave that attests payments knows eleven platforms, and each one needs its own payee lookup and payment driver before it turns on here.</p>
         <div class="platforms">
           <span class="on">Venmo</span><span>Cash App</span><span>PayPal</span><span>Zelle</span><span>Wise</span><span>Revolut</span><span>Monzo</span><span>Chime</span><span>Monobank</span><span>Alipay</span><span>UPI</span>
         </div>
       </div>
       <div class="limit">
-        <h3>Base mainnet only</h3>
-        <p>zk-p2p's Venmo verifier is deployed on Base and nowhere else, and the enclave binds every attestation to chain 8453. There is no testnet version of the payment leg.</p>
+        <h3>Small amounts only</h3>
+        <p>zpay fronts the dollars from its own Venmo balance, so one payment is capped at what that balance covers. The quote refuses anything above the cap and tells you the number.</p>
       </div>
       <div class="limit">
-        <h3>Orders wait for a taker</h3>
-        <p>Nothing bounds how long a sell order sits in escrow, and nothing reaches their Venmo until a taker fills it. Small orders wait longest, because a taker pays the same gas and locks their stake for fourteen days whether the order is $5 or $500. You can withdraw any time before a taker claims it.</p>
+        <h3>Bigger amounts wait longer</h3>
+        <p>zpay pays once the escrow is deep enough that reversing it would cost more than the trade. Up to $50 that is ten confirmations, about twelve minutes at 75-second blocks. From $50 to $500 it is thirty, about 38 minutes. Above $500 it is a hundred, about two hours, the depth at which Zcash nodes refuse a reorg outright.</p>
+      </div>
+      <div class="limit">
+        <h3>The tab stays open until it says locked</h3>
+        <p>The page holds the key that signs your half of the release, and there is no other copy. It signs as soon as your transaction reaches the mempool, before the first confirmation. Close the tab before that and nobody can sign; the ZEC then comes back to you at the deadline instead of paying anyone. Keep the status link either way: it is the only thing that can refund.</p>
       </div>
       <div class="limit">
         <h3>Their handle is not private</h3>
-        <p>The escrow stores a hash of the recipient's Venmo username, and zk-p2p's curator answers that hash to anyone who asks. Treat the handle, amount and time of a payment as public; if you pay your own handle, that is your handle. The Zcash side ends at a transparent deposit address, so spend from a shielded pool if you care about the input.</p>
+        <p>zpay looks the handle up with zk-p2p's curator to get the payee hash the enclave attests against, and the curator answers that hash to anyone who asks. The escrow is a transparent address, so the amount and the time are on the chain in the clear. Send from a shielded pool if you care about where the ZEC came from, and shield the refund afterwards if you get one.</p>
       </div>
       <div class="limit">
-        <h3>A floor, not a minimum that fills</h3>
-        <p>1Click refuses anything under 0.00052 ZEC. Above that, whether an order fills is up to takers, and the smallest orders are the ones they skip.</p>
-      </div>
-      <div class="limit">
-        <h3>One session at a time per contract</h3>
-        <p>The contract keeps every session's USDC in one pot and credits arrivals to one open session, so the coordinator serves payments in series. If yours is queued, the app says so.</p>
+        <h3>The refund is transparent</h3>
+        <p>If nobody pays, the page signs a refund to a transparent Zcash address you give it. Shield it from your wallet afterwards. The coordinator refuses orders under 0.0012 ZEC.</p>
       </div>
     </div>
   </div>
@@ -331,8 +329,8 @@
     <div class="band">
       <div>
         <span class="label blue">liquidity</span>
-        <h2>Fill orders. Keep the spread.</h2>
-        <p>Every open order is a USDC deposit on zk-p2p's escrow with a rate floor. Pay the Venmo, present the enclave's attestation, collect the USDC. The auto-taker daemon watches, claims, pays and proves from a browser you are already logged into, and stops before each money step unless you tell it not to.</p>
+        <h2>Be the one who pays. Keep the spread.</h2>
+        <p>An order is ZEC locked in a script with the payer's key as the second signer. Whoever holds that key fronts the dollars, proves the payment, and collects the ZEC at the market rate less the spread. Today that key is zpay's. The daemon that watches, pays and proves is the same code the taker page describes.</p>
       </div>
       <div class="btns">
         <a class="btn primary" href="takers/">Run a taker</a>
@@ -346,8 +344,8 @@
   <div class="wrap">
     <div class="col">
       <a class="wordmark" href="./">zpay<span class="tick">_</span></a>
-      <p class="fine"><span data-fee>0.15%</span> fee &middot; non-custodial &middot; <span data-chain>Base 8453</span></p>
-      <p class="fine">contract <span class="addr" data-contract>0x617544CC688F7f742cA68B5d9106890500b6C689</span></p>
+      <p class="fine"><span data-fee>0.15%</span> fee &middot; escrow on Zcash &middot; refund needs nobody</p>
+      <p class="fine">Your key is made in the page and never sent anywhere. Only the order leaves it.</p>
     </div>
     <div class="col">
       <h4>product</h4>
@@ -360,15 +358,12 @@
       <h4>takers</h4>
       <a href="takers/">Run a taker</a>
       <a data-link="githubTaker" href="#" rel="noopener">auto-taker on GitHub</a>
-      <a data-link="stakeVault" href="#" target="_blank" rel="noopener">Stake vault</a>
     </div>
     <div class="col">
       <h4>protocol</h4>
       <a data-link="github" href="#" rel="noopener">zpay on GitHub</a>
-      <a data-contract-link href="#" target="_blank" rel="noopener">Contract on BaseScan</a>
-      <a data-link="escrow" href="#" target="_blank" rel="noopener">zk-p2p EscrowV2</a>
-      <a data-link="verifier" href="#" target="_blank" rel="noopener">Payment verifier</a>
-      <a data-link="nearIntents" href="#" target="_blank" rel="noopener">NEAR Intents</a>
+      <a data-link="zkp2p" href="#" target="_blank" rel="noopener">zk-p2p attestation</a>
+      <a data-link="zcash" href="#" target="_blank" rel="noopener">Zcash</a>
     </div>
   </div>
 </footer>
