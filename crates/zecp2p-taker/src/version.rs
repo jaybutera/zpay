@@ -7,8 +7,13 @@
 //! - [`describe`] for a log line and `--version`;
 //! - [`STAMP`] as a fixed marker `strings` can find in a stripped binary on a
 //!   host with no way to run it, which is what a deploy verify does over ssh;
-//! - [`as_json`] for `/health`, so an operator comparing the hub against their
-//!   laptop reads it over HTTP rather than by shelling in.
+//! - [`as_json`] for a status command.
+//!
+//! Deliberately a copy of the coordinator's rather than a shared crate. It is
+//! forty lines that read three environment variables `build.rs` sets, and the
+//! two `build.rs` files must exist per crate anyway - a shared crate would be
+//! stamped with its *own* build's hash, which is the one thing this must never
+//! report.
 //!
 //! Nothing here is instance-specific. It says what the *code* is, not whose
 //! deployment it belongs to.
@@ -97,7 +102,7 @@ mod tests {
     /// break the verify step, so the shape is asserted rather than assumed.
     #[test]
     fn stamp_is_greppable_and_carries_the_hash() {
-        assert!(STAMP.starts_with("zecp2p-build:zecp2p-v2coordinator:"));
+        assert!(STAMP.starts_with("zecp2p-build:zecp2p-taker:"));
         let body = STAMP.strip_suffix(STAMP_END).expect("the stamp is terminated");
         let fields: Vec<&str> = body.split(':').collect();
         assert_eq!(fields.len(), 6, "stamp is prefix, pkg, version, hash, dirty, time: {STAMP}");

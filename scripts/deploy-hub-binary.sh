@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build, ship, verify and restart a coordinator on an LP's own host.
+# Build, ship, verify and restart one of this repo's daemons on an LP's own host.
 #
 # Finding 10: deployment was a laptop build, an `scp`, a hand-named `.bak`, and
 # no way to tell what was running short of `nm` or `strings` for a symbol that
@@ -23,10 +23,11 @@
 # them are running the same deployment.
 #
 # Usage:
-#   scripts/deploy-coordinator.sh --host lp-host
-#   scripts/deploy-coordinator.sh --host lp-host --dry-run
-#   scripts/deploy-coordinator.sh --host lp-host --rollback 1a705d4c9f21
-#   scripts/deploy-coordinator.sh --host lp-host --list
+#   scripts/deploy-hub-binary.sh --host lp-host
+#   scripts/deploy-hub-binary.sh --host lp-host --binary zecp2p-taker
+#   scripts/deploy-hub-binary.sh --host lp-host --dry-run
+#   scripts/deploy-hub-binary.sh --host lp-host --rollback 1a705d4c9f21
+#   scripts/deploy-hub-binary.sh --host lp-host --list
 #
 # Environment (all optional, all with the defaults the units use):
 #   ZECP2P_DEPLOY_HOST     the ssh destination, same as --host
@@ -37,12 +38,16 @@
 
 set -euo pipefail
 
+# Which binary. Both carry the same build stamp and both take `--version`, so
+# the whole of this script works for either; the coordinator additionally takes
+# `--check` and serves `/health`, and those steps are skipped for one that does
+# not.
 BIN_NAME="zecp2p-v2coordinator"
 CRATE="zecp2p-v2coordinator"
 
 HOST="${ZECP2P_DEPLOY_HOST:-}"
 REMOTE_DIR="${ZECP2P_DEPLOY_DIR:-\$HOME/.zecp2p}"
-UNIT="${ZECP2P_DEPLOY_UNIT:-zecp2p-v2coordinator}"
+UNIT="${ZECP2P_DEPLOY_UNIT:-}"
 REMOTE_CONFIG="${ZECP2P_DEPLOY_CONFIG:-}"
 HEALTH_URL="${ZECP2P_HEALTH_URL:-http://127.0.0.1:3000/health}"
 DRY_RUN=0
@@ -57,6 +62,7 @@ ok()  { printf '\033[32m  ok\033[0m %s\n' "$*"; }
 while [ $# -gt 0 ]; do
   case "$1" in
     --host)      HOST="$2"; shift 2 ;;
+    --binary)    BIN_NAME="$2"; CRATE="$2"; shift 2 ;;
     --dir)       REMOTE_DIR="$2"; shift 2 ;;
     --unit)      UNIT="$2"; shift 2 ;;
     --config)    REMOTE_CONFIG="$2"; shift 2 ;;
@@ -71,7 +77,22 @@ while [ $# -gt 0 ]; do
 done
 
 [ -n "$HOST" ] || die "no host. Pass --host, or set ZECP2P_DEPLOY_HOST."
-: "${REMOTE_CONFIG:=$REMOTE_DIR/config/config.v2coordinator.toml}"
+# The unit is named after the binary unless one was given, so `--binary
+# zecp2p-taker` restarts the taker's unit rather than the coordinator's.
+: "${UNIT:=$BIN_NAME}"
+
+# Only the coordinator has a `--check` and a `/health`. The taker's config path
+# differs too, so both are settled from the binary.
+case "$BIN_NAME" in
+  zecp2p-v2coordinator)
+    : "${REMOTE_CONFIG:=$REMOTE_DIR/config/config.v2coordinator.toml}"
+    HAS_CHECK=1
+    ;;
+  *)
+    : "${REMOTE_CONFIG:=$REMOTE_DIR/config/config.taker.toml}"
+    HAS_CHECK=0
+    ;;
+esac
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO"
@@ -194,12 +215,20 @@ ok "sha256 matches on both ends"
 # so a config the new build reads differently is caught while the old one is
 # still running.
 # ---------------------------------------------------------------------------
-say "checking the new binary against the live config"
-if ! r "$STAGED --config $REMOTE_CONFIG --check"; then
-  r "rm -f $STAGED"
-  die "the new binary will not accept the deployed config. Nothing was changed; the running binary is untouched."
+if [ "$HAS_CHECK" = 1 ]; then
+  say "checking the new binary against the live config"
+  if ! r "$STAGED --config $REMOTE_CONFIG --check"; then
+    r "rm -f $STAGED"
+    die "the new binary will not accept the deployed config. Nothing was changed; the running binary is untouched."
+  fi
+  ok "configuration, node, attestor and key all check out"
+else
+  # No `--check` on this binary. `--version` at least proves the artifact runs
+  # on this host - the right architecture, the right libc - which is the failure
+  # an scp from a different machine actually produces.
+  say "no --check on $BIN_NAME; confirming the binary runs at all"
+  r "$STAGED --version" || { r "rm -f $STAGED"; die "the shipped binary will not run on $HOST"; }
 fi
-ok "configuration, node, attestor and key all check out"
 
 # ---------------------------------------------------------------------------
 # 5. Swap and restart, keeping the outgoing version by its own hash.
@@ -243,6 +272,13 @@ ok "the unit is active"
 # Health, asked of the service rather than of systemd. A unit can be `active`
 # with a coordinator that cannot reach a node, and that distinction is the whole
 # point of /health being truthful.
+if [ "$HAS_CHECK" = 0 ]; then
+  say "deployed"
+  r "$REMOTE_DIR/bin/$BIN_NAME --version | head -1"
+  ok "rollback with: $0 --host $HOST --binary $BIN_NAME --rollback ${PREVIOUS_HASH:-<hash>}"
+  exit 0
+fi
+
 say "asking $HEALTH_URL what it thinks"
 HEALTH="$(r "curl -sS --max-time 10 $HEALTH_URL" || true)"
 if [ -z "$HEALTH" ]; then

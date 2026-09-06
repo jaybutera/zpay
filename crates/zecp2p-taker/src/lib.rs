@@ -16,6 +16,7 @@
 //!   `scripts/deploy/06_prove_payment.sh` produces it; the agent stops there
 //!   and says exactly what to run. See [`proof`].
 
+pub mod version;
 pub mod abi;
 pub mod agent;
 pub mod auto;

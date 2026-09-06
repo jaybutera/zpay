@@ -44,8 +44,20 @@ struct Cli {
     #[arg(long, env = "ZECP2P_TAKER_CONFIG", default_value = "config.taker.toml")]
     config: String,
 
+    /// Print what build this is and exit.
+    ///
+    /// Finding 10: identifying a deployed binary meant `nm` or `strings` for a
+    /// symbol that happened to have changed, which is how the hub ran a
+    /// three-day-old taker for three days without anyone noticing.
+    ///
+    /// A flag rather than a subcommand, and answered before the config is
+    /// loaded: "what build is this?" must be answerable on a host where the
+    /// config is wrong, missing, or the very thing being diagnosed.
+    #[arg(long, global = true)]
+    version: bool,
+
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
@@ -374,11 +386,24 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    if cli.version {
+        println!("{}", zecp2p_taker::version::describe());
+        println!("built_at_unix {}", zecp2p_taker::version::BUILD_TIME);
+        println!("{}", zecp2p_taker::version::STAMP);
+        return Ok(());
+    }
+    let Some(command) = cli.command else {
+        // clap's own error, so the help text is the one it would have printed.
+        use clap::CommandFactory;
+        Cli::command().print_help()?;
+        println!();
+        std::process::exit(2);
+    };
     let config = TakerConfig::load(&cli.config)?;
 
     // CheckVenmo is the one command that needs no key: it is what an operator
     // runs before funding anything.
-    if let Commands::CheckVenmo = cli.command {
+    if let Commands::CheckVenmo = command {
         let browser = VenmoBrowser::new(config.venmo.cdp_url.clone(), config.venmo.timeout_seconds);
         let tab = browser.find_venmo_tab().await?;
         if VenmoBrowser::session_looks_live(&tab) {
@@ -392,7 +417,7 @@ async fn main() -> Result<()> {
 
     // The session report needs no key: it reads the browser and, with
     // --relogin, drives the login form. Neither sends a transaction.
-    if let Commands::VenmoHealth { relogin } = &cli.command {
+    if let Commands::VenmoHealth { relogin } = &command {
         return run_venmo_health(&config, *relogin).await;
     }
 
@@ -402,7 +427,7 @@ async fn main() -> Result<()> {
         recipient,
         amount,
         send_for_real,
-    } = &cli.command
+    } = &command
     {
         return run_test_pay(&config, recipient, amount, *send_for_real).await;
     }
@@ -410,11 +435,11 @@ async fn main() -> Result<()> {
     // journal and, with --check-chain, the Zcash node; `zec-watch` reads the
     // Zcash node and the curator. Neither sends a transaction on either chain
     // and neither touches the Venmo cookie.
-    if let Commands::Rails { check_chain } = &cli.command {
+    if let Commands::Rails { check_chain } = &command {
         return run_rails(&config, *check_chain).await;
     }
-    if let Commands::ZecWatch { .. } = &cli.command {
-        return run_zec_watch(&config, &cli.command).await;
+    if let Commands::ZecWatch { .. } = &command {
+        return run_zec_watch(&config, &command).await;
     }
 
     // Retiring a stuck fill needs no key and touches no chain: it is one
@@ -428,7 +453,7 @@ async fn main() -> Result<()> {
         evidence,
         payment_was_sent,
         dry_run,
-    } = &cli.command
+    } = &command
     {
         return run_resolve_fill(&config, work, operator, evidence, *payment_was_sent, *dry_run);
     }
@@ -437,7 +462,7 @@ async fn main() -> Result<()> {
         recipient,
         amount,
         after,
-    } = &cli.command
+    } = &command
     {
         let after = match after {
             Some(text) => Some(
@@ -454,7 +479,7 @@ async fn main() -> Result<()> {
     // for Attest, the enclave. Neither sends a transaction. Requiring a funded
     // key to reproduce an attestation would mean the safest command in this
     // binary had the same prerequisites as the one that moves money.
-    match &cli.command {
+    match &command {
         Commands::Terms { intent, lookback } => {
             let provider = ProviderBuilder::new().connect_http(config.network.base_rpc_url.parse()?);
             let terms = read_terms(&provider, &config, intent, *lookback).await?;
@@ -509,7 +534,7 @@ async fn main() -> Result<()> {
         taker,
     );
 
-    match cli.command {
+    match command {
         Commands::CheckVenmo
         | Commands::VenmoHealth { .. }
         | Commands::TestPay { .. }
