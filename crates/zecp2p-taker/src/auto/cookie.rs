@@ -110,7 +110,9 @@ impl CookieHealth {
 pub struct CookieStore {
     path: PathBuf,
     max_age_hours: i64,
-    /// Numeric Venmo sender id, for a store holding a bare Cookie header.
+    /// Numeric Venmo sender id from the operator's config. It is the only id
+    /// for a store holding a bare Cookie header, and a cross-check against the
+    /// id inside a JSON store.
     sender_id: Option<String>,
     /// The User-Agent the cookie was captured under.
     user_agent: Option<String>,
@@ -126,7 +128,9 @@ impl CookieStore {
         }
     }
 
-    /// Supply the sender id and User-Agent for a plain-text cookie file.
+    /// Supply the configured sender id and User-Agent. A plain-text cookie file
+    /// takes both as its own; a JSON file keeps its own values, and `load`
+    /// refuses if its sender id and this one name different accounts.
     pub fn with_identity(
         mut self,
         sender_id: Option<String>,
@@ -151,6 +155,21 @@ impl CookieStore {
     /// comes from [`SessionConfig::sender_id`] and the capture time from the
     /// file's own mtime, which is a real answer rather than a guess: the file was
     /// written when the cookie was captured.
+    ///
+    /// When the file is JSON and a sender id is also configured, the two must
+    /// agree, and a disagreement is an error rather than a preference for
+    /// either. Until 2026-09-06 the JSON file's id won silently. That day the
+    /// hub's capture script wrote the counterparty's account id into the file
+    /// (its page scrape took the first long number in the DOM, which belonged
+    /// to the person being paid) while the coordinator config still named the
+    /// LP's own account. `locate_payment` read the counterparty's feed, found no
+    /// outgoing payment there, and refused to attest, with the $1.50 already
+    /// gone from Venmo. That is the one moment a refusal is useless: the
+    /// payment cannot be taken back and the escrow cannot be released. Refusing
+    /// here instead is what `preflight` was built for, because `preflight`
+    /// runs this before the journal is written and before the browser is
+    /// driven. The message names both ids and where each came from, so the
+    /// operator fixes whichever is wrong without a second round of digging.
     pub fn load(&self) -> Result<Option<SessionMaterial>> {
         let contents = match std::fs::read_to_string(&self.path) {
             Ok(contents) => contents,
@@ -165,6 +184,22 @@ impl CookieStore {
             let material: SessionMaterial = serde_json::from_str(trimmed).with_context(|| {
                 format!("{} looks like JSON but is not session material", self.path.display())
             })?;
+            if let Some(configured) = self.sender_id.as_deref().map(str::trim) {
+                // An empty configured id is "not configured", not "configured
+                // as nothing": there is no account it could name.
+                if !configured.is_empty() && configured != material.sender_id.trim() {
+                    anyhow::bail!(
+                        "the Venmo sender id in {} is {}, but the config says {}. The \
+                         enclave reads the feed of whichever account is attested, so \
+                         the two must name the same account: the LP's own, not the \
+                         counterparty's. Re-capture the session, or fix the config, \
+                         before any payment is sent. Nothing was paid.",
+                        self.path.display(),
+                        material.sender_id,
+                        configured
+                    );
+                }
+            }
             return Ok(Some(material));
         }
 
@@ -376,6 +411,95 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600, "session material must not be world-readable");
         }
+    }
+
+    /// The 2026-09-06 failure: the capture script wrote the counterparty's
+    /// account id into the JSON store while the config named the LP's own.
+    /// The store used to hand back the file's id without looking at the
+    /// config, and the mismatch surfaced as "no outgoing payment in the feed"
+    /// after $1.50 had left Venmo. Now it surfaces here, where nothing has
+    /// been spent, and the message carries both ids and their origins.
+    #[test]
+    fn a_json_store_whose_sender_id_disagrees_with_the_config_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        let mut m = material(0);
+        m.sender_id = "2041148646359040020".into();
+        CookieStore::new(&path, 24).store(&m).unwrap();
+
+        let store = CookieStore::new(&path, 24)
+            .with_identity(Some("4676038579717835818".into()), None);
+        let err = store.load().expect_err("must refuse");
+        let text = err.to_string();
+        assert!(text.contains("2041148646359040020"), "{text}");
+        assert!(text.contains("4676038579717835818"), "{text}");
+        assert!(text.contains("config"), "{text}");
+        assert!(text.contains(&path.display().to_string()), "{text}");
+        // The cookie must not ride along in the error.
+        assert!(!text.contains("api_access_token"), "{text}");
+        // `health` is what `preflight` calls, and it must fail the same way
+        // rather than reporting the file as usable.
+        assert!(store.health().is_err());
+    }
+
+    /// The normal case on the hub: the capture script read the id out of the
+    /// same config the coordinator runs with, so the two agree and the file's
+    /// material loads unchanged.
+    #[test]
+    fn a_json_store_whose_sender_id_matches_the_config_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        CookieStore::new(&path, 24).store(&material(0)).unwrap();
+
+        let store = CookieStore::new(&path, 24)
+            .with_identity(Some("1234567890".into()), Some("Something/1.0".into()));
+        let loaded = store.load().unwrap().expect("loads");
+        assert_eq!(loaded.sender_id, "1234567890");
+        // A JSON file's own User-Agent wins: the cookie was captured under it.
+        assert_eq!(loaded.user_agent.as_deref(), Some("Mozilla/5.0"));
+        assert!(store.health().unwrap().is_usable());
+    }
+
+    /// Whitespace around either id is not a different account.
+    #[test]
+    fn a_configured_sender_id_is_compared_without_surrounding_whitespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        CookieStore::new(&path, 24).store(&material(0)).unwrap();
+
+        let store = CookieStore::new(&path, 24).with_identity(Some(" 1234567890\n".into()), None);
+        assert_eq!(store.load().unwrap().unwrap().sender_id, "1234567890");
+    }
+
+    /// With nothing configured there is nothing to disagree with, and the
+    /// file's id is used as before. An empty configured id counts as nothing
+    /// configured: it names no account.
+    #[test]
+    fn a_json_store_with_no_configured_sender_id_uses_the_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        CookieStore::new(&path, 24).store(&material(0)).unwrap();
+
+        let plain = CookieStore::new(&path, 24);
+        assert_eq!(plain.load().unwrap().unwrap().sender_id, "1234567890");
+
+        let empty = CookieStore::new(&path, 24).with_identity(Some("".into()), None);
+        assert_eq!(empty.load().unwrap().unwrap().sender_id, "1234567890");
+    }
+
+    /// A bare cookie file has no id of its own to disagree with, so the
+    /// configured one is the id, as it always was.
+    #[test]
+    fn a_bare_cookie_header_file_takes_the_configured_sender_id_without_a_cross_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("venmo_cookie.txt");
+        std::fs::write(&path, "api_access_token=abc; _csrf=def\n").unwrap();
+
+        let store =
+            CookieStore::new(&path, 24).with_identity(Some("4676038579717835818".into()), None);
+        let loaded = store.load().unwrap().expect("loads");
+        assert_eq!(loaded.sender_id, "4676038579717835818");
+        assert!(store.health().unwrap().is_usable());
     }
 
     /// The Display impl is what goes in logs, and it must not carry the cookie.
