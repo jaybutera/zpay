@@ -89,6 +89,14 @@ pub async fn advance(state: &Arc<AppState>, order_id: &str) -> Result<()> {
         // `Locked` back - but only over the two stages that path itself
         // writes.
         //
+        // Finding 5 made this the second line of defence rather than the
+        // first. `set_stage_unless_signed` now stops those two stages being
+        // written over a signature at all, which is what closes the window a
+        // polling page could read them in; this restores the stage for any
+        // writer that does not go through it. Kept because the cost is one
+        // comparison and the failure it covers - a signed order left reading
+        // unsigned - is one the user is shown.
+        //
         // Restoring on "the stage changed" alone was wrong. `find_funding` can
         // also end in `check_deadlines`, which writes `Refundable` past T and
         // `Unpaid` past the pay deadline, and both are the deadline check's
@@ -251,12 +259,32 @@ async fn find_funding(state: &Arc<AppState>, mut order: Order) -> Result<()> {
 /// is replaced or never mined leaves an announcement and a signature that are
 /// simply never used, and the escrow refunds at T as if this had not run.
 async fn announce_from_mempool(state: &Arc<AppState>, mut order: Order) -> Result<()> {
-    // Only worth asking before there is an announcement to sign against, and
-    // only once: a second sighting cannot improve on the first, and re-reading
-    // the mempool every sweep for the life of an order is a lot of calls for
-    // nothing.
-    if order.announcement.is_some() || order.mempool_announced_txid.is_some() {
+    // Already announced. Nothing here can improve on that, and a second
+    // announcement would draw a fresh `R` the user's signature is not under.
+    if order.announcement.is_some() {
         return check_deadlines(state, order).await;
+    }
+
+    // Sighted before, but never announced.
+    //
+    // Finding 4: the sighting is recorded before the attestor is called, so an
+    // attestor that was unreachable at that moment left the txid set and no
+    // announcement. The guard used to key on the txid, so the mempool path was
+    // skipped on every later sweep and the order waited for its transaction to
+    // confirm before the page could sign - the wait this whole branch exists to
+    // skip. Announcing from the record costs no mempool read and nothing else
+    // is committed: no terms were signed, because there was nothing to sign
+    // against.
+    //
+    // The lock time stays as it was first stamped. It is committed by
+    // `terms_hash` and it is the cut for the feed search, and re-stamping it
+    // would move both for an escrow whose sighting has not changed.
+    if order.mempool_announced_txid.is_some() {
+        tracing::info!(
+            order = %order.order_id,
+            "a sighting was recorded but never announced; asking the attestor again"
+        );
+        return announce(state, order).await;
     }
 
     // One reading of the mempool for the whole sweep, matched locally. Asking
@@ -366,7 +394,10 @@ async fn advance_funded(state: &Arc<AppState>, mut order: Order) -> Result<()> {
     // ever sign and the escrow could only refund at T. That is what happened to
     // esc_1f2809bcb726cd630ff7932c. At one confirmation the window is one block.
     if confirmations < zecp2p_escrow::depth::ANNOUNCE_DEPTH {
-        order.stage = Stage::Confirming;
+        // Finding 5: not over a signature. A signed order re-entering this
+        // path is `Locked`, and writing `Confirming` tells a polling page the
+        // escrow is still filling on a trade that is past that.
+        set_stage_unless_signed(&mut order, Stage::Confirming);
         order.touch();
         state.store.put(&order)?;
         // A funding that never reaches depth - a stuck low-fee transaction, a
@@ -385,11 +416,37 @@ async fn advance_funded(state: &Arc<AppState>, mut order: Order) -> Result<()> {
     if order.lock_confirmed_ms.is_none() {
         order.lock_confirmed_ms = Some(chrono::Utc::now().timestamp_millis() as u64);
     }
-    order.stage = Stage::Confirming;
+    set_stage_unless_signed(&mut order, Stage::Confirming);
     order.touch();
     state.store.put(&order)?;
 
     announce(state, order).await
+}
+
+/// Moves the stage, unless the order is already signed.
+///
+/// Audit finding 5. The stages before `Locked` describe an escrow that is still
+/// being filled or is waiting for a signature, and a signed order is past both.
+/// It reaches them anyway: re-entering the funding scan for an order announced
+/// from a mempool sighting runs the ordinary funded path, which writes
+/// `Confirming` and then `NeedsPresignature` before the caller puts `Locked`
+/// back.
+///
+/// Each of those is a store write, and the status view reads the store without
+/// the order lock - it has to, or a `settle` driving a browser for two minutes
+/// would stall every poll. So a page polling inside that window is served
+/// `needs_presignature` for an order it has already signed, signs again, and is
+/// shown the 400 refusing a pre-signature at stage `locked`, with a "Try again"
+/// prompt, on a trade that is going fine.
+///
+/// Restoring `Locked` afterwards - which the caller still does, for the stages
+/// this cannot know about - closes the window but does not remove it. Not
+/// writing the wrong stage in the first place does.
+fn set_stage_unless_signed(order: &mut Order, stage: Stage) {
+    if order.pre_signature.is_some() && matches!(order.stage, Stage::Locked) {
+        return;
+    }
+    order.stage = stage;
 }
 
 /// Announces the escrow to the attestor and records the answer.
@@ -400,7 +457,10 @@ async fn advance_funded(state: &Arc<AppState>, mut order: Order) -> Result<()> {
 /// announcement per event for the same reason; this does not rely on that.
 async fn announce(state: &Arc<AppState>, mut order: Order) -> Result<()> {
     if order.announcement.is_some() {
-        order.stage = Stage::NeedsPresignature;
+        // Finding 5, the other half. A signed order re-entering the scan
+        // arrives here with its announcement already drawn, and asking the
+        // page for a signature it has given is what produced the 400.
+        set_stage_unless_signed(&mut order, Stage::NeedsPresignature);
         order.touch();
         state.store.put(&order)?;
         return Ok(());
@@ -424,7 +484,14 @@ async fn announce(state: &Arc<AppState>, mut order: Order) -> Result<()> {
             // Nothing is committed yet, so a failed announcement is a retry
             // rather than a loss. The order stays where it is.
             tracing::warn!(order = %order.order_id, error = %e, "announcement failed; will retry");
-            return Ok(());
+            // But the retry must not outlast `T`. An attestor that is down for
+            // good leaves the order at `Confirming` on every sweep, and this
+            // was the one exit from the funded path that never asked whether
+            // the deadline had passed - so an escrow with a real coin in it
+            // read "waiting" for ever and the page never offered the refund.
+            // Reached through the ordinary confirmed path as well as through a
+            // mempool sighting.
+            return check_deadlines(state, order).await;
         }
     };
 
@@ -500,22 +567,30 @@ async fn check_refund_deadline_only(state: &Arc<AppState>, mut order: Order) -> 
     // These orders need an operator to read the feed and decide. Promoting them
     // to `Refundable` puts a refund form in front of the user instead, over an
     // escrow the LP may have already bought.
+    //
+    // R5-3: read once for the whole sweep rather than once per order in it.
+    // Every held-back order asks this on every pass for as long as it exists,
+    // and the answer comes from the same file. `sweep_journal` says why this
+    // caller may share a read and the refund endpoint may not: withholding a
+    // promotion one sweep too long is self-correcting, and letting a refund
+    // broadcast against a line written since is not.
     if let Some(funding) = order.funding {
         let work = crate::slot::work_id_for(&funding.txid, funding.vout);
-        match crate::slot::fiat_may_have_left(&state.journal, &work) {
-            Ok(true) => {
-                tracing::debug!(
-                    order = %order.order_id,
-                    "not offering a refund: the journal says a payment may already have left"
-                );
-                return Ok(());
+        match state.sweep_journal().await {
+            Ok(latest) => {
+                if crate::slot::fiat_may_have_left_in(&latest, &work) {
+                    tracing::debug!(
+                        order = %order.order_id,
+                        "not offering a refund: the journal says a payment may already have left"
+                    );
+                    return Ok(());
+                }
             }
-            Ok(false) => {}
             Err(e) => {
                 // Unreadable journal is not permission to offer the refund.
                 tracing::warn!(
                     order = %order.order_id,
-                    error = %e,
+                    error = %format!("{e:#}"),
                     "could not read the journal, so not promoting this order to refundable"
                 );
                 return Ok(());
@@ -534,6 +609,22 @@ async fn check_refund_deadline_only(state: &Arc<AppState>, mut order: Order) -> 
         return Ok(());
     };
     if state.policy.may_refund_at(refund_height, height) && order.stage != Stage::Refundable {
+        // R5-2 and finding 7: an order whose only evidence of funding is a
+        // mempool sighting must not be promoted before the chain is asked what
+        // became of it. See `settle_sighted_funding`.
+        //
+        // **Below the height check, not above it.** R5-2 is one `gettxout` *at
+        // `T`*, and this function is reached the sweep after an order goes
+        // `Unpaid`, which is `pay_deadline_blocks` - sixty on mainnet - earlier.
+        // A null answer is recorded and stops the order being listed, so asking
+        // early writes off a transaction that is merely still unmined at the pay
+        // deadline and can confirm in the sixty blocks that remain. Nothing then
+        // asks again, and the refund over the outpoint the escrow really holds
+        // is refused for want of a `funding` this call could have recorded.
+        match settle_sighted_funding(state, &mut order).await {
+            SightedFunding::InEscrow => {}
+            SightedFunding::NothingThere | SightedFunding::Unknown => return Ok(()),
+        }
         // The reason is kept. The page shows it beside the refund form, so a
         // user who was told the funding was replaced still sees why.
         order.stage = Stage::Refundable;
@@ -541,6 +632,117 @@ async fn check_refund_deadline_only(state: &Arc<AppState>, mut order: Order) -> 
         state.store.put(&order)?;
     }
     Ok(())
+}
+
+/// What became of a funding transaction that was only ever seen in the mempool.
+enum SightedFunding {
+    /// There is a confirmed output at the sighted outpoint, and `order.funding`
+    /// now names it. Or the order already had a funding outpoint.
+    InEscrow,
+    /// The sighting expired unmined: nothing is at the address.
+    NothingThere,
+    /// The node would not say. Decide nothing this sweep.
+    Unknown,
+}
+
+/// Asks the chain whether a mempool-sighted funding is really in the escrow,
+/// and records it when it is.
+///
+/// R5-2 and finding 7 are the same question asked from `T`. An order can be
+/// promoted to `Refundable` on the strength of a mempool sighting alone, and
+/// two things can have happened to that transaction since, with the order
+/// looking identical either way:
+///
+/// - it confirmed, and the scan cursor passed its block before the scan found
+///   it, so `funding` was never written (finding 7). The coin is in the escrow
+///   and the refund is owed - but the endpoint refuses it, because it checks
+///   the user's bytes against a `funding` outpoint there is none of, while the
+///   mempool record held the right one all along;
+/// - it expired unmined and nobody resent it (R5-2). Nothing ever left the
+///   user's wallet, and promoting says "your ZEC is in the escrow" over an
+///   empty one, hands out a form the refund builder cannot fill, and keeps the
+///   order in the sweep list for the life of the store.
+///
+/// One `gettxout` on the sighted outpoint separates them. An output means the
+/// first case, and recording it is what makes the refund completable; a null
+/// means the second.
+///
+/// `gettxout` also answers null for a *spent* output, which is not a third case
+/// here: the escrow is spendable only by a release, which needs a payment, or
+/// by a refund, which leaves the stage `Refunded` - and neither of those stages
+/// reaches a deadline check with `funding` unset.
+async fn settle_sighted_funding(state: &Arc<AppState>, order: &mut Order) -> SightedFunding {
+    if order.funding.is_some() {
+        return SightedFunding::InEscrow;
+    }
+    let Some((txid, vout)) = order.mempool_outpoint() else {
+        // No sighting either. Nothing to ask about, and nothing this function
+        // can add - the caller's own guards decide.
+        return SightedFunding::InEscrow;
+    };
+    let utxo = state
+        .with_chain(move |chain| {
+            chain
+                .utxo(&txid, vout)
+                .map_err(|e| anyhow::anyhow!("could not read the sighted output: {e}"))
+        })
+        .await;
+    match utxo {
+        Ok(Some(utxo)) => {
+            tracing::info!(
+                order = %order.order_id,
+                txid = %zecp2p_escrow::rpc::txid_to_display(&txid),
+                vout,
+                "the sighted funding is on chain after all; recording it so the refund can be checked"
+            );
+            order.funding = Some(Funding {
+                txid,
+                vout,
+                confirmations: utxo.confirmations,
+                required: zecp2p_escrow::depth::required_depth(order.quote.usd_amount_6dec),
+            });
+            order.touch();
+            if let Err(e) = state.store.put(order) {
+                tracing::warn!(
+                    order = %order.order_id,
+                    error = %format!("{e:#}"),
+                    "could not record the sighted funding"
+                );
+                return SightedFunding::Unknown;
+            }
+            SightedFunding::InEscrow
+        }
+        Ok(None) => {
+            tracing::debug!(
+                order = %order.order_id,
+                "the sighted funding never confirmed, so there is nothing in this escrow to refund"
+            );
+            // Recorded so the answer costs one chain read rather than one per
+            // sweep for the life of the order, and so the predicate that lists
+            // the order stops counting a sighting the chain has disowned.
+            if !order.sighting_never_confirmed {
+                order.sighting_never_confirmed = true;
+                order.touch();
+                if let Err(e) = state.store.put(order) {
+                    tracing::warn!(
+                        order = %order.order_id,
+                        error = %format!("{e:#}"),
+                        "could not record that the sighted funding never confirmed"
+                    );
+                }
+            }
+            SightedFunding::NothingThere
+        }
+        Err(e) => {
+            // A node that will not answer is not proof the escrow is empty.
+            tracing::debug!(
+                order = %order.order_id,
+                error = %format!("{e:#}"),
+                "could not read the sighted output, so deciding nothing this sweep"
+            );
+            SightedFunding::Unknown
+        }
+    }
 }
 
 async fn check_deadlines(state: &Arc<AppState>, mut order: Order) -> Result<()> {
@@ -567,6 +769,39 @@ async fn check_deadlines(state: &Arc<AppState>, mut order: Order) -> Result<()> 
     };
 
     if state.policy.may_refund_at(refund_height, height) {
+        // R5-2 and finding 7. `Refundable` is the stage that puts the refund
+        // form in front of the user, so it must not be written over an escrow
+        // that has nothing in it. An order announced from a mempool sighting
+        // reaches here with no funding outpoint whether the transaction
+        // confirmed behind the scan cursor or expired unmined, and only the
+        // chain can say which. See `settle_sighted_funding`.
+        match settle_sighted_funding(state, &mut order).await {
+            SightedFunding::InEscrow => {}
+            SightedFunding::Unknown => return Ok(()),
+            SightedFunding::NothingThere => {
+                // Nothing is at the address and `T` has passed, so this order
+                // is over. It is written `Unpaid` here rather than left where
+                // it is, because `Unpaid` is what takes it out of the sweep
+                // list: returning without writing would leave it `Locked` and
+                // listed for the life of the store, which is the cost R4-2 was
+                // raised about.
+                //
+                // `Unpaid` is also the honest stage. Nobody sent the dollars,
+                // and there is no coin to come back either - `Refundable` would
+                // put a refund form in front of the user over an empty escrow,
+                // which is the whole of R5-2.
+                if !order.stage.fiat_may_have_left() && order.stage != Stage::Unpaid {
+                    order.stage = Stage::Unpaid;
+                    order.touch();
+                    state.store.put(&order)?;
+                    tracing::info!(
+                        order = %order.order_id,
+                        "the sighted funding never confirmed and T has passed; nothing to refund"
+                    );
+                }
+                return Ok(());
+            }
+        }
         if order.stage != Stage::Refundable {
             order.stage = Stage::Refundable;
             order.touch();

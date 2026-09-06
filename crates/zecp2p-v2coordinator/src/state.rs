@@ -37,6 +37,11 @@ pub const CHAIN_HEAD_TTL: std::time::Duration = std::time::Duration::from_secs(3
 /// block.
 pub const MEMPOOL_TTL: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// The journal as it stood at a given file length. See [`AppState::journal_cache`].
+type JournalCache =
+    Arc<std::sync::Mutex<Option<(u64, Arc<Vec<zecp2p_taker::auto::journal::FillRecord>>)>>>;
+
+
 /// How the coordinator settles the fiat leg.
 ///
 /// A trait so a test can run the whole flow without a browser or an enclave.
@@ -133,6 +138,37 @@ pub struct AppState {
     /// data; the cache above has its own lock. It exists so the second arrival
     /// waits for the first read rather than starting another.
     mempool_reading: Arc<tokio::sync::Mutex<()>>,
+    /// The journal as it stood at a known file length, shared by the deadline
+    /// checks of a sweep.
+    ///
+    /// R5-3. `check_refund_deadline_only` reads and parses the whole journal
+    /// for every `Unpaid` or `Failed` order that still has an escrow, every
+    /// sweep, before it reads the head. For an order the journal holds back
+    /// that read never stops: the order stays `Failed`, the predicate stays
+    /// true, and it is listed until an operator writes `Cancelled` or
+    /// `Fulfilled` for its work.
+    ///
+    /// **Keyed on the file's length, not on a clock.** A time window was the
+    /// obvious shape - it is what `mempool_cache` uses - and it is wrong here.
+    /// The mempool is somebody else's data that this process only reads, so a
+    /// slightly old copy is a slightly old copy. The journal is written *during
+    /// a sweep*, by this process at the pay gate and by the taker daemon in
+    /// another process against the same file, and a window that spans a write
+    /// hands the deadline check a snapshot with the line missing - which is the
+    /// unsafe direction, since the missing line is the one that withholds the
+    /// refund. The journal is append-only, so its length changes on every
+    /// write, by either writer: a cache that only answers at the length it was
+    /// read at cannot be behind one.
+    journal_cache: JournalCache,
+    /// Held across a journal read so concurrent orders share one, for the same
+    /// reason [`AppState::mempool_reading`] exists: a `JoinSet` delivers every
+    /// order of a sweep at once, and without this each finds the cache empty
+    /// and starts its own read.
+    journal_reading: Arc<tokio::sync::Mutex<()>>,
+    /// How many times the journal has actually been read for a sweep, so a
+    /// test can show that one sweep reads it once however many orders are in
+    /// it.
+    journal_reads: Arc<std::sync::atomic::AtomicUsize>,
     /// The LP's key. Its public half is in every order and every capability
     /// answer, and the page checks that the two agree.
     l_priv: SecretKey,
@@ -284,6 +320,104 @@ impl AppState {
             *slot = Some((txs.clone(), std::time::Instant::now()));
         }
         txs
+    }
+
+    /// The length of the journal file right now, or `None` if it cannot be
+    /// measured. A file that does not exist yet is zero bytes.
+    fn journal_len(&self) -> Option<u64> {
+        match std::fs::metadata(self.config.journal_path()) {
+            Ok(m) => Some(m.len()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(0),
+            Err(_) => None,
+        }
+    }
+
+    /// The cached journal, if it was read at the length the file is now.
+    fn cached_journal(
+        &self,
+        len: u64,
+    ) -> Option<Arc<Vec<zecp2p_taker::auto::journal::FillRecord>>> {
+        let slot = self.journal_cache.lock().ok()?;
+        let (read_at_len, records) = slot.as_ref()?;
+        (*read_at_len == len).then(|| records.clone())
+    }
+
+    /// How many times the journal has been read for a sweep.
+    pub fn journal_reads(&self) -> usize {
+        self.journal_reads
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The journal for this sweep, read once and shared by every order in it.
+    ///
+    /// R5-3. The per-order read is a local file read and a serde pass per line,
+    /// with no RPC - not the throttled network call R2-2 was about - but it is
+    /// paid by every held-back order on every sweep for as long as that order
+    /// exists, and the population it is paid for is exactly the one that never
+    /// clears on its own.
+    ///
+    /// **This is for the deadline check and nothing else.** That caller decides
+    /// whether to *withhold* a refund promotion, so a stale answer costs one
+    /// sweep of a refund offered late, which the next sweep corrects. The
+    /// refund endpoint and `slot::take` are gates in the opposite direction: a
+    /// stale answer there would let a refund broadcast or a payment start
+    /// against a line written since. Those read the file, and must keep
+    /// reading the file.
+    ///
+    /// An unreadable journal is returned as the error rather than as an empty
+    /// listing. "No line for this work" and "no answer" are different, and the
+    /// deadline check treats them differently: the first permits the promotion
+    /// and the second withholds it.
+    pub async fn sweep_journal(
+        &self,
+    ) -> Result<Arc<Vec<zecp2p_taker::auto::journal::FillRecord>>> {
+        // No length, no sharing. `metadata` failing is the same class of
+        // trouble as the read failing, and guessing a length would be guessing
+        // that nothing has been appended.
+        let Some(len) = self.journal_len() else {
+            let journal = self.journal.clone();
+            return tokio::task::spawn_blocking(move || journal.latest())
+                .await
+                .context("the journal read did not complete")?
+                .context("could not read the journal back")
+                .map(Arc::new);
+        };
+
+        if let Some(records) = self.cached_journal(len) {
+            return Ok(records);
+        }
+
+        // Single-flight, for the reason `mempool_reading` exists: `run` spawns
+        // every order of a sweep on a `JoinSet`, so they arrive together and
+        // each would find the cache empty.
+        let _reading = self.journal_reading.lock().await;
+        if let Some(records) = self.cached_journal(len) {
+            return Ok(records);
+        }
+
+        let journal = self.journal.clone();
+        let read = tokio::task::spawn_blocking(move || journal.latest())
+            .await
+            .context("the journal read did not complete")?;
+        self.journal_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // A failed read is not cached. The next caller asks again, which is
+        // what makes an outage last only as long as the outage.
+        let records = Arc::new(read.context("could not read the journal back")?);
+        // Re-measured after the read, not before. A write that lands while the
+        // read is in flight means the records may be from either side of it,
+        // and storing them under the length seen *before* would key a possibly
+        // newer snapshot to an older file. Storing under the length after the
+        // read only ever keys an older snapshot to a newer file, which the next
+        // caller's length check then rejects.
+        if let Some(after) = self.journal_len() {
+            if after == len {
+                if let Ok(mut slot) = self.journal_cache.lock() {
+                    *slot = Some((len, records.clone()));
+                }
+            }
+        }
+        Ok(records)
     }
 
     /// Reads the chain height and branch id, from the cache when it is fresh.
@@ -507,6 +641,9 @@ impl AppStateBuilder {
             prices: crate::price::PriceCache::new(),
             mempool_cache: Arc::new(std::sync::Mutex::new(None)),
             mempool_reading: Arc::new(tokio::sync::Mutex::new(())),
+            journal_cache: Arc::new(std::sync::Mutex::new(None)),
+            journal_reading: Arc::new(tokio::sync::Mutex::new(())),
+            journal_reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             l_priv,
             l_pub,
             lp_output_script,

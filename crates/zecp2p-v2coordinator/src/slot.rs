@@ -103,9 +103,21 @@ pub fn fiat_may_have_left(journal: &Journal, work: &WorkId) -> Result<bool> {
     let latest = journal
         .latest()
         .context("could not read the journal back")?;
-    Ok(latest
-        .into_iter()
-        .any(|r| &r.work_id() == work && may_already_have_paid(r.state)))
+    Ok(fiat_may_have_left_in(&latest, work))
+}
+
+/// The same question, asked of a journal somebody else has already read.
+///
+/// R5-3. The sweep's deadline check asks this once per held-back order per
+/// pass, and the answer comes from the same file every time. This is the half
+/// that decides; [`AppState::sweep_journal`] is the half that reads, and it
+/// says which callers may use a shared read and which must not.
+///
+/// One rule, in one place, whichever way the records arrived.
+pub fn fiat_may_have_left_in(latest: &[FillRecord], work: &WorkId) -> bool {
+    latest
+        .iter()
+        .any(|r| &r.work_id() == work && may_already_have_paid(r.state))
 }
 
 /// Takes the slot, deciding and claiming under one file lock.

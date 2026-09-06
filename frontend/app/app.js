@@ -632,6 +632,34 @@ async function presign(view) {
 
 // ---------- returns: the refund at T ----------
 
+/* The screen a stopped order gets when the dollars may already have gone.
+ *
+ * Three stages can reach it - `unpaid`, `refundable` and the `failed` default -
+ * and all three have to decide it the same way, on the boolean the view carries
+ * rather than on `view.payment`. Only one of the four failure writers that
+ * follow a journal claim records a payment on the order; the other three leave
+ * it null while the journal holds an open line. R5-1 was that read on two of
+ * the branches; R6-1 was the third branch not reading it at all.
+ *
+ * The wording is "may already have been sent", not "were already sent" (R6-2).
+ * The boolean is true on an open `Paying` line, on `NeedsOperator`, and on a
+ * journal the coordinator could not read at all - and in every one of those the
+ * truth is "may have", which is what the driver's own reason string above it
+ * says. The action the page takes is the same either way: this one needs a
+ * person, not a button.
+ */
+function needsAPerson(view) {
+  return view.fiat_may_have_left || view.payment;
+}
+
+function sayItNeedsAPerson(view, tail) {
+  $('returns-title').textContent = 'This one needs a person';
+  $('returns-body').textContent =
+    `${view.reason ? view.reason + ' ' : ''}The dollars for this order may already have been ` +
+    `sent, so the refund is not yours to take on your own${tail} Keep this link and get in touch.`;
+  $('form-return').hidden = true;
+}
+
 function renderReturns(view) {
   const box = $('returns');
   const form = $('form-return');
@@ -658,6 +686,37 @@ function renderReturns(view) {
 
   switch (stage) {
     case 'unpaid':
+      // R6-1: the same question the other two branches ask, asked here too.
+      //
+      // No driver path produces an `unpaid` order with the boolean true.
+      // `Unpaid` is written only by `check_deadlines`, and every call of it
+      // that follows a reservation follows a retract to `Cancelled`, which
+      // reads false. The guard is here so that stays true by construction
+      // rather than by the next writer having to re-derive the argument - the
+      // view carries the answer for every stage, and a branch that ignores it
+      // is the one that will be wrong when the set of writers changes.
+      if (needsAPerson(view)) { sayItNeedsAPerson(view, '.'); break; }
+      // R5-2's page half. The coordinator has asked the chain what became of
+      // this escrow's only evidence of funding - a transaction seen in the
+      // mempool - and been told nothing is there: it expired unmined and no
+      // wallet resent it, so the coins never left the user's own wallet.
+      //
+      // Without this the screen below says "N ZEC is in the escrow" over an
+      // empty one and shows the form. The builder then makes a refund spending
+      // an outpoint no block holds, taken from the view or from this page's own
+      // record of the signing, the endpoint refuses it for want of a funding it
+      // never learned, and the page tells the user any node will accept bytes
+      // no node will. There is nothing to refund and nothing to wait for; the
+      // only honest thing to say is that the payment never arrived.
+      if (view.escrow_is_empty) {
+        $('returns-title').textContent = 'Your ZEC never arrived';
+        $('returns-body').textContent =
+          'The transaction that would have funded this escrow never confirmed, so nothing ' +
+          'was ever sent to it and there is nothing here to come back. Your coins are still ' +
+          'in your own wallet. Start again whenever you like.';
+        form.hidden = true;
+        break;
+      }
       // Past T the coordinator moves this to `refundable`, but the page must
       // not depend on having seen that: it can be opened at any moment, and
       // the chain is the authority on whether the timeout branch is spendable.
@@ -682,14 +741,7 @@ function renderReturns(view) {
       // promotes finished orders to `refundable`, so this is where a user whose
       // dollars already went would land - and offering the form here would be
       // this page telling them to race a release the LP holds.
-      if (view.fiat_may_have_left || view.payment) {
-        $('returns-title').textContent = 'This one needs a person';
-        $('returns-body').textContent =
-          `${view.reason ? view.reason + ' ' : ''}The dollars for this order were already sent, ` +
-          'so the refund is not yours to take on your own. Keep this link and get in touch.';
-        form.hidden = true;
-        break;
-      }
+      if (needsAPerson(view)) { sayItNeedsAPerson(view, '.'); break; }
       $('returns-title').textContent = 'Where should your ZEC go?';
       // R4-3: the reason survives the promotion to `refundable`, and it is the
       // only place the user learns why the trade stopped. A page opened after
@@ -725,12 +777,8 @@ function renderReturns(view) {
       // order; the other three leave it null while the journal says the
       // dollars may be gone. Reading `payment` here offered the form on
       // exactly the failures the sweep withholds the promotion for.
-      if (view.fiat_may_have_left || view.payment) {
-        $('returns-body').textContent =
-          `${view.reason ? view.reason + ' ' : ''}The dollars for this order were already sent, ` +
-          'so the refund is not yours to take on your own - zpay has to settle this one by hand. ' +
-          'Keep this link and get in touch.';
-        form.hidden = true;
+      if (needsAPerson(view)) {
+        sayItNeedsAPerson(view, ' - zpay has to settle this one by hand.');
         break;
       }
       if (heightKnown && blocks === 0) {
