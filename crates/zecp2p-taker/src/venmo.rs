@@ -2008,6 +2008,79 @@ pub fn is_whole_cents(amount: alloy::primitives::U256) -> bool {
 }
 
 #[cfg(test)]
+mod balance_tests {
+    use super::balance_to_cents;
+
+    /// The dollars convention: a decimal string, which is what the account page
+    /// carries for a plain balance field.
+    #[test]
+    fn a_dollar_amount_becomes_cents() {
+        assert_eq!(balance_to_cents("balance", "60.49"), Some(6049));
+        assert_eq!(balance_to_cents("availableBalance", "0.00"), Some(0));
+        assert_eq!(balance_to_cents("balance", "1234.56"), Some(123_456));
+    }
+
+    /// Currency decoration and whitespace are not part of the number.
+    #[test]
+    fn formatting_around_the_number_is_ignored() {
+        assert_eq!(balance_to_cents("balance", " $60.49 "), Some(6049));
+        assert_eq!(balance_to_cents("balance", "$1,234.56"), Some(123_456));
+    }
+
+    /// A bare integer under a dollars key is dollars, not cents. `"12"` is
+    /// $12.00 - reading it as $0.12 would refuse every payment.
+    #[test]
+    fn a_bare_integer_under_a_dollars_key_is_dollars() {
+        assert_eq!(balance_to_cents("balance", "12"), Some(1200));
+    }
+
+    /// The key is what decides the convention, because the value cannot:
+    /// `500` is $5.00 under one and $500.00 under the other, and guessing the
+    /// permissive way starts a payment against money that is not there.
+    #[test]
+    fn the_key_decides_between_dollars_and_cents() {
+        assert_eq!(balance_to_cents("balanceInCents", "500"), Some(500));
+        assert_eq!(balance_to_cents("balance_in_cents", "6049"), Some(6049));
+        assert_eq!(balance_to_cents("balance", "500"), Some(50_000));
+    }
+
+    /// A cents field carrying a decimal is not what its name says, so it is
+    /// refused rather than rounded into a number nobody meant.
+    #[test]
+    fn a_cents_key_with_a_decimal_value_is_refused() {
+        assert_eq!(balance_to_cents("balanceInCents", "60.49"), None);
+    }
+
+    /// A negative balance is not a float to spend from. Zero, not a refusal:
+    /// the account really does have nothing available.
+    #[test]
+    fn a_negative_balance_is_no_float_at_all() {
+        assert_eq!(balance_to_cents("balance", "-5.00"), Some(0));
+        assert_eq!(balance_to_cents("balance", "-0.01"), Some(0));
+    }
+
+    /// Anything unreadable is `None`, which the caller must treat as "cannot
+    /// say" rather than as zero or as unlimited.
+    #[test]
+    fn an_unreadable_value_refuses_rather_than_guessing() {
+        assert_eq!(balance_to_cents("balance", ""), None);
+        assert_eq!(balance_to_cents("balance", "   "), None);
+        assert_eq!(balance_to_cents("balance", "unavailable"), None);
+        assert_eq!(balance_to_cents("balance", "."), None);
+    }
+
+    /// Rounded rather than truncated: the value has been through a float, and
+    /// truncating $10.00 read back as 9.999999 understates the float by a cent
+    /// on every read.
+    #[test]
+    fn the_cent_is_rounded_not_truncated() {
+        assert_eq!(balance_to_cents("balance", "10.00"), Some(1000));
+        assert_eq!(balance_to_cents("balance", "0.10"), Some(10));
+        assert_eq!(balance_to_cents("balance", "0.005"), Some(1));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use alloy::primitives::U256;
