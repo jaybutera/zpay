@@ -8,11 +8,21 @@
 //! ZECP2P_ATTESTOR_DB=attestor.sqlite \
 //! ZECP2P_ATTESTOR_KEY=attestor.key \
 //! ZECP2P_ATTESTOR_TOKEN=<shared bearer token> \
-//! ZECP2P_RPC_URL=https://api.tatum.io/v3/blockchain/node/zcash-testnet \
-//! ZECP2P_RPC_NETWORK=test \
+//! ZECP2P_RPC_URL=https://zec.nownodes.io \
+//! ZECP2P_RPC_NETWORK=main \
+//! ZECP2P_RPC_API_KEY_HEADER=api-key \
+//! ZECP2P_RPC_API_KEY=<provider key> \
 //! ZECP2P_BIND=127.0.0.1:8480 \
 //!   cargo run -p zecp2p-attestor
 //! ```
+//!
+//! The two `RPC_API_KEY` variables are optional and go together: a local node
+//! or a regtest run sets neither and talks to a keyless endpoint. A hosted
+//! provider needs both, and without them this daemon reads no chain at all -
+//! it then answers `EscrowNotFound` for outputs that exist and refuses to sign
+//! outcomes the LP has already paid for. **This must name the same network and
+//! provider as the coordinator's `[zec]` block.** A mainnet coordinator beside
+//! a testnet attestor starts cleanly and fails only after the dollars are gone.
 //!
 //! The key file is created on first boot with mode 0600 and never overwritten.
 //! Losing it means every outstanding escrow is unreleasable and every user
@@ -47,6 +57,22 @@ fn build_id() -> String {
     } else {
         env!("CARGO_PKG_VERSION").to_string()
     }
+}
+
+/// The API-key header for the chain RPC, when both halves are configured.
+///
+/// Mirrors the coordinator's `CoordinatorConfig::rpc_config`
+/// (`zecp2p-v2coordinator/src/config.rs`): the header name and the key must
+/// both be present, and a value that is empty or only whitespace counts as
+/// unset. Two daemons reading the same provider differently is its own class
+/// of outage, so the rule is written once here and matched to there.
+///
+/// Returning `None` is the keyless behaviour this had before, which is correct
+/// for a local node and for regtest.
+fn api_key_header(header: Option<&str>, key: Option<&str>) -> Option<(String, String)> {
+    let header = header.map(str::trim).filter(|h| !h.is_empty())?;
+    let key = key.map(str::trim).filter(|k| !k.is_empty())?;
+    Some((header.to_string(), key.to_string()))
 }
 
 fn env(name: &str) -> String {
@@ -161,6 +187,15 @@ async fn main() {
     // constructed inside a tokio runtime (R5-4). Build it on a blocking thread.
     let mut cfg = RpcConfig::public(rpc_url.clone(), network);
     cfg.timeout = Duration::from_secs(45);
+    // The hosted mainnet provider keys on a header, and every `RpcConfig`
+    // constructor leaves `api_key_header` unset. Without this the attestor can
+    // only reach a keyless endpoint - which on mainnet is no endpoint at all,
+    // so it answers `EscrowNotFound` for an output that is really there and
+    // refuses to sign an outcome the LP has already paid for.
+    cfg.api_key_header = api_key_header(
+        std::env::var("ZECP2P_RPC_API_KEY_HEADER").ok().as_deref(),
+        std::env::var("ZECP2P_RPC_API_KEY").ok().as_deref(),
+    );
     let chain = tokio::task::spawn_blocking(move || RpcChainClient::new(cfg))
         .await
         .expect("build the chain client")
@@ -219,4 +254,51 @@ async fn main() {
     axum::serve(listener, router(service))
         .await
         .expect("serve");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::api_key_header;
+
+    /// Both halves present is the hosted-provider case this exists for.
+    #[test]
+    fn a_header_and_a_key_are_sent_together() {
+        assert_eq!(
+            api_key_header(Some("api-key"), Some("abc123")),
+            Some(("api-key".to_string(), "abc123".to_string()))
+        );
+    }
+
+    /// Either half missing means keyless, which is what a local node and a
+    /// regtest run want. Sending a header with no value, or a value under no
+    /// header, would be neither.
+    #[test]
+    fn half_a_credential_is_no_credential() {
+        assert_eq!(api_key_header(None, Some("abc123")), None);
+        assert_eq!(api_key_header(Some("api-key"), None), None);
+        assert_eq!(api_key_header(None, None), None);
+    }
+
+    /// An unset variable often arrives as an empty string rather than absent -
+    /// an `EnvironmentFile` line left as `ZECP2P_RPC_API_KEY=`. That is unset,
+    /// not a key of length zero, and sending it would look configured while
+    /// authenticating as nobody.
+    #[test]
+    fn an_empty_or_blank_half_counts_as_unset() {
+        assert_eq!(api_key_header(Some("api-key"), Some("")), None);
+        assert_eq!(api_key_header(Some("api-key"), Some("   ")), None);
+        assert_eq!(api_key_header(Some(""), Some("abc123")), None);
+        assert_eq!(api_key_header(Some("  "), Some("abc123")), None);
+    }
+
+    /// Surrounding whitespace is stripped, because a key pasted into an env
+    /// file commonly carries a trailing space and the provider would reject it
+    /// with a 403 that looks like a bad key rather than a bad file.
+    #[test]
+    fn surrounding_whitespace_is_not_part_of_the_credential() {
+        assert_eq!(
+            api_key_header(Some(" api-key "), Some("  abc123  ")),
+            Some(("api-key".to_string(), "abc123".to_string()))
+        );
+    }
 }
