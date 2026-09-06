@@ -20,19 +20,30 @@ const path = require('path');
 
 const src = fs.readFileSync(path.join(__dirname, '..', 'app.js'), 'utf8');
 
-// Lift renderReturns out of the module rather than restating it.
-const start = src.indexOf('function renderReturns(view) {');
-if (start < 0) {
-  console.log('FAIL could not find renderReturns in app.js');
+// Lift renderReturns and the helpers it calls out of the module rather than
+// restating them. Restating is how a harness ends up testing its own copy of a
+// rule instead of the page's.
+function lift(signature) {
+  const start = src.indexOf(signature);
+  if (start < 0) {
+    console.log(`FAIL could not find ${signature} in app.js`);
+    process.exit(1);
+  }
+  // Balance braces to find the end of the function.
+  let depth = 0;
+  for (let i = src.indexOf('{', start); i < src.length; i++) {
+    if (src[i] === '{') depth++;
+    else if (src[i] === '}') { depth--; if (depth === 0) return src.slice(start, i + 1); }
+  }
+  console.log(`FAIL ${signature} does not close`);
   process.exit(1);
 }
-// Balance braces to find the end of the function.
-let depth = 0, end = -1;
-for (let i = src.indexOf('{', start); i < src.length; i++) {
-  if (src[i] === '{') depth++;
-  else if (src[i] === '}') { depth--; if (depth === 0) { end = i + 1; break; } }
-}
-const fnSrc = src.slice(start, end);
+
+const fnSrc = [
+  lift('function needsAPerson(view) {'),
+  lift('function sayItNeedsAPerson(view, tail) {'),
+  lift('function renderReturns(view) {'),
+].join('\n\n');
 
 function run(view, hasKey) {
   const els = {};
@@ -143,6 +154,53 @@ for (const [what, reason] of JOURNAL_ONLY_FAILURES) {
     `form.hidden=${r.form.hidden}`);
   check('  and names the block it becomes possible at', /1,000/.test(r.body.textContent),
     `said: ${r.body.textContent}`);
+}
+
+// 6. R6-1: the `unpaid` branch reads the boolean like the other two.
+//
+// No driver path produces an `unpaid` order with the boolean true today:
+// `Unpaid` is written only by the deadline check, and every call of it that
+// follows a reservation follows a retract to `Cancelled`, which reads false.
+// The guard is here so that stays true by construction rather than by
+// somebody re-deriving the argument. The view carries the answer for every
+// stage and the other two branches read it; this one should not be the
+// exception the next writer has to know about.
+{
+  const r = run({ stage: 'unpaid', escrow, current_height: 1004, payment: null,
+                  fiat_may_have_left: true }, true);
+  check('unpaid with an open journal line hides the form', r.form.hidden === true,
+    `form.hidden=${r.form.hidden} body=${r.body.textContent.slice(0, 120)}`);
+  check('  and does not say nobody sent the dollars',
+    !/Nobody sent the dollars/.test(r.body.textContent),
+    `said: ${r.body.textContent.slice(0, 160)}`);
+}
+
+// And an ordinary unpaid order is untouched: past T it still offers the form.
+{
+  const r = run({ stage: 'unpaid', escrow, current_height: 1004, payment: null,
+                  fiat_may_have_left: false }, true);
+  check('unpaid with a clean journal still offers the form', r.form.hidden === false,
+    `form.hidden=${r.form.hidden}`);
+  check('  and still says nobody sent the dollars',
+    /Nobody sent the dollars/.test(r.body.textContent),
+    `said: ${r.body.textContent}`);
+}
+
+// 7. R6-2: the sentence matches what the journal actually said.
+//
+// The boolean is true on an open `Paying` line, on `NeedsOperator`, and on a
+// journal the coordinator could not read at all. In every one of those the
+// truth is "may have"; the driver's own reason string above it says so. During
+// a journal outage the old wording told every stopped order its dollars went.
+for (const stage of ['failed', 'refundable', 'unpaid']) {
+  const r = run({ stage, escrow, current_height: 1004, payment: null,
+                  fiat_may_have_left: true }, true);
+  check(`${stage}: the page does not overstate what the journal said`,
+    !/were already sent/.test(r.body.textContent),
+    `said: ${r.body.textContent.slice(0, 160)}`);
+  check('  and says they may have been',
+    /may already have been sent/.test(r.body.textContent),
+    `said: ${r.body.textContent.slice(0, 160)}`);
 }
 
 console.log(`\n${failures === 0 ? 'all checks passed' : failures + ' check(s) failed'}`);
