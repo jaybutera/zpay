@@ -32,6 +32,33 @@
 //! So the slot is claimed **before** the journal write and is held across the
 //! whole of `settle`, and it is claimed in the journal, where a crash leaves it
 //! claimed rather than silently free.
+//!
+//! # One LP's leg, not the network's
+//!
+//! Everything in this module is scoped to a single LP instance, and that is a
+//! property to keep rather than an accident to build on. zpay is permissionless
+//! in principle: anybody may run a coordinator and become an LP, so nothing
+//! here may assume there is one of them.
+//!
+//! The scoping is structural. The slot is the *journal file*, whose path comes
+//! from this deployment's config and defaults under its own `state_dir`; the
+//! queue is this deployment's own order store, in the same place. What the slot
+//! serialises is therefore "the daemons sharing this journal", which is exactly
+//! one LP's Venmo account - the thing the feed-ambiguity argument is about. A
+//! second LP runs its own coordinator with its own state directory, its own
+//! journal and its own session, and neither one's parked fill, queue position
+//! or operator override is visible to the other.
+//!
+//! Two rules follow, and both are load-bearing:
+//!
+//! - **No account is named in this crate.** The recipient is carried on the
+//!   order and the sender comes from the configured session. A handle written
+//!   into coordinator logic would make that instance the only one that works.
+//! - **Nothing here may reach across instances.** A global registry of paying
+//!   LPs, a shared journal, a queue keyed on anything but this store's own
+//!   orders - each would turn one operator's stuck fill into everybody's
+//!   problem, which is the shape of the outage this queue exists to prevent,
+//!   scaled up to the network.
 
 use anyhow::{Context, Result};
 
@@ -124,6 +151,58 @@ pub fn fiat_may_have_left_in(latest: &[FillRecord], work: &WorkId) -> bool {
         .any(|r| &r.work_id() == work && record_may_already_have_paid(r))
 }
 
+/// The order at the head of the pay queue, among those ready to pay.
+///
+/// Serialising the Venmo leg is a requirement - one balance, one drive, and two
+/// feed entries of the same amount to the same handle cannot be told apart.
+/// Serving that queue in an *arbitrary* order is not. Before this, every locked
+/// order raced for the slot on each sweep and the winner was whichever task the
+/// runtime got to first, so an order could be passed over repeatedly while
+/// later ones went ahead of it. Under load that is unbounded: nothing made a
+/// waiting order's turn come round.
+///
+/// So the queue is explicit and it is FIFO on `created_at`, which is the order
+/// users arrived in and the only one they can predict. An order that is not at
+/// the head yields the tick and comes back on the next sweep; it is not
+/// refused, and nothing is written for it.
+///
+/// Ties are broken on `order_id`, so the answer is total and every task in a
+/// sweep computes the same head from the same list. Two orders created in the
+/// same millisecond would otherwise each be able to see the other as prior and
+/// both yield - a queue that stalls itself.
+///
+/// `ready` is the orders eligible to pay right now. The caller supplies it,
+/// because eligibility is the driver's question - stage, deadlines, funding -
+/// and this is only the ordering.
+pub fn head_of_queue(ready: &[crate::order::Order]) -> Option<&crate::order::Order> {
+    ready
+        .iter()
+        .min_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.order_id.cmp(&b.order_id))
+        })
+}
+
+/// Whether this order is the one whose turn it is.
+///
+/// The question `settle` asks before it competes for the slot. An order that is
+/// not at the head waits a tick rather than racing, which is what makes the
+/// wait bounded: every sweep, the head is served and leaves the queue, so an
+/// order that is `n`th waits at most `n` payments rather than indefinitely.
+///
+/// An order not in `ready` at all answers `true`: the caller has already
+/// decided this one may pay, and a list that does not contain it is a caller
+/// that did not supply one. Failing open here costs at worst the old
+/// behaviour - a race for the slot, which the journal still arbitrates safely -
+/// while failing closed would stop a payment over a bookkeeping disagreement.
+pub fn is_at_the_head(ready: &[crate::order::Order], order_id: &str) -> bool {
+    match head_of_queue(ready) {
+        Some(head) => head.order_id == order_id,
+        None => true,
+    }
+}
+
 /// Takes the slot, deciding and claiming under one file lock.
 ///
 /// R4-3: the read and the write used to be separate calls with the decision
@@ -148,11 +227,22 @@ pub fn take(
 ) -> Result<Result<FillRecord, SlotRefusal>> {
     let mut refusal = None;
     let claimed = journal.claim_if(|existing| {
-        // R7-2: the shared rule, not a second copy of it. `slot_verdict` asks
-        // the own-work question first and everybody else's second, and both
-        // daemons ask it the same way - the two copies had already drifted
+        // The record first, so the decision can see what this payment would be:
+        // a parked fill blocks only an amount-and-handle it could be confused
+        // with in the feed. Nothing is written unless the verdict is free.
+        let mut applicant = FillRecord::new_zec(
+            work.local.clone(),
+            alloy::primitives::U256::from(usd_amount_6dec),
+            alloy::primitives::U256::from(zecp2p_escrow::payment_details::IDENTITY_RATE_18DEC),
+            recipient.to_string(),
+        );
+        applicant.state = FillState::Seen;
+
+        // R7-2: the shared rule, not a second copy of it. `slot_verdict_for`
+        // asks the own-work question first and everybody else's second, and
+        // both daemons ask it the same way - the two copies had already drifted
         // once, and a drift here is a payment.
-        match zecp2p_taker::auto::journal::slot_verdict(existing, work) {
+        match zecp2p_taker::auto::journal::slot_verdict_for(existing, &applicant) {
             zecp2p_taker::auto::journal::SlotVerdict::Free => {}
             zecp2p_taker::auto::journal::SlotVerdict::OwnPaymentUnderway(r) => {
                 refusal = Some(SlotRefusal::ThisOrderMayHavePaid {
@@ -170,14 +260,7 @@ pub fn take(
             }
         }
 
-        let mut record = FillRecord::new_zec(
-            work.local.clone(),
-            alloy::primitives::U256::from(usd_amount_6dec),
-            alloy::primitives::U256::from(zecp2p_escrow::payment_details::IDENTITY_RATE_18DEC),
-            recipient.to_string(),
-        );
-        record.state = FillState::Seen;
-        Some(record)
+        Some(applicant)
     })?;
 
     match claimed {
@@ -336,6 +419,96 @@ pub fn definitely_paid(journal: &Journal, work: &WorkId) -> Result<bool> {
     Ok(latest
         .into_iter()
         .any(|r| &r.work_id() == work && r.state == FillState::Paid))
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+
+    fn order_at(id: &str, created: &str) -> crate::order::Order {
+        let mut o = crate::order::Order::for_test(id);
+        o.created_at = chrono::DateTime::parse_from_rfc3339(created)
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        o
+    }
+
+    #[test]
+    fn the_oldest_waiting_order_is_served_first() {
+        let queue = vec![
+            order_at("esc_c", "2026-09-06T20:10:00Z"),
+            order_at("esc_a", "2026-09-06T20:00:00Z"),
+            order_at("esc_b", "2026-09-06T20:05:00Z"),
+        ];
+        assert_eq!(head_of_queue(&queue).unwrap().order_id, "esc_a");
+        assert!(is_at_the_head(&queue, "esc_a"));
+        assert!(!is_at_the_head(&queue, "esc_b"));
+        assert!(!is_at_the_head(&queue, "esc_c"));
+    }
+
+    #[test]
+    fn the_answer_does_not_depend_on_the_order_the_list_arrives_in() {
+        // Every task in a sweep computes the head from its own read of the
+        // store, and the store is a hash map. If the answer moved with the
+        // iteration order, two tasks could each believe the other was ahead.
+        let a = order_at("esc_a", "2026-09-06T20:00:00Z");
+        let b = order_at("esc_b", "2026-09-06T20:05:00Z");
+        let c = order_at("esc_c", "2026-09-06T20:10:00Z");
+
+        for queue in [
+            vec![a.clone(), b.clone(), c.clone()],
+            vec![c.clone(), b.clone(), a.clone()],
+            vec![b.clone(), a.clone(), c.clone()],
+        ] {
+            assert_eq!(head_of_queue(&queue).unwrap().order_id, "esc_a");
+        }
+    }
+
+    #[test]
+    fn orders_created_in_the_same_instant_still_have_exactly_one_head() {
+        // A tie that both sides lose is a queue that stalls itself: each order
+        // sees another it considers prior, so neither ever pays. The order id
+        // breaks it, and it breaks it the same way for every reader.
+        let queue = vec![
+            order_at("esc_b", "2026-09-06T20:00:00Z"),
+            order_at("esc_a", "2026-09-06T20:00:00Z"),
+        ];
+        assert_eq!(head_of_queue(&queue).unwrap().order_id, "esc_a");
+
+        let at_the_head = queue
+            .iter()
+            .filter(|o| is_at_the_head(&queue, &o.order_id))
+            .count();
+        assert_eq!(at_the_head, 1, "exactly one order may be served");
+    }
+
+    #[test]
+    fn serving_the_head_brings_the_next_order_round() {
+        // What makes the wait bounded. The head pays and leaves `Locked`, so
+        // the order behind it becomes the head rather than waiting on anything
+        // else to happen.
+        let mut queue = vec![
+            order_at("esc_a", "2026-09-06T20:00:00Z"),
+            order_at("esc_b", "2026-09-06T20:05:00Z"),
+            order_at("esc_c", "2026-09-06T20:10:00Z"),
+        ];
+        for expected in ["esc_a", "esc_b", "esc_c"] {
+            assert_eq!(head_of_queue(&queue).unwrap().order_id, expected);
+            queue.retain(|o| o.order_id != expected);
+        }
+        assert!(head_of_queue(&queue).is_none());
+    }
+
+    #[test]
+    fn an_order_nobody_listed_is_not_held_back() {
+        // Fails open. The caller has already decided this order may pay, and a
+        // list that does not contain it is a caller that did not supply one -
+        // which costs at worst the old racing behaviour, safely arbitrated by
+        // the journal, rather than a payment stopped over bookkeeping.
+        assert!(is_at_the_head(&[], "esc_a"));
+        let queue = vec![order_at("esc_b", "2026-09-06T20:00:00Z")];
+        assert!(!is_at_the_head(&queue, "esc_a"));
+    }
 }
 
 #[cfg(test)]

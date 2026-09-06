@@ -965,6 +965,36 @@ async fn settle(state: &Arc<AppState>, mut order: Order) -> Result<()> {
     // could slip in - and skipping rather than queueing keeps this task from
     // being held for as long as a browser drive takes, since the sweep returns
     // in seconds.
+    // Whose turn is it?
+    //
+    // Serialising the payment is a requirement; serving it in an arbitrary
+    // order is not. Every locked order used to race for the slot on each sweep
+    // and the winner was whichever task the runtime reached first, so an order
+    // could be passed over indefinitely while later ones went ahead of it.
+    // Nothing made its turn come round.
+    //
+    // The queue is FIFO on `created_at`, which is the order users arrived in.
+    // An order that is not at the head yields the tick - it is not refused,
+    // nothing is written for it, and the next sweep asks again. That makes the
+    // wait bounded: the head is served and leaves `Locked`, so an order `n`th
+    // in line waits at most `n` payments.
+    //
+    // Asked before the lock rather than after, so a whole sweep's worth of
+    // tasks do not queue up on a mutex to be told it is not their turn.
+    let queue = state.store.waiting_to_pay();
+    if !crate::slot::is_at_the_head(&queue, &order.order_id) {
+        tracing::debug!(
+            order = %order.order_id,
+            waiting = queue.len(),
+            "not at the head of the pay queue yet"
+        );
+        // The deadline check still runs: an order past `T` must reach
+        // `Refundable` whether or not its turn has come, or waiting in line
+        // would cost the user the refund they are entitled to. Same reason
+        // R5-d gives for the slot-held path below.
+        return check_deadlines(state, order).await;
+    }
+
     let Some(_paying) = state.try_pay_lock() else {
         tracing::info!(
             order = %order.order_id,

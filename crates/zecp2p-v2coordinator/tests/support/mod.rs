@@ -475,6 +475,66 @@ impl FiatRail for RefusesBeforeFillingRail {
     }
 }
 
+/// A rail whose first payment fails ambiguously and whose later ones succeed.
+///
+/// For the queue: one order parks at `needs_operator`, and everything behind it
+/// has to be served normally. A rail that failed every payment could not tell
+/// "the queue drains" from "the rail is broken".
+pub struct FailsFirstPaymentRail {
+    attempts: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl FailsFirstPaymentRail {
+    pub fn new() -> Self {
+        Self {
+            attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+}
+
+impl Default for FailsFirstPaymentRail {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait::async_trait]
+impl FiatRail for FailsFirstPaymentRail {
+    async fn preflight(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn pay(&self, leg: &zecp2p_taker::auto::rail::FiatLeg) -> anyhow::Result<PaidFiat> {
+        let n = self
+            .attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if n == 0 {
+            // Ambiguous on purpose: the browser died mid-drive, so the journal
+            // claim stands and a human has to read the feed. That is the state
+            // that used to close the rail for everybody.
+            anyhow::bail!("the browser died halfway through the payment");
+        }
+        Ok(PaidFiat {
+            cents: u64::try_from(leg.payment.cents())?,
+            fiat_left: true,
+            note: Some(note_a_rail_would_type(leg)),
+        })
+    }
+
+    async fn attest(
+        &self,
+        leg: &zecp2p_taker::auto::rail::FiatLeg,
+    ) -> anyhow::Result<zecp2p_escrow::lp_client::WireAttestation> {
+        Ok(zecp2p_escrow::lp_client::WireAttestation {
+            intent_hash: hex::encode(leg.intent_hash.0),
+            release_amount: leg.intent_amount_6dec.to_string(),
+            data_hash: hex::encode([0u8; 32]),
+            signature: hex::encode([0u8; 65]),
+            encoded_payment_details: hex::encode(vec![0u8; 448]),
+        })
+    }
+}
+
 /// A coordinator whose rail cannot pay at all.
 pub fn coordinator_that_cannot_pay(
     dir: &std::path::Path,

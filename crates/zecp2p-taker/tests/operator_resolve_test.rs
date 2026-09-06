@@ -60,26 +60,52 @@ fn resolution(finding: Finding) -> Resolution {
 }
 
 #[test]
-fn retiring_a_stuck_fill_releases_the_payment_slot() {
-    // The 2026-09-06 shape: one `NeedsOperator` line, and every other order
-    // waiting behind it.
+fn retiring_a_stuck_fill_unblocks_its_own_escrow() {
+    // What the override is *for*, once a parked fill no longer blocks unrelated
+    // work: it is the exit for the escrow the fill belongs to.
+    //
+    // `NeedsOperator` still blocks its own work, and that is deliberate - a
+    // human has to read the feed before that escrow is touched again, because
+    // the whole ambiguity is about whether its dollars left. Retiring the line
+    // is how they say they have.
     let (_d, j) = journal();
     let stuck = write_and_read(&j, &zec_record(0xa8, FillState::NeedsOperator));
+    let mine = stuck.work_id();
 
-    let blocked = WorkId::base(U256::from(4499));
     assert!(
-        zecp2p_taker::auto::journal::holder_among(&j.latest().unwrap(), &blocked).is_some(),
-        "the stuck fill must hold the slot before it is retired, or this proves nothing"
+        !zecp2p_taker::auto::journal::slot_verdict(&j.latest().unwrap(), &mine).is_free(),
+        "a parked fill must still block its own escrow, or the operator override \
+         is not gating anything"
     );
 
     j.resolve_needs_operator(&stuck, resolution(Finding::NoPaymentWasSent))
         .expect("an operator may retire a needs_operator line");
 
     assert!(
-        zecp2p_taker::auto::journal::holder_among(&j.latest().unwrap(), &blocked).is_none(),
-        "retiring the fill must free the slot; that is the whole point of the command"
+        zecp2p_taker::auto::journal::slot_verdict(&j.latest().unwrap(), &mine).is_free(),
+        "retiring the fill must unblock the escrow it belongs to"
     );
     assert!(j.in_flight().unwrap().is_none());
+}
+
+#[test]
+fn a_parked_fill_never_held_the_slot_against_anybody_else() {
+    // The queue rule, asserted from the operator side. Retiring a line is now
+    // about that one escrow; it is not, and must not become, the way unrelated
+    // orders get served. If this ever fails, one refused payment can close the
+    // rail again and the override becomes load-bearing for the whole service.
+    let (_d, j) = journal();
+    write_and_read(&j, &zec_record(0xa8, FillState::NeedsOperator));
+
+    let somebody_else = WorkId::base(U256::from(4499));
+    assert!(
+        zecp2p_taker::auto::journal::holder_among(&j.latest().unwrap(), &somebody_else).is_none(),
+        "a parked fill must park itself and nothing else"
+    );
+    assert!(
+        zecp2p_taker::auto::journal::slot_verdict(&j.latest().unwrap(), &somebody_else).is_free(),
+        "unrelated work must be free to take the slot while a fill sits parked"
+    );
 }
 
 #[test]
@@ -329,4 +355,61 @@ fn an_operator_who_found_no_payment_does_open_the_refund() {
         !record_may_already_have_paid(&retired),
         "nothing was sent, so nothing should stand between the user and their refund"
     );
+}
+
+#[test]
+fn a_parked_fill_is_reported_but_a_live_one_is_what_stops_a_daemon() {
+    // Both reach an operator's list; only one of them may close the daemon.
+    //
+    // `needs_operator` reports every unresolved fill, and it must keep doing
+    // so - a parked fill that stopped blocking others must not thereby become
+    // invisible. What changed is what a *startup* does about each. A `Paying`
+    // line is a payment that was in progress when the process died: nothing is
+    // driving it, its outcome is unknown, and scanning again while one is
+    // outstanding is how a handle gets paid twice. A `NeedsOperator` line
+    // already stopped and was recorded as stopped; refusing to start over it
+    // means one parked fill takes the whole daemon down until somebody
+    // arrives, which was 22 hours on 2026-09-06.
+    let (_d, j) = journal();
+    write_and_read(&j, &zec_record(0xa8, FillState::NeedsOperator));
+
+    let mut other = zec_record(0xb9, FillState::Paying);
+    other.recipient = "someone-else".into();
+    write_and_read(&j, &other);
+
+    let stuck = j.needs_operator().unwrap();
+    assert_eq!(stuck.len(), 2, "both must stay visible to an operator");
+
+    let (live, parked): (Vec<_>, Vec<_>) = stuck
+        .iter()
+        .partition(|r| r.state != FillState::NeedsOperator);
+    assert_eq!(live.len(), 1, "the Paying line is the one that stops a start");
+    assert_eq!(live[0].state, FillState::Paying);
+    assert_eq!(parked.len(), 1);
+    assert_eq!(parked[0].state, FillState::NeedsOperator);
+}
+
+#[test]
+fn a_parked_fill_alone_leaves_a_daemon_free_to_start() {
+    // The partition a startup makes, with only a parked fill in the journal:
+    // nothing in the "must stop" half, so the daemon runs and serves every
+    // work item except the parked one's own.
+    let (_d, j) = journal();
+    write_and_read(&j, &zec_record(0xa8, FillState::NeedsOperator));
+
+    let live: Vec<_> = j
+        .needs_operator()
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.state != FillState::NeedsOperator)
+        .collect();
+    assert!(
+        live.is_empty(),
+        "a parked fill on its own must not stop a daemon starting"
+    );
+
+    // And the fill is still reported, and still blocks its own escrow.
+    assert_eq!(j.needs_operator().unwrap().len(), 1);
+    let its_own = j.latest().unwrap()[0].work_id();
+    assert!(!zecp2p_taker::auto::journal::slot_verdict(&j.latest().unwrap(), &its_own).is_free());
 }

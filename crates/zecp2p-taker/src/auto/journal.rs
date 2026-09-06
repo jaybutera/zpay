@@ -289,6 +289,60 @@ impl FillRecord {
     }
 }
 
+/// Could these two fills be confused for each other in the Venmo feed?
+///
+/// The question R2-2 was really asking. An unreconciled payment sitting in the
+/// feed is a hazard to a *later* payment only if the two are indistinguishable
+/// once they are both in there - and `locate_payment` distinguishes them on
+/// three things: the per-payment tag, the `not_before` cut, and amount plus
+/// recipient. Two payments of different amounts, or to different handles, are
+/// one match each no matter what state either fill is in.
+///
+/// So the collision is amount-and-recipient, and this names it. The recipient
+/// is compared case-insensitively, the way `note_carries_tag` and the feed
+/// search treat handles, and the amount in the 6-decimal units both rails
+/// carry.
+///
+/// Deliberately conservative in one direction: it does not consult the tag.
+/// Every payment this coordinator sends now carries one, so in principle even a
+/// same-amount, same-handle pair is separable - but a fill parked at
+/// `NeedsOperator` is precisely the one whose feed entry nobody has confirmed,
+/// and reasoning about what its note contains is reasoning about the thing
+/// under dispute. Amount and handle are read off the record, not off Venmo.
+pub fn could_be_confused_in_the_feed(a: &FillRecord, b: &FillRecord) -> bool {
+    a.amount == b.amount && a.recipient.eq_ignore_ascii_case(&b.recipient)
+}
+
+/// Is this fill actually using the Venmo account right now?
+///
+/// The distinction the single-slot rule was missing, and the reason one refused
+/// payment could close the rail for a day.
+///
+/// The slot exists for one reason: two payments in flight against one Venmo
+/// balance produce two feed entries `locate_payment` cannot tell apart, and by
+/// then both have left. That argument is about a payment **in progress**. It
+/// says nothing about a fill that stopped, which is what `NeedsOperator` is: a
+/// line handed to a human, with no browser attached and no click coming.
+///
+/// Yet `is_open` counted it, so it held the slot against every unrelated order
+/// - and nothing automatic ever clears it, because the states past it are only
+/// reached by the same fill making progress. On 2026-09-06 that turned one
+/// refusal into a 22-hour outage for every other order, which is not a
+/// property anyone chose; it is `is_open` being asked a question it was not
+/// written to answer.
+///
+/// So a parked fill parks **itself** and nothing else. Its own work stays
+/// blocked - [`slot_verdict`]'s own-work arm asks `is_open`, and an operator
+/// still has to read the feed before that escrow is touched again - while other
+/// work goes past it.
+///
+/// Every other open state stays in. `Seen` through `Paid` are all a live
+/// attempt: something is driving, or is about to, or has just finished and is
+/// waiting on an attestation whose feed search a second payment would spoil.
+pub fn holds_the_venmo_account(state: FillState) -> bool {
+    state.is_open() && state != FillState::NeedsOperator
+}
+
 /// Which record holds the payment slot against `mine`, if any.
 ///
 /// The gate both daemons use, as a pure function over the journal's latest
@@ -303,7 +357,43 @@ impl FillRecord {
 pub fn holder_among(latest: &[FillRecord], mine: &WorkId) -> Option<FillRecord> {
     latest
         .iter()
-        .find(|r| r.state.is_open() && &r.work_id() != mine)
+        .find(|r| holds_the_venmo_account(r.state) && &r.work_id() != mine)
+        .cloned()
+}
+
+/// The same, plus the parked fills this particular payment must not stand
+/// beside in the feed.
+///
+/// [`holder_among`] answers "is somebody using the Venmo account", which is
+/// what serialises live payments. This adds the second, narrower reason a fill
+/// may have to wait: an *unreconciled* entry of the same amount to the same
+/// handle is already sitting in the feed, and a new payment matching it would
+/// give `locate_payment` two candidates and no way to choose - which it
+/// answers, correctly, by refusing, after both payments have left.
+///
+/// R2-2 blocked every order on that hazard. It is real, and it is
+/// amount-and-recipient shaped: two payments that differ in either are one
+/// match each. Applying it globally turned one refused payment into a 22-hour
+/// outage for unrelated orders on 2026-09-06.
+///
+/// `applicant` is the fill that wants to pay, not just its key, because the
+/// collision is about its amount and its handle.
+pub fn blocker_for(latest: &[FillRecord], applicant: &FillRecord) -> Option<FillRecord> {
+    let mine = applicant.work_id();
+
+    // A live payment blocks everybody: one Venmo balance, one drive at a time.
+    if let Some(holder) = holder_among(latest, &mine) {
+        return Some(holder);
+    }
+
+    // A parked one blocks only what it could be mistaken for.
+    latest
+        .iter()
+        .find(|r| {
+            r.work_id() != mine
+                && r.state == FillState::NeedsOperator
+                && could_be_confused_in_the_feed(r, applicant)
+        })
         .cloned()
 }
 
@@ -470,6 +560,35 @@ pub fn slot_verdict(latest: &[FillRecord], mine: &WorkId) -> SlotVerdict {
     }
     if let Some(holder) = holder_among(latest, mine) {
         return SlotVerdict::HeldByAnother(holder);
+    }
+    SlotVerdict::Free
+}
+
+/// The whole slot decision, for a caller that has the applicant's record.
+///
+/// [`slot_verdict`] decides from a [`WorkId`] alone, which is all most callers
+/// have and all the live-payment rule needs. The parked-fill rule needs more:
+/// whether an unreconciled entry could be confused with *this* payment depends
+/// on its amount and its handle, so a caller that is about to open or claim a
+/// fill passes the record and gets the complete answer.
+///
+/// One function rather than two checks at the call site, for the reason R6-a
+/// gives: a decision assembled from parts at each call site is a decision that
+/// drifts, and the reviewer's revert of one such call site left every test
+/// green.
+pub fn slot_verdict_for(latest: &[FillRecord], applicant: &FillRecord) -> SlotVerdict {
+    let mine = applicant.work_id();
+
+    // The own-work arm is unchanged and comes first, for the reason
+    // `slot_verdict` gives: "I may have already paid for this" and "somebody
+    // else is paying" call for opposite answers.
+    if let Some(own) = latest.iter().find(|r| {
+        r.work_id() == mine && r.state.is_open() && !is_displaceable_reservation(r.state)
+    }) {
+        return SlotVerdict::OwnPaymentUnderway(own.clone());
+    }
+    if let Some(blocker) = blocker_for(latest, applicant) {
+        return SlotVerdict::HeldByAnother(blocker);
     }
     SlotVerdict::Free
 }
@@ -742,12 +861,22 @@ pub fn open_fill(
 ) -> Result<Result<FillRecord, String>> {
     let mut refused = None;
     let claimed = journal.claim_if(|existing| {
-        let verdict = slot_verdict(existing, mine);
+        // Built first, so the decision can see the amount and the handle this
+        // fill would pay: a parked fill blocks only what it could be confused
+        // with in the feed, and that is a property of this record, not of its
+        // key. Nothing is written unless the verdict is free.
+        let applicant = make();
+        debug_assert_eq!(
+            &applicant.work_id(),
+            mine,
+            "open_fill's record and its work id must describe the same fill"
+        );
+        let verdict = slot_verdict_for(existing, &applicant);
         if !verdict.is_free() {
             refused = Some(verdict.why(describes));
             return None;
         }
-        Some(make())
+        Some(applicant)
     })?;
 
     match (claimed, refused) {
@@ -1134,7 +1263,10 @@ impl Journal {
     /// Across both rails. The slot is global because the constraint it enforces
     /// is about the shared Venmo account, not about either chain.
     pub fn in_flight(&self) -> Result<Option<FillRecord>> {
-        Ok(self.latest()?.into_iter().find(|r| r.state.is_open()))
+        Ok(self
+            .latest()?
+            .into_iter()
+            .find(|r| holds_the_venmo_account(r.state)))
     }
 
     /// The open fill holding the slot against `mine`, if any.
@@ -1163,7 +1295,7 @@ impl Journal {
         Ok(self
             .latest()?
             .into_iter()
-            .find(|r| r.rail == rail && r.state.is_open()))
+            .find(|r| r.rail == rail && holds_the_venmo_account(r.state)))
     }
 
     /// Fills a restart must not touch without a human.

@@ -274,6 +274,23 @@ impl OrderStore {
     /// Deliberately not `open_count`, which is the cap on how many orders may
     /// be in flight at once: a finished trade must not hold a slot against that
     /// limit just because its escrow is still refundable.
+    /// Every order sitting at `Locked`, which is the pay queue.
+    ///
+    /// `Locked` is the stage that means "the LP may pay": funded, deep enough,
+    /// pre-signature verified, nothing sent. The driver still re-checks the
+    /// chain and the deadlines for the order it is about to pay; this is only
+    /// the set among which the turn is decided, so an order here that turns out
+    /// to be unpayable simply loses its turn and the next sweep moves on.
+    pub fn waiting_to_pay(&self) -> Vec<Order> {
+        self.orders
+            .lock()
+            .expect("order store lock")
+            .values()
+            .filter(|o| o.stage == Stage::Locked)
+            .cloned()
+            .collect()
+    }
+
     pub fn open_orders(&self) -> Vec<Order> {
         self.orders
             .lock()

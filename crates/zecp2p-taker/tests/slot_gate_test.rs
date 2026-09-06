@@ -68,18 +68,13 @@ fn a_coordinator_record_is_seen_behind_the_takers_own_open_deposit() {
 }
 
 #[test]
-fn every_open_coordinator_state_holds_the_slot() {
+fn every_live_coordinator_state_holds_the_slot() {
     // Not just `Paying`. `Seen` is the coordinator's reservation, written
-    // before its chain call; `Paid` is a payment waiting on an attestation;
-    // `NeedsOperator` is a payment nobody has reconciled. All of them mean the
-    // one Venmo balance is committed.
+    // before its chain call; `Paid` is a payment waiting on an attestation
+    // whose feed search a second payment of the same amount would spoil. Each
+    // of these means the one Venmo balance is committed *right now*.
     let mine = WorkId::base(U256::from(4499));
-    for state in [
-        FillState::Seen,
-        FillState::Paying,
-        FillState::Paid,
-        FillState::NeedsOperator,
-    ] {
+    for state in [FillState::Seen, FillState::Paying, FillState::Paid] {
         let journal = vec![zec_record(0xcc, state)];
         assert!(
             holder_among(&journal, &mine).is_some(),
@@ -89,9 +84,46 @@ fn every_open_coordinator_state_holds_the_slot() {
 }
 
 #[test]
+fn a_parked_fill_holds_the_slot_against_nobody_but_itself() {
+    // The rule this test used to assert the opposite of, and the change is
+    // deliberate.
+    //
+    // The slot exists because two payments in flight against one Venmo balance
+    // produce two feed entries `locate_payment` cannot tell apart. That is an
+    // argument about a payment in progress. `NeedsOperator` is the opposite: a
+    // fill that stopped, with no browser attached and no click coming, and one
+    // that nothing automatic will ever clear - the states past it are only
+    // reached by the same fill making progress.
+    //
+    // Counting it made one refused payment close the rail for everybody. On
+    // 2026-09-06 that was 22 hours, until an escrow nobody could pay reached
+    // its refund height. Nothing about the feed-ambiguity argument required it.
+    let parked = vec![zec_record(0xcc, FillState::NeedsOperator)];
+
+    assert!(
+        holder_among(&parked, &WorkId::base(U256::from(4499))).is_none(),
+        "a parked fill must not hold the slot against unrelated work"
+    );
+
+    // Its own escrow is still blocked, and that half is not relaxed: the whole
+    // ambiguity is whether *this* fill's dollars left, so it may not be
+    // re-entered until a human says.
+    let its_own = parked[0].work_id();
+    assert!(
+        !slot_verdict(&parked, &its_own).is_free(),
+        "a parked fill must still block the escrow it belongs to"
+    );
+}
+
+#[test]
 fn a_finished_coordinator_trade_frees_the_slot() {
     let mine = WorkId::base(U256::from(4499));
-    for state in [FillState::Fulfilled, FillState::Cancelled] {
+    for state in [
+        FillState::Fulfilled,
+        FillState::Cancelled,
+        // An operator read the feed and retired the line.
+        FillState::Resolved,
+    ] {
         let journal = vec![zec_record(0xcc, state)];
         assert!(
             holder_among(&journal, &mine).is_none(),

@@ -607,6 +607,18 @@ mod tests {
 
     /// A minimal order, enough for the pure functions over one.
     fn an_order(id: &str) -> Order {
+        Order::for_test(id)
+    }
+}
+
+#[cfg(test)]
+impl Order {
+    /// A minimal order, for the pure functions over one.
+    ///
+    /// On `Order` rather than inside one module's test block so the other
+    /// modules' tests - the pay queue's, above all - build their fixtures from
+    /// the same shape rather than from a second copy that drifts.
+    pub(crate) fn for_test(id: &str) -> Order {
         Order {
             order_id: id.into(),
             created_at: chrono::Utc::now(),
@@ -651,6 +663,15 @@ mod tests {
             release_txid: None,
             refund_txid: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod more_tests {
+    use super::*;
+
+    fn an_order(id: &str) -> Order {
+        Order::for_test(id)
     }
 
     fn paid_with(id: &str, note: Option<&str>) -> Order {

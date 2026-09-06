@@ -1117,14 +1117,37 @@ async fn two_orders_advancing_together_never_overlap_a_payment() {
     );
 }
 
+/// Stage an unreconciled fill for another work item at a chosen amount and
+/// handle: a payment that failed mid-drive and is waiting for a human.
+fn strand_a_payment(state: &Arc<AppState>, usd_6dec: u64, handle: &str) {
+    let stranded = zecp2p_v2coordinator::slot::work_id_for(&[0xf1u8; 32], 0);
+    let mut record = zecp2p_taker::auto::journal::FillRecord::new_zec(
+        stranded.local.clone(),
+        alloy::primitives::U256::from(usd_6dec),
+        alloy::primitives::U256::from(1_000_000_000_000_000_000u128),
+        handle.into(),
+    );
+    record.state = zecp2p_taker::auto::journal::FillState::NeedsOperator;
+    record.note = Some("the Venmo leg failed".into());
+    state.journal.append_unchecked(&record).unwrap();
+}
+
 #[tokio::test]
-async fn a_needs_operator_line_keeps_holding_the_slot() {
-    // R2-2. When `fiat::pay` failed, `settle` overwrote the `Paying` line with
-    // `NeedsOperator` - the state whose entire meaning is "a payment may have
-    // left and a human must look" - and the slot check blocked only on `Paying`
-    // and `Paid`. So the failure that most needs the slot held was the one that
-    // freed it, and the next order for the same handle paid into a feed with an
-    // unreconciled entry in it.
+async fn a_needs_operator_line_keeps_holding_the_slot_against_an_identical_payment() {
+    // R2-2, narrowed to the hazard it is actually about.
+    //
+    // The original finding: `settle` overwrote its `Paying` line with
+    // `NeedsOperator` - "a payment may have left and a human must look" - while
+    // the slot check blocked only on `Paying` and `Paid`, so the failure that
+    // most needed the slot held was the one that freed it.
+    //
+    // What the unreconciled entry endangers is a payment that would sit beside
+    // it in the feed indistinguishably. `locate_payment` separates entries on
+    // the per-payment tag, the `not_before` cut, and amount plus recipient, and
+    // it *refuses* rather than guessing when two match - after both payments
+    // have left. So the hazard is a second payment of the same amount to the
+    // same handle, and this stages exactly that: $2.00 to alice, which is what
+    // `locked_order` books.
     let dir = tempfile::tempdir().unwrap();
     let node = FakeNode::spawn().await;
     let scanner = Arc::new(FakeScanner::new());
@@ -1133,17 +1156,7 @@ async fn a_needs_operator_line_keeps_holding_the_slot() {
     let state = coordinator_with_fiat(dir.path(), scanner.clone(), &node, &attestor, fiat.clone());
     let app = zecp2p_v2coordinator::web::router(state.clone());
 
-    // Another work item failed mid-payment and is waiting for a human.
-    let stranded = zecp2p_v2coordinator::slot::work_id_for(&[0xf1u8; 32], 0);
-    let mut record = zecp2p_taker::auto::journal::FillRecord::new_zec(
-        stranded.local.clone(),
-        alloy::primitives::U256::from(700_000u64),
-        alloy::primitives::U256::from(1_000_000_000_000_000_000u128),
-        "alice".into(),
-    );
-    record.state = zecp2p_taker::auto::journal::FillState::NeedsOperator;
-    record.note = Some("the Venmo leg failed".into());
-    state.journal.append_unchecked(&record).unwrap();
+    strand_a_payment(&state, 2_000_000, "alice");
 
     let user = TestUser::new();
     let (order_id, _) = locked_order(&app, &state, &node, &scanner, &attestor, &user).await;
@@ -1156,10 +1169,56 @@ async fn a_needs_operator_line_keeps_holding_the_slot() {
     assert_eq!(
         fiat.payments(),
         paid_before,
-        "an order paid while a stranded payment was still unreconciled"
+        "an order paid an amount and handle indistinguishable from a stranded payment"
     );
     // And this order is not failed: it waits for the operator, then pays.
     assert_eq!(state.store.get(&order_id).unwrap().stage, Stage::Locked);
+}
+
+#[tokio::test]
+async fn a_stranded_payment_does_not_block_one_it_could_never_be_confused_with() {
+    // The other half of R2-2, and the reason a parked fill is no longer a
+    // global stop.
+    //
+    // This stranded payment is $0.70 to bob. The order is $2.00 to alice. They
+    // differ in both discriminators `locate_payment` uses before it ever looks
+    // at a tag, so no attestation could confuse them and there is nothing for
+    // the new payment to be protected from. Blocking it anyway is what turned
+    // one refusal into a 22-hour outage on 2026-09-06.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+    let fiat = Arc::new(CountingFiat::new());
+    let state = coordinator_with_fiat(dir.path(), scanner.clone(), &node, &attestor, fiat.clone());
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+
+    strand_a_payment(&state, 700_000, "bob");
+
+    let user = TestUser::new();
+    let (order_id, _) = locked_order(&app, &state, &node, &scanner, &attestor, &user).await;
+
+    zecp2p_v2coordinator::driver::advance(&state, &order_id)
+        .await
+        .expect("this order has nothing to wait for");
+
+    assert_eq!(
+        fiat.payments(),
+        1,
+        "an unrelated stranded payment stopped an order it could never be confused with"
+    );
+    assert_eq!(
+        state.store.get(&order_id).unwrap().stage,
+        Stage::Released,
+        "the order settles normally"
+    );
+
+    // And the stranded fill is still parked: serving past it must not clear it.
+    assert_eq!(
+        state.journal.needs_operator().unwrap().len(),
+        1,
+        "the stranded payment still needs a human; only its blast radius changed"
+    );
 }
 
 #[tokio::test]
@@ -5036,25 +5095,22 @@ async fn an_ambiguous_pay_failure_still_parks_for_an_operator() {
 }
 
 #[tokio::test]
-async fn baseline_a_parked_order_starves_every_later_one() {
-    // Establishes what is actually broken, before anything is built to fix it.
+async fn new_orders_flow_past_a_parked_one() {
+    // The requirement, end to end: a refused or parked payment parks only
+    // itself, and intake plus every other leg keeps running.
     //
-    // One order's fiat leg fails ambiguously and parks at `needs_operator`.
-    // A second, unrelated order then funds, confirms and locks - intake is not
-    // closed, and this asserts that - but it can never be paid, because
-    // `needs_operator` is an open journal line and every open line holds the
-    // one payment slot against everybody else.
+    // Before this, one order's fiat leg failing wrote `needs_operator`, and
+    // because every open journal line held the one payment slot, every later
+    // order sat at `locked` behind it with no way through - for the 22 hours
+    // until the parked escrow's refund height, on 2026-09-06.
     let dir = tempfile::tempdir().unwrap();
     let node = FakeNode::spawn().await;
     let scanner = Arc::new(FakeScanner::new());
     let attestor = TestAttestor::new();
-    let state = coordinator_with_fiat(
-        dir.path(),
-        scanner.clone(),
-        &node,
-        &attestor,
-        Arc::new(PayErrorsRail),
-    );
+    // Fails the first payment, then behaves. The parked order is the one that
+    // hits the failure; everything after it must be served normally.
+    let fiat = Arc::new(FailsFirstPaymentRail::new());
+    let state = coordinator_with_fiat(dir.path(), scanner.clone(), &node, &attestor, fiat.clone());
     let app = zecp2p_v2coordinator::web::router(state.clone());
     let user = TestUser::new();
 
@@ -5068,27 +5124,246 @@ async fn baseline_a_parked_order_starves_every_later_one() {
     assert_eq!(
         state.journal.needs_operator().unwrap().len(),
         1,
-        "the parked order must be holding the slot for this test to mean anything"
+        "the parked order must be parked for this test to mean anything"
     );
 
-    // A later order, at a different amount so the duplicate guard is not what
-    // stops it. Intake is open: it is accepted, funded and locked.
-    let (later, _) =
-        locked_order_for(&app, &state, &node, &scanner, &attestor, &user, "0.07").await;
+    // Three more orders arrive behind it, at distinct amounts. Intake is open,
+    // the escrows confirm, and each reaches `locked`.
+    let mut later = Vec::new();
+    for amount in ["0.07", "0.09", "0.11"] {
+        let (id, _) =
+            locked_order_for(&app, &state, &node, &scanner, &attestor, &user, amount).await;
+        assert_eq!(
+            state.store.get(&id).unwrap().stage,
+            Stage::Locked,
+            "intake and the escrow legs must not be gated on the pay slot"
+        );
+        later.push(id);
+    }
+
+    // And they drain. Not one of them, and not eventually-after-a-human: each
+    // one is paid and released.
+    for _ in 0..6 {
+        for id in &later {
+            zecp2p_v2coordinator::driver::advance(&state, id).await.ok();
+        }
+    }
+
+    for id in &later {
+        assert_eq!(
+            state.store.get(id).unwrap().stage,
+            Stage::Released,
+            "order {id} never got served behind the parked one"
+        );
+    }
+
+    // The parked order is untouched throughout. Serving past it is not the same
+    // as clearing it, and only an operator who has read the feed may do that.
+    assert_eq!(state.store.get(&parked).unwrap().stage, Stage::Failed);
     assert_eq!(
-        state.store.get(&later).unwrap().stage,
-        Stage::Locked,
-        "intake and the escrow legs are not what the parked order blocks"
+        state.journal.needs_operator().unwrap().len(),
+        1,
+        "draining the queue must not quietly resolve somebody's stuck fill"
+    );
+}
+
+#[tokio::test]
+async fn the_pay_queue_serves_orders_in_the_order_they_arrived() {
+    // Serialising the Venmo leg is a requirement. Serving it in an arbitrary
+    // order is not, and it used to be exactly that: every locked order raced
+    // for the slot on each sweep and the winner was whichever task the runtime
+    // reached first, so an order could be passed over while later ones went
+    // ahead of it, with nothing making its turn come round.
+    //
+    // `TestFiat` records the cents it was asked to send, in order, so the
+    // amounts are the receipt: three orders at distinct sizes, oldest first.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+    let fiat = Arc::new(TestFiat::new());
+    let state = coordinator_with_fiat(dir.path(), scanner.clone(), &node, &attestor, fiat.clone());
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+    let user = TestUser::new();
+
+    // Created oldest first, and each one's `created_at` is stamped when the
+    // order is opened, so arrival order is creation order.
+    let mut ids = Vec::new();
+    for amount in ["0.05", "0.07", "0.09"] {
+        let (id, _) =
+            locked_order_for(&app, &state, &node, &scanner, &attestor, &user, amount).await;
+        ids.push(id);
+    }
+
+    let expected: Vec<u64> = ids
+        .iter()
+        .map(|id| state.store.get(id).unwrap().quote.net_cents)
+        .collect();
+    assert_eq!(
+        expected.len(),
+        3,
+        "the three orders must be distinguishable by amount"
+    );
+    assert!(
+        expected[0] != expected[1] && expected[1] != expected[2],
+        "the amounts are the receipt, so they have to differ: {expected:?}"
     );
 
-    // And now it starves. Not refused, not failed - it simply never pays.
-    for _ in 0..5 {
-        zecp2p_v2coordinator::driver::advance(&state, &later).await.ok();
+    // Advanced in the *reverse* of arrival order on every pass, which is what
+    // a hash-map sweep can produce. The queue, not the caller, decides.
+    for _ in 0..8 {
+        for id in ids.iter().rev() {
+            zecp2p_v2coordinator::driver::advance(&state, id).await.ok();
+        }
+    }
+
+    let paid = fiat.paid.lock().unwrap().clone();
+    assert_eq!(
+        paid, expected,
+        "orders were paid in {paid:?}; the queue must serve them oldest first, {expected:?}"
+    );
+
+    for id in &ids {
+        assert_eq!(state.store.get(id).unwrap().stage, Stage::Released);
+    }
+}
+
+#[tokio::test]
+async fn waiting_in_line_does_not_cost_a_user_their_refund() {
+    // The queue must not become a way to strand somebody. An order whose escrow
+    // has passed `T` is entitled to its refund form whether or not its turn to
+    // pay has come, so the deadline check runs on the yield path too - the same
+    // rule R5-d set for an order waiting on the slot.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+    // Nothing ever pays, so the head never leaves the queue and the order
+    // behind it waits for as long as the test likes.
+    let state = coordinator_with_fiat(
+        dir.path(),
+        scanner.clone(),
+        &node,
+        &attestor,
+        Arc::new(UnavailableRail),
+    );
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+    let user = TestUser::new();
+
+    let (first, _) =
+        locked_order_for(&app, &state, &node, &scanner, &attestor, &user, "0.05").await;
+    let (behind, _) =
+        locked_order_for(&app, &state, &node, &scanner, &attestor, &user, "0.07").await;
+
+    // The second order is genuinely behind the first.
+    let queue = state.store.waiting_to_pay();
+    assert!(zecp2p_v2coordinator::slot::is_at_the_head(&queue, &first));
+    assert!(!zecp2p_v2coordinator::slot::is_at_the_head(&queue, &behind));
+
+    // Past `T`.
+    let stored = state.store.get(&behind).unwrap();
+    node.set_height(u32::try_from(stored.refund_height).unwrap() + 1)
+        .await;
+    for _ in 0..3 {
+        zecp2p_v2coordinator::driver::advance(&state, &behind).await.ok();
+    }
+
+    assert_eq!(
+        state.store.get(&behind).unwrap().stage,
+        Stage::Refundable,
+        "an order waiting its turn must still reach its refund at T"
+    );
+}
+
+#[tokio::test]
+async fn one_lps_parked_fill_and_queue_are_invisible_to_another_lp() {
+    // zpay is permissionless in principle: anybody may run a coordinator and
+    // become an LP. So the payment slot, the pay queue and an operator's
+    // override all have to be per-instance - an LP serialises its own Venmo
+    // leg, and another LP is unaffected by anything it does.
+    //
+    // Two coordinators, two state directories, two journals: which is what two
+    // LPs are. The first one's fiat leg fails and parks; the second must be
+    // entirely unaware of it.
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let attestor = TestAttestor::new();
+
+    let scanner_a = Arc::new(FakeScanner::new());
+    let lp_a = coordinator_with_fiat(
+        dir_a.path(),
+        scanner_a.clone(),
+        &node,
+        &attestor,
+        Arc::new(PayErrorsRail),
+    );
+    let app_a = zecp2p_v2coordinator::web::router(lp_a.clone());
+
+    let scanner_b = Arc::new(FakeScanner::new());
+    let fiat_b = Arc::new(TestFiat::new());
+    let lp_b = coordinator_with_fiat(
+        dir_b.path(),
+        scanner_b.clone(),
+        &node,
+        &attestor,
+        fiat_b.clone(),
+    );
+    let app_b = zecp2p_v2coordinator::web::router(lp_b.clone());
+
+    let user = TestUser::new();
+
+    // LP A takes an order and its payment fails ambiguously: parked, needing a
+    // human, holding A's own slot against A's own identical work.
+    let (parked, _) =
+        locked_order_for(&app_a, &lp_a, &node, &scanner_a, &attestor, &user, "0.05").await;
+    for _ in 0..2 {
+        zecp2p_v2coordinator::driver::advance(&lp_a, &parked).await.ok();
+    }
+    assert_eq!(lp_a.store.get(&parked).unwrap().stage, Stage::Failed);
+    assert_eq!(lp_a.journal.needs_operator().unwrap().len(), 1);
+
+    // LP B takes an order at the same amount to the same handle - the one shape
+    // that would collide in a *shared* feed - and pays it without interference.
+    let (theirs, _) =
+        locked_order_for(&app_b, &lp_b, &node, &scanner_b, &attestor, &user, "0.05").await;
+    for _ in 0..4 {
+        zecp2p_v2coordinator::driver::advance(&lp_b, &theirs).await.ok();
     }
     assert_eq!(
-        state.store.get(&later).unwrap().stage,
-        Stage::Locked,
-        "this is the bug: an unrelated order sits at `locked` behind somebody \
-         else's parked fill, with no way through until a human intervenes"
+        lp_b.store.get(&theirs).unwrap().stage,
+        Stage::Released,
+        "another LP's parked fill must not stop this one; they do not share a Venmo account"
     );
+
+    // Neither instance can see the other's bookkeeping.
+    assert!(
+        lp_b.journal.needs_operator().unwrap().is_empty(),
+        "LP B inherited LP A's stuck fill"
+    );
+    assert!(
+        lp_b.store.get(&parked).is_none(),
+        "LP B can see LP A's orders"
+    );
+    assert!(
+        lp_a.store.get(&theirs).is_none(),
+        "LP A can see LP B's orders"
+    );
+
+    // And the queues are separate: each LP's head is its own order.
+    assert!(zecp2p_v2coordinator::slot::is_at_the_head(
+        &lp_a.store.waiting_to_pay(),
+        &parked
+    ) || lp_a.store.waiting_to_pay().is_empty());
+    assert!(
+        !lp_b
+            .store
+            .waiting_to_pay()
+            .iter()
+            .any(|o| o.order_id == parked),
+        "LP A's order appeared in LP B's pay queue"
+    );
+
+    // LP A's fill is still parked. Another LP being served is not a resolution.
+    assert_eq!(lp_a.journal.needs_operator().unwrap().len(), 1);
 }

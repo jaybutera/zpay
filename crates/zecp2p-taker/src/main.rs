@@ -621,6 +621,12 @@ async fn main() -> Result<()> {
 /// finding; it does not move an order's stage, cancel an intent, broadcast a
 /// refund or attest a payment. Each of those is a decision about somebody's
 /// money and each has its own command with its own evidence.
+///
+/// Scoped to one LP, through `taker.journal_path` in this instance's own
+/// config. zpay is permissionless in principle - anybody may run a coordinator
+/// and become an LP - so an operator retires fills in *their* journal, about
+/// *their* Venmo account, and no other LP's rail is affected. There is
+/// deliberately no way to name somebody else's journal from here.
 fn run_resolve_fill(
     config: &TakerConfig,
     work: &str,
@@ -1494,10 +1500,49 @@ async fn run_auto<P: alloy::providers::Provider + Clone>(
 
     // A fill whose fiat may have left is not something to reason around. It is
     // read by a human before anything else moves.
+    //
+    // Which of them stop the daemon is the question, and it is not "all of
+    // them". A line still at `Paying` is a payment that was in progress when
+    // this process died: nothing is driving it now, its outcome is unknown, and
+    // starting a fresh scan while one of those is outstanding is how the same
+    // handle gets paid twice. That refuses.
+    //
+    // A line at `NeedsOperator` is a fill that already stopped and was recorded
+    // as stopped. It is exactly as unresolved, and it is *reported* just as
+    // loudly - but refusing to start over it means one parked fill takes the
+    // whole daemon down until a human arrives, which on 2026-09-06 was 22
+    // hours. Its own work stays blocked by the slot rules, and everything else
+    // is served. The coordinator makes the same distinction; a taker that did
+    // not would still close the rail on a machine running both.
     let stuck = journal.needs_operator()?;
-    if !stuck.is_empty() {
-        println!("\n{} fill(s) need an operator before the daemon can continue:\n", stuck.len());
-        for record in &stuck {
+    let (live, parked): (Vec<_>, Vec<_>) = stuck
+        .iter()
+        .partition(|r| r.state != zecp2p_taker::auto::journal::FillState::NeedsOperator);
+
+    if !parked.is_empty() {
+        println!("\n{} fill(s) are parked and need an operator:\n", parked.len());
+        for record in &parked {
+            println!(
+                "  {} is {:?}: ${} to @{}",
+                record.describe(),
+                record.state,
+                record.paid.clone().unwrap_or_else(|| "?".into()),
+                record.recipient
+            );
+            if let Some(note) = &record.note {
+                println!("      {note}");
+            }
+        }
+        println!(
+            "\nEach of these blocks its own work and nothing else. Read the Venmo feed, \n\
+             then retire it with `zecp2p-taker resolve-fill --work <id> --operator <who> \n\
+             --evidence <what the feed showed>`. Starting anyway.\n"
+        );
+    }
+
+    if !live.is_empty() {
+        println!("\n{} fill(s) need an operator before the daemon can continue:\n", live.len());
+        for record in &live {
             println!(
                 "  deposit {} is {:?}: ${} to @{}",
                 record.deposit_id,
