@@ -222,6 +222,38 @@ mod tests {
         );
     }
 
+    /// `Sent::Live` must come from the outcome, never from the mode.
+    ///
+    /// Reverting this to `if mode.is_dry_run()` used to pass everything: the
+    /// mode says what the run was *allowed* to do and only the browser can say
+    /// what happened. That inference is what recorded the 2026-09-05 order
+    /// paid. This pins the mapping so the shortcut cannot come back quietly.
+    #[test]
+    fn live_is_read_off_the_outcome_and_not_off_the_mode() {
+        // The function is async and needs a browser, so the mapping itself is
+        // what is pinned here: each outcome has exactly one `Sent`, and a
+        // dry-run outcome can never produce one that says the fiat left.
+        let would = PaymentOutcome::WouldHaveSent {
+            recipient: "jay-butera".into(),
+            amount: "2.01".into(),
+        };
+        let did = PaymentOutcome::Sent {
+            recipient: "jay-butera".into(),
+            amount: "2.01".into(),
+        };
+        let map = |o: PaymentOutcome| match o {
+            PaymentOutcome::WouldHaveSent { recipient, amount } => {
+                Sent::DryRun { recipient, amount }
+            }
+            PaymentOutcome::Sent { recipient, amount } => Sent::Live { recipient, amount },
+        };
+        assert!(
+            !map(would).fiat_left(),
+            "a would-have-sent never spent money"
+        );
+        assert!(map(did).fiat_left());
+    }
+
     #[test]
     fn a_dry_run_reports_that_no_fiat_left() {
         let dry = Sent::DryRun {
