@@ -302,9 +302,9 @@ fn report(harness: &Harness, stats: &generator::Stats) {
     println!("  released        {}", stats.released());
     println!("  refunded        {}", stats.refunded());
     println!(
-        "  distinct escrow addresses  {} of {} orders",
+        "  distinct escrow addresses  {} of {} orders that opened",
         stats.distinct_addresses(),
-        stats.total()
+        stats.orders_with_an_address()
     );
 
     println!();
@@ -363,13 +363,17 @@ fn report(harness: &Harness, stats: &generator::Stats) {
         counters.max_overlap() <= 1,
         format!("max overlap was {}", counters.max_overlap()),
     );
+    // Against the orders that were *given* an address, not against every order
+    // attempted. A node outage refuses orders at the quote, and those never had
+    // an address to reuse; comparing against the total reported a reuse that
+    // had not happened, which is exactly the false alarm a soak must not raise.
     check(
-        "every order got its own escrow address",
-        stats.distinct_addresses() == stats.total(),
+        "every order that opened got its own escrow address",
+        stats.distinct_addresses() == stats.orders_with_an_address(),
         format!(
-            "{} distinct addresses for {} orders",
+            "{} distinct addresses for {} orders that opened",
             stats.distinct_addresses(),
-            stats.total()
+            stats.orders_with_an_address()
         ),
     );
     // The one an operator most wants to be told about.

@@ -173,3 +173,39 @@ worth re-measuring before a deployment expects to hold tens of thousands.
 opened and 3,488 were refused with a 503 and a message naming the reason.
 Unfunded orders stay open, so they accumulate against the cap; the refusal is
 the intended behaviour under overload and it is exact.
+
+## A node outage mid-trade
+
+`--node-outage-at 30 --node-outage-for 25` over 300 orders, with the provider
+failing every RPC for 25 seconds in the middle. 917 calls were refused. What the
+run showed:
+
+**Nothing unsafe happened.** 90 payments left, 89 escrows released, and both
+money invariants held: no release without dollars behind it, and no escrow
+released twice. Orders that could not be quoted were refused with a 503 and
+never opened, so no key was drawn and no escrow existed to strand - 99 orders
+opened and got 99 distinct addresses.
+
+**One order landed in the state that needs a human.** The dollars went, and the
+node disappeared before the release could broadcast:
+
+> the dollars were sent and the release did not broadcast: chain error: the node
+> is unreachable: getblockchaininfo: rate limit exceeded (code -32005). The
+> release is still valid and is now racing the refund at block 3471852.
+
+The message is exactly right, and `driver.rs` says so at the site: this is the
+one state that always needs a human. Worth being explicit about what follows
+from it, though, because the soak makes it concrete.
+
+`order.fail` writes `Failed`, which is not open, so `advance` returns early on
+every later sweep. `still_owes_a_refund_check` is false because a payment was
+recorded. So **the release is never re-attempted, even once the node comes
+back.** The escrow holds a valid release the LP has already paid for, and
+nothing in the coordinator will broadcast it; the LP's exposure ends only when
+an operator sends it by hand, or at `T` when the user refunds and the LP eats
+the loss (spec 4.5).
+
+A single retry of `broadcast_release` for an order that is `Failed` with a
+recorded payment and no `release_txid` would close most of this window, since
+the failure it recovers from is usually a provider blip of seconds. That is a
+coordinator change and is not made here.

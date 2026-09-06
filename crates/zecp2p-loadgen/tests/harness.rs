@@ -126,8 +126,13 @@ async fn every_order_derives_its_own_escrow_address() {
         .expect("the run completes");
 
     assert_eq!(
-        stats.distinct_addresses(),
+        stats.orders_with_an_address(),
         stats.total(),
+        "every order in this run should have opened"
+    );
+    assert_eq!(
+        stats.distinct_addresses(),
+        stats.orders_with_an_address(),
         "two orders shared an escrow address, so the funding scan can find the wrong output"
     );
 }

@@ -160,6 +160,16 @@ impl Stats {
             .count()
     }
 
+    /// How many orders got as far as being given an escrow address.
+    ///
+    /// The denominator for [`Self::distinct_addresses`]. An order refused at
+    /// the quote - which is what every order does while the node is down - has
+    /// no address and never had one, so counting it as a missing address says
+    /// the coordinator reused one when it did nothing of the kind.
+    pub fn orders_with_an_address(&self) -> usize {
+        self.outcomes.iter().filter(|o| o.address.is_some()).count()
+    }
+
     /// The escrow addresses a run used, deduplicated.
     ///
     /// Distinct addresses are not a nice-to-have: two orders sharing one would
