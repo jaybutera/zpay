@@ -116,3 +116,27 @@ order, against a slot that was never going to free.
 all 8 orders still released: the coordinator retried on the next sweep, 11
 attest calls for 8 orders. The prover-config gap is survivable where the
 ambiguous pay failure is not.
+
+## The stuck slot is invisible to monitoring
+
+Following the ambiguous pay failure through the coordinator: on a `pay` error
+after the journal claim, `driver.rs` writes the line as `NeedsOperator` with a
+note saying the payment may or may not have left, and fails the order. That is
+the right call, and `slot.rs` counts `NeedsOperator` as holding the slot, so
+nothing else pays until a human reads the Venmo feed and clears it.
+
+The gap is not the behaviour, it is the visibility. `GET /health` returns a
+static `{"ok": true}`, and nothing else exports the journal's state, so a
+coordinator with a stuck slot reports healthy while trading is completely
+halted. The only signal is an `info`-level "waiting for the payment slot" line
+repeating once per sweep per open order.
+
+What a run with `--pay-failure-in 3` measured: one stuck line, five orders
+queued behind it until the run's own timeout, zero throughput for the rest of
+the run, and 7,984 `getblockchaininfo` calls spent asking a question whose
+answer could not change.
+
+A `/health` that reported the journal's open lines, or an operator alert on the
+first `NeedsOperator` write, would turn a silent halt into a page. That is a
+coordinator change and is deliberately not made here; the harness's job was to
+find it.
