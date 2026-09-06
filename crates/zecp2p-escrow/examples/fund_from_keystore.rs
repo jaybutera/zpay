@@ -18,7 +18,8 @@
 //! ZECP2P_RPC_API_KEY_HEADER=api-key ZECP2P_RPC_API_KEY=... \
 //! ZECP2P_KEYSTORE=$HOME/.zecp2p/mainnet-v2coord \
 //!   cargo run -p zecp2p-escrow --example fund_from_keystore -- \
-//!     <label> <txid> <vout> <value_zat> <escrow_address> <amount_zat>
+//!     <label> <txid> <vout> <value_zat> <escrow_address> <amount_zat> \
+//!     <u_pub_hex> <l_pub_hex> <refund_height>
 //! ```
 //!
 //! The escrow is named by the address the page shows, not by a scriptPubKey
@@ -27,6 +28,15 @@
 //! given the way an explorer prints it. Nothing is broadcast until every
 //! argument has been echoed back, so a mistyped amount is visible before it
 //! costs anything.
+//!
+//! The last three arguments are the escrow's own parameters, and giving them
+//! turns the address from something trusted into something checked: the redeem
+//! script is rebuilt here from `u_pub`, `l_pub` and the refund height, hashed,
+//! and the resulting P2SH address compared against the address being paid. A
+//! coordinator that returns an address it cannot open, or a page that displays
+//! one it did not derive, stops here with nothing signed. They are optional
+//! only so a regtest funding with no order behind it still works; a run against
+//! a live coordinator should always pass them.
 
 use std::time::Duration;
 
@@ -41,7 +51,9 @@ use zcash_transparent::address::Script;
 use zcash_transparent::bundle::{Authorized as TAuthorized, Bundle, OutPoint, TxIn, TxOut};
 
 use zecp2p_escrow::address::{script_pubkey_for, AddrNetwork};
+use zecp2p_escrow::script::CompressedPubkey;
 use zecp2p_escrow::chain::ChainClient;
+use zecp2p_escrow::funding::AddressNetwork;
 use zecp2p_escrow::keystore::Keystore;
 use zecp2p_escrow::rpc::{txid_from_display, Network, RpcChainClient, RpcConfig};
 use zecp2p_escrow::tx::encode_signature;
@@ -51,9 +63,10 @@ const FEE_ZAT: u64 = 10_000;
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
-    if a.len() != 7 {
+    if a.len() != 7 && a.len() != 10 {
         eprintln!(
-            "usage: fund_from_keystore <label> <txid> <vout> <value_zat> <escrow_address> <amount_zat>"
+            "usage: fund_from_keystore <label> <txid> <vout> <value_zat> <escrow_address> <amount_zat> \
+             [<u_pub_hex> <l_pub_hex> <refund_height>]"
         );
         std::process::exit(2);
     }
@@ -77,6 +90,49 @@ fn main() {
     // mainnet run stops here instead of sending coin to an unspendable script.
     let escrow_spk = script_pubkey_for(&escrow_address, addr_network)
         .expect("the escrow address, on this network");
+
+    // The address is checked, not believed. Rebuilding the redeem script from
+    // the order's own parameters and hashing it reproduces the address without
+    // asking whoever supplied it, so an address that belongs to some other
+    // script - a coordinator bug, a tampered response, a wrong order pasted in
+    // - is caught before anything is signed.
+    if a.len() == 10 {
+        let u_pub: CompressedPubkey = hex::decode(a[7].trim())
+            .expect("u_pub as hex")
+            .try_into()
+            .expect("u_pub is 33 bytes");
+        let l_pub: CompressedPubkey = hex::decode(a[8].trim())
+            .expect("l_pub as hex")
+            .try_into()
+            .expect("l_pub is 33 bytes");
+        let refund_height: u64 = a[9].parse().expect("refund height");
+        let plan = zecp2p_escrow::funding::escrow_address(
+            &u_pub,
+            &l_pub,
+            refund_height,
+            amount_zat,
+            match network {
+                Network::Main => AddressNetwork::Main,
+                _ => AddressNetwork::Test,
+            },
+        )
+        .expect("the escrow parameters build a redeem script");
+        println!("derived     : {} (from u_pub, l_pub, height {refund_height})", plan.address);
+        if plan.address != escrow_address {
+            eprintln!(
+                "REFUSING: the address given is {escrow_address} but these parameters derive \
+                 {}. Nothing was signed.",
+                plan.address
+            );
+            std::process::exit(3);
+        }
+        if plan.script_pubkey != escrow_spk {
+            eprintln!("REFUSING: the derived scriptPubKey does not match. Nothing was signed.");
+            std::process::exit(3);
+        }
+    } else {
+        println!("derived     : not checked (no escrow parameters given)");
+    }
     let keystore_dir = std::env::var("ZECP2P_KEYSTORE").expect("set ZECP2P_KEYSTORE");
     // `load`, never `load_or_create`: a fresh key here would sign for an
     // address that holds nothing, and the failure would look like a node fault.

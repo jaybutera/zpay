@@ -51,13 +51,18 @@ def log(*a):
     TRANSCRIPT.flush()
 
 
-def fund(escrow_address, amount_zat):
-    """Broadcast the funding transaction and return its txid."""
+def fund(escrow_address, amount_zat, u_pub, l_pub, refund_height):
+    """Broadcast the funding transaction and return its txid.
+
+    The escrow parameters ride along so the funder rebuilds the address from
+    them and refuses to sign if what it derives is not what it was told to pay.
+    """
     env = dict(os.environ)
     cmd = [
         "cargo", "run", "-q", "-p", "zecp2p-escrow",
         "--example", "fund_from_keystore", "--",
         FUND_LABEL, FUND_TXID, FUND_VOUT, FUND_VALUE, escrow_address, str(amount_zat),
+        u_pub, l_pub, str(refund_height),
     ]
     log("funding:", " ".join(cmd[6:]))
     r = subprocess.run(cmd, cwd=REPO, env=env, capture_output=True, text=True, timeout=300)
@@ -82,6 +87,13 @@ with sync_playwright() as p:
     pg.goto("https://zpay.cash/app/", wait_until="networkidle", timeout=60000)
     pg.wait_for_timeout(1500)
     log("connection banner:", pg.inner_text("#conn-text").strip())
+
+    # Read from a path that opens nothing, so the payer key the order will name
+    # is known before any order exists to name it.
+    caps = json.loads(pg.evaluate(
+        "async () => { const r = await fetch('/escrow/capabilities'); return await r.text(); }"))
+    caps_l_pub = caps["l_pub"]
+    log("capabilities  :", caps["network"], "l_pub", caps_l_pub, "fee", caps["fee"]["bps"], "bps")
 
     pg.click("#unit-usd")
     pg.fill("#amount", USD)
@@ -129,15 +141,21 @@ with sync_playwright() as p:
     view = json.loads(pg.evaluate(
         "async (id) => { const r = await fetch('/escrow/orders/' + id); return await r.text(); }",
         order_id))
-    amount_zat = view["escrow"]["amount_zat"]
+    esc = view["escrow"]
+    amount_zat = esc["amount_zat"]
     log("amount_zat    :", amount_zat)
-    if view["escrow"]["address"] != addr:
+    log("refund_height :", esc["refund_height"])
+    if esc["address"] != addr:
         raise RuntimeError("the address on the page is not the address in the order")
+    if esc["l_pub"] != caps_l_pub:
+        raise RuntimeError("the order's payer key is not the one /escrow/capabilities published")
     json.dump({"order_id": order_id, "order_url": order_url, "address": addr,
-               "asked": asked, "amount_zat": amount_zat, "usd": USD, "handle": HANDLE},
+               "asked": asked, "amount_zat": amount_zat, "usd": USD, "handle": HANDLE,
+               "u_pub": esc["u_pub"], "l_pub": esc["l_pub"],
+               "refund_height": esc["refund_height"]},
               open(f"{OUT}/order.json", "w"), indent=1)
 
-    txid = fund(addr, amount_zat)
+    txid = fund(addr, amount_zat, esc["u_pub"], esc["l_pub"], esc["refund_height"])
     log("FUNDING TXID  :", txid)
     json.dump({"funding_txid": txid}, open(f"{OUT}/funding.json", "w"), indent=1)
 
