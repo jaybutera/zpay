@@ -4314,3 +4314,144 @@ async fn a_sighting_the_cursor_overtook_is_still_offered_a_refund() {
         "the refund broadcast but the order did not record it"
     );
 }
+
+#[tokio::test]
+async fn one_sweep_reads_the_journal_once_however_many_orders_are_held_back() {
+    // R5-3. `check_refund_deadline_only` read and parsed the whole journal for
+    // every `Unpaid` or `Failed` order with an escrow, every sweep, before the
+    // head read. For an order the journal holds back that read never stops: the
+    // order stays `Failed`, the predicate stays true, and it is listed until an
+    // operator writes `Cancelled` or `Fulfilled` for its work. The same
+    // per-order-per-sweep shape as the mempool scan of finding 3, and it wants
+    // the same treatment - the journal is the same file for every order in a
+    // sweep.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+    let state = coordinator_with_everything(dir.path(), scanner.clone(), &node, &attestor);
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+
+    // Three failed orders the journal holds back, each with its own escrow.
+    // Distinct amounts so the same-handle-same-amount guard does not refuse the
+    // second and third; this test is about how often the journal is read.
+    let mut ids = Vec::new();
+    let mut refund_height = 0u32;
+    for amount in ["0.05", "0.06", "0.07"] {
+        let user = TestUser::new();
+        let (id, funding_txid) =
+            locked_order_for(&app, &state, &node, &scanner, &attestor, &user, amount).await;
+        let work = zecp2p_v2coordinator::slot::work_id_for(&funding_txid, 0);
+        let mut record = zecp2p_taker::auto::journal::FillRecord::new_zec(
+            work.local.clone(),
+            alloy::primitives::U256::from(700_000u64),
+            alloy::primitives::U256::from(1_000_000_000_000_000_000u128),
+            "alice".into(),
+        );
+        record.state = zecp2p_taker::auto::journal::FillState::NeedsOperator;
+        state.journal.append_unchecked(&record).unwrap();
+
+        let mut failed = state.store.get(&id).unwrap();
+        failed.fail("the payment could not be completed. Check the Venmo feed.");
+        refund_height = u32::try_from(failed.refund_height).unwrap();
+        state.store.put(&failed).unwrap();
+        ids.push(id);
+    }
+    node.set_height(refund_height + 1).await;
+
+    // Advanced CONCURRENTLY on a JoinSet, the way `run` sweeps. Driving them
+    // one after another hides it: the first read fills the cache before the
+    // second order looks.
+    let before = state.journal_reads();
+    let mut tasks = tokio::task::JoinSet::new();
+    for id in ids.clone() {
+        let state = state.clone();
+        tasks.spawn(async move {
+            zecp2p_v2coordinator::driver::advance(&state, &id).await.ok();
+        });
+    }
+    while tasks.join_next().await.is_some() {}
+    let reads = state.journal_reads() - before;
+    assert_eq!(
+        reads, 1,
+        "three orders in one sweep read the journal {reads} times; it is the same file \
+         for all of them"
+    );
+    // And the answer they shared is the right one: all three are still held.
+    for id in &ids {
+        assert_eq!(
+            state.store.get(id).unwrap().stage,
+            Stage::Failed,
+            "a shared journal read let an order past the guard that withholds the refund"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_journal_line_written_since_the_shared_read_is_not_missed() {
+    // The cost of sharing a read is staleness, and here staleness runs the
+    // wrong way. The journal is written *during* a sweep - by this process at
+    // the pay gate, and by the taker daemon in another process against the same
+    // file - and the line that arrives is the one that withholds the refund. A
+    // snapshot taken before it and reused after it promotes an order whose
+    // dollars may already have gone, which is exactly what the guard exists to
+    // stop.
+    //
+    // So the cache is keyed on the journal's length rather than on a clock. The
+    // file is append-only, so any write by either writer changes it, and a
+    // cache that only answers at the length it was read at cannot be behind
+    // one. A time window cannot make that promise, and a first cut of this fix
+    // used one - this test is what caught it.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+    let state = coordinator_with_everything(dir.path(), scanner.clone(), &node, &attestor);
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+    let user = TestUser::new();
+    let (order_id, _funding_txid) =
+        locked_order(&app, &state, &node, &scanner, &attestor, &user).await;
+
+    let mut failed = state.store.get(&order_id).unwrap();
+    failed.fail("the payment could not be completed. Check the Venmo feed.");
+    let refund_height = u32::try_from(failed.refund_height).unwrap();
+    state.store.put(&failed).unwrap();
+    node.set_height(refund_height + 1).await;
+
+    // A sweep with a clean journal fills the cache, and promotes: nothing says
+    // otherwise.
+    zecp2p_v2coordinator::driver::advance(&state, &order_id).await.ok();
+    assert_eq!(
+        state.store.get(&order_id).unwrap().stage,
+        Stage::Refundable,
+        "a clean journal is permission to offer the refund"
+    );
+
+    // Now the line arrives - the taker's, or this process's own at the pay
+    // gate - for an order that has already been promoted. A second order in the
+    // same store must not be promoted off the snapshot taken before it.
+    let user2 = TestUser::new();
+    let (second_id, second_txid) =
+        locked_order_for(&app, &state, &node, &scanner, &attestor, &user2, "0.06").await;
+    let mut second = state.store.get(&second_id).unwrap();
+    second.fail("the payment could not be completed. Check the Venmo feed.");
+    state.store.put(&second).unwrap();
+
+    let work = zecp2p_v2coordinator::slot::work_id_for(&second_txid, 0);
+    let mut record = zecp2p_taker::auto::journal::FillRecord::new_zec(
+        work.local.clone(),
+        alloy::primitives::U256::from(700_000u64),
+        alloy::primitives::U256::from(1_000_000_000_000_000_000u128),
+        "alice".into(),
+    );
+    record.state = zecp2p_taker::auto::journal::FillState::NeedsOperator;
+    state.journal.append_unchecked(&record).unwrap();
+
+    zecp2p_v2coordinator::driver::advance(&state, &second_id).await.ok();
+    assert_eq!(
+        state.store.get(&second_id).unwrap().stage,
+        Stage::Failed,
+        "a journal line written since the shared read was missed, and the order was \
+         steered to a refund over an escrow the LP may already have bought"
+    );
+}

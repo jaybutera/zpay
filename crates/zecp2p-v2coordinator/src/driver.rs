@@ -500,22 +500,30 @@ async fn check_refund_deadline_only(state: &Arc<AppState>, mut order: Order) -> 
     // These orders need an operator to read the feed and decide. Promoting them
     // to `Refundable` puts a refund form in front of the user instead, over an
     // escrow the LP may have already bought.
+    //
+    // R5-3: read once for the whole sweep rather than once per order in it.
+    // Every held-back order asks this on every pass for as long as it exists,
+    // and the answer comes from the same file. `sweep_journal` says why this
+    // caller may share a read and the refund endpoint may not: withholding a
+    // promotion one sweep too long is self-correcting, and letting a refund
+    // broadcast against a line written since is not.
     if let Some(funding) = order.funding {
         let work = crate::slot::work_id_for(&funding.txid, funding.vout);
-        match crate::slot::fiat_may_have_left(&state.journal, &work) {
-            Ok(true) => {
-                tracing::debug!(
-                    order = %order.order_id,
-                    "not offering a refund: the journal says a payment may already have left"
-                );
-                return Ok(());
+        match state.sweep_journal().await {
+            Ok(latest) => {
+                if crate::slot::fiat_may_have_left_in(&latest, &work) {
+                    tracing::debug!(
+                        order = %order.order_id,
+                        "not offering a refund: the journal says a payment may already have left"
+                    );
+                    return Ok(());
+                }
             }
-            Ok(false) => {}
             Err(e) => {
                 // Unreadable journal is not permission to offer the refund.
                 tracing::warn!(
                     order = %order.order_id,
-                    error = %e,
+                    error = %format!("{e:#}"),
                     "could not read the journal, so not promoting this order to refundable"
                 );
                 return Ok(());
