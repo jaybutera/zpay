@@ -13,17 +13,15 @@ const SITE = {
   // Placeholder until the fee is fixed. Rendered everywhere as data-fee.
   feePercent: '0.15',
 
-  // Repositories do not exist yet. Swap these when they do.
+  // Only destinations that exist. The source repository is private, so there
+  // is no GitHub link; add one here when it is public and both pages pick it
+  // up. `verifier` is the Base contract whose EIP-712 domain the zk-p2p
+  // enclave signs under; nothing is submitted there, the takers page links it
+  // as the signing domain.
   links: {
-    github: 'https://github.com/zpay-cash/zpay',
-    githubTaker: 'https://github.com/zpay-cash/auto-taker',
     zkp2p: 'https://zkp2p.xyz',
     zcash: 'https://z.cash',
-    nearIntents: 'https://near-intents.org',
-    escrow: 'https://basescan.org/address/0x777777779d229cdF3110e9de47943791c26300Ef',
-    orchestrator: 'https://basescan.org/address/0x014025fDE093f8701d86e9f38e2C3a9b779cb5c7',
     verifier: 'https://basescan.org/address/0xC6F4a193576C60892a47e111Bb5706c30162502B',
-    stakeVault: 'https://basescan.org/address/0x47c26258222e2f96424bD2B21bf173f0DA5034C7',
   },
 
   // zk-p2p's buyer platform enum, as the enclave enumerates it. Venmo is the

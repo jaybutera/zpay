@@ -13,7 +13,8 @@ frontend/
   fonts/            Inter and JetBrains Mono, latin subsets, self-hosted so
                     the page makes no third-party request
   og.png            the 1200x630 social card the meta tags point at
-  takers/index.html how to run the auto-taker daemon
+  takers/index.html what the taker runs: the v2 coordinator, the attestor,
+                    the Venmo browser, and the payment slot
   app/index.html    the offramp terminal: create, watch, manage
   app/app.js        API calls, validation, polling
   app/styles.css    the terminal's own styling
@@ -63,9 +64,10 @@ with it.
 ## The SITE block
 
 The top of `site.js` holds every value the copy leans on: the fee percent, the
-contract address, the GitHub URLs, the block explorer links, and the platform
-list. The repositories do not exist yet; the URLs there are placeholders. The
-fee is a placeholder too. Change them there and both pages update.
+outbound links, and the platform list. There is no GitHub link because the
+repository is private; when it is public, add it to `links` and give the
+markup a `data-link` for it. Every entry in `links` must resolve. Change them
+there and both pages update.
 
 ## App views
 
