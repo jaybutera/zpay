@@ -80,6 +80,20 @@ refundable the next day.
 node frontend/app/test/refund-wait.js
 ```
 
+## What the confirming screen says about an unmined transaction
+
+`confirming-mempool.js` drives the ladder's side text and the `confirming`
+sub-line for a funding that is only a mempool sighting. `FundingView.mempool`
+is on the wire because `confirmations: 0` on a mined output cannot happen, so a
+zero without the flag is "in no block, and it may never be". The page ignored
+the flag, so both states rendered as "0 of 10 confirmations. About 13 minutes." -
+a depth for a transaction with no depth, and a countdown off a first
+confirmation that had not happened.
+
+```
+node frontend/app/test/confirming-mempool.js
+```
+
 ## When the refund form is offered
 
 `refund-form-visibility.js` drives `renderReturns` under a stub DOM. The form

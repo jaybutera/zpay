@@ -449,7 +449,7 @@ function render(view) {
     const n = document.createElement('span'); n.className = 'n'; n.textContent = String(i + 1).padStart(2, '0');
     const t = document.createElement('span'); t.textContent = label;
     const side = document.createElement('span'); side.className = 'side';
-    if (key === 'confirming' && f && stage === 'confirming') side.textContent = `${f.confirmations} / ${f.required}`;
+    if (key === 'confirming' && f && stage === 'confirming') side.textContent = f.mempool ? 'in the mempool' : `${f.confirmations} / ${f.required}`;
     if (key === 'locked' && stage === 'needs_presignature') side.textContent = state.presign === 'signing' ? 'signing…' : state.presign === 'failed' ? 'not signed' : 'signing';
     if (key === 'paid' && view.payment) side.textContent = money(view.payment.cents);
     li.appendChild(n); li.appendChild(t); li.appendChild(side);
@@ -467,7 +467,15 @@ function render(view) {
     case 'confirming':
       liveText = 'confirming';
       headline = 'ZEC received, confirming';
-      sub = f ? `${f.confirmations} of ${f.required} confirmations. About ${Math.ceil(((f.required - f.confirmations) * (state.caps && state.caps.block_seconds || 75)) / 60)} minutes.` : '';
+      // `confirmations: 0` on a mined output cannot happen, so a zero here is
+      // either a mempool sighting or nothing at all. The coordinator marks the
+      // first with `mempool`, and without reading it this line said "0 of 10
+      // confirmations" for a transaction in no block, and quoted a countdown
+      // off a first confirmation that has not happened. The wait until mining
+      // is not a number of blocks, so it is not given as one.
+      sub = !f ? ''
+        : f.mempool ? 'Your transaction is in the mempool, waiting to be mined. Leave this page open.'
+        : `${f.confirmations} of ${f.required} confirmations. About ${Math.ceil(((f.required - f.confirmations) * (state.caps && state.caps.block_seconds || 75)) / 60)} minutes.`;
       break;
     case 'needs_presignature':
       liveText = 'locking';
@@ -875,7 +883,7 @@ function renderDetails(view) {
   rows.push(['amount', zec(esc.amount_zat)]);
   rows.push(['refund height', String(esc.refund_height)]);
   if (view.current_height) rows.push(['chain height', String(view.current_height)]);
-  if (view.funding) rows.push(['funding', `${view.funding.txid}:${view.funding.vout}`]);
+  if (view.funding) rows.push(['funding', `${view.funding.txid}:${view.funding.vout}${view.funding.mempool ? ' (in the mempool)' : ''}`]);
   if (view.announcement) rows.push(['terms hash', view.announcement.terms_hash || '']);
   if (view.payment) rows.push(['venmo', `${money(view.payment.cents)} at ${view.payment.sent_at}`]);
   if (view.release) rows.push(['release', view.release.txid]);
