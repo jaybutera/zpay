@@ -445,20 +445,102 @@ fn the_recipient_check_does_not_read_the_url_we_navigated_to() {
     if !node_available() {
         return;
     }
-    let step = PaymentStep::RequireRecipient {
-        recipient: "jay-butera".to_string(),
-    };
-    let results = run_sequence("wrongpayeeform", &[step.expression_for_test()]);
-    let ok = results[0]
-        .value
-        .get("ok")
-        .and_then(|v| v.as_bool())
-        .expect("the recipient check answers a report");
     assert!(
-        !ok,
-        "the page names someone-else and only the URL names jay-butera, so this          must not pass: {:?}",
-        results[0].value
+        !recipient_matches("wrongpayeeform", "jay-butera"),
+        "the page names @someone-else and only the URL names jay-butera"
     );
+}
+
+/// Whether the driver would accept this page as a payment to this handle.
+///
+/// Mirrors the comparison in `execute`'s `RequireRecipient` arm: the page
+/// returns the handles it renders and the caller requires one of them to equal
+/// ours once both are normalised.
+fn recipient_matches(page: &str, recipient: &str) -> bool {
+    use zecp2p_taker::payee::normalize_venmo_username;
+
+    let step = PaymentStep::RequireRecipient {
+        recipient: recipient.to_string(),
+    };
+    let results = run_sequence(page, &[step.expression_for_test()]);
+    let handles = results[0]
+        .value
+        .get("handles")
+        .and_then(|v| v.as_array())
+        .expect("the recipient check answers the handles it found")
+        .iter()
+        .filter_map(|h| h.as_str())
+        .map(|h| h.to_string())
+        .collect::<Vec<_>>();
+
+    let wanted = normalize_venmo_username(recipient);
+    handles
+        .iter()
+        .any(|h| normalize_venmo_username(h).eq_ignore_ascii_case(wanted))
+}
+
+/// The prefix collision, closed.
+///
+/// The round-3 review read the live account page and found it renders the
+/// header handle `@Jay-Butera-2`. Lowercased, that *contains* `jay-butera`, so
+/// the substring check this replaces would have passed on a form for a
+/// different account. Whole-handle equality does not.
+#[test]
+fn a_handle_that_merely_starts_with_ours_is_not_ours() {
+    if !node_available() {
+        return;
+    }
+    assert!(
+        !recipient_matches("prefixcollision", "jay-butera"),
+        "@Jay-Butera-2 is a different account from @jay-butera"
+    );
+    // And the substring test really would have passed, which is what makes
+    // this worth a test rather than a comment.
+    let results = run_sequence(
+        "prefixcollision",
+        &[PaymentStep::RequireRecipient {
+            recipient: "jay-butera".to_string(),
+        }
+        .expression_for_test()],
+    );
+    let rendered = results[0]
+        .value
+        .get("handles")
+        .and_then(|v| v.as_array())
+        .expect("handles")
+        .iter()
+        .filter_map(|h| h.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        rendered.to_lowercase().contains("jay-butera"),
+        "the old substring check would have passed on {rendered:?}"
+    );
+}
+
+/// Case is presentation, not identity.
+///
+/// Venmo renders a handle in whatever case its owner set; the string we pay
+/// comes from the curator. A payment must not turn on that difference, or the
+/// rail fails closed on every order for a payee who capitalised their name.
+#[test]
+fn a_handle_in_another_case_is_still_ours() {
+    if !node_available() {
+        return;
+    }
+    assert!(
+        recipient_matches("mixedcase", "jay-butera"),
+        "@Jay-Butera is the same account as @jay-butera"
+    );
+}
+
+/// The ordinary case still passes.
+#[test]
+fn the_payee_the_page_names_is_accepted() {
+    if !node_available() {
+        return;
+    }
+    assert!(recipient_matches("cleanpay", "jay-butera"));
 }
 
 /// A payment never blocks on the audience control.
