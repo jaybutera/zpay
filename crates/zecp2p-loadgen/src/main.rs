@@ -93,6 +93,23 @@ struct Args {
     /// Write every iteration's outcome to this file as JSON lines.
     #[arg(long)]
     jsonl: Option<String>,
+
+    /// Make the node fail every RPC for this many seconds, starting this far
+    /// into the run: `--node-outage-at 60 --node-outage-for 30`.
+    ///
+    /// A rate-limited provider, in the shape the client sees it. This project
+    /// has hit that twice for real, so it is worth a soak: what must not happen
+    /// is an escrow settled or released on a node answer nobody got.
+    #[arg(long)]
+    node_outage_at: Option<u64>,
+
+    /// How long the injected node outage lasts, in seconds.
+    #[arg(long, default_value_t = 30)]
+    node_outage_for: u64,
+
+    /// Delay every node answer by this many milliseconds, for the whole run.
+    #[arg(long, default_value_t = 0)]
+    node_stall_ms: u64,
 }
 
 fn parse_mix(text: &str) -> Result<Vec<(Path, u32)>> {
@@ -189,6 +206,35 @@ async fn main() -> Result<()> {
         ),
     }
     println!();
+
+    // A node that stalls for the whole run, if asked.
+    if args.node_stall_ms > 0 {
+        harness
+            .node
+            .faults()
+            .stall_ms
+            .store(args.node_stall_ms, std::sync::atomic::Ordering::Relaxed);
+        println!("  node answers delayed by {}ms", args.node_stall_ms);
+    }
+
+    // And a provider that goes away in the middle of the run and comes back.
+    if let Some(at) = args.node_outage_at {
+        let node = harness.node.clone();
+        let for_secs = args.node_outage_for;
+        tokio::spawn(async move {
+            use std::sync::atomic::Ordering::Relaxed;
+            tokio::time::sleep(Duration::from_secs(at)).await;
+            tracing::warn!(seconds = for_secs, "INJECTED node outage: every RPC now fails");
+            node.faults().fail_rpc.store(true, Relaxed);
+            tokio::time::sleep(Duration::from_secs(for_secs)).await;
+            node.faults().fail_rpc.store(false, Relaxed);
+            tracing::warn!("the node is answering again");
+        });
+        println!(
+            "  node fails every RPC from {}s for {}s",
+            at, args.node_outage_for
+        );
+    }
 
     let env = harness.env.clone();
     let stats = generator::run(env, plan).await?;
@@ -287,6 +333,10 @@ fn report(harness: &Harness, stats: &generator::Stats) {
             "  calls per order {:.1}",
             node.total() as f64 / stats.total() as f64
         );
+    }
+    let refused = node.failed.load(Relaxed);
+    if refused > 0 {
+        println!("  refused         {refused} (injected outage)");
     }
     println!(
         "  attestor        {} announces, {} attests",
