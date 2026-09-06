@@ -42,12 +42,12 @@ and needs no configuration.
 
 ## What the front door reads
 
-- `GET /stats` every 30 seconds: fills, USDC settled, open orders, last fill,
-  and the contract address. The address in the markup is a fallback; the
-  coordinator's answer overrides it.
-- `GET /quote?zec_amount=1` every two minutes for the rate cell and the quote
-  card's header, and once per pause in typing for the quote card itself. A
-  reply that arrives after a newer keystroke is dropped.
+- `GET /api/stats` every 30 seconds: payments completed, dollars settled, open
+  orders, last payment. A static snapshot behind a Lambda, not the coordinator.
+- `GET /escrow/capabilities` every two minutes for the rate cell, the quote
+  card's header and the spread figure on the fees table.
+- `GET /escrow/quote?amount=X&unit=zec` once per pause in typing for the quote
+  card itself. A reply that arrives after a newer keystroke is dropped.
 
 Nothing on the front door posts. Starting an offramp hands off to `app/` with
 `?zec=` and optionally `?venmo=` prefilled.
