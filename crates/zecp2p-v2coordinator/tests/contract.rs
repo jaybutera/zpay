@@ -4455,3 +4455,184 @@ async fn a_journal_line_written_since_the_shared_read_is_not_missed() {
          steered to a refund over an escrow the LP may already have bought"
     );
 }
+
+#[tokio::test]
+async fn re_entering_the_scan_never_shows_a_signed_order_as_unsigned() {
+    // Audit finding 5. On the sweep that records the outpoint for an order
+    // announced from the mempool, a signed order was written to the store as
+    // `Confirming`, then as `NeedsPresignature`, and only then restored to
+    // `Locked`. The status view does not take the order lock - it must not, or
+    // a `settle` driving a browser for two minutes would stall every poll - so
+    // a page that polls inside that window reads `needs_presignature` for an
+    // order it has already signed, signs again, and gets a 400 refusing a
+    // pre-signature at stage `locked`, shown to the user as an error with a
+    // "Try again" prompt on a trade that is going fine.
+    //
+    // The store is where the transient stages were visible, so that is where
+    // this looks: every stage the order is ever written as, over the whole
+    // re-entry. A signed order must never be written as unsigned.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+    let state = coordinator_that_cannot_pay(dir.path(), scanner.clone(), &node, &attestor);
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+    let user = TestUser::new();
+    let (order_id, amount_zat, stored) = opened_order(&app, &state, &user).await;
+
+    let funding_txid = [0x51u8; 32];
+    scanner.pay_mempool(
+        &stored.script_pubkey,
+        FoundOutput { txid: funding_txid, vout: 0, amount_zat },
+    );
+    zecp2p_v2coordinator::driver::advance(&state, &order_id).await.unwrap();
+    sign_it(&app, &state, &attestor, &user, &order_id).await;
+    assert_eq!(state.store.get(&order_id).unwrap().stage, Stage::Locked);
+
+    // The same transaction confirms, and the next sweep re-enters the scan.
+    scanner.pay(
+        &stored.script_pubkey,
+        FoundOutput { txid: funding_txid, vout: 0, amount_zat },
+    );
+    node.add_utxo(funding_txid, 0, stored.script_pubkey.clone(), amount_zat, 30)
+        .await;
+
+    for _ in 0..4 {
+        zecp2p_v2coordinator::driver::advance(&state, &order_id).await.ok();
+    }
+
+    let end = state.store.get(&order_id).unwrap();
+    assert!(end.funding.is_some(), "the re-entry never recorded the outpoint");
+    assert!(end.pre_signature.is_some(), "the signature was lost");
+
+    // Every stage the store was asked to hold, from the signature onwards. The
+    // status view reads without the order lock, so each of these is a stage a
+    // polling page can be served.
+    let stages = state.store.stages_written(&order_id);
+    let after_signing: Vec<_> = stages
+        .iter()
+        .skip_while(|s| **s != Stage::Locked)
+        .copied()
+        .collect();
+    assert!(
+        !after_signing.contains(&Stage::NeedsPresignature),
+        "a signed order was written as needs_presignature; a page polling then \
+         signs again and is shown a 400 on a trade that is going fine. \
+         Stages written after the signature: {after_signing:?}"
+    );
+    assert!(
+        !after_signing.contains(&Stage::Confirming),
+        "a signed order was written as confirming, which the page shows as \
+         still waiting for the escrow. Stages written after the signature: \
+         {after_signing:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_attestor_that_was_down_at_the_sighting_is_asked_again() {
+    // Audit finding 4. `announce_from_mempool` records the sighting - the txid,
+    // the vout and the lock time - and only then calls the attestor. If the
+    // attestor is unreachable at that moment the announcement fails softly and
+    // the order stays where it is, which is right; what is wrong is that the
+    // guard at the top of that function then skips the mempool path on every
+    // later sweep, because it keys on the txid the failed attempt left behind.
+    //
+    // The order still announces once the transaction confirms, so nothing is
+    // lost but the early signing this whole branch exists for - the user's page
+    // has to stay open through the depth wait after all.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+
+    // A coordinator whose attestor is not answering.
+    let down = coordinator_with_node(dir.path(), scanner.clone(), &node);
+    let app = zecp2p_v2coordinator::web::router(down.clone());
+    let user = TestUser::new();
+    let (order_id, amount_zat, stored) = opened_order(&app, &down, &user).await;
+
+    let funding_txid = [0x61u8; 32];
+    scanner.pay_mempool(
+        &stored.script_pubkey,
+        FoundOutput { txid: funding_txid, vout: 0, amount_zat },
+    );
+    zecp2p_v2coordinator::driver::advance(&down, &order_id).await.ok();
+
+    let after = down.store.get(&order_id).unwrap();
+    assert!(
+        after.announcement.is_none(),
+        "the attestor was down; there should be nothing to sign against"
+    );
+
+    // The attestor comes back. Same store, same sighting still in the mempool.
+    let up = coordinator_with_everything(dir.path(), scanner.clone(), &node, &attestor);
+    for _ in 0..3 {
+        zecp2p_v2coordinator::driver::advance(&up, &order_id).await.ok();
+    }
+
+    let end = up.store.get(&order_id).unwrap();
+    assert!(
+        end.announcement.is_some(),
+        "the sighting was never announced after the attestor came back, so the page \
+         cannot sign until the transaction confirms - which is the wait this whole \
+         branch exists to skip. Stage {:?}",
+        end.stage
+    );
+    assert_eq!(
+        end.stage,
+        Stage::NeedsPresignature,
+        "announced, but the page is not being asked for the signature"
+    );
+}
+
+#[tokio::test]
+async fn a_sighting_the_attestor_never_answered_for_still_reaches_its_deadline() {
+    // The finding 4 fix re-enters `announce` for a sighting that was recorded
+    // but never announced. `announce` returns Ok on a soft attestor failure -
+    // nothing is committed, so it is a retry rather than a loss - and an order
+    // that leaves through it has not had its deadlines looked at.
+    //
+    // Every other exit from this function ends in `check_deadlines`, and the
+    // one that does not is the one where the attestor is down for good: exactly
+    // the case where the user needs to be told to wait for their refund rather
+    // than left reading "waiting for your ZEC" for ever.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+
+    // No attestor, for the whole life of the order.
+    let state = coordinator_with_node(dir.path(), scanner.clone(), &node);
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+    let user = TestUser::new();
+    let (order_id, amount_zat, stored) = opened_order(&app, &state, &user).await;
+
+    let funding_txid = [0x62u8; 32];
+    scanner.pay_mempool(
+        &stored.script_pubkey,
+        FoundOutput { txid: funding_txid, vout: 0, amount_zat },
+    );
+    zecp2p_v2coordinator::driver::advance(&state, &order_id).await.ok();
+    assert!(state.store.get(&order_id).unwrap().mempool_announced_txid.is_some());
+
+    // The transaction confirms, so there really is a coin in the escrow, and
+    // the chain runs past T with the attestor still down.
+    scanner.pay(
+        &stored.script_pubkey,
+        FoundOutput { txid: funding_txid, vout: 0, amount_zat },
+    );
+    node.add_utxo(funding_txid, 0, stored.script_pubkey.clone(), amount_zat, 30)
+        .await;
+    node.set_height(u32::try_from(stored.refund_height).unwrap() + 1).await;
+    for _ in 0..4 {
+        for o in state.store.open_orders() {
+            zecp2p_v2coordinator::driver::advance(&state, &o.order_id).await.ok();
+        }
+    }
+
+    assert_eq!(
+        state.store.get(&order_id).unwrap().stage,
+        Stage::Refundable,
+        "the attestor never answered and the user was never told they could take \
+         their ZEC back"
+    );
+}

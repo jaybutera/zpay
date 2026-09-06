@@ -21,6 +21,20 @@ use crate::order::{Order, Stage};
 pub struct OrderStore {
     dir: PathBuf,
     orders: Arc<Mutex<HashMap<String, Order>>>,
+    /// Every `(order_id, stage)` this store has written, in order.
+    ///
+    /// Audit finding 5 is about a stage the store held only between two writes
+    /// of one sweep. The status view reads the store without the order lock -
+    /// it has to, or a `settle` driving a browser for two minutes would stall
+    /// every poll - so any stage written is a stage a polling page can be
+    /// served, however briefly. Racing a reader against the sweep to catch it
+    /// would be flaky in whichever direction it went; the sequence of writes is
+    /// the same question asked deterministically.
+    ///
+    /// One `push` per order write. The write itself is a serialise, a file
+    /// write and a rename, so the cost does not register, and it is worth it to
+    /// have the invariant checkable rather than argued.
+    stage_writes: Arc<Mutex<Vec<(String, Stage)>>>,
 }
 
 impl OrderStore {
@@ -59,6 +73,7 @@ impl OrderStore {
         Ok(Self {
             dir,
             orders: Arc::new(Mutex::new(orders)),
+            stage_writes: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -95,7 +110,22 @@ impl OrderStore {
         std::fs::rename(&tmp, &path)
             .with_context(|| format!("could not move {} into place", tmp.display()))?;
         orders.insert(order.order_id.clone(), order.clone());
+        if let Ok(mut log) = self.stage_writes.lock() {
+            log.push((order.order_id.clone(), order.stage));
+        }
         Ok(())
+    }
+
+    /// The stages this store has been asked to hold for `order_id`, in the
+    /// order they were written. See [`OrderStore::stage_writes`].
+    pub fn stages_written(&self, order_id: &str) -> Vec<Stage> {
+        self.stage_writes
+            .lock()
+            .expect("stage write log lock")
+            .iter()
+            .filter(|(id, _)| id == order_id)
+            .map(|(_, stage)| *stage)
+            .collect()
     }
 
     pub fn get(&self, order_id: &str) -> Option<Order> {

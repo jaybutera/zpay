@@ -89,6 +89,14 @@ pub async fn advance(state: &Arc<AppState>, order_id: &str) -> Result<()> {
         // `Locked` back - but only over the two stages that path itself
         // writes.
         //
+        // Finding 5 made this the second line of defence rather than the
+        // first. `set_stage_unless_signed` now stops those two stages being
+        // written over a signature at all, which is what closes the window a
+        // polling page could read them in; this restores the stage for any
+        // writer that does not go through it. Kept because the cost is one
+        // comparison and the failure it covers - a signed order left reading
+        // unsigned - is one the user is shown.
+        //
         // Restoring on "the stage changed" alone was wrong. `find_funding` can
         // also end in `check_deadlines`, which writes `Refundable` past T and
         // `Unpaid` past the pay deadline, and both are the deadline check's
@@ -251,12 +259,32 @@ async fn find_funding(state: &Arc<AppState>, mut order: Order) -> Result<()> {
 /// is replaced or never mined leaves an announcement and a signature that are
 /// simply never used, and the escrow refunds at T as if this had not run.
 async fn announce_from_mempool(state: &Arc<AppState>, mut order: Order) -> Result<()> {
-    // Only worth asking before there is an announcement to sign against, and
-    // only once: a second sighting cannot improve on the first, and re-reading
-    // the mempool every sweep for the life of an order is a lot of calls for
-    // nothing.
-    if order.announcement.is_some() || order.mempool_announced_txid.is_some() {
+    // Already announced. Nothing here can improve on that, and a second
+    // announcement would draw a fresh `R` the user's signature is not under.
+    if order.announcement.is_some() {
         return check_deadlines(state, order).await;
+    }
+
+    // Sighted before, but never announced.
+    //
+    // Finding 4: the sighting is recorded before the attestor is called, so an
+    // attestor that was unreachable at that moment left the txid set and no
+    // announcement. The guard used to key on the txid, so the mempool path was
+    // skipped on every later sweep and the order waited for its transaction to
+    // confirm before the page could sign - the wait this whole branch exists to
+    // skip. Announcing from the record costs no mempool read and nothing else
+    // is committed: no terms were signed, because there was nothing to sign
+    // against.
+    //
+    // The lock time stays as it was first stamped. It is committed by
+    // `terms_hash` and it is the cut for the feed search, and re-stamping it
+    // would move both for an escrow whose sighting has not changed.
+    if order.mempool_announced_txid.is_some() {
+        tracing::info!(
+            order = %order.order_id,
+            "a sighting was recorded but never announced; asking the attestor again"
+        );
+        return announce(state, order).await;
     }
 
     // One reading of the mempool for the whole sweep, matched locally. Asking
@@ -366,7 +394,10 @@ async fn advance_funded(state: &Arc<AppState>, mut order: Order) -> Result<()> {
     // ever sign and the escrow could only refund at T. That is what happened to
     // esc_1f2809bcb726cd630ff7932c. At one confirmation the window is one block.
     if confirmations < zecp2p_escrow::depth::ANNOUNCE_DEPTH {
-        order.stage = Stage::Confirming;
+        // Finding 5: not over a signature. A signed order re-entering this
+        // path is `Locked`, and writing `Confirming` tells a polling page the
+        // escrow is still filling on a trade that is past that.
+        set_stage_unless_signed(&mut order, Stage::Confirming);
         order.touch();
         state.store.put(&order)?;
         // A funding that never reaches depth - a stuck low-fee transaction, a
@@ -385,11 +416,37 @@ async fn advance_funded(state: &Arc<AppState>, mut order: Order) -> Result<()> {
     if order.lock_confirmed_ms.is_none() {
         order.lock_confirmed_ms = Some(chrono::Utc::now().timestamp_millis() as u64);
     }
-    order.stage = Stage::Confirming;
+    set_stage_unless_signed(&mut order, Stage::Confirming);
     order.touch();
     state.store.put(&order)?;
 
     announce(state, order).await
+}
+
+/// Moves the stage, unless the order is already signed.
+///
+/// Audit finding 5. The stages before `Locked` describe an escrow that is still
+/// being filled or is waiting for a signature, and a signed order is past both.
+/// It reaches them anyway: re-entering the funding scan for an order announced
+/// from a mempool sighting runs the ordinary funded path, which writes
+/// `Confirming` and then `NeedsPresignature` before the caller puts `Locked`
+/// back.
+///
+/// Each of those is a store write, and the status view reads the store without
+/// the order lock - it has to, or a `settle` driving a browser for two minutes
+/// would stall every poll. So a page polling inside that window is served
+/// `needs_presignature` for an order it has already signed, signs again, and is
+/// shown the 400 refusing a pre-signature at stage `locked`, with a "Try again"
+/// prompt, on a trade that is going fine.
+///
+/// Restoring `Locked` afterwards - which the caller still does, for the stages
+/// this cannot know about - closes the window but does not remove it. Not
+/// writing the wrong stage in the first place does.
+fn set_stage_unless_signed(order: &mut Order, stage: Stage) {
+    if order.pre_signature.is_some() && matches!(order.stage, Stage::Locked) {
+        return;
+    }
+    order.stage = stage;
 }
 
 /// Announces the escrow to the attestor and records the answer.
@@ -400,7 +457,10 @@ async fn advance_funded(state: &Arc<AppState>, mut order: Order) -> Result<()> {
 /// announcement per event for the same reason; this does not rely on that.
 async fn announce(state: &Arc<AppState>, mut order: Order) -> Result<()> {
     if order.announcement.is_some() {
-        order.stage = Stage::NeedsPresignature;
+        // Finding 5, the other half. A signed order re-entering the scan
+        // arrives here with its announcement already drawn, and asking the
+        // page for a signature it has given is what produced the 400.
+        set_stage_unless_signed(&mut order, Stage::NeedsPresignature);
         order.touch();
         state.store.put(&order)?;
         return Ok(());
@@ -424,7 +484,14 @@ async fn announce(state: &Arc<AppState>, mut order: Order) -> Result<()> {
             // Nothing is committed yet, so a failed announcement is a retry
             // rather than a loss. The order stays where it is.
             tracing::warn!(order = %order.order_id, error = %e, "announcement failed; will retry");
-            return Ok(());
+            // But the retry must not outlast `T`. An attestor that is down for
+            // good leaves the order at `Confirming` on every sweep, and this
+            // was the one exit from the funded path that never asked whether
+            // the deadline had passed - so an escrow with a real coin in it
+            // read "waiting" for ever and the page never offered the refund.
+            // Reached through the ordinary confirmed path as well as through a
+            // mempool sighting.
+            return check_deadlines(state, order).await;
         }
     };
 
