@@ -86,13 +86,6 @@ class Element {
       return true;
     }
 
-    if (this.frozen) {
-      // A control the page has detached from: the write lands nowhere, which
-      // is how an already-open confirmation sheet behaves when the form
-      // beneath it is refilled.
-      this.value = this.committed;
-      return true;
-    }
     this.committed = this.value;
     this._valueTracker.tracked = this.value;
     this._valueTracker.cleared = false;
@@ -228,58 +221,122 @@ function stalePayPage() {
   return page;
 }
 
-/// The same page, but where the confirmation click actually posts.
+/// A clean pay form: no confirmation open, the way a fresh navigation lands.
+///
+/// This is the starting state every honest drive begins from, and it is what
+/// `RequireNoOpenSheet` requires. Clicking the bare "Pay" opens a sheet for
+/// whatever the form currently holds, which is how the real page behaves and
+/// is what lets a test reach the post-click checks without the page having
+/// been stale to begin with.
+function cleanPayPage() {
+  const page = {
+    url: 'https://account.venmo.com/pay?recipients=jay-butera',
+    elements: [
+      new Element('input', { 'aria-label': 'Amount', value: '' }),
+      new Element('textarea', { id: 'payment-note', value: '' }),
+      new Element('button', {}, 'Pay'),
+    ],
+    text: 'Pay jay-butera',
+  };
+  page.location = { href: page.url };
+
+  const pay = page.elements.find((e) => e.innerText === 'Pay');
+  pay.onclick = () => {
+    if (page.sheetOpen) return;
+    page.sheetOpen = true;
+    const amount = page.elements.find((e) => e.getAttribute('aria-label') === 'Amount');
+    const note = page.elements.find((e) => e.getAttribute('id') === 'payment-note');
+    // The sheet states the payment it was opened for, and carries the note as
+    // rendered copy rather than as an input.
+    const sheet = new Element('button', {}, `Pay Jay Butera $${amount.value}`);
+    page.sheet = sheet;
+    page.elements.push(sheet);
+    // The sheet's own copy of the note, rendered as text. `carriesNote` now
+    // reads only rendered text, so this is what it sees -- never the field.
+    page.elements.push(new Element('div', {}, note.value));
+  };
+  return page;
+}
+
+/// A clean form whose confirm click does nothing.
+///
+/// The round-1 state, reached honestly: our own click opens the sheet, and
+/// pressing it has no effect. Every step up to the confirmation passes, which
+/// is what made the incident expensive, and only `RequireSendConfirmed`
+/// objects.
+function inertClickPayPage() {
+  const page = cleanPayPage();
+  const pay = page.elements.find((e) => e.innerText === 'Pay');
+  const open = pay.onclick;
+  pay.onclick = () => {
+    open();
+    // The sheet is there and its button does nothing at all.
+    page.sheet.onclick = () => {};
+  };
+  return page;
+}
+
+/// A clean form where confirming actually posts the payment.
 ///
 /// Venmo takes the payment form away when a payment goes through: the page
-/// moves to the feed and the confirmation button goes with it. That is what
-/// this models, and it is what the confirmation step keys on.
+/// moves to the feed and the confirmation goes with it. Built on the clean
+/// page so the drive opens its own sheet, which is what `RequireNoOpenSheet`
+/// now requires of every honest payment.
 function livePayPage() {
-  const page = stalePayPage();
-  page.location = { href: page.url };
-  const confirm = page.elements.find((e) => e.innerText.startsWith('Pay Jay Butera'));
-  confirm.onclick = () => {
-    // The send posted, so the whole form goes: Venmo navigates to the feed and
-    // the amount field, the bare "Pay" button and the confirmation sheet all
-    // leave with it. Removing only the confirmation button, which is what this
-    // page used to do, models a page no real successful payment produces --
-    // and it is indistinguishable from Venmo dismissing the sheet on an error.
-    page.elements.length = 0;
-    page.elements.push(new Element('div', {}, 'You paid Jay Butera $2.01'));
-    page.location.href = 'https://account.venmo.com/';
+  const page = cleanPayPage();
+  const pay = page.elements.find((e) => e.innerText === 'Pay');
+  const open = pay.onclick;
+  pay.onclick = () => {
+    open();
+    page.sheet.onclick = () => {
+      // The send posted, so the whole form goes with it.
+      page.elements.length = 0;
+      page.elements.push(new Element('div', {}, 'You paid Jay Butera $2.01'));
+      page.location.href = 'https://account.venmo.com/';
+    };
   };
   return page;
 }
 
 /// The confirmation sheet dismisses on click without sending.
 ///
-/// Venmo rejecting a stale confirmation does this: the sheet closes and the
-/// page drops back to the plain pay form, whose button reads "Pay" rather than
-/// "Pay Jay Butera $2.01". Under the first version of the confirmation check
-/// -- "the button naming the amount is gone" -- that reported the payment sent
-/// for money that never moved. Finding 1 of the review.
+/// Venmo rejecting a confirmation does this: the sheet closes and the page
+/// drops back to the plain pay form, whose button reads "Pay" rather than
+/// "Pay Jay Butera $2.01". A check that only asked whether the amount-naming
+/// button was gone reported this as sent while the money sat in the account.
 function dismissingPayPage() {
-  const page = stalePayPage();
-  const confirm = page.elements.find((e) => e.innerText.startsWith('Pay Jay Butera'));
-  confirm.onclick = () => {
-    // The sheet closes. The form, and its bare "Pay" button, are still there.
-    page.elements.splice(page.elements.indexOf(confirm), 1);
+  const page = cleanPayPage();
+  const pay = page.elements.find((e) => e.innerText === 'Pay');
+  const open = pay.onclick;
+  pay.onclick = () => {
+    open();
+    page.sheet.onclick = () => {
+      // The sheet closes. The form, and its bare "Pay" button, remain.
+      const at = page.elements.indexOf(page.sheet);
+      if (at !== -1) page.elements.splice(at, 1);
+      page.sheetOpen = false;
+    };
   };
   return page;
 }
 
-/// The session expires at the click and Venmo redirects to sign-in.
+/// The session expires at the confirm click and Venmo redirects to sign-in.
 ///
-/// The pay form is gone, the confirmation is gone, and no payment posted. A
-/// check that only asks whether the named button vanished calls this sent.
+/// The form is gone, the sheet is gone, and no payment posted -- so every
+/// "is the button gone" question answers yes on a page where nothing could
+/// have been sent.
 function expiringPayPage() {
-  const page = stalePayPage();
-  page.location = { href: page.url };
-  const confirm = page.elements.find((e) => e.innerText.startsWith('Pay Jay Butera'));
-  confirm.onclick = () => {
-    page.elements.length = 0;
-    page.elements.push(new Element('input', { type: 'password', name: 'password' }));
-    page.elements.push(new Element('button', {}, 'Sign In'));
-    page.location.href = 'https://id.venmo.com/signin';
+  const page = cleanPayPage();
+  const pay = page.elements.find((e) => e.innerText === 'Pay');
+  const open = pay.onclick;
+  pay.onclick = () => {
+    open();
+    page.sheet.onclick = () => {
+      page.elements.length = 0;
+      page.elements.push(new Element('input', { type: 'password', name: 'password' }));
+      page.elements.push(new Element('button', {}, 'Sign In'));
+      page.location.href = 'https://id.venmo.com/signin';
+    };
   };
   return page;
 }
@@ -298,13 +355,12 @@ function otherPayeeSheetPage() {
   // matching finds this; only the note tells it apart from ours.
   sheet.innerText = 'Pay Someone Else $2.01';
 
-  // The earlier drive's note, frozen: an already-open sheet is detached from
-  // the form beneath it, so refilling the form does not update it.
-  const note = page.elements.find((e) => e.getAttribute('id') === 'payment-note');
-  note.value = 'thanks 0000aaaa';
-  note.committed = 'thanks 0000aaaa';
-  note._valueTracker.tracked = 'thanks 0000aaaa';
-  note.frozen = true;
+  // The note field behaves normally: this run's fill lands in it, exactly as
+  // it would on the live page. The earlier version froze it so the note check
+  // would discriminate, which encoded an unverified claim about Venmo -- the
+  // round-2 review flipped that one line and the wrong payee's sheet was
+  // clicked. The refusal must not depend on it, so the mock no longer offers
+  // it.
 
   // The page still names our payee: the form under the sheet is for us. That
   // is exactly the case `RequireRecipient` cannot catch and the note must.
@@ -334,6 +390,8 @@ const PAGES = {
   code: codePage,
   account: accountPage,
   stalepay: stalePayPage,
+  cleanpay: cleanPayPage,
+  inertclickpay: inertClickPayPage,
   livepay: livePayPage,
   dismissingpay: dismissingPayPage,
   expiringpay: expiringPayPage,

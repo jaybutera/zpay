@@ -132,12 +132,13 @@ fn expressions(steps: &[PaymentStep]) -> Vec<String> {
     steps.iter().map(|s| s.expression_for_test()).collect()
 }
 
-/// The reproduction.
+/// The reproduction, now caught before the first click rather than after it.
 ///
-/// Every step up to and including the two clicks passes against the stale page,
-/// which is what made this so expensive: there was no error to see. The
-/// confirmation is the one predicate that answers "no", and before it existed
-/// there was nothing after the click to answer at all.
+/// The incident's tab had a confirmation sheet open when the drive started, so
+/// the temporal rule refuses it at `RequireNoOpenSheet` and no money button is
+/// ever pressed. That is strictly better than what round 1 achieved -- the
+/// clicks used to happen and only the post-click check objected -- and it is
+/// the same page that produced the false success.
 #[test]
 fn the_stale_page_that_caused_the_false_success_is_now_caught() {
     if !node_available() {
@@ -145,9 +146,52 @@ fn the_stale_page_that_caused_the_false_success_is_now_caught() {
     }
     let steps = the_incident_payment();
     let results = run_sequence("stalepay", &expressions(&steps));
+
+    // The open-sheet check answers a report and the driver judges it in Rust,
+    // so the refusal shows up as `ok: false` in its value rather than as a
+    // thrown error.
+    let at = steps
+        .iter()
+        .position(|s| matches!(s, PaymentStep::RequireNoOpenSheet))
+        .expect("the sequence must carry the open-sheet check");
+    let report = &results[at].value;
+    assert_eq!(
+        report.get("ok"),
+        Some(&serde_json::json!(false)),
+        "the incident's page had a sheet open, so this must refuse: {report:?}"
+    );
+    // And it names what to close.
+    let sheets = report
+        .get("sheets")
+        .and_then(|v| v.as_array())
+        .expect("the report lists the sheets it found");
+    assert_eq!(sheets, &vec![serde_json::json!("Pay Jay Butera $2.01")]);
+
+    // The check sits before every money step, so the refusal costs nothing.
+    assert!(
+        steps[..at].iter().all(|s| !s.is_irreversible()),
+        "the open-sheet check must come before any money button"
+    );
+}
+
+/// The post-click confirmation still catches a click that does nothing.
+///
+/// `RequireNoOpenSheet` removes the incident's *entry* condition, so without
+/// this the post-click check would no longer have a test that reaches it on a
+/// page where the click is inert. Here the form starts clean, our own click
+/// opens the sheet, and the confirm click does nothing -- which is the state
+/// round 1 was built for.
+#[test]
+fn a_click_that_does_nothing_is_still_caught_after_the_sheet_opens() {
+    if !node_available() {
+        return;
+    }
+    let steps = the_incident_payment();
+    let results = run_sequence("inertclickpay", &expressions(&steps));
     assert_eq!(results.len(), steps.len(), "every step should have run");
 
-    // The bug, stated: nothing before the confirmation objects to this page.
+    // The point that made the incident expensive: nothing before the
+    // confirmation objects, because everything before it asks about the form.
     let last_click = steps
         .iter()
         .rposition(|s| s.is_irreversible())
@@ -155,25 +199,18 @@ fn the_stale_page_that_caused_the_false_success_is_now_caught() {
     for (i, (step, result)) in steps.iter().zip(&results).enumerate().take(last_click + 1) {
         assert!(
             result.ok,
-            "step {i} ({}) failed on the stale page: {:?}. \
-             The incident's whole difficulty was that none of these failed.",
+            "step {i} ({}) failed before the confirmation: {:?}",
             step.describe(),
             result.error
         );
     }
 
-    // And the confirmation is what catches it: the button naming $2.01 is
-    // still on the page after both clicks, so the predicate is false and the
-    // driver's poll runs out and errors instead of returning success.
     let confirmation = results.last().expect("the confirmation step");
-    assert!(confirmation.ok, "the predicate itself must not throw");
     assert!(
         !confirmed(confirmation),
-        "the $2.01 confirmation is still on the stale page, so the send did not post: {:?}",
+        "the sheet is still up after the confirm click, so nothing was sent: {:?}",
         confirmation.value
     );
-    // And it says so in the page's own terms, which is what the operator is
-    // told. The sheet is what is still standing here.
     assert_eq!(
         confirmation.value.get("sheet"),
         Some(&serde_json::json!(true)),
@@ -289,6 +326,55 @@ fn a_session_that_expires_at_the_click_is_not_confirmed() {
         Some(&serde_json::json!(true)),
         "the report must say the tab went to a signed-out page: {:?}",
         confirmation.value
+    );
+}
+
+/// A same-order retry does not click its own stale sheet.
+///
+/// The reviewer's ruling in round 2: even when the amount and note match --
+/// which for a retry of the same order they always do -- a pre-existing sheet
+/// is a refusal. Its terms were fixed when it opened, before this drive ran a
+/// single readback, so clicking it would send something none of this run's own
+/// checks looked at. The note binding permitted exactly this; the temporal
+/// rule does not.
+///
+/// There is no automatic retry in the coordinator -- every `fiat.pay` failure
+/// writes `NeedsOperator` and fails the order -- so this is only reached after
+/// a human has looked at the tab, and the right instruction is to close the
+/// sheet and start clean.
+#[test]
+fn a_retry_of_the_same_order_refuses_its_own_stale_sheet() {
+    if !node_available() {
+        return;
+    }
+    let steps = the_incident_payment();
+    // `stalepay` is this order's own earlier attempt: same payee, same amount,
+    // same note. Nothing textual can tell it from a fresh one.
+    let results = run_sequence("stalepay", &expressions(&steps));
+
+    let at = steps
+        .iter()
+        .position(|s| matches!(s, PaymentStep::RequireNoOpenSheet))
+        .expect("the open-sheet check");
+    assert_eq!(
+        results[at].value.get("ok"),
+        Some(&serde_json::json!(false)),
+        "a retry must refuse the sheet its own earlier attempt left open: {:?}",
+        results[at].value
+    );
+
+    // And it is refused for being open, not for what it says: the label names
+    // this very payment.
+    let sheets = results[at]
+        .value
+        .get("sheets")
+        .and_then(|v| v.as_array())
+        .expect("the sheets it found");
+    assert!(
+        sheets
+            .iter()
+            .any(|s| s.as_str().unwrap_or_default().contains("2.01")),
+        "the stale sheet names this order's own amount: {sheets:?}"
     );
 }
 

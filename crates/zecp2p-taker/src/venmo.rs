@@ -75,10 +75,18 @@ const CONFIRM_PREFIX: &str = "Pay ";
 /// note is per-payment, this run typed it two steps earlier, and it is the same
 /// string `locate_payment` later searches the feed for.
 ///
-/// Read from the note field's `value` first, because that is where it lives
-/// while the form is up, and fall back to the rendered text for the
-/// confirmation sheet, which shows the note as copy rather than as an input.
-const CARRIES_NOTE_JS: &str = "const carriesNote = (note) => {      const el = document.querySelector(NOTE_SEL);      if (el && String(el.value || '').includes(note)) return true;      const body = document.body ? document.body.innerText : '';      return body.includes(note);    };";
+/// Read from the page's rendered text only, never from the note field. Reading
+/// the field made this satisfiable by our own fill two steps earlier, so it
+/// discriminated between sheets only when the field rejected the write -- an
+/// assumption about Venmo nothing on record supports, and the round-2 review
+/// showed the mock was the only thing enforcing it.
+///
+/// So this is now a *second* layer behind [`PaymentStep::RequireNoOpenSheet`],
+/// which is the check that actually establishes the sheet is ours. If the live
+/// sheet turns out not to render the note at all this adds nothing, and it
+/// costs nothing either: the temporal check has already refused every sheet
+/// this drive did not open.
+const CARRIES_NOTE_JS: &str = "const carriesNote = (note) => {      const body = document.body ? document.body.innerText : '';      return body.includes(note);    };";
 
 /// Whether this run is allowed to move money.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -466,6 +474,10 @@ impl VenmoBrowser {
             // so each is individually irreversible, individually logged, and
             // individually dropped by a dry run, rather than one step that
             // guesses how many buttons the flow has.
+            // The last check before anything irreversible, and the one that
+            // makes the sheet we later confirm demonstrably ours: it did not
+            // exist a moment ago.
+            PaymentStep::RequireNoOpenSheet,
             PaymentStep::ConfirmSend {
                 selector: PAY_BUTTON.to_string(),
             },
@@ -588,6 +600,37 @@ impl VenmoBrowser {
                 Ok(())
             }
 
+            // Refused, not waited on: a sheet that is open now will still be
+            // open in a second, and the answer does not improve with time.
+            PaymentStep::RequireNoOpenSheet => {
+                let value = self.evaluate(tab, &step.to_expression()).await?;
+                let report = value.get("result").and_then(|r| r.get("value"));
+                let ok = report
+                    .and_then(|v| v.get("ok"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if !ok {
+                    let sheets = report
+                        .and_then(|v| v.get("sheets"))
+                        .and_then(|v| v.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|v| v.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        })
+                        .unwrap_or_default();
+                    anyhow::bail!(
+                        "a Venmo confirmation sheet is already open on this page ({sheets}). \
+                         It was not opened by this payment, so nothing here has checked what \
+                         it would send -- its amount, its payee and its audience were fixed \
+                         before this run started. Close it in the browser and let the next \
+                         attempt start from a clean form. Not clicking Pay."
+                    );
+                }
+                Ok(())
+            }
+
             PaymentStep::WaitForConfirm { amount, .. } => {
                 self.wait_for_expression(
                     tab,
@@ -615,12 +658,9 @@ impl VenmoBrowser {
                 let deadline = std::time::Instant::now() + self.timeout;
                 // Overwritten every pass on purpose: what the operator needs is
                 // what the page looked like when we gave up, not when we
-                // started. `None` until the first answer, so a poll that never
-                // completed a pass is reported as exactly that rather than as
-                // an observation nobody made.
-                // Declared without an initialiser: every path through the loop
-                // body assigns it before the deadline check reads it, and a
-                // placeholder here would be dead on the first pass.
+                // started. Declared without an initialiser, because every path
+                // through the loop body assigns it before the deadline check
+                // reads it and a placeholder would be dead on the first pass.
                 let mut last_seen: String;
 
                 loop {
@@ -875,6 +915,31 @@ pub enum PaymentStep {
         selector: String,
         expected: String,
     },
+    /// Refuse to click `Pay` while a confirmation sheet is already open.
+    ///
+    /// The rule is temporal and needs no assumption about Venmo's DOM: a
+    /// confirmation that exists *before* our own click was not opened by this
+    /// drive, whatever it says, and the sheet our click opens is the only one
+    /// `WaitForConfirm` should ever find.
+    ///
+    /// This replaces binding the sheet to this payment by its note. That
+    /// binding read the note field, which this run had filled two steps
+    /// earlier, so it only discriminated when the field rejected the write --
+    /// an "already-open sheets detach from the form beneath them" claim about
+    /// Venmo that nothing on record supports. The round-2 review flipped the
+    /// one line in the mock that hard-coded it and the wrong payee's sheet was
+    /// clicked, which showed the test was proving the mock rather than the
+    /// page.
+    ///
+    /// A pre-existing sheet is a refusal even when it is this order's own,
+    /// from an earlier attempt. Its terms were fixed when it opened, before
+    /// this drive ran a single readback, so a drive that clicked it would be
+    /// sending something none of its own checks looked at. There is no
+    /// automatic retry -- every `fiat.pay` failure writes `NeedsOperator` and
+    /// fails the order -- so this is only ever reached after a human has seen
+    /// the tab, and the right instruction to that human is to close the sheet
+    /// and let the retry start from a clean form.
+    RequireNoOpenSheet,
     /// Wait for the confirmation button that names this amount, on a sheet
     /// that carries this payment's own note.
     ///
@@ -1023,12 +1088,28 @@ impl PaymentStep {
             // Matches on the prefix, then requires the label to carry the
             // amount. Both halves matter: the prefix finds it, and the amount
             // is the page telling us what it will do.
+            // Any confirmation sheet at all, whatever it names. Matched on the
+            // prefix plus a dollar amount rather than on *our* amount, because
+            // the point is that a sheet opened before our click is not ours no
+            // matter what it says -- a stale sheet for the same amount is
+            // exactly the dangerous case.
+            PaymentStep::RequireNoOpenSheet => format!(
+                "(() => {{ \
+                   const pre = {pre}; \
+                   const open = [...document.querySelectorAll('button')] \
+                     .map(b => (b.innerText||'').trim()) \
+                     .filter(t => t.startsWith(pre) && /\\$[0-9]/.test(t)); \
+                   return {{ ok: open.length === 0, sheets: open }}; \
+                 }})()",
+                pre = json!(CONFIRM_PREFIX)
+            ),
+
             // The note has to be on the page as well as the amount on the
             // button. Both halves are about identity: the amount says what the
             // sheet will do, the note says which drive it belongs to.
             PaymentStep::WaitForConfirm { amount, note } => format!(
                 "(() => {{ \
-                   const NOTE_SEL = {nsel}; {helper} \
+                   {helper} \
                    const pre = {pre}; const amt = {amt}; const note = {note}; \
                    if (note && !carriesNote(note)) return false; \
                    const el = [...document.querySelectorAll('button')] \
@@ -1039,13 +1120,12 @@ impl PaymentStep {
                 pre = json!(CONFIRM_PREFIX),
                 amt = json!(amount),
                 note = json!(note),
-                nsel = json!(NOTE_SELECTOR),
                 helper = CARRIES_NOTE_JS
             ),
 
             PaymentStep::ConfirmNamedAmount { amount, note } => format!(
                 "(() => {{ \
-                   const NOTE_SEL = {nsel}; {helper} \
+                   {helper} \
                    const pre = {pre}; const amt = {amt}; const note = {note}; \
                    if (note && !carriesNote(note)) \
                      throw new Error('the confirmation does not carry this payment\\'s note'); \
@@ -1063,7 +1143,6 @@ impl PaymentStep {
                 pre = json!(CONFIRM_PREFIX),
                 amt = json!(amount),
                 note = json!(note),
-                nsel = json!(NOTE_SELECTOR),
                 helper = CARRIES_NOTE_JS
             ),
 
@@ -1075,18 +1154,27 @@ impl PaymentStep {
             // a signed-in Venmo page.
             //
             // "The named button vanished" was too weak on its own: it is also
-            // true of the sign-in page a session expiry redirects to, of a
-            // DataDome interstitial, of a 5xx, and of Venmo dismissing the
-            // confirmation sheet on an error and dropping back to the plain
-            // form (whose button reads "Pay", not "Pay ... $2.01"). Each of
-            // those is the incident again with a different page shape: no
-            // payment posted, and the check says sent.
+            // true of the sign-in page a session expiry redirects to, and of
+            // Venmo dismissing the confirmation sheet on an error and dropping
+            // back to the plain form (whose button reads "Pay", not
+            // "Pay ... $2.01"). Both are the incident again with a different
+            // page shape: no payment posted, and the check says sent.
             //
             // What a posted payment actually does is take the *form* away --
             // the amount field goes with the sheet. So all of these must hold:
             // no amount field, no bare "Pay" button, no confirmation naming
             // this amount, and a URL that is not one of Venmo's signed-out
             // pages. The bare-"Pay" clause is what catches the dismissed sheet.
+            //
+            // **What this still does not catch**, stated plainly because
+            // 51795d6's message wrongly claimed otherwise: any *signed-in*
+            // Venmo page with no form and no sheet answers `ok: true`. That is
+            // the account home, a DataDome interstitial at the pay URL, a 5xx,
+            // or Venmo unmounting the form to show an error panel. This proves
+            // a negative and always will. The positive signal is the feed --
+            // `fiat::attest` already searches it for the tagged note -- and
+            // gating `Stage::Paid` on that story is the recorded follow-up,
+            // conditioned on the rail running without an operator watching.
             //
             // Returns a report rather than a bool so the caller can say what it
             // saw instead of asserting a reason it never observed.
@@ -1170,6 +1258,9 @@ impl PaymentStep {
             }
             PaymentStep::RequireAmount { selector, expected } => {
                 format!("read {selector} back and require it to be {expected:?}")
+            }
+            PaymentStep::RequireNoOpenSheet => {
+                "require no confirmation sheet to be open before clicking Pay".to_string()
             }
             PaymentStep::WaitForConfirm { amount, .. } => {
                 format!("wait for the confirmation button naming ${amount}")
@@ -1490,16 +1581,30 @@ mod tests {
         );
     }
 
-    /// The amount readback is the last thing before the first click. This is the
-    /// ordering NEW-3 was about, and the two-button flow must not have moved it.
+    /// The amount readback is the last thing that *reads the form* before the
+    /// first click. This is the ordering NEW-3 was about.
+    ///
+    /// `RequireNoOpenSheet` now sits between it and the click. That is allowed
+    /// and only that: it reads no form control, writes nothing, and refuses on
+    /// a condition the amount cannot change. What must never appear here is a
+    /// step that touches the amount or the note after the readback, because
+    /// then the value clicked would not be the value checked.
     #[test]
     fn the_readback_is_the_last_step_before_any_money_moves() {
         let steps = a_payment();
         let first_money = steps.iter().position(|s| s.is_irreversible()).unwrap();
-        assert!(
-            matches!(steps[first_money - 1], PaymentStep::RequireAmount { .. }),
-            "expected the amount readback immediately before the first click"
-        );
+        let verify = steps
+            .iter()
+            .position(|s| matches!(s, PaymentStep::RequireAmount { .. }))
+            .expect("the amount must be verified");
+        assert!(verify < first_money, "the readback comes before the click");
+        for step in &steps[verify + 1..first_money] {
+            assert!(
+                matches!(step, PaymentStep::RequireNoOpenSheet),
+                "only a read-only refusal may sit between the readback and the \
+                 click, found {step:?}"
+            );
+        }
     }
 
     fn a_payment() -> Vec<PaymentStep> {
@@ -1539,11 +1644,15 @@ mod tests {
             .expect("a fill");
 
         assert!(last_fill < verify, "the check has to come after the fills");
-        assert_eq!(
-            verify + 1,
-            confirm,
-            "and nothing may come between it and the click"
-        );
+        // Nothing that touches the form may come between the readback and the
+        // click. `RequireNoOpenSheet` may, because it reads no form control:
+        // see `the_readback_is_the_last_step_before_any_money_moves`.
+        for step in &steps[verify + 1..confirm] {
+            assert!(
+                matches!(step, PaymentStep::RequireNoOpenSheet),
+                "unexpected step between the amount readback and the click: {step:?}"
+            );
+        }
 
         match &steps[verify] {
             PaymentStep::RequireAmount { expected, .. } => assert_eq!(expected, "25.00"),
@@ -1617,11 +1726,13 @@ mod tests {
             if !js.contains("querySelector") {
                 continue;
             }
-            // A step that only tests for presence never dereferences, so it
-            // needs no guard: `!!el && !el.disabled` answers about a handle it
-            // never reaches through, and `.some(...)` never binds one at all.
-            // Everything that does reach through a handle is checked below.
-            if js.contains("!!el") || js.contains(".some(") {
+            // A step that never binds an element handle cannot dereference a
+            // missing one. `!!el && !el.disabled` answers about a handle it
+            // does not reach through; `.some(...)` binds none at all; and a
+            // `.map(...)` over a NodeList reads each node's text without ever
+            // holding a lookup result that could be null. Everything that does
+            // reach through a handle is checked below.
+            if js.contains("!!el") || js.contains(".some(") || js.contains(".map(b =>") {
                 continue;
             }
             // The confirmation step filters rather than finds, and guards on the

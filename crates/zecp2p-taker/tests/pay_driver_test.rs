@@ -30,6 +30,8 @@ enum Confirmation {
     Posted,
     /// The confirmation sheet is still standing: nothing was sent.
     SheetStillUp,
+    /// A sheet was already open before the drive clicked anything.
+    SheetOpenBeforeWeClicked,
 }
 
 /// A fake browser: an HTTP `/json/list` and a websocket that answers
@@ -235,6 +237,25 @@ fn answer_for(expression: &str, confirmation: Confirmation) -> serde_json::Value
                 "payBtn": true, "signedOut": false,
                 "url": "https://account.venmo.com/pay?recipients=jay-butera"
             }),
+            // Unreachable in practice: this mode refuses at the open-sheet
+            // check, long before anything is clicked. Answered rather than
+            // `todo!()`ed so a future step reordering surfaces as a failed
+            // assertion instead of a panic in the fake.
+            Confirmation::SheetOpenBeforeWeClicked => serde_json::json!({
+                "ok": false, "sheet": true, "form": true,
+                "payBtn": true, "signedOut": false,
+                "url": "https://account.venmo.com/pay?recipients=jay-butera"
+            }),
+        };
+    }
+    // The open-sheet check: a healthy page has no confirmation open when the
+    // drive starts, which is the state every honest payment begins from.
+    if expression.contains("sheets:") {
+        return match confirmation {
+            Confirmation::SheetOpenBeforeWeClicked => serde_json::json!({
+                "ok": false, "sheets": ["Pay Someone Else $9.99"]
+            }),
+            _ => serde_json::json!({ "ok": true, "sheets": [] }),
         };
     }
     // The recipient check answers a report with `ok`.
@@ -353,5 +374,134 @@ async fn a_dry_run_stops_before_the_click_and_is_not_unconfirmed() {
             .iter()
             .any(|e| e.contains(".click()") && e.contains("2.01")),
         "a dry run must not click a button naming the amount"
+    );
+}
+
+/// `fiat::pay` reads the outcome, and a dry run never reports the fiat gone.
+///
+/// The round-2 review's probe M8 changed the production match to map
+/// `WouldHaveSent` to `Sent::Live` and every `auto::fiat` test still passed,
+/// because the test built a closure that re-implemented the match instead of
+/// calling the function. This one calls `fiat::pay`, so that mutation goes
+/// red: a dry run drives the page, stops before the first click, and
+/// `fiat_left()` must be false.
+#[tokio::test]
+async fn fiat_pay_reports_no_fiat_left_for_a_dry_run() {
+    use alloy::primitives::{B256, U256};
+    use zecp2p_taker::auto::{fiat, money::payment_cents, rail::FiatLeg};
+
+    // SheetStillUp, so if the mode were ever ignored the run would click
+    // through and fail loudly rather than quietly passing.
+    let fake = FakeBrowser::start(Confirmation::SheetStillUp).await;
+    let browser = VenmoBrowser::new(fake.cdp_url(), 5);
+
+    let leg = FiatLeg {
+        tag: None,
+        recipient: "jay-butera".into(),
+        payment: payment_cents(
+            U256::from(2_010_000u64),
+            U256::from(1_000_000_000_000_000_000u128),
+            10_000,
+        )
+        .expect("a payable amount"),
+        not_before: chrono::DateTime::from_timestamp_millis(1_756_000_000_000).unwrap(),
+        intent_hash: B256::repeat_byte(0xa3),
+        intent_amount_6dec: U256::from(2_010_000u64),
+        rate_18dec: U256::from(1_000_000_000_000_000_000u128),
+        intent_timestamp_ms: 1_756_000_000_000,
+        payee_hash: B256::repeat_byte(0x85),
+    };
+
+    let sent = fiat::pay(&browser, &leg, "thanks 5df45b72", SendMode::DryRun)
+        .await
+        .expect("a dry run is not an error");
+
+    assert!(
+        !sent.fiat_left(),
+        "a dry run must never report the fiat gone, got {sent:?}"
+    );
+    assert!(
+        matches!(sent, fiat::Sent::DryRun { .. }),
+        "a dry run maps to DryRun, got {sent:?}"
+    );
+    assert!(
+        !fake
+            .evaluated()
+            .iter()
+            .any(|e| e.contains(".click()") && e.contains("2.01")),
+        "a dry run must not click a button naming the amount"
+    );
+}
+
+/// And a live run that the page confirms does report the fiat gone.
+///
+/// Without this the test above is satisfied by a `fiat::pay` that always
+/// answers `DryRun`.
+#[tokio::test]
+async fn fiat_pay_reports_the_fiat_gone_when_the_page_confirms() {
+    use alloy::primitives::{B256, U256};
+    use zecp2p_taker::auto::{fiat, money::payment_cents, rail::FiatLeg};
+
+    let fake = FakeBrowser::start(Confirmation::Posted).await;
+    let browser = VenmoBrowser::new(fake.cdp_url(), 5);
+
+    let leg = FiatLeg {
+        tag: None,
+        recipient: "jay-butera".into(),
+        payment: payment_cents(
+            U256::from(2_010_000u64),
+            U256::from(1_000_000_000_000_000_000u128),
+            10_000,
+        )
+        .expect("a payable amount"),
+        not_before: chrono::DateTime::from_timestamp_millis(1_756_000_000_000).unwrap(),
+        intent_hash: B256::repeat_byte(0xa3),
+        intent_amount_6dec: U256::from(2_010_000u64),
+        rate_18dec: U256::from(1_000_000_000_000_000_000u128),
+        intent_timestamp_ms: 1_756_000_000_000,
+        payee_hash: B256::repeat_byte(0x85),
+    };
+
+    let sent = fiat::pay(&browser, &leg, "thanks 5df45b72", SendMode::Live)
+        .await
+        .expect("a confirmed send succeeds");
+
+    assert!(sent.fiat_left(), "a confirmed live send spent money");
+}
+
+/// A sheet open before our own click stops the payment, in the driver.
+///
+/// The page-level tests show the predicate answers `ok: false`; this shows
+/// `pay` acts on it. It must be an ordinary refusal and *not* `Unconfirmed`:
+/// nothing was clicked, so there is no ambiguity about whether money left, and
+/// treating it as unconfirmed would stall the rail and send an operator
+/// looking for a payment that was never attempted.
+#[tokio::test]
+async fn a_sheet_open_before_our_click_refuses_without_ambiguity() {
+    let fake = FakeBrowser::start(Confirmation::SheetOpenBeforeWeClicked).await;
+    let browser = VenmoBrowser::new(fake.cdp_url(), 5);
+    let tab = browser.find_venmo_tab().await.expect("the fake tab");
+
+    let error = browser
+        .pay(&tab, &request(), SendMode::Live)
+        .await
+        .expect_err("a pre-existing sheet must stop the payment");
+
+    assert!(
+        error.downcast_ref::<Unconfirmed>().is_none(),
+        "nothing was clicked, so this is not the ambiguous case: {error:#}"
+    );
+    let text = format!("{error:#}");
+    assert!(text.contains("already open"), "{text}");
+    // It names the sheet so the operator knows what to close.
+    assert!(text.contains("Pay Someone Else $9.99"), "{text}");
+
+    // And no money button was ever pressed.
+    assert!(
+        !fake
+            .evaluated()
+            .iter()
+            .any(|e| e.contains(".click()") && e.contains("2.01")),
+        "no money button may be clicked when a stale sheet is refused"
     );
 }
