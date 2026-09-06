@@ -89,7 +89,7 @@ fn a_release_is_retried_through_not_yet_and_then_accepted() {
 
     let mut naps = 0;
     let txid =
-        broadcast_release_until_deadline(&node, &policy, refund_height, &[0u8; 8], || naps += 1)
+        broadcast_release_until_deadline(&node, &policy, refund_height, &[0u8; 8], || { naps += 1; true })
             .expect("a release must survive three temporary answers");
     assert_eq!(txid, [0x42; 32]);
     assert_eq!(naps, 3, "each temporary answer should have cost one wait");
@@ -111,7 +111,7 @@ fn a_script_failure_stops_immediately() {
         &policy,
         3_500_000,
         &[0u8; 8],
-        || naps += 1,
+        || { naps += 1; true },
     )
     .expect_err("a script failure is a verdict");
     assert!(matches!(err, LpError::Chain(ChainError::Rejected(_))), "got {err}");
@@ -139,7 +139,7 @@ fn retrying_stops_at_the_broadcast_deadline() {
         &policy,
         refund_height,
         &[0u8; 8],
-        || naps += 1,
+        || { naps += 1; true },
     )
     .expect_err("past the deadline the LP must stop and say why");
     match err {
@@ -169,7 +169,7 @@ fn a_release_inside_the_margin_keeps_trying() {
     );
     let mut naps = 0;
     let txid =
-        broadcast_release_until_deadline(&node, &policy, refund_height, &[0u8; 8], || naps += 1)
+        broadcast_release_until_deadline(&node, &policy, refund_height, &[0u8; 8], || { naps += 1; true })
             .expect("at the deadline itself the LP still tries");
     assert_eq!(txid, [0x43; 32]);
     assert_eq!(naps, 1);

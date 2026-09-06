@@ -1040,7 +1040,7 @@ fn broadcast(s: &Setup, raw: &[u8], record: &RunRecord) {
         &policy,
         s.terms.refund_height as u32,
         raw,
-        || std::thread::sleep(Duration::from_secs(15)),
+        || { std::thread::sleep(Duration::from_secs(15)); true },
     ) {
         Ok(id) => {
             println!("  node accepted  {}", txid_to_display(&id));

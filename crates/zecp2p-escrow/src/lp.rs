@@ -61,6 +61,15 @@ pub enum LpError {
         deadline: u32,
         last: String,
     },
+    /// The caller's `sleep` hook ended the loop between attempts.
+    ///
+    /// Distinct from [`LpError::BroadcastDeadlinePassed`], which means the
+    /// chain has moved past the point where the release still wins its race
+    /// with the refund. This means only that *this attempt* stopped: the
+    /// deadline has not passed, the release is still worth broadcasting, and
+    /// the caller is expected to come back.
+    #[error("stopped retrying the broadcast before the deadline; the node last said: {last}")]
+    BroadcastGaveUp { last: String },
 }
 
 /// Whether the LP has paid, and whether it holds the attestor's scalar.
@@ -237,12 +246,28 @@ pub fn attestation_matches_terms(
 /// A `Rejected` is a verdict and returns immediately: the transaction is wrong
 /// and retrying it will not change that. An `Unreachable` is retried too, since
 /// it says nothing about the transaction.
+///
+/// # Stopping early
+///
+/// `sleep` returns `false` to end the loop between attempts. That is how a
+/// caller puts a wall-clock budget on one *attempt* at broadcasting without
+/// giving up on the release: the coordinator runs this inside its sweep, and
+/// the deadline it loops to is tens of minutes away.
+///
+/// Stopping is offered at the sleep and nowhere else, so an attempt is never
+/// abandoned part-way through: the loop has just been told the node cannot
+/// judge the transaction yet, and nothing is in flight. A caller that always
+/// returns `true` gets the original behaviour, which is to retry until the
+/// deadline.
+///
+/// Ending early is reported as [`LpError::BroadcastGaveUp`] carrying the node's
+/// last word, so a caller can tell "we stopped" from "the chain refused".
 pub fn broadcast_release_until_deadline(
     chain: &impl ChainClient,
     policy: &EscrowPolicy,
     refund_height: u32,
     raw_tx: &[u8],
-    mut sleep: impl FnMut(),
+    mut sleep: impl FnMut() -> bool,
 ) -> Result<[u8; 32], LpError> {
     let deadline = policy.broadcast_deadline_for_refund_height(refund_height);
 
@@ -262,7 +287,11 @@ pub fn broadcast_release_until_deadline(
                         last: e.to_string(),
                     });
                 }
-                sleep();
+                if !sleep() {
+                    return Err(LpError::BroadcastGaveUp {
+                        last: e.to_string(),
+                    });
+                }
             }
         }
     }

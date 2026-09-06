@@ -44,17 +44,21 @@
 //! right arguments, and to record enough that a crash between them is
 //! recoverable.
 
+pub mod alert;
 pub mod config;
 pub mod driver;
 pub mod funding;
+pub mod nodes;
 pub mod order;
 pub mod price;
 pub mod quote;
+pub mod ratelimit;
 #[cfg(feature = "test-rails")]
 pub mod simulated_rail;
 pub mod slot;
 pub mod state;
 pub mod store;
+pub mod version;
 pub mod view;
 pub mod web;
 

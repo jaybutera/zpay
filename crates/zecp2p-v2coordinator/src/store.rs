@@ -216,6 +216,43 @@ impl OrderStore {
             .count()
     }
 
+    /// The ids of every order this store holds.
+    ///
+    /// For the per-order lock map's eviction: a lock whose id is not here
+    /// belongs to no order and, once nothing is holding it, can go.
+    pub fn open_order_ids(&self) -> std::collections::HashSet<String> {
+        self.orders
+            .lock()
+            .expect("order store lock")
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    /// Open orders one client address holds.
+    ///
+    /// Finding 4: the per-handle cap cannot be this bound. A handle is the
+    /// *payee* - whoever opens the order chooses it - so it counts who gets
+    /// paid rather than who is calling, and a caller with a list of served
+    /// handles is not limited by it at all.
+    ///
+    /// Counts the same population `awaiting_for_handle` does: orders this
+    /// coordinator is still going to do something about. A `Refundable` order
+    /// needs nothing further and an `Expired` one was never funded, so neither
+    /// holds a place.
+    pub fn open_for_client(&self, client: &str) -> usize {
+        self.orders
+            .lock()
+            .expect("order store lock")
+            .values()
+            .filter(|o| {
+                o.opened_by.as_deref() == Some(client)
+                    && o.stage.is_open()
+                    && o.stage != Stage::Refundable
+            })
+            .count()
+    }
+
     /// Inserts an order unless the handle already has one in flight for the
     /// same number of cents, deciding and writing under one lock.
     ///
@@ -305,6 +342,7 @@ mod tests {
 
     fn an_order(id: &str, stage: Stage) -> Order {
         Order {
+            opened_by: None,
             order_id: id.into(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),

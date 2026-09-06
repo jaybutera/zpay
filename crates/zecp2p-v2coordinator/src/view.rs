@@ -361,6 +361,7 @@ mod tests {
 
     fn order_with_funding() -> Order {
         Order {
+            opened_by: None,
             order_id: "esc_1".into(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),

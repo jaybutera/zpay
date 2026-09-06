@@ -72,6 +72,65 @@ pub trait FiatRail: Send + Sync {
         &self,
         leg: &zecp2p_taker::auto::rail::FiatLeg,
     ) -> Result<zecp2p_escrow::lp_client::WireAttestation>;
+
+    /// What this rail has left to spend, in cents.
+    ///
+    /// Finding 5: nothing read the float. Running out did not present as a
+    /// refusal at intake - it presented as a payment that failed partway
+    /// through, which is the ambiguous state a person has to resolve, holding
+    /// the payment slot while they do.
+    ///
+    /// **Rail-agnostic by construction.** The rail knows where its money is and
+    /// how to count it; the coordinator only compares a number against a
+    /// configured reserve. A rail with no balance to report - one drawing on a
+    /// line of credit, one that cannot be asked without moving money - returns
+    /// [`RailBalance::Unknown`] with a reason, and the coordinator's policy for
+    /// unknown is configuration rather than a rule baked in here.
+    ///
+    /// Must not have side effects, and must not move money. It is called on the
+    /// reservation path and from `/health`.
+    ///
+    /// The default is `Unknown`, so a rail that has not implemented this
+    /// behaves exactly as every rail did before it existed.
+    async fn balance_cents(&self) -> RailBalance {
+        RailBalance::Unknown("this rail does not report a balance".to_string())
+    }
+}
+
+/// What a rail says it has left.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RailBalance {
+    /// The rail counted its money. Cents.
+    Known(u64),
+    /// The rail cannot say, and why.
+    ///
+    /// Deliberately not an error type. "I have no balance to report" and "I
+    /// tried to read my balance and failed" are both this, because the
+    /// coordinator does the same thing with them: it applies the configured
+    /// policy for an unknown balance. What differs is the string, which reaches
+    /// the log and `/health` so an operator can tell the two apart.
+    Unknown(String),
+}
+
+impl RailBalance {
+    /// Whether a payment of `needed_cents` may be committed to.
+    ///
+    /// `unknown_is_ok` is `float.pay_when_balance_unknown`: an LP whose rail
+    /// can report and who wants a failed read treated as an empty account sets
+    /// it false.
+    pub fn covers(&self, needed_cents: u64, unknown_is_ok: bool) -> bool {
+        match self {
+            RailBalance::Known(have) => *have >= needed_cents,
+            RailBalance::Unknown(_) => unknown_is_ok,
+        }
+    }
+
+    pub fn cents(&self) -> Option<u64> {
+        match self {
+            RailBalance::Known(c) => Some(*c),
+            RailBalance::Unknown(_) => None,
+        }
+    }
 }
 
 /// What a fiat leg reported.
@@ -102,6 +161,13 @@ pub struct AppState {
     pub quotes: Arc<std::sync::Mutex<std::collections::HashMap<String, crate::order::Quote>>>,
     pub policy: EscrowPolicy,
     pub rpc: RpcConfig,
+    /// Every node endpoint, in preference order, with the working one
+    /// remembered. Finding 6.
+    ///
+    /// `rpc` above is still the primary and is what the funding scanner is
+    /// built from; this is what every read the escrow protocol depends on goes
+    /// through, so a provider incident costs a failover rather than an outage.
+    pub nodes: crate::nodes::NodePool,
     pub scanner: Arc<dyn FundingScanner>,
     pub http: reqwest::Client,
     /// The ZEC/USD price, cached for [`crate::price::PRICE_TTL`].
@@ -178,6 +244,13 @@ pub struct AppState {
     pub attestor_pubkey: Option<PublicKey>,
     pub fiat: Option<Arc<dyn FiatRail>>,
     pub journal: Arc<zecp2p_taker::auto::journal::Journal>,
+    /// What has already been said to an operator, so a condition noticed on
+    /// every sweep is not reported on every sweep. Finding 7.
+    pub alerts: Arc<crate::alert::AlertHistory>,
+    /// What one caller may ask for at the door. Finding 4.
+    pub rate_limiter: Arc<crate::ratelimit::RateLimiter>,
+    /// The rail's last reported balance, and when it was read. Finding 5.
+    balance_cache: Arc<std::sync::Mutex<Option<(RailBalance, std::time::Instant)>>>,
     pub secp: Secp256k1<secp256k1_zkp::All>,
     /// One advance at a time per order.
     ///
@@ -205,6 +278,32 @@ pub struct AppState {
     /// value that was true, never a value that was guessed, and it is empty
     /// until a real read succeeds. A node that cannot be reached still fails.
     chain_head_cache: Arc<std::sync::Mutex<Option<((u32, u32), std::time::Instant)>>>,
+    /// The head read for the sweep pass now running, and which pass that is.
+    ///
+    /// Finding 6. `check_deadlines` read the node twice per order per sweep and
+    /// documented that "the sweep-wide saving is taken in `advance_all`" - a
+    /// function that has never existed. At the 200-order cap that is 400
+    /// uncached calls a minute against one provider, and the provider's answer
+    /// to that is a 429 whose backoff is measured in minutes, inside the sweep.
+    ///
+    /// **Keyed on the pass, not on a clock**, for the same reason
+    /// [`AppState::journal_cache`] is keyed on a file length. `check_deadlines`
+    /// decides when a user is offered their refund, and a time-based cache
+    /// cannot distinguish "this head is a few seconds old" from "this head was
+    /// read before the chain passed T". A generation can: the sweep reads the
+    /// head once at the top of a pass and every order in *that* pass shares it,
+    /// so the value an order sees was read after the pass it belongs to began
+    /// and never earlier. A caller outside any sweep - the refund endpoint,
+    /// `presign`'s own advance - finds no head for its generation and reads the
+    /// node, which is the old behaviour exactly.
+    sweep_head: Arc<std::sync::Mutex<Option<(u64, (u32, u32))>>>,
+    /// Held across the sweep's head read so concurrent orders share one.
+    sweep_head_reading: Arc<tokio::sync::Mutex<()>>,
+    /// Which sweep pass is running. Zero means none.
+    sweep_generation: Arc<std::sync::atomic::AtomicU64>,
+    /// When the last sweep pass finished, for `/health` and the sweep-age
+    /// alert. `None` until one has.
+    last_sweep_done: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
     /// One payment at a time, across every order.
     ///
     /// R2-1: the per-order lock above serialises an order with itself and
@@ -264,9 +363,41 @@ impl AppState {
     /// The lock for one order, created on first use.
     pub async fn order_lock(&self, order_id: &str) -> Arc<tokio::sync::Mutex<()>> {
         let mut map = self.advancing.lock().await;
+
+        // Finding 4: this map is keyed on a string a caller supplies, and
+        // `presign` and `refund` used to take the lock before checking the
+        // order existed - so a request naming an order id that has never
+        // existed inserted a permanent entry, and nothing ever removed one.
+        //
+        // Two changes close it. The handlers now look the order up first, so
+        // an unknown id never reaches here. And entries are dropped once
+        // nothing holds them and no order carries the id, so the map tracks
+        // live orders rather than every id ever named.
+        //
+        // Swept when the map has grown past the number of orders that could
+        // legitimately be in it, rather than on every call: the sweep walks
+        // the map, and walking it on every advance would make the cost scale
+        // with the thing being bounded.
+        let ceiling = self.config.quote.max_open_orders.saturating_mul(2).max(64);
+        if map.len() > ceiling {
+            let live = self.store.open_order_ids();
+            map.retain(|id, lock| {
+                // `strong_count` of 1 means this map is the only holder: no
+                // task is advancing that order right now. Dropping a lock
+                // somebody holds would let two tasks advance one order at
+                // once, which is the whole thing this map prevents.
+                Arc::strong_count(lock) > 1 || live.contains(id)
+            });
+        }
+
         map.entry(order_id.to_string())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
+    }
+
+    /// How many per-order locks are held, for a test and for `/health`.
+    pub async fn order_locks_tracked(&self) -> usize {
+        self.advancing.lock().await.len()
     }
 
     /// The LP's secret. Private so it is reached only through the signing
@@ -464,26 +595,143 @@ impl AppState {
     }
 
     /// Reads the chain height and branch id from the node, ignoring the cache.
+    ///
+    /// Both reads go to whichever endpoint answers, and to the *same* one:
+    /// they are asked inside one `try_each`, so a failover between them cannot
+    /// pair a height from one chain view with a branch id from another.
     pub async fn chain_head_uncached(&self) -> Result<(u32, u32)> {
-        let rpc = self.rpc.clone();
+        let nodes = self.nodes.clone();
         tokio::task::spawn_blocking(move || {
-            let chain = RpcChainClient::new(rpc)?;
-            let height = ChainClient::height(&chain)?;
-            let branch = ChainClient::consensus_branch_id(&chain)?;
-            Ok::<_, zecp2p_escrow::chain::ChainError>((height, branch))
+            nodes.try_each(|chain| {
+                let height = ChainClient::height(chain)?;
+                let branch = ChainClient::consensus_branch_id(chain)?;
+                Ok((height, branch))
+            })
         })
         .await
         .context("the Zcash node read did not complete")?
         .map_err(|e| anyhow::anyhow!("could not read the Zcash node: {e}"))
     }
 
-    /// Runs a blocking closure with a fresh chain client.
+    /// The head for the sweep pass now running, read from the node once.
+    ///
+    /// Every caller inside a sweep gets the same value; a caller outside one
+    /// reads the node. See [`AppState::sweep_head`] for why this is keyed on
+    /// the pass rather than on a clock.
+    ///
+    /// Single-flight like the journal and mempool reads: the sweep hands every
+    /// order to a `JoinSet` at once, so without it each of them would find the
+    /// slot empty and start its own read.
+    pub async fn head_for_this_sweep(&self) -> Result<(u32, u32)> {
+        let generation = self.sweep_generation.load(std::sync::atomic::Ordering::Acquire);
+        if generation == 0 {
+            // Not in a sweep. The refund endpoint and `presign`'s own advance
+            // arrive here, and they must see the node.
+            return self.chain_head_uncached().await;
+        }
+        if let Some(head) = self.head_for_generation(generation) {
+            return Ok(head);
+        }
+
+        let _reading = self.sweep_head_reading.lock().await;
+        if let Some(head) = self.head_for_generation(generation) {
+            return Ok(head);
+        }
+
+        let head = self.chain_head_uncached().await?;
+        // Re-read the generation after the call: a pass that ended while this
+        // was in flight must not have a later pass's orders served a head read
+        // during the earlier one.
+        if self.sweep_generation.load(std::sync::atomic::Ordering::Acquire) == generation {
+            if let Ok(mut slot) = self.sweep_head.lock() {
+                *slot = Some((generation, head));
+            }
+            // The page's own cache is refreshed from the same read rather than
+            // paying for a second one.
+            if let Ok(mut slot) = self.chain_head_cache.lock() {
+                *slot = Some((head, std::time::Instant::now()));
+            }
+        }
+        Ok(head)
+    }
+
+    fn head_for_generation(&self, generation: u64) -> Option<(u32, u32)> {
+        let slot = self.sweep_head.lock().ok()?;
+        let (g, head) = (*slot)?;
+        (g == generation).then_some(head)
+    }
+
+    /// Opens a sweep pass. Every `head_for_this_sweep` inside it shares one
+    /// head read. Returns the pass number.
+    pub fn begin_sweep(&self) -> u64 {
+        let generation = self
+            .sweep_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            + 1;
+        if let Ok(mut slot) = self.sweep_head.lock() {
+            *slot = None;
+        }
+        generation
+    }
+
+    /// Closes a sweep pass, recording that one finished.
+    ///
+    /// The generation goes back to zero so a straggler - an order whose task
+    /// outlived the pass, a `presign` advance running alongside - reads the
+    /// node rather than inheriting a head from a pass that has ended.
+    pub fn end_sweep(&self) {
+        self.sweep_generation
+            .store(0, std::sync::atomic::Ordering::Release);
+        if let Ok(mut slot) = self.sweep_head.lock() {
+            *slot = None;
+        }
+        if let Ok(mut slot) = self.last_sweep_done.lock() {
+            *slot = Some(std::time::Instant::now());
+        }
+    }
+
+    /// How long since a sweep pass last finished. `None` if none has.
+    ///
+    /// The sweep-age signal finding 7 asks for: a sweep that has not completed
+    /// leaves no log line at all, which is what a wedged browser looked like.
+    pub fn since_last_sweep(&self) -> Option<std::time::Duration> {
+        let slot = self.last_sweep_done.lock().ok()?;
+        slot.map(|t| t.elapsed())
+    }
+
+    /// Runs a blocking closure against the first node endpoint that answers.
+    ///
+    /// `FnMut` rather than `FnOnce`, because a closure that has to be retried
+    /// against a second endpoint has to be callable twice. Every existing
+    /// caller passes a closure that is already re-runnable - they read an
+    /// output, a height, or broadcast a transaction the caller still holds -
+    /// and the pool only re-runs on "the node was unreachable", so a closure
+    /// is never re-run after a node has acted on it.
     pub async fn with_chain<T, F>(&self, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnMut(&RpcChainClient) -> Result<T, zecp2p_escrow::chain::ChainError> + Send + 'static,
+    {
+        let nodes = self.nodes.clone();
+        tokio::task::spawn_blocking(move || nodes.try_each(f))
+            .await
+            .context("the Zcash node call did not complete")?
+            .map_err(|e| anyhow::anyhow!("could not reach the Zcash node: {e}"))
+    }
+
+    /// `with_chain` for a closure that produces an `anyhow::Error`.
+    ///
+    /// Several callers do work beyond the node call inside the closure -
+    /// assembling a transaction, deciding on an amount - and those errors are
+    /// not `ChainError`. They cannot be failed over either way: an error that
+    /// is not the node being unreachable is an answer, so this runs against
+    /// the currently preferred endpoint and does not retry.
+    pub async fn with_chain_any<T, F>(&self, f: F) -> Result<T>
     where
         T: Send + 'static,
         F: FnOnce(&RpcChainClient) -> Result<T> + Send + 'static,
     {
-        let rpc = self.rpc.clone();
+        let rpc = self.nodes.current().clone();
         tokio::task::spawn_blocking(move || {
             let chain = RpcChainClient::new(rpc)
                 .map_err(|e| anyhow::anyhow!("could not reach the Zcash node: {e}"))?;
@@ -520,6 +768,59 @@ impl AppState {
         self.config
             .address_network()
             .expect("the network was validated at load")
+    }
+
+    /// The rail's balance, from a short cache.
+    ///
+    /// Cached because it is read on every reservation and by every `/health`
+    /// poll, and it does not move except when this coordinator spends or the
+    /// operator tops up. `float.balance_cache_seconds` bounds how stale it can
+    /// be; the reserve in `float.reserve_cents` is what covers the staleness.
+    ///
+    /// A failed read is not cached, for the reason the journal read is not: an
+    /// outage should last as long as the outage.
+    pub async fn fiat_balance_cents(&self) -> RailBalance {
+        let ttl = std::time::Duration::from_secs(self.config.float.balance_cache_seconds);
+        if !ttl.is_zero() {
+            if let Ok(slot) = self.balance_cache.lock() {
+                if let Some((balance, at)) = slot.as_ref() {
+                    if at.elapsed() < ttl {
+                        return balance.clone();
+                    }
+                }
+            }
+        }
+        let Some(rail) = self.fiat.as_ref() else {
+            return RailBalance::Unknown("no fiat rail is configured".to_string());
+        };
+        let balance = rail.balance_cents().await;
+        if matches!(balance, RailBalance::Known(_)) {
+            if let Ok(mut slot) = self.balance_cache.lock() {
+                *slot = Some((balance.clone(), std::time::Instant::now()));
+            }
+        }
+        balance
+    }
+
+    /// Forgets the cached balance, so the next read asks the rail.
+    ///
+    /// Called after a payment: the number just changed by an amount this
+    /// process knows, and a stale reading is exactly what would let a second
+    /// payment through on a float that no longer covers it.
+    pub fn forget_fiat_balance(&self) {
+        if let Ok(mut slot) = self.balance_cache.lock() {
+            *slot = None;
+        }
+    }
+
+    /// What this coordinator calls itself in an alert and in `/health`.
+    pub fn instance_name(&self) -> String {
+        let configured = self.config.server.instance_name.trim();
+        if configured.is_empty() {
+            self.network_name().to_string()
+        } else {
+            configured.to_string()
+        }
     }
 
     /// The network string the page reads: `main` or `test`.
@@ -564,6 +865,10 @@ impl AppStateBuilder {
 
         let policy = config.policy()?;
         let rpc = config.rpc_config()?;
+        // Finding 6: the primary plus whatever fallbacks the operator listed.
+        // Always non-empty - `rpc_configs` leads with the primary - so the pool
+        // behaves exactly as the single client did when nothing is configured.
+        let nodes = crate::nodes::NodePool::new(config.rpc_configs()?);
 
         let l_priv = load_lp_key(&config)?;
         let secp = Secp256k1::new();
@@ -636,6 +941,7 @@ impl AppStateBuilder {
             quotes: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             policy,
             rpc,
+            nodes,
             scanner,
             http: reqwest::Client::new(),
             prices: crate::price::PriceCache::new(),
@@ -653,6 +959,13 @@ impl AppStateBuilder {
             secp,
             advancing: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             chain_head_cache: Arc::new(std::sync::Mutex::new(None)),
+            alerts: Arc::new(crate::alert::AlertHistory::default()),
+            rate_limiter: Arc::new(crate::ratelimit::RateLimiter::new()),
+            balance_cache: Arc::new(std::sync::Mutex::new(None)),
+            sweep_head: Arc::new(std::sync::Mutex::new(None)),
+            sweep_head_reading: Arc::new(tokio::sync::Mutex::new(())),
+            sweep_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            last_sweep_done: Arc::new(std::sync::Mutex::new(None)),
             paying: Arc::new(tokio::sync::Mutex::new(())),
         }))
     }

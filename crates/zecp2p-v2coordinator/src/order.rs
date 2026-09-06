@@ -31,6 +31,22 @@ pub enum Stage {
     Released,
     /// The pay deadline passed with nothing sent.
     Unpaid,
+    /// Opened, never funded, and left long enough that it stopped counting.
+    ///
+    /// Finding 4. Opening an order is free - a quote id, a curve point and a
+    /// served handle - and until this existed an unfunded one held capacity
+    /// against every intake guard for the length of a refund window, about 23
+    /// hours. Five of them locked a handle out for a day; two hundred closed
+    /// intake entirely; one at a given amount blocked every real order for that
+    /// amount to that handle. None of it cost the caller anything.
+    ///
+    /// Terminal and empty. Nothing was ever sent to the escrow - that is what
+    /// makes it expirable, and the check is the chain rather than a clock alone
+    /// - so there is nothing to refund and nothing to release. The record stays
+    /// readable so a user who funded late is told what happened rather than
+    /// getting a 404, and `still_owes_a_refund_check` keeps watching the
+    /// address in case coin arrives after all.
+    Expired,
     /// At or past `T`, and the user may refund.
     Refundable,
     /// The refund was broadcast.
@@ -49,6 +65,7 @@ impl Stage {
             Stage::Paid => "paid",
             Stage::Released => "released",
             Stage::Unpaid => "unpaid",
+            Stage::Expired => "expired",
             Stage::Refundable => "refundable",
             Stage::Refunded => "refunded",
             Stage::Failed => "failed",
@@ -64,7 +81,11 @@ impl Stage {
     pub fn is_open(self) -> bool {
         !matches!(
             self,
-            Stage::Released | Stage::Refunded | Stage::Failed | Stage::Unpaid
+            Stage::Released
+                | Stage::Refunded
+                | Stage::Failed
+                | Stage::Unpaid
+                | Stage::Expired
         )
     }
 
@@ -130,6 +151,17 @@ pub struct Announcement {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Order {
     pub order_id: String,
+    /// Which client opened this order, for the per-client standing bound.
+    ///
+    /// Finding 4. An address, and a weak identity: it is what is available at
+    /// this layer without asking users to hold an account. Never shown to
+    /// anyone - it is absent from every view - and used only to count how many
+    /// open orders one caller holds.
+    ///
+    /// Optional because orders written before this existed do not carry one,
+    /// and because a coordinator may be reached over a socket with no address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opened_by: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
     pub stage: Stage,
@@ -380,7 +412,14 @@ impl Order {
     /// there is nothing left to refund. `Refundable` is excluded because it is
     /// already the answer.
     pub fn still_owes_a_refund_check(&self) -> bool {
-        matches!(self.stage, Stage::Unpaid | Stage::Failed)
+        // `Expired` is here for the case the expiry itself cannot rule out:
+        // coin that arrives after the order stopped counting. Expiry is only
+        // written over an order with no funding and no sighting, so the common
+        // case leaves this false on the first evaluation and the order drops
+        // out of the sweep - which is the whole saving. An expired order that
+        // *does* acquire a funding outpoint later is a user owed their coin
+        // back, and it stays in the sweep until `T` puts it in front of them.
+        matches!(self.stage, Stage::Unpaid | Stage::Failed | Stage::Expired)
             && self.payment.is_none()
             && !self.stage.fiat_may_have_left()
             // Something has to be at the address. An order nobody ever funded
@@ -609,6 +648,7 @@ mod tests {
     fn an_order(id: &str) -> Order {
         Order {
             order_id: id.into(),
+            opened_by: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             stage: Stage::Locked,

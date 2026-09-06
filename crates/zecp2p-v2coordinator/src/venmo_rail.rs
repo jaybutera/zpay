@@ -22,7 +22,7 @@ use zecp2p_taker::auto::rail::FiatLeg;
 use zecp2p_taker::venmo::{SendMode, VenmoBrowser};
 
 use zecp2p_v2coordinator::config::{expand_home, CoordinatorConfig};
-use zecp2p_v2coordinator::state::{FiatRail, PaidFiat};
+use zecp2p_v2coordinator::state::{FiatRail, PaidFiat, RailBalance};
 
 pub struct VenmoRail {
     browser: VenmoBrowser,
@@ -170,6 +170,28 @@ impl FiatRail for VenmoRail {
             // one a later build would have written.
             note: Some(note),
         })
+    }
+
+    /// What the signed-in account has to spend. Finding 5.
+    ///
+    /// Everything that can go wrong here answers `Unknown` with the reason
+    /// rather than an error: this is called on the reservation path, and a
+    /// browser hiccup must not be read as an empty account. The coordinator's
+    /// `float.pay_when_balance_unknown` is where an operator says what an
+    /// unreadable balance should mean for *their* deployment.
+    async fn balance_cents(&self) -> RailBalance {
+        let tab = match self.browser.find_venmo_tab().await {
+            Ok(t) => t,
+            Err(e) => return RailBalance::Unknown(format!("no logged-in tab to read: {e}")),
+        };
+        match self.browser.available_balance_cents(&tab).await {
+            Ok(Some(cents)) => RailBalance::Known(cents),
+            Ok(None) => RailBalance::Unknown(
+                "the account page answered without a balance field this build recognises"
+                    .to_string(),
+            ),
+            Err(e) => RailBalance::Unknown(format!("{e:#}")),
+        }
     }
 
     async fn attest(&self, leg: &FiatLeg) -> Result<WireAttestation> {

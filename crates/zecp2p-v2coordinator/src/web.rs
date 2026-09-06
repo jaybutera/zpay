@@ -45,6 +45,18 @@ impl ApiError {
         }
     }
 
+    /// A caller who has asked too often. Finding 4.
+    ///
+    /// 429 rather than 400, because the request is well formed and the answer
+    /// is "not yet" rather than "no": a client that retries later succeeds, and
+    /// the status code is what tells it so.
+    pub fn too_many_requests(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: message.into(),
+        }
+    }
+
     pub fn unavailable(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
@@ -66,6 +78,15 @@ impl IntoResponse for ApiError {
 type ApiResult<T> = Result<T, ApiError>;
 
 pub fn router(state: Arc<AppState>) -> Router {
+    // Long enough for the slowest legitimate handler - `refund`, which
+    // broadcasts - under a node that is answering slowly, and far short of
+    // holding a connection indefinitely.
+    let request_timeout_seconds = state
+        .config
+        .timeouts
+        .node_call_seconds
+        .saturating_mul(2)
+        .max(30);
     let cors = if state.config.server.allowed_origins.is_empty() {
         tower_http::cors::CorsLayer::new()
     } else {
@@ -90,12 +111,284 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/escrow/orders/{order_id}", get(read_order))
         .route("/escrow/orders/{order_id}/presign", post(presign))
         .route("/escrow/orders/{order_id}/refund", post(refund))
+        // Finding 4: no route had a request timeout, so a handler that blocked
+        // on a node call under a rate limit held a connection for as long as
+        // the node took. The budget is generous - `refund` broadcasts, and a
+        // user's refund is the last thing that should be cut short - and its
+        // job is to bound the pathological case rather than the slow one.
+        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            StatusCode::SERVICE_UNAVAILABLE,
+            std::time::Duration::from_secs(request_timeout_seconds),
+        ))
+        // A body bigger than this is not a request this service takes: the
+        // largest thing any route accepts is a raw transaction.
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(1 << 20))
         .layer(cors)
         .with_state(state)
 }
 
-async fn health() -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "ok": true }))
+/// What this coordinator can actually do right now.
+///
+/// Finding 7: this returned `{"ok":true}` unconditionally, so the page's own
+/// indicator read "responding" through every failure short of the process being
+/// gone - a dead node, a signed-out rail, a sweep that had not run in an hour,
+/// a payment slot held since yesterday.
+///
+/// # The status codes
+///
+/// - **200 `ok`**: everything checked answered, and nothing is stale.
+/// - **200 `degraded`**: this coordinator is serving, and something an operator
+///   should know about is true - running on a fallback node endpoint, a low
+///   float, an unusable fiat rail. A user can still open and fund an order, and
+///   still refund one, so this is deliberately not an error: a monitor that
+///   pages on 200-vs-not still hears about it through the body.
+/// - **503 `unhealthy`**: something users depend on is not working. No node
+///   answers, or no sweep has completed in `alerts.sweep_age_minutes`, which
+///   means nothing is noticing funding, checking deadlines or offering refunds.
+///
+/// # Why it costs a node call
+///
+/// The node read is the cached one, refreshed once per sweep, so polling this
+/// does not multiply calls against a provider. A cached head that has gone
+/// stale is itself the signal: it means the sweep is not refreshing it.
+async fn health(State(state): State<Arc<AppState>>) -> Response {
+    let mut checks = serde_json::Map::new();
+    let mut unhealthy: Vec<String> = Vec::new();
+    let mut degraded: Vec<String> = Vec::new();
+
+    // The node. Cached, for the reason above.
+    match state.chain_head().await {
+        Ok((height, branch)) => {
+            checks.insert(
+                "node".into(),
+                serde_json::json!({
+                    "ok": true,
+                    "height": height,
+                    "branch_id": format!("{branch:#x}"),
+                    "endpoint": crate::nodes::redact(&state.nodes.current().url),
+                    "on_fallback": state.nodes.on_fallback(),
+                    "endpoints_configured": state.nodes.len(),
+                }),
+            );
+            if state.nodes.on_fallback() {
+                degraded.push("node calls are going to a fallback endpoint".into());
+            }
+        }
+        Err(e) => {
+            checks.insert(
+                "node".into(),
+                serde_json::json!({
+                    "ok": false,
+                    "error": format!("{e:#}"),
+                    "endpoints_configured": state.nodes.len(),
+                }),
+            );
+            unhealthy.push("no Zcash node endpoint answered".into());
+        }
+    }
+
+    // The sweep. Nothing else notices a wedged one: it leaves no log line.
+    let sweep_limit = state.config.alerts.sweep_age_minutes;
+    match state.since_last_sweep() {
+        Some(since) => {
+            let minutes = since.as_secs() / 60;
+            let stale = sweep_limit > 0 && minutes >= sweep_limit;
+            checks.insert(
+                "sweep".into(),
+                serde_json::json!({
+                    "ok": !stale,
+                    "minutes_since_last": minutes,
+                    "alert_after_minutes": sweep_limit,
+                }),
+            );
+            if stale {
+                unhealthy.push(format!("no sweep has completed in {minutes} minutes"));
+            }
+        }
+        None => {
+            // Starting up. Not a failure: the first sweep has not run yet.
+            checks.insert(
+                "sweep".into(),
+                serde_json::json!({ "ok": true, "minutes_since_last": null, "note": "no sweep has completed yet" }),
+            );
+        }
+    }
+
+    // The fiat rail. Asked whether it could pay, which is what `preflight`
+    // answers; nothing here is specific to any one rail.
+    match state.fiat.as_ref() {
+        Some(rail) => {
+            let budget = std::time::Duration::from_secs(
+                state.config.timeouts.node_call_seconds.max(1),
+            );
+            match tokio::time::timeout(budget, rail.preflight()).await {
+                Ok(Ok(())) => {
+                    checks.insert("fiat_rail".into(), serde_json::json!({ "ok": true }));
+                }
+                Ok(Err(e)) => {
+                    checks.insert(
+                        "fiat_rail".into(),
+                        serde_json::json!({ "ok": false, "error": format!("{e:#}") }),
+                    );
+                    // Degraded, not unhealthy. A user can still open, fund and
+                    // refund an order; what they cannot get is paid, and their
+                    // escrow comes back to them at T if this does not clear.
+                    degraded.push("the fiat rail cannot pay right now".into());
+                }
+                Err(_) => {
+                    checks.insert(
+                        "fiat_rail".into(),
+                        serde_json::json!({
+                            "ok": false,
+                            "error": format!("the rail did not answer within {} s", budget.as_secs()),
+                        }),
+                    );
+                    degraded.push("the fiat rail did not answer a health check".into());
+                }
+            }
+
+            // The float. Reported whenever the rail can say, so an operator
+            // reads a number rather than inferring one from refusals.
+            match state.fiat_balance_cents().await {
+                crate::state::RailBalance::Known(cents) => {
+                    let threshold = state.config.float.low_balance_cents;
+                    let low = threshold > 0 && cents < threshold;
+                    checks.insert(
+                        "fiat_float".into(),
+                        serde_json::json!({
+                            "ok": !low,
+                            "balance_cents": cents,
+                            "alert_below_cents": threshold,
+                            "reserve_cents": state.config.float.reserve_cents,
+                        }),
+                    );
+                    if low {
+                        degraded.push("the fiat float is under the configured threshold".into());
+                    }
+                }
+                crate::state::RailBalance::Unknown(why) => {
+                    // Not a failure. A rail with no balance concept is a
+                    // perfectly good rail; this only says nobody can report it.
+                    checks.insert(
+                        "fiat_float".into(),
+                        serde_json::json!({ "ok": true, "balance_cents": null, "why": why }),
+                    );
+                }
+            }
+        }
+        None => {
+            checks.insert(
+                "fiat_rail".into(),
+                serde_json::json!({ "ok": true, "note": "no fiat rail is configured" }),
+            );
+        }
+    }
+
+    // The journal: what holds the payment slot, and for how long.
+    match state.sweep_journal().await {
+        Ok(records) => {
+            let now = chrono::Utc::now();
+            let mut oldest: Option<(String, i64, String)> = None;
+            let mut needs_operator = 0usize;
+            for r in records.iter() {
+                if matches!(
+                    r.state,
+                    zecp2p_taker::auto::journal::FillState::NeedsOperator
+                ) {
+                    needs_operator += 1;
+                }
+                if !r.state.is_open() {
+                    continue;
+                }
+                let age = (now - r.updated_at).num_minutes();
+                if oldest.as_ref().is_none_or(|(_, a, _)| age > *a) {
+                    oldest = Some((r.work_id().to_string(), age, format!("{:?}", r.state)));
+                }
+            }
+            let limit = i64::try_from(state.config.alerts.slot_age_minutes).unwrap_or(i64::MAX);
+            let held_too_long = state.config.alerts.slot_age_minutes > 0
+                && oldest.as_ref().is_some_and(|(_, age, _)| *age >= limit);
+            checks.insert(
+                "payment_slot".into(),
+                serde_json::json!({
+                    "ok": !held_too_long && needs_operator == 0,
+                    "held_by": oldest.as_ref().map(|(w, _, _)| w.clone()),
+                    "held_state": oldest.as_ref().map(|(_, _, s)| s.clone()),
+                    "held_minutes": oldest.as_ref().map(|(_, a, _)| *a),
+                    "alert_after_minutes": state.config.alerts.slot_age_minutes,
+                    "needs_operator": needs_operator,
+                }),
+            );
+            if needs_operator > 0 {
+                degraded.push(format!(
+                    "{needs_operator} fill(s) need a person before the slot they hold is free"
+                ));
+            } else if held_too_long {
+                degraded.push("the payment slot has been held longer than a trade takes".into());
+            }
+        }
+        Err(e) => {
+            checks.insert(
+                "payment_slot".into(),
+                serde_json::json!({ "ok": false, "error": format!("{e:#}") }),
+            );
+            degraded.push("the fill journal could not be read".into());
+        }
+    }
+
+    // Orders paid but not released: the LP's money is out with nothing held
+    // against it, and there is no automatic exit.
+    let stalled: Vec<serde_json::Value> = state
+        .store
+        .open_orders()
+        .into_iter()
+        .filter(|o| o.stage == Stage::Paid)
+        .map(|o| {
+            serde_json::json!({
+                "order_id": o.order_id,
+                "minutes": (chrono::Utc::now() - o.updated_at).num_minutes(),
+            })
+        })
+        .collect();
+    let paid_limit = i64::try_from(state.config.alerts.paid_age_minutes).unwrap_or(i64::MAX);
+    let paid_stall = state.config.alerts.paid_age_minutes > 0
+        && stalled
+            .iter()
+            .any(|o| o["minutes"].as_i64().unwrap_or(0) >= paid_limit);
+    checks.insert(
+        "paid_orders".into(),
+        serde_json::json!({
+            "ok": !paid_stall,
+            "awaiting_release": stalled,
+            "alert_after_minutes": state.config.alerts.paid_age_minutes,
+        }),
+    );
+    if paid_stall {
+        degraded.push("an order has been paid without releasing for longer than expected".into());
+    }
+
+    let (status, verdict) = if !unhealthy.is_empty() {
+        (StatusCode::SERVICE_UNAVAILABLE, "unhealthy")
+    } else if !degraded.is_empty() {
+        (StatusCode::OK, "degraded")
+    } else {
+        (StatusCode::OK, "ok")
+    };
+
+    let body = serde_json::json!({
+        // Kept, and kept meaning what it used to: the page reads it, and a
+        // page against an older or newer coordinator should not break on it.
+        // `false` now actually happens.
+        "ok": status == StatusCode::OK,
+        "status": verdict,
+        "instance": state.instance_name(),
+        "network": state.network_name(),
+        "build": crate::version::as_json(),
+        "problems": unhealthy.iter().chain(degraded.iter()).collect::<Vec<_>>(),
+        "checks": serde_json::Value::Object(checks),
+    });
+
+    (status, Json(body)).into_response()
 }
 
 /// The USD-per-ZEC rate a quote is built on, spread already applied.
@@ -246,8 +539,83 @@ struct DestinationRequest {
 
 async fn open_order(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<OpenOrderRequest>,
+    // Read out of the request's extensions rather than through the
+    // `ConnectInfo` extractor. The extractor is a hard requirement: a request
+    // that arrives without connection info - which is every request a test
+    // drives through `oneshot`, and any future path that is not a TCP listener
+    // - fails to extract and the route stops existing. Reading the extension
+    // makes the address optional, and `client_key` already has a rule for
+    // having none.
+    request: axum::extract::Request,
 ) -> ApiResult<Json<view::OrderView>> {
+    let headers = request.headers().clone();
+    let connect = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|c| c.0.ip());
+    let body: OpenOrderRequest = {
+        let (_, body) = request.into_parts();
+        let bytes = axum::body::to_bytes(body, 1 << 20)
+            .await
+            .map_err(|_| ApiError::bad_request("that request body could not be read"))?;
+        serde_json::from_slice(&bytes)
+            .map_err(|e| ApiError::bad_request(format!("that request body is not the shape this endpoint takes: {e}")))?
+    };
+    // Finding 4: the door, before anything is looked up or called out to.
+    //
+    // Ahead of every other check on purpose. A refused request still costs a
+    // quote lookup, a curator call and a scan of the store, so the cheapest
+    // possible refusal has to come first or the limit is protecting the
+    // expensive work with expensive work.
+    let client = crate::ratelimit::client_key(
+        connect,
+        state
+            .config
+            .limits
+            .client_ip_header
+            .as_deref()
+            .and_then(|h| headers.get(h))
+            .and_then(|v| v.to_str().ok()),
+        state.config.limits.client_ip_header.is_some(),
+    );
+    match state.rate_limiter.check(
+        &client,
+        state.config.limits.open_rate_per_client,
+        state.config.limits.open_rate_global,
+        std::time::Duration::from_secs(state.config.limits.rate_window_seconds.max(1)),
+    ) {
+        crate::ratelimit::LimitVerdict::Allowed => {}
+        crate::ratelimit::LimitVerdict::TooManyRequests { retry_after_seconds } => {
+            return Err(ApiError::too_many_requests(format!(
+                "That is more orders than zpay opens for one caller at a time. Try again in \
+                 {retry_after_seconds} seconds."
+            )));
+        }
+        crate::ratelimit::LimitVerdict::ServiceBusy { retry_after_seconds } => {
+            return Err(ApiError::too_many_requests(format!(
+                "zpay is opening more orders than it can watch right now. Try again in \
+                 {retry_after_seconds} seconds."
+            )));
+        }
+        crate::ratelimit::LimitVerdict::TooManyOpenOrders { held, limit } => {
+            return Err(ApiError::bad_request(format!(
+                "You already have {held} escrows open, and zpay watches {limit} at a time \
+                 for one caller. Fund or let those expire before opening another."
+            )));
+        }
+    }
+
+    let per_client = state.config.limits.max_open_per_client;
+    if per_client > 0 {
+        let held = state.store.open_for_client(&client);
+        if held >= per_client {
+            return Err(ApiError::bad_request(format!(
+                "You already have {held} escrows open, and zpay watches {per_client} at a \
+                 time for one caller. Fund or let those expire before opening another."
+            )));
+        }
+    }
+
     if !body.destination.rail.is_empty() && body.destination.rail != "venmo" {
         return Err(ApiError::bad_request("This coordinator only serves Venmo."));
     }
@@ -321,7 +689,7 @@ async fn open_order(
     //
     // Written as one fallible block rather than a put-back at each refusal, so
     // the next refusal added here cannot forget one.
-    let opened = open_order_with_quote(&state, &body, handle, quote.clone()).await;
+    let opened = open_order_with_quote(&state, &body, handle, quote.clone(), &client).await;
     let (order, height) = match opened {
         Ok(opened) => opened,
         Err(e) => {
@@ -355,6 +723,7 @@ async fn open_order_with_quote(
     body: &OpenOrderRequest,
     handle: String,
     quote: crate::order::Quote,
+    client: &str,
 ) -> Result<(Order, u32), ApiError> {
     let u_pub_raw = hex::decode(body.u_pub.trim())
         .map_err(|_| ApiError::bad_request("The key this page sent is not hex."))?;
@@ -426,6 +795,7 @@ async fn open_order_with_quote(
 
     let order = Order {
         order_id: crate::new_id("esc"),
+        opened_by: Some(client.to_string()),
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
         stage: Stage::AwaitingZec,
@@ -540,6 +910,16 @@ async fn presign(
     Path(order_id): Path<String>,
     Json(body): Json<PresignRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    // Finding 4: does this order exist, before a lock is minted for its id?
+    // The lock map is keyed on a caller-supplied string, so taking the lock
+    // first meant a request naming an id that had never existed left a
+    // permanent entry behind. The real read happens under the lock below; this
+    // one only decides whether to take a lock at all, so a race that creates
+    // the order between the two costs nothing but a retry.
+    if state.store.get(&order_id).is_none() {
+        return Err(ApiError::not_found("no such order"));
+    }
+
     // The same lock the driver takes. Two pre-signatures arriving together
     // would both read `needs_presignature`, both pass, and both spawn a
     // settlement task; the second would then be refused by the payment slot,
@@ -636,6 +1016,12 @@ async fn refund(
     Path(order_id): Path<String>,
     Json(body): Json<RefundRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    // Existence first, for the reason `presign` checks it first: the lock map
+    // is keyed on a caller-supplied id. Finding 4.
+    if state.store.get(&order_id).is_none() {
+        return Err(ApiError::not_found("no such order"));
+    }
+
     // Held across the whole handler, so a refund cannot interleave with the
     // settlement path deciding to pay the same escrow.
     let lock = state.order_lock(&order_id).await;
@@ -681,7 +1067,15 @@ async fn refund(
     // A refund is only due once the escrow is past `T` and unsettled. Outside
     // those stages this endpoint has nothing to broadcast, and answering
     // anyway is what let a caller drive an arbitrary order to `refunded`.
-    if !matches!(order.stage, Stage::Refundable | Stage::Unpaid | Stage::Failed) {
+    // `Expired` is here for the same reason `Unpaid` is: an order that stopped
+    // counting toward intake can still have coin at its address - somebody who
+    // funded late - and that coin is the user's. The checks above still apply,
+    // and the escrow's own timeout branch still decides whether the refund is
+    // spendable, so this widens who may ask rather than what they may get.
+    if !matches!(
+        order.stage,
+        Stage::Refundable | Stage::Unpaid | Stage::Failed | Stage::Expired
+    ) {
         return Err(ApiError::bad_request(format!(
             "this escrow is not refundable yet (it is {}). Your key can spend the timeout \
              branch from block {} and the page will offer it then.",
@@ -731,12 +1125,12 @@ async fn refund(
         }
     }
 
+    // Fails over: a user's refund must not be lost because one provider is
+    // down, and the pool only moves on when a node is unreachable - a node that
+    // *rejected* the transaction has answered, and asking another until one
+    // accepts is how a transaction gets broadcast twice.
     let txid = state
-        .with_chain(move |chain| {
-            chain
-                .broadcast(&raw)
-                .map_err(|e| anyhow::anyhow!("{e}"))
-        })
+        .with_chain(move |chain| chain.broadcast(&raw))
         .await
         .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
 

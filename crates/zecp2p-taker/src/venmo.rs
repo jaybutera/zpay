@@ -502,6 +502,90 @@ impl VenmoBrowser {
         }
     }
 
+    /// What the signed-in account has available to spend, in cents.
+    ///
+    /// Finding 5: nothing read the balance, so running out of float did not
+    /// present as a refusal at intake. It presented as a payment that failed
+    /// partway through - the ambiguous state a person has to resolve.
+    ///
+    /// One same-origin authenticated read, from the page, with its cookies,
+    /// exactly as [`Self::session_is_authenticated`] and [`Self::resolve_payee`]
+    /// are. It moves nothing.
+    ///
+    /// # Reading the answer
+    ///
+    /// `/api/account` is the endpoint already proven to answer 200 signed in
+    /// and 401 signed out. Its body is not a documented interface, so this does
+    /// not depend on one field name: it walks the JSON for the first
+    /// balance-shaped number under a balance-shaped key, and reports that it
+    /// could not find one rather than guessing. A caller that gets `None` is
+    /// expected to treat it as "cannot say", not as "zero" - reading an empty
+    /// account into a real balance is the direction that spends money that is
+    /// not there, and reading a real balance as empty only stops trades.
+    ///
+    /// The value is taken as **dollars** when it has a decimal point or is
+    /// under a plausible cent threshold, and as cents when the field name says
+    /// cents. Both conventions appear in this body across account types, and
+    /// getting it wrong by 100x in the permissive direction is the expensive
+    /// mistake, so an ambiguous reading is refused rather than assumed.
+    pub async fn available_balance_cents(&self, tab: &CdpTab) -> Result<Option<u64>> {
+        const PROBE: &str = r#"
+        (async () => {
+          try {
+            const r = await fetch('https://account.venmo.com/api/account', {
+              credentials: 'include',
+              headers: {'Accept': 'application/json'},
+            });
+            if (!r.ok) return JSON.stringify({error: 'status ' + r.status});
+            const body = await r.json();
+            // Walk for a balance-shaped key rather than pinning one path: the
+            // body is not a documented interface.
+            const wanted = /^(balance|availableBalance|available_balance|balanceInCents|balance_in_cents|spendableBalance|spendable_balance)$/i;
+            const found = [];
+            const seen = new Set();
+            const walk = (node, depth) => {
+              if (!node || typeof node !== 'object' || depth > 6) return;
+              if (seen.has(node)) return;
+              seen.add(node);
+              for (const [k, v] of Object.entries(node)) {
+                if (wanted.test(k) && (typeof v === 'number' || typeof v === 'string')) {
+                  found.push({key: k, value: String(v)});
+                } else if (v && typeof v === 'object') {
+                  walk(v, depth + 1);
+                }
+              }
+            };
+            walk(body, 0);
+            return JSON.stringify({found});
+          } catch (e) { return JSON.stringify({error: String(e)}); }
+        })()"#;
+
+        let value = self.evaluate(tab, PROBE).await?;
+        let raw = value
+            .get("result")
+            .and_then(|r| r.get("value"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let parsed: serde_json::Value = serde_json::from_str(raw)
+            .context("the balance probe did not answer with JSON")?;
+        if let Some(err) = parsed.get("error").and_then(|e| e.as_str()) {
+            anyhow::bail!("could not read the account balance: {err}");
+        }
+        let found = parsed
+            .get("found")
+            .and_then(|f| f.as_array())
+            .map(|a| a.as_slice())
+            .unwrap_or_default();
+        for entry in found {
+            let key = entry.get("key").and_then(|k| k.as_str()).unwrap_or("");
+            let value = entry.get("value").and_then(|v| v.as_str()).unwrap_or("");
+            if let Some(cents) = balance_to_cents(key, value) {
+                return Ok(Some(cents));
+            }
+        }
+        Ok(None)
+    }
+
     /// Ask the page for its own current URL.
     async fn current_url(&self, tab: &CdpTab) -> Result<String> {
         let value = self.evaluate(tab, "location.href").await?;
@@ -1704,6 +1788,56 @@ pub fn usdc_to_dollars(amount: alloy::primitives::U256) -> String {
     let cents = units.div_ceil(10_000);
 
     format!("{}.{:02}", cents / 100, cents % 100)
+}
+
+/// One balance field, as cents, or `None` when it cannot be read confidently.
+///
+/// The two conventions - dollars as a decimal string, cents as an integer -
+/// cannot always be told apart from the value alone: `500` is $5.00 in one and
+/// $500.00 in the other. So the *key* decides, and a key that does not say is
+/// read as dollars only when the value carries a decimal point, which no cent
+/// count does.
+///
+/// Refusing is the safe answer. A balance read too high lets a payment start
+/// against money that is not there, which ends in the ambiguous mid-payment
+/// failure this whole check exists to prevent; a balance that cannot be read
+/// makes the coordinator apply its configured policy for "unknown", which the
+/// operator chose.
+pub fn balance_to_cents(key: &str, value: &str) -> Option<u64> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let key_says_cents = key.to_ascii_lowercase().contains("cent");
+
+    if key_says_cents {
+        // An integer count of cents. A decimal point here means the field is
+        // not what its name says, so it is refused rather than rounded.
+        return value.parse::<u64>().ok();
+    }
+
+    // Dollars. A bare integer is still dollars - `"12"` is $12.00 - because
+    // that is what a dollars field holds; the cents case was handled above.
+    let cleaned: String = value
+        .chars()
+        .filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
+        .collect();
+    if cleaned.starts_with('-') {
+        // A negative balance is not a float to spend from.
+        return Some(0);
+    }
+    let dollars: f64 = cleaned.parse().ok()?;
+    if !dollars.is_finite() || dollars < 0.0 {
+        return None;
+    }
+    // Rounded rather than truncated: the number is a decimal string that has
+    // already been through a float, and truncating $10.00 read as 9.999999 to
+    // $9.99 understates the float by a cent every time.
+    let cents = (dollars * 100.0).round();
+    if cents > u64::MAX as f64 {
+        return None;
+    }
+    Some(cents as u64)
 }
 
 /// Whether the loaded pay page pays exactly the account we resolved, and nobody

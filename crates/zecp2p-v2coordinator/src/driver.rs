@@ -161,7 +161,84 @@ async fn watch_funding(state: &Arc<AppState>, order: Order) -> Result<()> {
     if order.funding.is_some() {
         return advance_funded(state, order).await;
     }
+    if let Some(expired) = expire_if_never_funded(state, &order).await? {
+        return expired;
+    }
     find_funding(state, order).await
+}
+
+/// Retires an order nobody ever sent coin to. Finding 4.
+///
+/// Opening an order costs a caller nothing - a free quote id, a curve point and
+/// a served handle - and until this existed it held capacity against every
+/// intake guard until its refund height, about 23 hours later. Five requests
+/// locked a handle out for a day. Two hundred closed intake entirely. One
+/// request at a given amount blocked every real order for that amount to that
+/// handle, because two escrows to one handle for the same cents are the pair
+/// the feed search cannot tell apart.
+///
+/// # What it refuses to expire
+///
+/// Only an order with **no funding outpoint and no mempool sighting**, which is
+/// to say one where nothing has ever been observed moving toward the escrow.
+/// Anything else is a user with coin in flight, and taking their order out from
+/// under them would be the expensive kind of wrong.
+///
+/// The age is measured from when the order was opened, not from the last sweep,
+/// so a coordinator that was down does not grant an extension it did not mean
+/// to.
+///
+/// # Why it is a stage and not a filter
+///
+/// Writing `Expired` drops the order out of `open_orders`, `awaiting_count`,
+/// `awaiting_for_handle` and the duplicate-amount guard in one write, because
+/// every one of those is keyed on `Stage::is_open`. A filter would have had to
+/// be added to each of them and would have been missed from the next one.
+///
+/// The record is not deleted. A user who funded late gets an answer rather than
+/// a 404, the refund endpoint still serves them, and
+/// `still_owes_a_refund_check` puts the order back in the sweep if a funding
+/// outpoint ever appears.
+///
+/// Returns `Some` when the order was expired and there is nothing further to do
+/// this sweep.
+async fn expire_if_never_funded(
+    state: &Arc<AppState>,
+    order: &Order,
+) -> Result<Option<Result<()>>> {
+    let minutes = state.config.limits.unfunded_order_minutes;
+    if minutes == 0 {
+        return Ok(None);
+    }
+    if order.stage != Stage::AwaitingZec {
+        // Past `AwaitingZec` something has been seen. Only the stage where
+        // nothing has is expirable.
+        return Ok(None);
+    }
+    if order.funding.is_some() || order.mempool_announced_txid.is_some() {
+        return Ok(None);
+    }
+    let age = chrono::Utc::now() - order.created_at;
+    if age.num_minutes() < i64::try_from(minutes).unwrap_or(i64::MAX) {
+        return Ok(None);
+    }
+
+    let mut expired = order.clone();
+    expired.stage = Stage::Expired;
+    expired.reason = Some(format!(
+        "nothing was sent to this escrow within {minutes} minutes of it being opened, so it \
+         stopped holding a place in the queue. Nothing was lost: the address was never \
+         funded. Open a new order to trade."
+    ));
+    expired.touch();
+    state.store.put(&expired)?;
+    tracing::info!(
+        order = %order.order_id,
+        handle = %order.handle,
+        age_minutes = age.num_minutes(),
+        "expiring an order nobody funded; it no longer counts against intake"
+    );
+    Ok(Some(Ok(())))
 }
 
 /// Walks blocks for an output paying this escrow, for an order with none yet.
@@ -334,12 +411,9 @@ async fn advance_funded(state: &Arc<AppState>, mut order: Order) -> Result<()> {
     let txid = funding.txid;
     let vout = funding.vout;
     let utxo = state
-        .with_chain(move |chain| {
-            chain
-                .utxo(&txid, vout)
-                .map_err(|e| anyhow::anyhow!("could not read the funding output: {e}"))
-        })
-        .await?;
+        .with_chain(move |chain| chain.utxo(&txid, vout))
+        .await
+        .context("could not read the funding output")?;
 
     let Some(utxo) = utxo else {
         // Seen by the scanner but not by `gettxout`: either in the mempool
@@ -598,7 +672,7 @@ async fn check_refund_deadline_only(state: &Arc<AppState>, mut order: Order) -> 
         }
     }
 
-    let (height, _) = match state.chain_head_uncached().await {
+    let (height, _) = match state.head_for_this_sweep().await {
         Ok(h) => h,
         Err(e) => {
             tracing::debug!(error = %e, "could not read the height for a refund deadline check");
@@ -680,13 +754,7 @@ async fn settle_sighted_funding(state: &Arc<AppState>, order: &mut Order) -> Sig
         // can add - the caller's own guards decide.
         return SightedFunding::InEscrow;
     };
-    let utxo = state
-        .with_chain(move |chain| {
-            chain
-                .utxo(&txid, vout)
-                .map_err(|e| anyhow::anyhow!("could not read the sighted output: {e}"))
-        })
-        .await;
+    let utxo = state.with_chain(move |chain| chain.utxo(&txid, vout)).await;
     match utxo {
         Ok(Some(utxo)) => {
             tracing::info!(
@@ -746,16 +814,18 @@ async fn settle_sighted_funding(state: &Arc<AppState>, order: &mut Order) -> Sig
 }
 
 async fn check_deadlines(state: &Arc<AppState>, mut order: Order) -> Result<()> {
-    // Uncached. This decides when a user is *offered their refund*, and it is
-    // the one caller where a head that is merely recent is not good enough: a
-    // height read before the chain passed `T` keeps an order Locked when it has
-    // become Refundable, and a time-based cache cannot tell those apart.
+    // Not the time-based cache. This decides when a user is *offered their
+    // refund*, and a height read before the chain passed `T` keeps an order
+    // Locked when it has become Refundable - a distinction a "within N seconds"
+    // cache cannot make.
     //
-    // The sweep-wide saving is taken in `advance_all` instead, which reads the
-    // head once and hands it down. That is an explicit "this is the head for
-    // this pass" rather than "a head from within N seconds", so it cannot go
-    // stale behind a caller's back.
-    let (height, _) = match state.chain_head_uncached().await {
+    // `head_for_this_sweep` is the sweep-wide saving the comment here used to
+    // promise via `advance_all`, a function that did not exist: the head is
+    // read once per sweep pass and shared by every order in that pass, so the
+    // value is explicitly "the head for this pass" rather than a head of some
+    // age. Outside a sweep it reads the node, which is what the refund endpoint
+    // and `presign`'s own advance need. Finding 6.
+    let (height, _) = match state.head_for_this_sweep().await {
         Ok(h) => h,
         Err(e) => {
             tracing::debug!(error = %e, "could not read the height for a deadline check");
@@ -989,6 +1059,48 @@ async fn settle(state: &Arc<AppState>, mut order: Order) -> Result<()> {
     }
     let mut order = order_now;
 
+    // Finding 5: is there money to pay with?
+    //
+    // Asked **before** the slot is taken, which is the whole point. Running out
+    // of float used to present as a payment that failed partway through - the
+    // ambiguous state a person has to resolve, holding the payment slot while
+    // they do. Asked here it presents as this order waiting, with the slot
+    // never taken and every other order still able to use it.
+    //
+    // Nothing about which rail or which account: the rail reports cents, the
+    // reserve is configured, and an LP whose rail cannot report a balance is
+    // covered by `float.pay_when_balance_unknown`.
+    let needed = order
+        .quote
+        .net_cents
+        .saturating_add(state.config.float.reserve_cents);
+    let balance = state.fiat_balance_cents().await;
+    if !balance.covers(needed, state.config.float.pay_when_balance_unknown) {
+        let have = balance.cents().unwrap_or(0);
+        tracing::warn!(
+            order = %order.order_id,
+            balance_cents = have,
+            needed_cents = needed,
+            "not reserving the payment slot: the fiat float will not cover this payment \
+             plus the configured reserve. The order waits and the escrow refunds at T if \
+             the float does not arrive first."
+        );
+        crate::alert::fire(state, crate::alert::Alert::float_exhausted(have, needed)).await;
+        // Still run the deadline check, for the same reason a held slot does
+        // (R5-d): an order past `T` must reach `Refundable` however long it has
+        // been waiting for something else.
+        drop(_paying);
+        return check_deadlines(state, order).await;
+    }
+    if let Some(have) = balance.cents() {
+        let threshold = state.config.float.low_balance_cents;
+        if threshold > 0 && have < threshold {
+            // Fires while trades are still being served, so the LP tops up
+            // before the refusals start rather than after.
+            crate::alert::fire(state, crate::alert::Alert::low_balance(have, threshold)).await;
+        }
+    }
+
     // The one payment slot: read and claimed under one file lock, so the
     // window a second daemon could read through does not exist. `take` writes a
     // `Seen` line, which holds the slot without asserting money may have moved
@@ -1070,7 +1182,7 @@ async fn settle(state: &Arc<AppState>, mut order: Order) -> Result<()> {
     let check = watched.clone();
     let terms = watched.terms.clone();
     let payable = state
-        .with_chain(move |chain| {
+        .with_chain_any(move |chain| {
             // The funding output, re-read. `lp::evaluate` below does this too,
             // via `chain.utxo`, and refuses on a script or amount mismatch or
             // insufficient depth - so a reorg that unwound the funding between
@@ -1176,7 +1288,24 @@ async fn settle(state: &Arc<AppState>, mut order: Order) -> Result<()> {
         }
     };
 
-    let paid = match fiat.pay(&leg).await {
+    // Finding 3: bounded, but generously. Interrupting a browser mid-payment
+    // produces exactly the ambiguity the `Paying` line above exists for -
+    // money that may or may not have moved - so this timeout is set longer
+    // than the rail's own internal waits. The rail's specific error wins the
+    // race with it, and the operator gets a reason rather than "timed out".
+    //
+    // What it stops is the unbounded case: a wedged page holding this task,
+    // and with it the payment slot, for as long as the page felt like it.
+    let pay_budget = std::time::Duration::from_secs(state.config.timeouts.pay_seconds.max(1));
+    let pay_result = match tokio::time::timeout(pay_budget, fiat.pay(&leg)).await {
+        Ok(r) => r,
+        Err(_) => Err(anyhow::anyhow!(
+            "the fiat rail did not answer within {} s. This is the ambiguous case: the \
+             payment may or may not have left. Read the feed before anything else runs.",
+            pay_budget.as_secs()
+        )),
+    };
+    let paid = match pay_result {
         Ok(p) => p,
 
         // The rail refused before it filled the form in. Nothing was typed and
@@ -1342,6 +1471,10 @@ async fn settle(state: &Arc<AppState>, mut order: Order) -> Result<()> {
         );
     }
     tracing::info!(order = %order.order_id, cents = paid.cents, "the dollars have gone");
+    // The float just moved by an amount this process knows. A cached reading
+    // from before it is exactly what would let the next order through on money
+    // that is no longer there.
+    state.forget_fiat_balance();
 
     // The payment slot is released here, by dropping the guard, and not before:
     // the order is `Paid` on disk and the journal line is written, so any other
@@ -1376,10 +1509,24 @@ async fn finish_payment(state: &Arc<AppState>, mut order: Order) -> Result<()> {
     let watched = watched_escrow(state, &order)?;
     let leg = watched.fiat_leg(state.config.quote.max_payment_cents)?;
 
-    let attestation = fiat
-        .attest(&leg)
-        .await
-        .context("the payment could not be attested; the fiat has already left")?;
+    // Finding 3: the enclave is a `node` child process that was awaited with no
+    // timeout at all, inside the sweep. Safe to cut short, unlike the payment
+    // above: attestation is a read, no money moves either way, and the next
+    // sweep re-enters. The order stays `Paid` on disk meanwhile, which is the
+    // truth about it.
+    let attest_budget =
+        std::time::Duration::from_secs(state.config.timeouts.attest_seconds.max(1));
+    let attestation = match tokio::time::timeout(attest_budget, fiat.attest(&leg)).await {
+        Ok(r) => r.context("the payment could not be attested; the fiat has already left")?,
+        Err(_) => {
+            anyhow::bail!(
+                "attesting this payment did not finish within {} s, so this attempt was cut \
+                 off. The dollars have gone and the order stays paid; the next sweep tries \
+                 again.",
+                attest_budget.as_secs()
+            )
+        }
+    };
 
     let canonical = order
         .canonical_terms()
@@ -1471,16 +1618,51 @@ async fn broadcast_release(
         .map_err(|_| anyhow::anyhow!("this escrow's refund height is not a block height"))?;
     let policy = state.policy;
 
+    // Finding 3: one attempt, bounded. The loop below retries a node that
+    // cannot judge the transaction yet, sleeping 15 s between tries, until the
+    // escrow's own broadcast deadline - which is tens of minutes away, and it
+    // did all of that inside the sweep under this order's lock.
+    //
+    // The budget is spent through the sleep hook rather than by cancelling the
+    // blocking task, because a cancelled `spawn_blocking` keeps running: the
+    // thread is not interruptible and the broadcast would carry on unobserved.
+    // Stopping at the sleep is a stop the loop actually honours, and it stops
+    // between attempts rather than during one, so no broadcast is abandoned
+    // half-sent.
+    //
+    // Giving up here does not give up on the release. The order is `Paid` on
+    // disk with no release txid, so the next sweep re-enters `finish_payment`
+    // and tries again, and the escrow's broadcast deadline still bounds the
+    // whole effort the way it always did.
+    let attempt_budget =
+        std::time::Duration::from_secs(state.config.timeouts.broadcast_seconds.max(1));
     let txid = state
-        .with_chain(move |chain| {
-            zecp2p_escrow::lp::broadcast_release_until_deadline(
+        .with_chain_any(move |chain| {
+            let started = std::time::Instant::now();
+            let mut gave_up = false;
+            let out = zecp2p_escrow::lp::broadcast_release_until_deadline(
                 chain,
                 &policy,
                 refund_height,
                 &raw,
-                || std::thread::sleep(std::time::Duration::from_secs(15)),
-            )
-            .map_err(|e| anyhow::anyhow!("{e}"))
+                || {
+                    if started.elapsed() >= attempt_budget {
+                        gave_up = true;
+                        return false;
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(15));
+                    true
+                },
+            );
+            match out {
+                Ok(txid) => Ok(txid),
+                Err(e) if gave_up => Err(anyhow::anyhow!(
+                    "the release did not broadcast within {} s of trying; the node's last \
+                     word was: {e}. The order stays paid and the next sweep tries again.",
+                    attempt_budget.as_secs()
+                )),
+                Err(e) => Err(anyhow::anyhow!("{e}")),
+            }
         })
         .await;
 
@@ -1630,42 +1812,125 @@ pub fn wire_terms(order: &Order) -> Option<WireTerms> {
 
 /// Sweeps every open order on a timer.
 ///
-/// Each order is advanced on its own task. The sweep used to `await` them in
-/// turn, which meant one order driving a browser for two minutes held up the
-/// funding scan for every other order behind it in the list - including orders
-/// approaching `T` whose users were waiting to be told they could refund.
+/// Each order is advanced on its own task, at most `timeouts.sweep_concurrency`
+/// of them at once, and each task is bounded by `timeouts.order_advance_seconds`.
+///
+/// # What the bounds are for
 ///
 /// Concurrency here is safe because it is not concurrency over the things that
 /// must be serialised: `advance` takes the per-order lock, so one order is
 /// never advanced twice at once, and the payment slot in `slot.rs` is global,
 /// so only one order can be paying whatever the sweep does.
+///
+/// It is *bounded* because unbounded was its own failure. Every order in a
+/// sweep hits the node, and 200 of them arriving together is what a hosted
+/// provider answers with a 429 - whose backoff is minutes, taken inside the
+/// sweep. Finding 6.
+///
+/// And each task is bounded in time because several per-order paths could
+/// block for as long as they liked: a browser wait, a `node` child process with
+/// no timeout, a broadcast loop that retries until a deadline tens of minutes
+/// away. The watchdog does not make those paths safe on its own - `advance`
+/// puts its own, tighter timeout on each of them - it catches the path that has
+/// no specific bound at all, so a sweep can always start the next pass.
+/// Finding 3.
+///
+/// # Why the pass is still joined
+///
+/// The sweep waits for its tasks before the next tick. That is not the same
+/// wait finding 3 is about: with every money path individually bounded, a pass
+/// cannot outlast the watchdog, so joining it costs a known maximum rather than
+/// an unknown one. What finding 3 removed is the *unbounded* join - one wedged
+/// browser holding every other order's funding scan and deadline check for as
+/// long as the browser felt like it.
 pub async fn run(state: Arc<AppState>, interval: std::time::Duration) {
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         ticker.tick().await;
+        sweep_once(&state).await;
+    }
+}
 
-        // Refreshes the head the *page* serves, once per tick, so
-        // `/escrow/capabilities` and `/escrow/quote` are usually answered from
-        // a value this loop already paid for rather than each making the user
-        // wait on a node read. Deadline checks below deliberately do not use
-        // it; see `check_deadlines`.
-        if let Err(e) = state.refresh_chain_head().await {
-            tracing::debug!(error = %format!("{e:#}"), "could not refresh the head for this sweep");
-        }
+/// One sweep pass. Separated from the timer so a test can run exactly one.
+pub async fn sweep_once(state: &Arc<AppState>) {
+    let generation = state.begin_sweep();
+    let started = std::time::Instant::now();
 
-        let mut tasks = tokio::task::JoinSet::new();
-        for order in state.store.open_orders() {
-            let state = state.clone();
-            let id = order.order_id;
-            tasks.spawn(async move {
-                if let Err(e) = advance(&state, &id).await {
+    // Refreshes the head the *page* serves. `head_for_this_sweep` fills the
+    // same cache from its own read, so this is only for a pass with no orders
+    // in it at all.
+    if let Err(e) = state.refresh_chain_head().await {
+        tracing::debug!(error = %format!("{e:#}"), "could not refresh the head for this sweep");
+    }
+
+    let orders = state.store.open_orders();
+    let total = orders.len();
+    let limit = state.config.timeouts.sweep_concurrency.max(1);
+    let permits = Arc::new(tokio::sync::Semaphore::new(limit));
+    let watchdog = std::time::Duration::from_secs(
+        state.config.timeouts.order_advance_seconds.max(1),
+    );
+    let timed_out = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    let mut tasks = tokio::task::JoinSet::new();
+    for order in orders {
+        let state = state.clone();
+        let permits = permits.clone();
+        let timed_out = timed_out.clone();
+        let id = order.order_id;
+        tasks.spawn(async move {
+            // Acquired inside the task rather than before spawning, so the
+            // sweep's own loop never blocks: every order is queued at once and
+            // the semaphore decides how many run.
+            let Ok(_permit) = permits.acquire().await else {
+                return;
+            };
+            match tokio::time::timeout(watchdog, advance(&state, &id)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
                     tracing::warn!(order = %id, error = %format!("{e:#}"), "could not advance");
                 }
-            });
-        }
-        // Waited out before the next tick, so a stalled order cannot make the
-        // sweeps pile up on top of each other.
-        while tasks.join_next().await.is_some() {}
+                Err(_) => {
+                    // The watchdog. Everything with a specific bound has its
+                    // own, tighter one, so reaching this means a path with no
+                    // bound at all - which is a bug rather than a slow trade,
+                    // and is logged as one.
+                    //
+                    // Cancelling the future does not undo anything it did: the
+                    // steps that cost money write what they did before they do
+                    // it, and the next sweep re-enters from what is on disk.
+                    // What it does undo is the pass being held open.
+                    timed_out.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tracing::error!(
+                        order = %id,
+                        seconds = watchdog.as_secs(),
+                        "advancing this order hit the watchdog and was cut off. Nothing it \
+                         had already recorded is undone; the next sweep re-enters from \
+                         what is on disk. A path with no timeout of its own reached this."
+                    );
+                }
+            }
+        });
     }
+    while tasks.join_next().await.is_some() {}
+
+    state.end_sweep();
+    let elapsed = started.elapsed();
+    let stalled = timed_out.load(std::sync::atomic::Ordering::Relaxed);
+    tracing::debug!(
+        generation,
+        orders = total,
+        seconds = elapsed.as_secs(),
+        concurrency = limit,
+        "sweep finished"
+    );
+    if stalled > 0 {
+        crate::alert::fire(
+            state,
+            crate::alert::Alert::sweep_watchdog(stalled, watchdog.as_secs()),
+        )
+        .await;
+    }
+    crate::alert::scan(state).await;
 }

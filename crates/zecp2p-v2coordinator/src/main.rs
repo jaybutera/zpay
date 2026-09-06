@@ -37,6 +37,14 @@ struct Args {
     #[arg(long, default_value_t = 60)]
     poll_seconds: u64,
 
+    /// Print what build this is and exit.
+    ///
+    /// Finding 10: identifying a deployed binary meant `strings` for a symbol.
+    /// This is the same answer `/health` publishes and the same hash the deploy
+    /// script verifies, so all three agree by construction.
+    #[arg(long)]
+    version: bool,
+
     /// Settle with a simulated fiat leg instead of a browser and an enclave.
     ///
     /// Only exists in a build with `--features test-rails`. It reports a
@@ -58,6 +66,12 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    if args.version {
+        println!("{}", zecp2p_v2coordinator::version::describe());
+        println!("built_at_unix {}", zecp2p_v2coordinator::version::BUILD_TIME);
+        println!("{}", zecp2p_v2coordinator::version::STAMP);
+        return Ok(());
+    }
     let config = CoordinatorConfig::load(&args.config)
         .with_context(|| format!("could not load {}", args.config))?;
 
@@ -89,6 +103,7 @@ async fn main() -> Result<()> {
     let state = AppStateBuilder::new(config).with_fiat(fiat).build()?;
 
     tracing::info!(
+        build = %zecp2p_v2coordinator::version::describe(),
         network = state.network_name(),
         l_pub = %hex::encode(state.l_pub),
         payout = %state.config.lp.payout_address,
@@ -101,11 +116,13 @@ async fn main() -> Result<()> {
     // hear about now.
     // Uncached on purpose: this is the startup check that the node is actually
     // reachable, and a cache hit here would report a node nobody had asked.
-    let (height, branch) = state
-        .chain_head_uncached()
-        .await
-        .context("could not reach the Zcash node")?;
-    tracing::info!(height, branch = format!("{branch:#x}"), "node reachable");
+    let (height, branch) = wait_for_node(&state, args.check).await?;
+    tracing::info!(
+        height,
+        branch = format!("{branch:#x}"),
+        endpoints = state.nodes.len(),
+        "node reachable"
+    );
 
     let identity = state
         .with_attestor(|client| {
@@ -235,10 +252,82 @@ async fn main() -> Result<()> {
         .with_context(|| format!("could not bind {addr}"))?;
     tracing::info!(%addr, "listening");
 
-    axum::serve(listener, zecp2p_v2coordinator::web::router(state))
-        .await
-        .context("the server stopped")?;
+    // `into_make_service_with_connect_info` rather than the plain service, so
+    // the order-opening route can see who is calling. Without it the
+    // `ConnectInfo` extractor is missing at runtime and every request falls
+    // into one rate-limit bucket. Finding 4.
+    axum::serve(
+        listener,
+        zecp2p_v2coordinator::web::router(state)
+            .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
+    .context("the server stopped")?;
     Ok(())
+}
+
+/// Waits for a node rather than exiting on the first refusal. Finding 6.
+///
+/// The old behaviour exited, and the unit restarts, so a provider incident
+/// during a restart became a restart loop: every 15 s a process started, made
+/// its calls, waited out a rate limit and died. A coordinator that is not
+/// running does not offer anybody the refund they are owed, and every deadline
+/// it serves is tens of minutes wide, so waiting is strictly better than
+/// exiting for any wait shorter than those deadlines.
+///
+/// It still gives up eventually. `zec.startup_retry_seconds` at zero restores
+/// the old fail-fast behaviour, and `--check` never waits: that mode exists to
+/// answer a question now, and a check that blocks for ten minutes in a deploy
+/// script is a check nobody runs.
+async fn wait_for_node(
+    state: &Arc<zecp2p_v2coordinator::state::AppState>,
+    check_only: bool,
+) -> Result<(u32, u32)> {
+    let budget = std::time::Duration::from_secs(state.config.zec.startup_retry_seconds);
+    let started = std::time::Instant::now();
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        match state.chain_head_uncached().await {
+            Ok(head) => {
+                if attempt > 1 {
+                    tracing::info!(
+                        attempt,
+                        waited_seconds = started.elapsed().as_secs(),
+                        "the node answered; carrying on"
+                    );
+                }
+                return Ok(head);
+            }
+            Err(e) => {
+                if check_only || budget.is_zero() {
+                    return Err(e).context("could not reach the Zcash node");
+                }
+                if started.elapsed() >= budget {
+                    return Err(e).with_context(|| {
+                        format!(
+                            "no Zcash node answered in {} s across {} endpoint(s). Raise \
+                             zec.startup_retry_seconds, add a zec.fallback_rpc entry, or \
+                             fix the endpoint.",
+                            budget.as_secs(),
+                            state.nodes.len()
+                        )
+                    });
+                }
+                // Backs off to a minute rather than hammering an endpoint that
+                // may be rate-limiting, which is one of the ways it fails.
+                let wait = std::time::Duration::from_secs(u64::from(attempt.min(6)) * 10);
+                tracing::warn!(
+                    attempt,
+                    error = %format!("{e:#}"),
+                    retry_in_seconds = wait.as_secs(),
+                    budget_seconds = budget.as_secs(),
+                    "no Zcash node answered; waiting rather than exiting into a restart loop"
+                );
+                tokio::time::sleep(wait).await;
+            }
+        }
+    }
 }
 
 /// A rail that refuses to do anything, for a coordinator run without Venmo.

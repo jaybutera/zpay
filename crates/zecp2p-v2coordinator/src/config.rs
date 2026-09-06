@@ -31,10 +31,31 @@ pub struct CoordinatorConfig {
     pub zkp2p: Zkp2pConfig,
     #[serde(default)]
     pub attestation: AttestationConfig,
+    /// Per-order hard deadlines. Finding 3.
+    #[serde(default)]
+    pub timeouts: TimeoutConfig,
+    /// Intake bounds a stranger runs into. Finding 4.
+    #[serde(default)]
+    pub limits: LimitConfig,
+    /// What the rail must hold before this coordinator reserves. Finding 5.
+    #[serde(default)]
+    pub float: FloatConfig,
+    /// Where an operator hears about a stall. Finding 7.
+    #[serde(default)]
+    pub alerts: AlertConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ServerConfig {
+    /// What this coordinator calls itself in an alert.
+    ///
+    /// An LP may run more than one - a mainnet instance and a testnet one, or
+    /// two hosts - and an alert that does not say which one it came from is an
+    /// alert the operator has to go and identify. Configured rather than taken
+    /// from the hostname, because two coordinators on one host is the case that
+    /// needs telling apart. Empty falls back to the network name.
+    #[serde(default)]
+    pub instance_name: String,
     #[serde(default = "default_host")]
     pub host: String,
     #[serde(default = "default_port")]
@@ -114,6 +135,76 @@ pub struct ZecConfig {
     /// How far back a block scan will walk when an order is reopened.
     #[serde(default = "default_scan_lookback")]
     pub scan_lookback_blocks: u32,
+
+    /// Further endpoints to fall back to, in order, when `rpc_url` fails.
+    ///
+    /// Finding 6: one hosted provider is one incident away from a coordinator
+    /// that cannot read a height, and reading a height is what decides when a
+    /// user is offered their refund. Each entry is a whole endpoint - its own
+    /// URL, credentials and key - because providers do not share an auth
+    /// scheme, and an operator running their own node beside a hosted one is
+    /// the case this has to serve.
+    ///
+    /// Order is preference. `rpc_url` is always tried first; these follow it.
+    /// Nothing here names a provider: which endpoints an LP uses is theirs.
+    #[serde(default)]
+    pub fallback_rpc: Vec<FallbackRpc>,
+
+    /// How long to keep retrying an unreachable node at startup before giving
+    /// up. Zero means the old behaviour: exit on the first failure.
+    ///
+    /// Finding 6: exiting made a provider incident during a restart into a
+    /// restart loop, and a coordinator that is not running is a coordinator
+    /// that does not offer anyone a refund. Waiting is strictly better: every
+    /// deadline it serves is measured in tens of minutes.
+    #[serde(default = "default_startup_retry_seconds")]
+    pub startup_retry_seconds: u64,
+}
+
+/// One further RPC endpoint, with its own credentials.
+///
+/// The fields mirror `ZecConfig`'s because a fallback is a whole endpoint, not
+/// a second URL onto the first one's auth. An LP whose primary is a hosted
+/// provider keyed on a header and whose secondary is their own zcashd with a
+/// cookie needs both shapes at once.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct FallbackRpc {
+    pub rpc_url: String,
+    #[serde(default)]
+    pub rpc_user: Option<String>,
+    #[serde(default)]
+    pub rpc_password: Option<String>,
+    #[serde(default)]
+    pub rpc_api_key_header: Option<String>,
+    #[serde(default)]
+    pub rpc_api_key: Option<String>,
+    /// Name of an environment variable holding this endpoint's key, preferred
+    /// over `rpc_api_key` for the same reason the primary prefers it.
+    #[serde(default)]
+    pub rpc_api_key_env: Option<String>,
+}
+
+/// A fallback endpoint's API key, environment first for the same reason the
+/// primary's is: this file is readable by every local account.
+fn fallback_api_key(extra: &FallbackRpc) -> Option<String> {
+    if let Some(var) = &extra.rpc_api_key_env {
+        if let Ok(v) = std::env::var(var) {
+            let v = v.trim();
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    extra
+        .rpc_api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+}
+
+fn default_startup_retry_seconds() -> u64 {
+    600
 }
 
 fn default_refund_hours() -> u32 {
@@ -380,6 +471,343 @@ fn default_chain_id() -> u64 {
     zecp2p_escrow::attestation::DOMAIN_CHAIN_ID
 }
 
+/// Hard deadlines on the steps that can block forever. Finding 3.
+///
+/// Every one of these bounds a call into something this process does not
+/// control: a browser, a child process, an attestation service, a node. The
+/// sweep used to inherit whatever they did, so one wedged page stopped every
+/// other order's funding scan and deadline check.
+///
+/// A timeout that fires is not a failure of the trade. It ends *this attempt*
+/// so the next sweep can make another one; what it must never do is convert an
+/// ambiguous payment into a confident answer, which is why the pay timeout is
+/// generous and the ones around it are not.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TimeoutConfig {
+    /// The ceiling on one whole `advance` for one order.
+    ///
+    /// The watchdog, not the fine-grained bound. It is longer than the sum of
+    /// the specific timeouts below on purpose: it exists to catch a path that
+    /// has no specific timeout at all, and firing it should mean a bug rather
+    /// than a slow trade.
+    #[serde(default = "default_order_advance_seconds")]
+    pub order_advance_seconds: u64,
+
+    /// The ceiling on the fiat rail's `pay`.
+    ///
+    /// The one number here that must not be tightened casually. Interrupting a
+    /// browser mid-payment produces exactly the ambiguity the `Paying` journal
+    /// line exists for: money that may or may not have moved, which costs an
+    /// operator's attention rather than a retry. Sized to be longer than the
+    /// rail's own internal waits, so the rail's specific error wins the race
+    /// with this and the operator gets a reason rather than "timed out".
+    #[serde(default = "default_pay_seconds")]
+    pub pay_seconds: u64,
+
+    /// The ceiling on getting a payment attested, which includes the enclave.
+    ///
+    /// Safe to cut short: attestation is a read, it is retried on the next
+    /// sweep, and no money moves either way. The enclave is a `node` child
+    /// process that had no timeout at all.
+    #[serde(default = "default_attest_seconds")]
+    pub attest_seconds: u64,
+
+    /// The ceiling on one attempt at broadcasting a release.
+    ///
+    /// The broadcast loop retries until the escrow's own broadcast deadline,
+    /// which is tens of minutes away, and it does that inside the sweep. This
+    /// bounds one attempt; the deadline still bounds the whole effort, and the
+    /// next sweep re-enters. An order whose release has not broadcast is not
+    /// dropped by this - it is `Paid` on disk and re-entered every sweep.
+    #[serde(default = "default_broadcast_seconds")]
+    pub broadcast_seconds: u64,
+
+    /// The ceiling on any single node call.
+    #[serde(default = "default_node_call_seconds")]
+    pub node_call_seconds: u64,
+
+    /// How many orders the sweep advances at once.
+    ///
+    /// Finding 6: an unbounded fan-out over 200 open orders is hundreds of node
+    /// calls arriving together, which is what a hosted provider answers with a
+    /// 429. Bounded, the sweep takes longer and finishes; unbounded it is
+    /// rate-limited into taking longer anyway, and the limiter's backoff is
+    /// measured in minutes.
+    #[serde(default = "default_sweep_concurrency")]
+    pub sweep_concurrency: usize,
+}
+
+impl Default for TimeoutConfig {
+    fn default() -> Self {
+        Self {
+            order_advance_seconds: default_order_advance_seconds(),
+            pay_seconds: default_pay_seconds(),
+            attest_seconds: default_attest_seconds(),
+            broadcast_seconds: default_broadcast_seconds(),
+            node_call_seconds: default_node_call_seconds(),
+            sweep_concurrency: default_sweep_concurrency(),
+        }
+    }
+}
+
+fn default_order_advance_seconds() -> u64 {
+    900
+}
+fn default_pay_seconds() -> u64 {
+    420
+}
+fn default_attest_seconds() -> u64 {
+    180
+}
+fn default_broadcast_seconds() -> u64 {
+    120
+}
+fn default_node_call_seconds() -> u64 {
+    30
+}
+fn default_sweep_concurrency() -> usize {
+    8
+}
+
+/// What a caller who has funded nothing can consume. Finding 4.
+///
+/// Opening an order is free and costs the LP capacity for the length of a
+/// refund window. The guards that already exist - the open-order caps and the
+/// same-amount-per-handle rule - are all keyed on orders that may never be
+/// funded, so a caller with no coin at all can exhaust every one of them.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct LimitConfig {
+    /// How long an order with no funding sighted may hold capacity.
+    ///
+    /// After this it is expired: dropped from the open-order counts, the
+    /// per-handle count and the duplicate-amount guard, and no longer swept.
+    /// It is not deleted - the record stays readable, so a user who funded it
+    /// late is told what happened rather than getting a 404.
+    ///
+    /// The number is a judgement about how long a real user takes between
+    /// getting an address and broadcasting to it. Long enough for a hardware
+    /// wallet and a coffee; far short of the ~23 hours an unfunded order used
+    /// to hold.
+    #[serde(default = "default_unfunded_order_minutes")]
+    pub unfunded_order_minutes: u64,
+
+    /// Open orders one client address may hold at once. Zero disables.
+    ///
+    /// Per-IP rather than per-handle because the handle is the *payee*, which
+    /// is not a caller identity: whoever opens the order chooses it, so a
+    /// per-handle cap bounds who gets served rather than who is calling. An IP
+    /// is a weak identity and this is a weak bound; it is the one available at
+    /// this layer without asking users to hold an account.
+    #[serde(default = "default_max_open_per_client")]
+    pub max_open_per_client: usize,
+
+    /// Order-opening requests one client address may make in `window_seconds`.
+    /// Zero disables.
+    ///
+    /// Separate from the open-order cap because they stop different things.
+    /// The open-order cap bounds standing capacity; this bounds the rate of
+    /// *attempts*, including the ones that are refused - each of which still
+    /// costs a quote, a curator call and a store scan.
+    #[serde(default = "default_open_rate_per_client")]
+    pub open_rate_per_client: u32,
+
+    /// Order-opening requests from everyone in `window_seconds`. Zero disables.
+    ///
+    /// The backstop for the case the per-client limit cannot see: many clients,
+    /// or one client behind many addresses.
+    #[serde(default = "default_open_rate_global")]
+    pub open_rate_global: u32,
+
+    /// The window both rates are measured over.
+    #[serde(default = "default_rate_window_seconds")]
+    pub rate_window_seconds: u64,
+
+    /// A header carrying the real client address, for a coordinator behind a
+    /// proxy. Empty means trust the socket address.
+    ///
+    /// Off by default, and it must stay off unless a proxy actually rewrites
+    /// it: a caller can set any header they like, so trusting one that is not
+    /// overwritten upstream turns the rate limit into a header the attacker
+    /// chooses. Which header depends on the LP's own relay, so it is named
+    /// here rather than assumed.
+    #[serde(default)]
+    pub client_ip_header: Option<String>,
+}
+
+impl Default for LimitConfig {
+    fn default() -> Self {
+        Self {
+            unfunded_order_minutes: default_unfunded_order_minutes(),
+            max_open_per_client: default_max_open_per_client(),
+            open_rate_per_client: default_open_rate_per_client(),
+            open_rate_global: default_open_rate_global(),
+            rate_window_seconds: default_rate_window_seconds(),
+            client_ip_header: None,
+        }
+    }
+}
+
+fn default_unfunded_order_minutes() -> u64 {
+    45
+}
+fn default_max_open_per_client() -> usize {
+    5
+}
+fn default_open_rate_per_client() -> u32 {
+    10
+}
+fn default_open_rate_global() -> u32 {
+    120
+}
+fn default_rate_window_seconds() -> u64 {
+    60
+}
+
+/// What the fiat rail must be holding before this coordinator commits. Finding 5.
+///
+/// Nothing here names a payment provider. The rail reports a balance in cents
+/// or reports that it cannot; this is the policy applied to that number, and it
+/// is the LP's own risk appetite rather than anything protocol-side.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct FloatConfig {
+    /// Cents to keep back beyond the payment being made.
+    ///
+    /// A reserve rather than a floor at zero, because the balance read is a
+    /// snapshot: a payment authorised on a balance that exactly covers it can
+    /// still fail if anything else moved in between, and a failed payment
+    /// mid-flight is the expensive kind.
+    #[serde(default = "default_reserve_cents")]
+    pub reserve_cents: u64,
+
+    /// Warn when the balance falls below this. Zero disables.
+    ///
+    /// Distinct from `reserve_cents`: this is the number that should reach a
+    /// human while trades are still being served, so the LP tops up before the
+    /// refusals start rather than after.
+    #[serde(default = "default_low_balance_cents")]
+    pub low_balance_cents: u64,
+
+    /// Whether to reserve the payment slot when the balance cannot be read.
+    ///
+    /// Defaults to permitting it. A rail that cannot report a balance is the
+    /// normal case for a rail that has no such concept, and refusing there
+    /// would make the balance check a requirement on every future rail rather
+    /// than a capability. An LP whose rail *can* report and who wants an
+    /// unreadable balance treated as empty sets this false.
+    #[serde(default = "default_true")]
+    pub pay_when_balance_unknown: bool,
+
+    /// How long a balance reading is reused before the rail is asked again.
+    ///
+    /// The read costs a request against the rail on every reservation
+    /// otherwise, and the balance does not move except when this coordinator
+    /// moves it or the operator tops up.
+    #[serde(default = "default_balance_cache_seconds")]
+    pub balance_cache_seconds: u64,
+}
+
+impl Default for FloatConfig {
+    fn default() -> Self {
+        Self {
+            reserve_cents: default_reserve_cents(),
+            low_balance_cents: default_low_balance_cents(),
+            pay_when_balance_unknown: true,
+            balance_cache_seconds: default_balance_cache_seconds(),
+        }
+    }
+}
+
+fn default_reserve_cents() -> u64 {
+    0
+}
+fn default_low_balance_cents() -> u64 {
+    0
+}
+fn default_true() -> bool {
+    true
+}
+fn default_balance_cache_seconds() -> u64 {
+    120
+}
+
+/// How an operator hears that something is stuck. Finding 7.
+///
+/// One hook, run as a subprocess, receiving a JSON alert on stdin. A
+/// subprocess rather than a built-in Telegram client because the destination is
+/// the LP's own: a phone, a pager, a Matrix room, a webhook, a file. Baking one
+/// service in would make every other LP's alerting a fork.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AlertConfig {
+    /// The program to run. Empty means alerts are logged and not delivered.
+    ///
+    /// Run with no shell, so it is a program and its arguments rather than a
+    /// command line: an alert body carrying a handle a stranger chose must not
+    /// be able to reach `sh -c`.
+    #[serde(default)]
+    pub notify_command: Vec<String>,
+
+    /// How long the hook may take before it is killed.
+    #[serde(default = "default_notify_timeout_seconds")]
+    pub notify_timeout_seconds: u64,
+
+    /// The shortest gap between two alerts with the same key.
+    ///
+    /// The existing session keeper re-alerts every 20 minutes with no state,
+    /// which means the first real incident buries the channel. Keyed
+    /// suppression makes a stuck order one message and a reminder, not eighty.
+    #[serde(default = "default_repeat_minutes")]
+    pub repeat_minutes: u64,
+
+    /// How long the payment slot may be held before it is an alert, and before
+    /// `/health` calls itself degraded.
+    #[serde(default = "default_slot_age_alert_minutes")]
+    pub slot_age_minutes: u64,
+
+    /// How long an order may sit paid-but-unreleased before it is an alert.
+    ///
+    /// This is the window where the dollars have gone and the escrow has not
+    /// released, so it is the most expensive state on the board and the one
+    /// with no automatic exit.
+    #[serde(default = "default_paid_age_alert_minutes")]
+    pub paid_age_minutes: u64,
+
+    /// How long since the last completed sweep before it is an alert.
+    ///
+    /// A sweep that has not finished is not visible in any log line, which is
+    /// how a wedged browser looked like nothing at all.
+    #[serde(default = "default_sweep_age_alert_minutes")]
+    pub sweep_age_minutes: u64,
+}
+
+impl Default for AlertConfig {
+    fn default() -> Self {
+        Self {
+            notify_command: Vec::new(),
+            notify_timeout_seconds: default_notify_timeout_seconds(),
+            repeat_minutes: default_repeat_minutes(),
+            slot_age_minutes: default_slot_age_alert_minutes(),
+            paid_age_minutes: default_paid_age_alert_minutes(),
+            sweep_age_minutes: default_sweep_age_alert_minutes(),
+        }
+    }
+}
+
+fn default_notify_timeout_seconds() -> u64 {
+    20
+}
+fn default_repeat_minutes() -> u64 {
+    30
+}
+fn default_slot_age_alert_minutes() -> u64 {
+    20
+}
+fn default_paid_age_alert_minutes() -> u64 {
+    20
+}
+fn default_sweep_age_alert_minutes() -> u64 {
+    10
+}
+
 impl CoordinatorConfig {
     pub fn load(path: &str) -> Result<Self> {
         let text = std::fs::read_to_string(path)
@@ -456,6 +884,32 @@ impl CoordinatorConfig {
             rpc.api_key_header = Some((header.clone(), key));
         }
         Ok(rpc)
+    }
+
+    /// Every RPC endpoint, primary first, in the order to try them.
+    ///
+    /// Finding 6. One endpoint was a single point of failure for the read that
+    /// decides when a user is offered their refund, and the only recovery was
+    /// an operator editing a config and restarting.
+    ///
+    /// The primary always leads. Fallbacks are tried in the order written,
+    /// which is the operator's stated preference - typically their own node
+    /// first among the fallbacks, or a second provider with a separate quota.
+    pub fn rpc_configs(&self) -> Result<Vec<RpcConfig>> {
+        let network = self.network()?;
+        let mut all = vec![self.rpc_config()?];
+        for extra in &self.zec.fallback_rpc {
+            let mut rpc = match (&extra.rpc_user, &extra.rpc_password) {
+                (Some(u), Some(p)) => RpcConfig::local(extra.rpc_url.clone(), u, p, network),
+                _ => RpcConfig::hosted(extra.rpc_url.clone(), network),
+            };
+            if let (Some(header), Some(key)) = (&extra.rpc_api_key_header, fallback_api_key(extra))
+            {
+                rpc.api_key_header = Some((header.clone(), key));
+            }
+            all.push(rpc);
+        }
+        Ok(all)
     }
 
     /// The RPC API key, from the environment when a variable is named for it.
@@ -727,7 +1181,12 @@ mod tests {
 
     fn base() -> CoordinatorConfig {
         CoordinatorConfig {
+            timeouts: TimeoutConfig::default(),
+            limits: LimitConfig::default(),
+            float: FloatConfig::default(),
+            alerts: AlertConfig::default(),
             server: ServerConfig {
+                instance_name: String::new(),
                 host: default_host(),
                 port: default_port(),
                 state_dir: "/tmp/v2coord-test".into(),
@@ -735,6 +1194,8 @@ mod tests {
                 journal_path: None,
             },
             zec: ZecConfig {
+                fallback_rpc: Vec::new(),
+                startup_retry_seconds: 0,
                 rpc_url: "http://127.0.0.1:18232".into(),
                 rpc_user: None,
                 rpc_password: None,

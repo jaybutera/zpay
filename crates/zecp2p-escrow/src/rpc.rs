@@ -251,6 +251,16 @@ impl RpcChainClient {
         })
     }
 
+    /// Which endpoint this client talks to.
+    ///
+    /// For a caller holding several endpoints - see the coordinator's node pool
+    /// - so it can say in a log which one answered. The string is the
+    /// configured URL and may carry a key in its path, so a caller putting it
+    /// anywhere a user or a log aggregator can read must redact it first.
+    pub fn url(&self) -> &str {
+        &self.config.url
+    }
+
     /// Replaces the rate-limit wait, so a test can assert the retry sequence
     /// without sitting through three real minutes. The recorded durations are
     /// what the client would have slept.
