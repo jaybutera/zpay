@@ -801,7 +801,10 @@ impl VenmoBrowser {
         //
         // `Fill` itself is the boundary and is deliberately on the far side of
         // it. It is the first step that changes the page, and a failure *inside*
-        // one leaves a form in a state this function did not read back.
+        // one leaves a form in a state this function did not read back. The
+        // flag is therefore cleared before the step's result is read, so a
+        // `Fill` that failed part-way counts as touched - R1-4 found the clear
+        // on the wrong side of that.
         let mut form_untouched = true;
 
         for step in &steps {
@@ -837,10 +840,23 @@ impl VenmoBrowser {
                     Err(other) => other,
                 });
 
+            // Cleared *before* the result is read, not after. R1-4: clearing
+            // it on success put a `Fill` that failed part-way - the CDP
+            // evaluate timing out after the JS had run - on the untouched side
+            // of the boundary, which contradicted this function's own rule that
+            // `Fill` is where the form stops being untouched. The money is
+            // still in the account either way, so this is not a money finding;
+            // it is the code and the doc disagreeing about which side the case
+            // falls on, and the doc has the safer answer.
+            if matches!(step, PaymentStep::Fill { .. }) {
+                form_untouched = false;
+            }
+
             if let Err(e) = outcome {
                 // Only while the form is still untouched. Past the first
-                // `Fill` the honest answer is the ambiguous one, and this
-                // function does not get to soften it.
+                // `Fill` - including a `Fill` that failed - the honest answer
+                // is the ambiguous one, and this function does not get to
+                // soften it.
                 if form_untouched {
                     return Err(anyhow::Error::from(NothingWasSent {
                         recipient: req.recipient.clone(),
@@ -849,10 +865,6 @@ impl VenmoBrowser {
                     }));
                 }
                 return Err(e);
-            }
-
-            if matches!(step, PaymentStep::Fill { .. }) {
-                form_untouched = false;
             }
         }
 

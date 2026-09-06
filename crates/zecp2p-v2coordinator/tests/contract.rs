@@ -5257,8 +5257,9 @@ async fn waiting_in_line_does_not_cost_a_user_their_refund() {
 
     // The second order is genuinely behind the first.
     let queue = state.store.waiting_to_pay();
-    assert!(zecp2p_v2coordinator::slot::is_at_the_head(&queue, &first));
-    assert!(!zecp2p_v2coordinator::slot::is_at_the_head(&queue, &behind));
+    let journal = state.journal.latest().unwrap();
+    assert!(zecp2p_v2coordinator::slot::is_next_to_pay(&journal, &queue, &first));
+    assert!(!zecp2p_v2coordinator::slot::is_next_to_pay(&journal, &queue, &behind));
 
     // Past `T`.
     let stored = state.store.get(&behind).unwrap();
@@ -5351,10 +5352,13 @@ async fn one_lps_parked_fill_and_queue_are_invisible_to_another_lp() {
     );
 
     // And the queues are separate: each LP's head is its own order.
-    assert!(zecp2p_v2coordinator::slot::is_at_the_head(
-        &lp_a.store.waiting_to_pay(),
-        &parked
-    ) || lp_a.store.waiting_to_pay().is_empty());
+    assert!(
+        zecp2p_v2coordinator::slot::is_next_to_pay(
+            &lp_a.journal.latest().unwrap(),
+            &lp_a.store.waiting_to_pay(),
+            &parked
+        ) || lp_a.store.waiting_to_pay().is_empty()
+    );
     assert!(
         !lp_b
             .store
@@ -5366,4 +5370,92 @@ async fn one_lps_parked_fill_and_queue_are_invisible_to_another_lp() {
 
     // LP A's fill is still parked. Another LP being served is not a resolution.
     assert_eq!(lp_a.journal.needs_operator().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_blocked_head_does_not_starve_the_queue_behind_it() {
+    // Rail audit round 1, question 2. The narrower shape of the outage the
+    // queue was built to close.
+    //
+    // `blocker_for` correctly refuses an order that would be indistinguishable
+    // in the feed from a parked fill. But a refused order stays `Locked`, and
+    // `waiting_to_pay` lists every `Locked` order, so it stays the head - for
+    // the ~24 hours until its own deadline. Everything behind it yields to it
+    // the whole time, including orders that share nothing with the parked fill
+    // and could be paid immediately.
+    //
+    // One user opening an order of the same amount to the same handle as a
+    // parked fill is enough to reach it, which makes it the 2026-09-06 outage
+    // with extra steps. `new_orders_flow_past_a_parked_one` misses it because
+    // its parked order is `Failed`, so it never enters the queue at all.
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+    let attestor = TestAttestor::new();
+    let fiat = Arc::new(TestFiat::new());
+    let state = coordinator_with_fiat(dir.path(), scanner.clone(), &node, &attestor, fiat.clone());
+    let app = zecp2p_v2coordinator::web::router(state.clone());
+    let user = TestUser::new();
+
+    // A parked fill for $2.00 to alice, which is what a 0.05 ZEC order books.
+    strand_a_payment(&state, 2_000_000, "alice");
+
+    // The head: same amount, same handle, so `blocker_for` refuses it - and
+    // refuses it correctly. It must not be paid while that entry is
+    // unreconciled.
+    let (head, _) =
+        locked_order_for(&app, &state, &node, &scanner, &attestor, &user, "0.05").await;
+
+    // Behind it: a different amount, nothing to do with the parked fill.
+    let (behind, _) =
+        locked_order_for(&app, &state, &node, &scanner, &attestor, &user, "0.07").await;
+
+    // The precondition: the head is the older order by arrival, and it is the
+    // one the parked fill blocks. Asserted on the ordering and the block
+    // separately, because `is_next_to_pay` combines them and would answer
+    // `false` here for the very reason this test is about.
+    let queue = state.store.waiting_to_pay();
+    let journal = state.journal.latest().unwrap();
+    assert_eq!(
+        zecp2p_v2coordinator::slot::head_of_queue(&queue)
+            .map(|o| o.order_id.clone())
+            .unwrap(),
+        head,
+        "the older order must be first by arrival for this test to mean anything"
+    );
+    assert!(
+        zecp2p_v2coordinator::slot::is_blocked_for_this_sweep(
+            &journal,
+            &state.store.get(&head).unwrap()
+        ),
+        "the head must be the one the parked fill blocks"
+    );
+
+    for _ in 0..6 {
+        for id in [&head, &behind] {
+            zecp2p_v2coordinator::driver::advance(&state, id).await.ok();
+        }
+    }
+
+    // The head is still blocked, and that is right: its payment would be
+    // indistinguishable from the parked one.
+    assert_eq!(
+        state.store.get(&head).unwrap().stage,
+        Stage::Locked,
+        "the blocked head must not be paid; the parked entry is still unreconciled"
+    );
+
+    // But the order behind it owes nothing to that parked fill and must be
+    // served rather than waiting out somebody else's deadline.
+    assert_eq!(
+        state.store.get(&behind).unwrap().stage,
+        Stage::Released,
+        "an order behind a blocked head starved; the queue must step over an \
+         order that cannot be served this sweep"
+    );
+    assert_eq!(
+        fiat.paid.lock().unwrap().len(),
+        1,
+        "exactly the servable order should have been paid"
+    );
 }

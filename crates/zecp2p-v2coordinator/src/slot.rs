@@ -184,21 +184,134 @@ pub fn head_of_queue(ready: &[crate::order::Order]) -> Option<&crate::order::Ord
         })
 }
 
-/// Whether this order is the one whose turn it is.
+/// Whether the journal will refuse this order's payment for the whole of this
+/// sweep, whatever else happens.
 ///
-/// The question `settle` asks before it competes for the slot. An order that is
-/// not at the head waits a tick rather than racing, which is what makes the
-/// wait bounded: every sweep, the head is served and leaves the queue, so an
-/// order that is `n`th waits at most `n` payments rather than indefinitely.
+/// Round 1, question 2. FIFO alone reintroduced the outage in a narrower shape:
+/// `blocker_for` correctly refuses an order indistinguishable in the feed from
+/// a parked fill, but a refused order stays `Locked`, and `waiting_to_pay`
+/// lists every `Locked` order - so it stayed the head for the ~24 hours until
+/// its own deadline, and everything behind it yielded to it for that long. One
+/// user opening an order of the same amount to the same handle as a parked fill
+/// was enough to close the rail again.
 ///
-/// An order not in `ready` at all answers `true`: the caller has already
-/// decided this one may pay, and a list that does not contain it is a caller
-/// that did not supply one. Failing open here costs at worst the old
-/// behaviour - a race for the slot, which the journal still arbitrates safely -
-/// while failing closed would stop a payment over a bookkeeping disagreement.
-pub fn is_at_the_head(ready: &[crate::order::Order], order_id: &str) -> bool {
-    match head_of_queue(ready) {
+/// So the queue steps over an order it can prove will not be served. The proof
+/// has to be about something that cannot change within the sweep, or stepping
+/// over would be a race rather than a decision:
+///
+/// - A **parked** fill it could be confused with. `NeedsOperator` is cleared
+///   only by a human running `resolve-fill`, so within a sweep this answer is
+///   stable, and the order is genuinely unservable rather than merely losing a
+///   race.
+/// - Its **own** open line past a reservation, which is the "I may already have
+///   paid for this" case. Only that fill's own progress or an operator clears
+///   it, and neither happens while this order waits its turn.
+///
+/// Deliberately **not** a live holder. `holder_among` says somebody is paying
+/// right now, which is exactly the condition that resolves on its own moments
+/// later - skipping an order for that would hand its place to a younger order
+/// over a transient, which is the unfairness the queue exists to remove. An
+/// order blocked only by a live payment keeps the head and takes the slot when
+/// it frees.
+///
+/// Read from the journal snapshot the caller already has, so a sweep does not
+/// re-read the file once per waiting order.
+pub fn is_blocked_for_this_sweep(latest: &[FillRecord], order: &crate::order::Order) -> bool {
+    let Some(funding) = &order.funding else {
+        // No outpoint, no fill: this order cannot be at the pay step at all.
+        // Not blocked, and the driver's own checks will move it on.
+        return false;
+    };
+    let work = work_id_for(&funding.txid, funding.vout);
+
+    // Its own line, past the states a fresh attempt may displace.
+    let own_underway = latest.iter().any(|r| {
+        r.work_id() == work
+            && r.state.is_open()
+            && !zecp2p_taker::auto::journal::is_displaceable_reservation(r.state)
+    });
+    if own_underway {
+        return true;
+    }
+
+    // A parked fill this payment could not be told apart from in the feed.
+    let applicant = fill_for(&work, order);
+    latest.iter().any(|r| {
+        r.work_id() != work
+            && r.state == FillState::NeedsOperator
+            && zecp2p_taker::auto::journal::could_be_confused_in_the_feed(r, &applicant)
+    })
+}
+
+/// The record this order would claim the slot with.
+///
+/// One builder, used by both [`take`] and [`is_blocked_for_this_sweep`], so the
+/// amount and handle the queue reasons about are the same ones the slot
+/// decision will see. Two constructions of this shape would be two chances to
+/// disagree about whether an order is confusable, and a queue that skipped an
+/// order the slot would have served is a queue that loses somebody's turn.
+fn fill_for(work: &WorkId, order: &crate::order::Order) -> FillRecord {
+    let mut record = FillRecord::new_zec(
+        work.local.clone(),
+        alloy::primitives::U256::from(order.quote.usd_amount_6dec),
+        alloy::primitives::U256::from(zecp2p_escrow::payment_details::IDENTITY_RATE_18DEC),
+        order.handle.clone(),
+    );
+    record.state = FillState::Seen;
+    record
+}
+
+/// The queue, with the orders that cannot be served this sweep stepped over.
+///
+/// FIFO among the rest, so an order's turn is still decided by when its user
+/// arrived. Skipping is not losing a place: a stepped-over order is back in
+/// contention the moment its blocker clears, ahead of everything younger.
+pub fn servable<'a>(
+    latest: &[FillRecord],
+    ready: &'a [crate::order::Order],
+) -> Vec<&'a crate::order::Order> {
+    ready
+        .iter()
+        .filter(|o| !is_blocked_for_this_sweep(latest, o))
+        .collect()
+}
+
+/// Whether it is this order's turn, once unservable orders are stepped over.
+///
+/// What `settle` asks. An order blocked for the whole sweep does not hold the
+/// head, so the queue behind it moves; an order merely waiting on a live
+/// payment does hold it, because that clears on its own and giving its place
+/// away would be the unfairness the queue removes.
+pub fn is_next_to_pay(
+    latest: &[FillRecord],
+    ready: &[crate::order::Order],
+    order_id: &str,
+) -> bool {
+    // Not in the list at all: fail open. The caller has already decided this
+    // order may pay, and a list that does not contain it is a caller that did
+    // not supply one. Failing open costs at worst a race for the slot, which
+    // the journal arbitrates safely; failing closed would stop a payment over a
+    // bookkeeping disagreement.
+    if !ready.iter().any(|o| o.order_id == order_id) {
+        return true;
+    }
+
+    let servable = servable(latest, ready);
+
+    let head = servable.iter().min_by(|a, b| {
+        a.created_at
+            .cmp(&b.created_at)
+            .then_with(|| a.order_id.cmp(&b.order_id))
+    });
+
+    match head {
+        // Somebody can be served. It is their turn, and an order that is not
+        // them waits - including one that is itself blocked, which gains
+        // nothing from walking into a refusal it would only be stuck behind.
         Some(head) => head.order_id == order_id,
+        // Nothing in the queue can be served this sweep, so there is no turn to
+        // be behind. Everyone goes on to the slot check, which is where the
+        // reason each of them cannot pay actually lives.
         None => true,
     }
 }
@@ -214,8 +327,13 @@ pub fn is_at_the_head(ready: &[crate::order::Order], order_id: &str) -> bool {
 /// `Seen` holds the slot against every other work item, because
 /// `slot_verdict` counts every open record - but it does not assert that
 /// money may have moved, so this order can still [`retract`] it when the chain
-/// check or the preflight refuses. `Paying` comes later, from [`claim`], and is
-/// never retracted: past that point a crash means a human reads the feed.
+/// check or the preflight refuses. `Paying` comes later, from [`claim`].
+///
+/// A `Paying` line is retracted in exactly one place: the rail refusing before
+/// it filled the form in, where `NothingWasSent` proves nothing was typed and
+/// nothing clicked. Everywhere else a crash past `Paying` still means a human
+/// reads the feed. That exception rests entirely on the type being unforgeable
+/// - see `venmo::NothingWasSent`.
 ///
 /// Returns the refusal when somebody else holds the slot, so the caller can
 /// tell "wait" from "this escrow may already have been paid".
@@ -296,6 +414,9 @@ pub fn retract(journal: &Journal, record: FillRecord, why: &str) {
 /// it happens: take the slot, decide, claim, pay. The claim is `Paying`, the
 /// ambiguous state - written before the click precisely so that a crash is
 /// recorded as "may have paid" rather than as nothing at all.
+///
+/// It is given back only for a `NothingWasSent` refusal, which proves the form
+/// was never filled. See [`take`]'s note.
 pub fn claim(
     journal: &Journal,
     reserved: FillRecord,
@@ -441,9 +562,11 @@ mod queue_tests {
             order_at("esc_b", "2026-09-06T20:05:00Z"),
         ];
         assert_eq!(head_of_queue(&queue).unwrap().order_id, "esc_a");
-        assert!(is_at_the_head(&queue, "esc_a"));
-        assert!(!is_at_the_head(&queue, "esc_b"));
-        assert!(!is_at_the_head(&queue, "esc_c"));
+        // Through the function `settle` calls, with an empty journal so
+        // nothing is blocked: a helper exercised only by tests proves the test.
+        assert!(is_next_to_pay(&[], &queue, "esc_a"));
+        assert!(!is_next_to_pay(&[], &queue, "esc_b"));
+        assert!(!is_next_to_pay(&[], &queue, "esc_c"));
     }
 
     #[test]
@@ -477,7 +600,7 @@ mod queue_tests {
 
         let at_the_head = queue
             .iter()
-            .filter(|o| is_at_the_head(&queue, &o.order_id))
+            .filter(|o| is_next_to_pay(&[], &queue, &o.order_id))
             .count();
         assert_eq!(at_the_head, 1, "exactly one order may be served");
     }
@@ -499,15 +622,205 @@ mod queue_tests {
         assert!(head_of_queue(&queue).is_none());
     }
 
+    /// A journal line for an order, in a given state.
+    fn line_for(order: &crate::order::Order, state: FillState) -> FillRecord {
+        let funding = order.funding.as_ref().expect("the fixture is funded");
+        let work = work_id_for(&funding.txid, funding.vout);
+        let mut r = super::fill_for(&work, order);
+        r.state = state;
+        r
+    }
+
+    fn funded(id: &str, created: &str, usd_6dec: u64, handle: &str) -> crate::order::Order {
+        let mut o = order_at(id, created);
+        o.quote.usd_amount_6dec = usd_6dec;
+        o.handle = handle.into();
+        let mut txid = [0x9au8; 32];
+        txid[0] = id.as_bytes()[id.len() - 1];
+        o.funding = Some(crate::order::Funding {
+            txid,
+            vout: 0,
+            confirmations: 30,
+            required: 2,
+        });
+        o
+    }
+
+    /// A parked fill for another work item, at a chosen amount and handle.
+    fn parked(usd_6dec: u64, handle: &str) -> FillRecord {
+        let work = work_id_for(&[0xf1u8; 32], 0);
+        let mut r = FillRecord::new_zec(
+            work.local.clone(),
+            alloy::primitives::U256::from(usd_6dec),
+            alloy::primitives::U256::from(1_000_000_000_000_000_000u128),
+            handle.into(),
+        );
+        r.state = FillState::NeedsOperator;
+        r
+    }
+
+    #[test]
+    fn the_queue_steps_over_a_head_a_parked_fill_blocks() {
+        // R1-2. The head is refused by `blocker_for` and stays `Locked`, so
+        // without this it stays the head until its own deadline - about 24
+        // hours - and everything behind it yields to it for that long.
+        let head = funded("esc_a", "2026-09-06T20:00:00Z", 2_000_000, "alice");
+        let behind = funded("esc_b", "2026-09-06T20:05:00Z", 700_000, "bob");
+        let queue = vec![head.clone(), behind.clone()];
+        let journal = vec![parked(2_000_000, "alice")];
+
+        assert!(
+            is_blocked_for_this_sweep(&journal, &head),
+            "the head is confusable with the parked fill and must be refused"
+        );
+        assert!(!is_blocked_for_this_sweep(&journal, &behind));
+
+        assert!(
+            !is_next_to_pay(&journal, &queue, "esc_a"),
+            "a blocked head must not hold the queue"
+        );
+        assert!(
+            is_next_to_pay(&journal, &queue, "esc_b"),
+            "the order behind must be served rather than waiting out somebody \
+             else's deadline"
+        );
+    }
+
+    #[test]
+    fn a_live_payment_does_not_cost_the_head_its_place() {
+        // The distinction that makes stepping over a decision rather than a
+        // race. `Paying` clears on its own moments later; handing the head's
+        // place to a younger order over that would be exactly the unfairness
+        // the queue was built to remove.
+        let head = funded("esc_a", "2026-09-06T20:00:00Z", 2_000_000, "alice");
+        let behind = funded("esc_b", "2026-09-06T20:05:00Z", 700_000, "bob");
+        let queue = vec![head.clone(), behind.clone()];
+
+        // Somebody else is mid-drive.
+        let mut elsewhere = parked(500_000, "carol");
+        elsewhere.state = FillState::Paying;
+        let journal = vec![elsewhere];
+
+        assert!(
+            !is_blocked_for_this_sweep(&journal, &head),
+            "a live payment elsewhere is not a reason to skip an order"
+        );
+        assert!(
+            is_next_to_pay(&journal, &queue, "esc_a"),
+            "the head keeps its place while another payment is in flight"
+        );
+        assert!(!is_next_to_pay(&journal, &queue, "esc_b"));
+    }
+
+    #[test]
+    fn an_order_that_may_already_have_paid_is_stepped_over_too() {
+        // Its own line past a reservation. Only that fill's own progress or an
+        // operator clears it, so it is stable within a sweep - and an order
+        // that would be refused for "I may already have paid for this" must not
+        // hold the queue while a human decides.
+        let head = funded("esc_a", "2026-09-06T20:00:00Z", 2_000_000, "alice");
+        let behind = funded("esc_b", "2026-09-06T20:05:00Z", 700_000, "bob");
+        let queue = vec![head.clone(), behind.clone()];
+        let journal = vec![line_for(&head, FillState::NeedsOperator)];
+
+        assert!(is_blocked_for_this_sweep(&journal, &head));
+        assert!(is_next_to_pay(&journal, &queue, "esc_b"));
+    }
+
+    #[test]
+    fn a_crashed_reservation_does_not_cost_an_order_its_turn() {
+        // `Seen` and the two signalling states are displaceable: a fresh
+        // attempt takes them over, so an order carrying one is servable and
+        // keeps its place. Treating them as blocked would send an order to the
+        // back of the queue for having crashed once.
+        let head = funded("esc_a", "2026-09-06T20:00:00Z", 2_000_000, "alice");
+        let queue = vec![head.clone()];
+
+        for state in [
+            FillState::Seen,
+            FillState::Signalling,
+            FillState::Signalled,
+        ] {
+            let journal = vec![line_for(&head, state)];
+            assert!(
+                !is_blocked_for_this_sweep(&journal, &head),
+                "{state:?} is displaceable, so the order is still servable"
+            );
+            assert!(is_next_to_pay(&journal, &queue, "esc_a"));
+        }
+    }
+
+    #[test]
+    fn stepping_over_is_not_losing_a_place() {
+        // A skipped order returns to the front the moment its blocker clears,
+        // ahead of everything younger. Skipping is per-sweep, not a demotion.
+        let head = funded("esc_a", "2026-09-06T20:00:00Z", 2_000_000, "alice");
+        let behind = funded("esc_b", "2026-09-06T20:05:00Z", 700_000, "bob");
+        let queue = vec![head.clone(), behind.clone()];
+
+        let blocked = vec![parked(2_000_000, "alice")];
+        assert!(is_next_to_pay(&blocked, &queue, "esc_b"));
+
+        // The operator retires the parked fill.
+        let mut retired = parked(2_000_000, "alice");
+        retired.state = FillState::Resolved;
+        let cleared = vec![retired];
+
+        assert!(
+            is_next_to_pay(&cleared, &queue, "esc_a"),
+            "the older order takes the head back once its blocker is gone"
+        );
+        assert!(!is_next_to_pay(&cleared, &queue, "esc_b"));
+    }
+
+    #[test]
+    fn a_queue_of_nothing_but_blocked_orders_still_lets_them_reach_the_slot() {
+        // When every waiting order is blocked there is no queue to be behind,
+        // and holding them all here would only hide the refusal. They go on to
+        // the slot check, which is where the reason lives.
+        let head = funded("esc_a", "2026-09-06T20:00:00Z", 2_000_000, "alice");
+        let queue = vec![head.clone()];
+        let journal = vec![parked(2_000_000, "alice")];
+
+        assert!(servable(&journal, &queue).is_empty());
+        assert!(
+            is_next_to_pay(&journal, &queue, "esc_a"),
+            "an order with nobody ahead of it must reach the refusal that names its reason"
+        );
+    }
+
+    #[test]
+    fn an_unfunded_order_is_not_treated_as_blocked() {
+        // No outpoint means no fill, so it cannot be at the pay step at all and
+        // the driver's own checks move it on.
+        let mut o = order_at("esc_a", "2026-09-06T20:00:00Z");
+        o.funding = None;
+        assert!(!is_blocked_for_this_sweep(&[], &o));
+    }
+
     #[test]
     fn an_order_nobody_listed_is_not_held_back() {
         // Fails open. The caller has already decided this order may pay, and a
         // list that does not contain it is a caller that did not supply one -
         // which costs at worst the old racing behaviour, safely arbitrated by
         // the journal, rather than a payment stopped over bookkeeping.
-        assert!(is_at_the_head(&[], "esc_a"));
+        assert!(is_next_to_pay(&[], &[], "esc_a"));
+
+        // And an order the list does not mention, while others wait. The
+        // caller has already decided this one may pay; the worst case is a
+        // race for the slot, which the journal arbitrates safely.
         let queue = vec![order_at("esc_b", "2026-09-06T20:00:00Z")];
-        assert!(!is_at_the_head(&queue, "esc_a"));
+        assert!(is_next_to_pay(&[], &queue, "esc_a"));
+
+        // An order that *is* listed still waits its turn.
+        assert!(!is_next_to_pay(
+            &[],
+            &[
+                order_at("esc_a", "2026-09-06T20:05:00Z"),
+                order_at("esc_b", "2026-09-06T20:00:00Z"),
+            ],
+            "esc_a"
+        ));
     }
 }
 

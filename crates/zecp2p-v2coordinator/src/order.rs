@@ -605,10 +605,6 @@ mod tests {
         }
     }
 
-    /// A minimal order, enough for the pure functions over one.
-    fn an_order(id: &str) -> Order {
-        Order::for_test(id)
-    }
 }
 
 #[cfg(test)]

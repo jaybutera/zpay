@@ -274,29 +274,32 @@ impl OrderStore {
     /// Deliberately not `open_count`, which is the cap on how many orders may
     /// be in flight at once: a finished trade must not hold a slot against that
     /// limit just because its escrow is still refundable.
-    /// Every order sitting at `Locked`, which is the pay queue.
-    ///
-    /// `Locked` is the stage that means "the LP may pay": funded, deep enough,
-    /// pre-signature verified, nothing sent. The driver still re-checks the
-    /// chain and the deadlines for the order it is about to pay; this is only
-    /// the set among which the turn is decided, so an order here that turns out
-    /// to be unpayable simply loses its turn and the next sweep moves on.
-    pub fn waiting_to_pay(&self) -> Vec<Order> {
-        self.orders
-            .lock()
-            .expect("order store lock")
-            .values()
-            .filter(|o| o.stage == Stage::Locked)
-            .cloned()
-            .collect()
-    }
-
     pub fn open_orders(&self) -> Vec<Order> {
         self.orders
             .lock()
             .expect("order store lock")
             .values()
             .filter(|o| o.stage.is_open() || o.still_owes_a_refund_check())
+            .cloned()
+            .collect()
+    }
+
+    /// Every order sitting at `Locked`, which is the pay queue.
+    ///
+    /// `Locked` is the stage that means "the LP may pay": funded, deep enough,
+    /// pre-signature verified, nothing sent.
+    ///
+    /// This is the whole waiting list, including orders that cannot be served
+    /// right now - an order refused by the journal stays `Locked`, so it stays
+    /// here. `slot::is_next_to_pay` is what steps over those; R1-2 found that
+    /// leaving it to "the next sweep moves on" does not happen, because nothing
+    /// removes an unpayable order from this list.
+    pub fn waiting_to_pay(&self) -> Vec<Order> {
+        self.orders
+            .lock()
+            .expect("order store lock")
+            .values()
+            .filter(|o| o.stage == Stage::Locked)
             .cloned()
             .collect()
     }

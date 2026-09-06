@@ -48,6 +48,21 @@ struct Cli {
     command: Commands,
 }
 
+/// What an operator found in the Venmo feed, as the CLI takes it.
+///
+/// A required value rather than a flag, so neither answer can be reached by
+/// forgetting something. Mapped to [`zecp2p_taker::auto::journal::Finding`] at
+/// the call site.
+#[derive(Copy, Clone, PartialEq, Eq, clap::ValueEnum)]
+enum FeedFinding {
+    /// The feed shows the payment. The dollars are gone, the escrow is the
+    /// LP's to recover, and no refund may be offered against it.
+    Sent,
+    /// The feed shows no payment for this fill. The dollars are still in the
+    /// account and the escrow refunds to the user at `T`.
+    NotSent,
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Watch for claimable deposits and serve them
@@ -338,13 +353,21 @@ enum Commands {
         #[arg(long)]
         evidence: String,
 
-        /// The feed showed the payment: the dollars are gone.
+        /// What the feed showed: `sent` or `not-sent`.
         ///
-        /// Without this the record says no payment was sent. The two are kept
-        /// apart because they mean opposite things for the escrow, and neither
-        /// is inferred from the other.
-        #[arg(long)]
-        payment_was_sent: bool,
+        /// Required, with no default, and that is the point. This was a bare
+        /// `--payment-was-sent` flag, so the finding an operator got by
+        /// *omitting* an argument was `not-sent` - the one that opens the
+        /// refund. An operator who read the feed, saw the payment, and forgot
+        /// the flag would have recorded the opposite of what they saw, and the
+        /// coordinator would then broadcast the user's refund against a release
+        /// the LP had already paid for. A default that loses money on
+        /// forgetfulness is not a default.
+        ///
+        /// The two answers are never inferred from each other, and nothing else
+        /// on this command implies one.
+        #[arg(long, value_enum)]
+        finding: FeedFinding,
 
         /// Print what would be written and stop.
         #[arg(long)]
@@ -426,11 +449,11 @@ async fn main() -> Result<()> {
         work,
         operator,
         evidence,
-        payment_was_sent,
+        finding,
         dry_run,
     } = &cli.command
     {
-        return run_resolve_fill(&config, work, operator, evidence, *payment_was_sent, *dry_run);
+        return run_resolve_fill(&config, work, operator, evidence, *finding, *dry_run);
     }
 
     if let Commands::FindPayment {
@@ -632,7 +655,7 @@ fn run_resolve_fill(
     work: &str,
     operator: &str,
     evidence: &str,
-    payment_was_sent: bool,
+    finding: FeedFinding,
     dry_run: bool,
 ) -> Result<()> {
     use zecp2p_taker::auto::journal::{Finding, Resolution};
@@ -657,10 +680,9 @@ fn run_resolve_fill(
         anyhow::bail!("nothing to retire");
     };
 
-    let finding = if payment_was_sent {
-        Finding::PaymentWasSent
-    } else {
-        Finding::NoPaymentWasSent
+    let finding = match finding {
+        FeedFinding::Sent => Finding::PaymentWasSent,
+        FeedFinding::NotSent => Finding::NoPaymentWasSent,
     };
 
     println!("fill      : {}", record.work_id());
@@ -690,7 +712,7 @@ fn run_resolve_fill(
     // written. Nothing here acts on it - the escrow's recovery is a separate
     // decision - but a record saying the dollars are gone is not a thing to
     // write past without reading.
-    if payment_was_sent {
+    if finding == Finding::PaymentWasSent {
         println!(
             "recording that the payment WAS sent. This releases the slot and nothing else: \n\
              it does not attest the payment, and it does not release the escrow. If this \n\

@@ -981,8 +981,26 @@ async fn settle(state: &Arc<AppState>, mut order: Order) -> Result<()> {
     //
     // Asked before the lock rather than after, so a whole sweep's worth of
     // tasks do not queue up on a mutex to be told it is not their turn.
+    //
+    // R1-2: and the queue steps over an order it can prove will not be served
+    // this sweep. FIFO alone put the outage back in a narrower shape - a head
+    // refused by a confusable parked fill stayed `Locked`, so it stayed the
+    // head for the ~24 hours until its own deadline and everything behind it
+    // yielded to it. `is_next_to_pay` skips only what is blocked for the whole
+    // sweep; an order waiting on a *live* payment keeps its place, because that
+    // clears on its own and giving the place away would be the unfairness the
+    // queue exists to remove.
+    //
+    // Through `sweep_journal`, not a direct `latest()`. R5-3 built that cache
+    // for this exact shape: `run` spawns every order of a sweep together, so a
+    // per-order read would open the file once per waiting order and do it on
+    // the async runtime's threads. The cache is keyed on the file's length and
+    // single-flighted, and a stale-by-one-append answer is harmless here -
+    // whatever it misses, the slot check re-reads under the lock before
+    // anything is written.
     let queue = state.store.waiting_to_pay();
-    if !crate::slot::is_at_the_head(&queue, &order.order_id) {
+    let journal_now = state.sweep_journal().await.unwrap_or_default();
+    if !crate::slot::is_next_to_pay(&journal_now, &queue, &order.order_id) {
         tracing::debug!(
             order = %order.order_id,
             waiting = queue.len(),

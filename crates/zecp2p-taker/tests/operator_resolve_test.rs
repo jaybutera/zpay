@@ -413,3 +413,101 @@ fn a_parked_fill_alone_leaves_a_daemon_free_to_start() {
     let its_own = j.latest().unwrap()[0].work_id();
     assert!(!zecp2p_taker::auto::journal::slot_verdict(&j.latest().unwrap(), &its_own).is_free());
 }
+
+/// The command refuses to run without an explicit finding.
+///
+/// Rail audit round 1, question 4. `--payment-was-sent` was a bare boolean, so
+/// the finding an operator got by *omitting* an argument was the one that opens
+/// the refund. An operator who read the feed, saw the payment, and forgot the
+/// flag would have recorded the opposite of what they saw, and the coordinator
+/// would then broadcast the user's refund against a release the LP had already
+/// paid for.
+///
+/// Asserted against the real binary's argument parsing, because that is where
+/// the hazard lived: the journal API never had a default, and a test of the
+/// journal would have passed throughout.
+#[test]
+fn the_retire_command_will_not_run_without_an_explicit_finding() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_zecp2p-taker"))
+        .args([
+            "resolve-fill",
+            "--work",
+            "zec/abc:0",
+            "--operator",
+            "casper",
+            "--evidence",
+            "balance $60.49 unchanged, no $2.00 debit",
+        ])
+        .output()
+        .expect("the taker binary should run");
+
+    assert!(
+        !out.status.success(),
+        "omitting the finding must not be a runnable command"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--finding"),
+        "the refusal must name the missing argument: {stderr}"
+    );
+}
+
+/// Both findings are reachable, and neither is the one you get by accident.
+#[test]
+fn the_retire_command_takes_either_finding_explicitly() {
+    for finding in ["sent", "not-sent"] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_zecp2p-taker"))
+            .args([
+                "resolve-fill",
+                "--work",
+                "zec/abc:0",
+                "--operator",
+                "casper",
+                "--evidence",
+                "read the feed",
+                "--finding",
+                finding,
+                "--dry-run",
+            ])
+            .env("ZECP2P_TAKER_CONFIG", "/nonexistent-on-purpose.toml")
+            .output()
+            .expect("the taker binary should run");
+
+        // It gets past argument parsing and fails on the missing config, which
+        // is as far as this test needs it to go: the point is that `--finding
+        // <value>` is accepted and neither value is special.
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("--finding"),
+            "`--finding {finding}` should parse: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn an_already_retired_line_cannot_be_retired_again() {
+    // The audit noted `every_state_that_is_not_needs_operator_is_refused` omits
+    // `Resolved` from its list, so re-retiring was refused by code and not
+    // pinned by a test. A second override would write a second operator's name
+    // over the first one's account of the feed.
+    let (_d, j) = journal();
+    let stuck = write_and_read(&j, &zec_record(0xa8, FillState::NeedsOperator));
+    let retired = j
+        .resolve_needs_operator(&stuck, resolution(Finding::NoPaymentWasSent))
+        .expect("the first retire succeeds");
+
+    let mut second = resolution(Finding::PaymentWasSent);
+    second.operator = "somebody-else".into();
+    let refused = j
+        .resolve_needs_operator(&retired, second)
+        .expect_err("an already retired line must not be retired again");
+    assert!(
+        format!("{refused:#}").contains("Resolved"),
+        "the refusal must name the state it found: {refused:#}"
+    );
+
+    // The first operator's account stands.
+    let audit = j.resolutions().unwrap();
+    assert_eq!(audit.len(), 1);
+    assert_eq!(audit[0].resolution.as_ref().unwrap().operator, "casper");
+}
