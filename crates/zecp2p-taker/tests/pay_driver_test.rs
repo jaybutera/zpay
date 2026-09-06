@@ -32,6 +32,9 @@ enum Confirmation {
     SheetStillUp,
     /// A sheet was already open before the drive clicked anything.
     SheetOpenBeforeWeClicked,
+    /// The page renders `@Jay-Butera-2`, a different account whose handle has
+    /// ours as a prefix.
+    PrefixCollidingPayee,
 }
 
 /// A fake browser: an HTTP `/json/list` and a websocket that answers
@@ -241,6 +244,14 @@ fn answer_for(expression: &str, confirmation: Confirmation) -> serde_json::Value
             // check, long before anything is clicked. Answered rather than
             // `todo!()`ed so a future step reordering surfaces as a failed
             // assertion instead of a panic in the fake.
+            // Unreachable: this mode refuses at the recipient check, long
+            // before anything is clicked. Answered rather than `todo!()`ed so
+            // a reordering surfaces as a failed assertion, not a panic.
+            Confirmation::PrefixCollidingPayee => serde_json::json!({
+                "ok": false, "sheet": true, "form": true,
+                "payBtn": true, "signedOut": false,
+                "url": "https://account.venmo.com/pay?recipients=jay-butera"
+            }),
             Confirmation::SheetOpenBeforeWeClicked => serde_json::json!({
                 "ok": false, "sheet": true, "form": true,
                 "payBtn": true, "signedOut": false,
@@ -258,9 +269,19 @@ fn answer_for(expression: &str, confirmation: Confirmation) -> serde_json::Value
             _ => serde_json::json!({ "ok": true, "sheets": [] }),
         };
     }
-    // The recipient check answers a report with `ok`.
-    if expression.contains("wanted") && expression.contains("url: location.href") {
-        return serde_json::json!({ "ok": true, "url": "https://account.venmo.com/pay" });
+    // The recipient check answers the handles the page renders. A healthy pay
+    // form names the payee we asked for.
+    if expression.contains("handles:") {
+        return match confirmation {
+            Confirmation::PrefixCollidingPayee => serde_json::json!({
+                "handles": ["Jay-Butera-2"],
+                "url": "https://account.venmo.com/pay?recipients=jay-butera"
+            }),
+            _ => serde_json::json!({
+                "handles": ["jay-butera"],
+                "url": "https://account.venmo.com/pay?recipients=jay-butera"
+            }),
+        };
     }
     // The amount readback answers the field's string.
     if expression.contains("the amount field is gone") {
@@ -503,5 +524,43 @@ async fn a_sheet_open_before_our_click_refuses_without_ambiguity() {
             .iter()
             .any(|e| e.contains(".click()") && e.contains("2.01")),
         "no money button may be clicked when a stale sheet is refused"
+    );
+}
+
+/// The driver refuses a page whose handle merely starts with ours.
+///
+/// The page-level test proves the predicate returns the handles; this proves
+/// `execute` compares them as whole handles. Reverting that comparison to a
+/// substring test makes this red -- without it the production path had no test
+/// at all, which is the defect round 2 caught in the `fiat::pay` test.
+///
+/// `@Jay-Butera-2` is what the round-3 review found on the live account page.
+/// Lowercased it contains `jay-butera`, so the old check would have filled in
+/// an amount and clicked send on a payment to a different account.
+#[tokio::test]
+async fn the_driver_refuses_a_payee_whose_handle_only_starts_with_ours() {
+    let fake = FakeBrowser::start(Confirmation::PrefixCollidingPayee).await;
+    let browser = VenmoBrowser::new(fake.cdp_url(), 5);
+    let tab = browser.find_venmo_tab().await.expect("the fake tab");
+
+    let error = browser
+        .pay(&tab, &request(), SendMode::Live)
+        .await
+        .expect_err("a different account must stop the payment");
+
+    let text = format!("{error:#}");
+    assert!(text.contains("does not name @jay-butera"), "{text}");
+    // It says what the page actually renders, so the operator can see why.
+    assert!(text.contains("Jay-Butera-2"), "{text}");
+
+    // Refused before anything was typed, let alone clicked: the recipient
+    // check is the first thing after the form appears.
+    assert!(
+        !fake.evaluated().iter().any(|e| e.contains(".click()")),
+        "nothing may be clicked when the payee does not match"
+    );
+    assert!(
+        !fake.evaluated().iter().any(|e| e.contains("_valueTracker")),
+        "no field may be filled when the payee does not match"
     );
 }

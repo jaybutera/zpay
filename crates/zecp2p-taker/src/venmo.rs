@@ -564,17 +564,43 @@ impl VenmoBrowser {
             PaymentStep::RequireRecipient { recipient } => {
                 let value = self.evaluate(tab, &step.to_expression()).await?;
                 let result = value.get("result").and_then(|r| r.get("value"));
-                let ok = result
-                    .and_then(|v| v.get("ok"))
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                if !ok {
-                    let url = result
-                        .and_then(|v| v.get("url"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("(unknown)");
+                let url = result
+                    .and_then(|v| v.get("url"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("(unknown)");
+                let handles: Vec<String> = result
+                    .and_then(|v| v.get("handles"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|h| h.as_str())
+                            .map(|h| h.to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                // Whole-handle equality, not "the page text contains this
+                // string". Both sides go through the same normaliser the
+                // coordinator and the curator use, so `@Alice` and ` alice `
+                // are the one handle they name -- and `jay-butera` no longer
+                // matches a page whose only handle is `Jay-Butera-2`.
+                //
+                // Case-insensitive because Venmo renders a handle in whatever
+                // case the owner set, while the string we are paying comes
+                // from the curator. Case is presentation; the handle is not.
+                let wanted = crate::payee::normalize_venmo_username(recipient);
+                let matched = handles.iter().any(|h| {
+                    crate::payee::normalize_venmo_username(h).eq_ignore_ascii_case(wanted)
+                });
+
+                if !matched {
+                    let seen = if handles.is_empty() {
+                        "no handles at all".to_string()
+                    } else {
+                        format!("@{}", handles.join(", @"))
+                    };
                     anyhow::bail!(
-                        "the Venmo page at {url} does not name @{recipient} anywhere. \
+                        "the Venmo page at {url} does not name @{wanted}; it renders {seen}. \
                          Refusing to fill in an amount and click send on a payment to \
                          someone else."
                     );
@@ -1059,7 +1085,8 @@ impl PaymentStep {
                 sel = json!(selector),
                 val = json!(value)
             ),
-            // Returns the rendered recipient text so a mismatch can name it.
+            // Returns the handles the page renders, so the caller compares them
+            // whole rather than as substrings.
             //
             // The page's own text, and **not** `location.href`. The URL used to
             // be part of the haystack, which made this check answer yes to the
@@ -1067,14 +1094,26 @@ impl PaymentStep {
             // confirm a claim we had made ourselves one step earlier. A pay
             // form left open for another payee, at a URL naming ours, passed.
             // Only what the document renders is evidence about who it pays.
-            PaymentStep::RequireRecipient { recipient } => format!(
+            //
+            // And a *whole* handle, not a substring of the page text. Asking
+            // whether the body contains "jay-butera" is true of a page whose
+            // only handle is `@Jay-Butera-2`, a different account -- the
+            // round-3 review found exactly that string on the live account
+            // page. Every handle Venmo can render is a candidate; the caller
+            // requires one of them to equal ours once both are normalised.
+            //
+            // Handles are extracted by their `@` prefix over Venmo's own
+            // character set (alphanumerics, `_`, `-`), which is the set
+            // `payee::validate_username_shape` already enforces on the string
+            // we are about to pay.
+            PaymentStep::RequireRecipient { .. } => format!(
                 "(() => {{ \
-                   const wanted = {want}; \
                    const hay = document.body ? document.body.innerText : ''; \
-                   return {{ ok: hay.toLowerCase().includes(wanted.toLowerCase()), \
+                   const found = hay.match({pat}) || []; \
+                   return {{ handles: found.map(h => h.slice(1)), \
                              url: location.href }}; \
                  }})()",
-                want = json!(recipient)
+                pat = "/@[A-Za-z0-9_-]+/g"
             ),
             // Returns what the field actually holds, so the caller compares.
             PaymentStep::RequireAmount { selector, .. } => format!(

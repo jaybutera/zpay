@@ -216,7 +216,7 @@ function stalePayPage() {
       new Element('button', { disabled: true }, 'Confirm'),
     ],
     // The recipient has to be findable in the page text, as on the real page.
-    text: 'Pay jay-butera',
+    text: 'Pay @jay-butera',
   };
   return page;
 }
@@ -236,7 +236,7 @@ function cleanPayPage() {
       new Element('textarea', { id: 'payment-note', value: '' }),
       new Element('button', {}, 'Pay'),
     ],
-    text: 'Pay jay-butera',
+    text: 'Pay @jay-butera',
   };
   page.location = { href: page.url };
 
@@ -381,8 +381,37 @@ function wrongPayeeFormPage() {
       new Element('textarea', { id: 'payment-note', value: '' }),
       new Element('button', {}, 'Pay'),
     ],
-    text: 'Pay someone-else',
+    text: 'Pay @someone-else',
   };
+}
+
+/// A pay form for `@Jay-Butera-2`, a different account whose handle has ours
+/// as a prefix.
+///
+/// This is the collision the round-3 review found on the live account page,
+/// which renders the header handle `@Jay-Butera-2`. A substring check asking
+/// whether the body contains "jay-butera" answers yes here and pays the wrong
+/// account; whole-handle equality answers no.
+function prefixCollisionFormPage() {
+  return {
+    url: 'https://account.venmo.com/pay?recipients=jay-butera',
+    elements: [
+      new Element('input', { 'aria-label': 'Amount', value: '' }),
+      new Element('textarea', { id: 'payment-note', value: '' }),
+      new Element('button', {}, 'Pay'),
+    ],
+    text: 'Pay @Jay-Butera-2',
+  };
+}
+
+/// The same payee, rendered in the case its owner chose.
+///
+/// Venmo shows a handle however the owner set it while the string we pay comes
+/// from the curator, so case must not decide a payment.
+function mixedCaseFormPage() {
+  const page = cleanPayPage();
+  page.text = 'Pay @Jay-Butera';
+  return page;
 }
 
 const PAGES = {
@@ -397,6 +426,8 @@ const PAGES = {
   expiringpay: expiringPayPage,
   otherpayeesheet: otherPayeeSheetPage,
   wrongpayeeform: wrongPayeeFormPage,
+  prefixcollision: prefixCollisionFormPage,
+  mixedcase: mixedCaseFormPage,
 };
 
 // ---------------------------------------------------------------------------
