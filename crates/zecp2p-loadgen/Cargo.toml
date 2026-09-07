@@ -1,0 +1,46 @@
+[package]
+name = "zecp2p-loadgen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Testnet traffic and soak harness for the v2 escrow coordinator"
+
+[[bin]]
+name = "zecp2p-loadgen"
+path = "src/main.rs"
+
+[lib]
+name = "zecp2p_loadgen"
+path = "src/lib.rs"
+
+[dependencies]
+zecp2p-escrow = { path = "../zecp2p-escrow" }
+zecp2p-taker = { path = "../zecp2p-taker" }
+# No feature flags. `test-rails` would be unified across a workspace build by
+# resolver 2, which would compile the simulated fiat rail into the production
+# `zecp2p-v2coordinator` binary that DEPLOY.md builds with a bare `cargo build
+# --release`. Nothing here is behind that gate: the harness installs its own
+# `ModelRail` through `AppStateBuilder::with_fiat`, which is not feature-gated.
+zecp2p-v2coordinator = { path = "../zecp2p-v2coordinator" }
+tokio = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+hex = { workspace = true }
+chrono = { workspace = true }
+rand = { workspace = true }
+clap = { workspace = true }
+tempfile = { workspace = true }
+secp256k1 = { version = "0.30", features = ["rand", "global-context"] }
+secp256k1-zkp = { version = "0.11", features = ["rand", "rand-std", "std", "global-context"] }
+sha2 = "0.10"
+async-trait = "0.1"
+http-body-util = "0.1"
+
+[dev-dependencies]
+tempfile = { workspace = true }
