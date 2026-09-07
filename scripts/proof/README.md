@@ -66,14 +66,7 @@ Or find `externalId=` in the URL of the stories request in the Network tab.
 
 ## Generate the proof
 
-The wrapper reads the intent's amount, payee hash and on-chain signal timestamp
-off the orchestrator for you, so use it rather than driving the script by hand:
-
-```bash
-scripts/deploy/06_prove_payment.sh --intent 0x<intentHash>
-```
-
-Directly, if you already have every field:
+The coordinator drives `prove_payment_pinned.mjs` itself. By hand:
 
 ```bash
 export VENMO_COOKIE='<the whole Cookie header>'
