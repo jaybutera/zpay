@@ -109,7 +109,14 @@ impl Harness {
 
         // The LP key. Set in this process's environment because that is how the
         // coordinator reads it; it is the published constant above.
-        std::env::set_var("ZECP2P_LP_PRIV", hex::encode(HARNESS_LP_PRIV));
+        //
+        // Once for the process, not once per harness. It is the same constant
+        // every time, so a second write changes nothing - but the test binary
+        // builds harnesses on parallel threads while `load_lp_key` reads the
+        // variable, and a write racing a read is the pattern Rust 2024 makes
+        // `unsafe`.
+        static LP_KEY: std::sync::Once = std::sync::Once::new();
+        LP_KEY.call_once(|| std::env::set_var("ZECP2P_LP_PRIV", hex::encode(HARNESS_LP_PRIV)));
 
         let config = harness_config(&options, dir.path(), &node.url, &attestor.url, &curator.url)?;
 

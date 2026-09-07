@@ -26,6 +26,12 @@ cargo run -p zecp2p-loadgen -- --duration 3600 --concurrency 8 \
 cargo run -p zecp2p-loadgen -- --count 20 --false-paid-in 5      # the 2026-09-05 shape
 cargo run -p zecp2p-loadgen -- --count 20 --attest-failure-in 4  # a prover-config gap
 cargo run -p zecp2p-loadgen -- --count 20 --pay-failure-in 4     # an ambiguous pay failure
+
+# And the faults that come from outside the process, as windows in the run.
+cargo run -p zecp2p-loadgen -- --count 300 --node-outage-at 30 --node-outage-for 25
+cargo run -p zecp2p-loadgen -- --count 300 --node-stall-ms 200
+cargo run -p zecp2p-loadgen -- --count 20 --reject-broadcasts-at 5 --reject-broadcasts-for 10
+cargo run -p zecp2p-loadgen -- --count 20 --attestor-refuses-at 5 --attestor-refuses-for 10
 ```
 
 `cargo test -p zecp2p-loadgen` holds the harness itself to what it claims.
@@ -123,6 +129,18 @@ order, against a slot that was never going to free.
 all 8 orders still released: the coordinator retried on the next sweep, 11
 attest calls for 8 orders. The prover-config gap is survivable where the
 ambiguous pay failure is not.
+
+**A node that will not relay strands the escrow; an attestor that will not sign
+does not.** Two runs of 6 orders, each with a 3 second window of the fault.
+With `--reject-broadcasts-at 1 --reject-broadcasts-for 3`, all 6 payments left
+and 5 escrows released: the one whose release fell in the window ended `failed`
+with the dollars gone, and nothing re-attempted it after the node came back -
+the same dead end the node-outage run found below. With
+`--attestor-refuses-at 1 --attestor-refuses-for 3` all 6 released, at the cost
+of 33 attest calls for 6 orders: the coordinator kept asking, and got an answer
+once the enclave came back. The difference is where the failure falls. Before
+the release is assembled it is a retry; after the dollars have gone and the
+transaction exists, it needs a human.
 
 ## The stuck slot is invisible to monitoring
 

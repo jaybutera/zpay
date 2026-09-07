@@ -110,6 +110,33 @@ struct Args {
     /// Delay every node answer by this many milliseconds, for the whole run.
     #[arg(long, default_value_t = 0)]
     node_stall_ms: u64,
+
+    /// Make the node refuse every `sendrawtransaction` for this many seconds,
+    /// starting this far into the run, while leaving reads working.
+    ///
+    /// The shape of a node that accepted the escrow and then rejected the
+    /// release. It is the worst window there is: the dollars have already gone
+    /// and the coin cannot be claimed, so what a soak is looking for is whether
+    /// the coordinator ever gets back to a release it could not broadcast.
+    #[arg(long)]
+    reject_broadcasts_at: Option<u64>,
+
+    /// How long the injected broadcast refusal lasts, in seconds.
+    #[arg(long, default_value_t = 30)]
+    reject_broadcasts_for: u64,
+
+    /// Make the attestor refuse to sign the outcome for this many seconds,
+    /// starting this far into the run.
+    ///
+    /// An enclave with no prover configured, at the seam the rail's
+    /// `--attest-failure-in` cannot reach: this is the DLC outcome scalar, and
+    /// without it the pre-signature cannot be decrypted into a release.
+    #[arg(long)]
+    attestor_refuses_at: Option<u64>,
+
+    /// How long the injected attestor refusal lasts, in seconds.
+    #[arg(long, default_value_t = 30)]
+    attestor_refuses_for: u64,
 }
 
 fn parse_mix(text: &str) -> Result<Vec<(Path, u32)>> {
@@ -236,6 +263,46 @@ async fn main() -> Result<()> {
         );
     }
 
+    // A node that takes the release and then will not relay it.
+    if let Some(at) = args.reject_broadcasts_at {
+        let node = harness.node.clone();
+        let for_secs = args.reject_broadcasts_for;
+        tokio::spawn(async move {
+            use std::sync::atomic::Ordering::Relaxed;
+            tokio::time::sleep(Duration::from_secs(at)).await;
+            tracing::warn!(
+                seconds = for_secs,
+                "INJECTED broadcast refusal: reads work, sendrawtransaction does not"
+            );
+            node.faults().reject_broadcast.store(true, Relaxed);
+            tokio::time::sleep(Duration::from_secs(for_secs)).await;
+            node.faults().reject_broadcast.store(false, Relaxed);
+            tracing::warn!("the node is relaying again");
+        });
+        println!(
+            "  node refuses every broadcast from {}s for {}s",
+            at, args.reject_broadcasts_for
+        );
+    }
+
+    // And an enclave that will not sign the outcome.
+    if let Some(at) = args.attestor_refuses_at {
+        let attestor = harness.attestor.clone();
+        let for_secs = args.attestor_refuses_for;
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(at)).await;
+            tracing::warn!(seconds = for_secs, "INJECTED attestor refusal: /attest fails");
+            attestor.set_refuse_attest(true);
+            tokio::time::sleep(Duration::from_secs(for_secs)).await;
+            attestor.set_refuse_attest(false);
+            tracing::warn!("the attestor is signing again");
+        });
+        println!(
+            "  attestor refuses to sign from {}s for {}s",
+            at, args.attestor_refuses_for
+        );
+    }
+
     let env = harness.env.clone();
     let stats = generator::run(env, plan).await?;
 
@@ -339,7 +406,9 @@ fn report(harness: &Harness, stats: &generator::Stats, broadcasts: usize) {
     }
     let refused = node.failed.load(Relaxed);
     if refused > 0 {
-        println!("  refused         {refused} (injected outage)");
+        // Both the RPC outage and the broadcast refusal land here, so the
+        // label names neither.
+        println!("  refused         {refused} (injected fault)");
     }
     println!(
         "  attestor        {} announces, {} attests",
