@@ -13,12 +13,11 @@ const SITE = {
   // Placeholder until the fee is fixed. Rendered everywhere as data-fee.
   feePercent: '0.15',
 
-  // Only destinations that exist. The source repository is private, so there
-  // is no GitHub link; add one here when it is public and both pages pick it
-  // up. `verifier` is the Base contract whose EIP-712 domain the zk-p2p
-  // enclave signs under; nothing is submitted there, the takers page links it
-  // as the signing domain.
+  // Only destinations that exist. `verifier` is the Base contract whose
+  // EIP-712 domain the zk-p2p enclave signs under; nothing is submitted there,
+  // the takers page links it as the signing domain.
   links: {
+    source: 'https://github.com/jaybutera/zpay',
     zkp2p: 'https://zkp2p.xyz',
     zcash: 'https://z.cash',
     verifier: 'https://basescan.org/address/0xC6F4a193576C60892a47e111Bb5706c30162502B',
