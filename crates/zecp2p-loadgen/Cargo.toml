@@ -16,7 +16,12 @@ path = "src/lib.rs"
 [dependencies]
 zecp2p-escrow = { path = "../zecp2p-escrow" }
 zecp2p-taker = { path = "../zecp2p-taker" }
-zecp2p-v2coordinator = { path = "../zecp2p-v2coordinator", features = ["test-rails"] }
+# No feature flags. `test-rails` would be unified across a workspace build by
+# resolver 2, which would compile the simulated fiat rail into the production
+# `zecp2p-v2coordinator` binary that DEPLOY.md builds with a bare `cargo build
+# --release`. Nothing here is behind that gate: the harness installs its own
+# `ModelRail` through `AppStateBuilder::with_fiat`, which is not feature-gated.
+zecp2p-v2coordinator = { path = "../zecp2p-v2coordinator" }
 tokio = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }
