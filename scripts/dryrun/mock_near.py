@@ -13,7 +13,7 @@ structs. Deriving them from the spec is the point: a mock written to match our
 own types cannot catch a mismatch between our types and the API.
 
 Response fields and values are pinned to a real mainnet swap captured on
-2026-08-31 (scripts/stageb/fixtures/), so the mock reproduces what the service
+2026-08-31 (crates/zecp2p-coordinator/tests/fixtures/), so the mock reproduces what the service
 actually sends rather than what we assumed it sends.
 
 Details this reproduces that a hand-written mock got wrong:

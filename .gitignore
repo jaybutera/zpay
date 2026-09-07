@@ -26,9 +26,6 @@ contracts/cache/
 contracts/out/
 contracts/broadcast/
 
-# ralph loop log
-.ralph.log
-
 # testnet deployment output (local to each deployer). The glob catches the next
 # deployed.<chain>.env before someone writes one.
 scripts/testnet/*.env
@@ -38,16 +35,9 @@ scripts/proof/node_modules/
 scripts/proof/attestation.json
 scripts/testnet/live.intent.env.*
 
-# Stage B live-test keystore (real private keys; never commit)
-scripts/stageb/keystore/
-scripts/stageb/*.key
-scripts/stageb/quote.json
-scripts/stageb/poll.log
-scripts/stageb/live.quote.env
-# Every staged live run, not just the first one named. These record one
-# operator's deposit address, refund address and session id: no keys, but a
-# public repo has no business carrying a person's Zcash addresses.
-scripts/stageb/live.*.env
+# Stage B live-test keystore (real private keys; never commit). The scripts
+# are gone; the ignore stays because the keys are still on operators' disks.
+scripts/stageb/
 
 # Deploy state: addresses recorded per chain by scripts/deploy/*. No keys, but
 # it names one specific deployment, so it belongs to the operator, not the repo.

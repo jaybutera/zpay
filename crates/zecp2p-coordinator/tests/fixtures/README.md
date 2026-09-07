@@ -12,7 +12,7 @@ timings and correlation ids. That is a linkage between a Zcash address and an
 Ethereum address, in a repository about moving value between the two, and it is
 worth nothing to keep. It was NEW-6 in the 2026-08-31 re-audit.
 
-Replaced in every file here and in `scripts/stageb/fixtures/`:
+Replaced in every file here:
 
 | Field | Replaced with |
 |---|---|

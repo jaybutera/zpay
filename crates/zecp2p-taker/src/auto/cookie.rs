@@ -10,8 +10,8 @@
 //! depends only on the upstream session still being active. So one capture from
 //! a real logged-in browser serves many fills for the life of that Venmo
 //! session. The daemon does not need a browser per attestation, and the
-//! browser-driven step belongs in a `refresh-cookie` subcommand rather
-//! than in the fill path.
+//! browser-driven refresh step belongs in a `refresh-cookie` subcommand
+//! rather than in the fill path.
 //!
 //! The same document says the flip side plainly: a leaked encrypted JWE is
 //! valid for the upstream session lifetime and should be treated as equivalent
