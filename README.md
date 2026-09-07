@@ -136,26 +136,19 @@ Two of the choices above are not optional:
   for `account.venmo.com` gets a DataDome interstitial with no login form.
   The same profile run headed under Xvfb gets the real page.
 
-Sign that browser into Venmo. There is no display, so the way in is the CDP
-port. [scripts/venmo-hub-login.sh](scripts/venmo-hub-login.sh) forwards the
-port over ssh, fills the form from the credentials file, stops for you to solve
-the captcha, then prompts for the SMS code and submits it. The captcha is an
-interaction proof and stays manual. Once the browser is signed in,
-[scripts/capture-venmo-session.sh](scripts/capture-venmo-session.sh) writes the
-session cookie to the `session_path` in the config; the enclave replays that
-cookie to read the payment feed. `sender_id` in the `[venmo]` block is the
-account's numeric id, not the handle; the coordinator refuses a session whose
-id differs.
+Sign that browser into Venmo through its DevTools port; the captcha is an
+interaction proof and stays manual. Then write the signed-in session's cookies
+to the `session_path` named in the config, as the JSON the coordinator
+documents next to that setting; the enclave replays that cookie to read the
+payment feed. `sender_id` in the `[venmo]` block is the account's numeric id,
+not the handle; the coordinator refuses a session whose id differs.
 
-The session goes idle-stale in about three hours if nothing uses it.
-[scripts/venmo-session-keeper.sh](scripts/venmo-session-keeper.sh) makes one
-authenticated request from the signed-in browser and re-captures the cookie
-before it ages out; `--install` puts it on a systemd timer every 20 minutes.
-When the browser is signed out, the keeper says so and names the command that
-fixes it. Unattended re-login exists only for an account enrolled in an
-authenticator app: with `method = "totp"` and the seed in
-`config/venmo.local.toml`, the daemon computes its own codes. SMS and email
-second factors stop at the code box and wait for a human.
+The session goes idle-stale in about three hours if nothing uses it, so
+something has to make one authenticated request from the signed-in browser
+and re-capture the cookie before it ages out. Unattended re-login exists only
+for an account enrolled in an authenticator app: with `method = "totp"` and
+the seed in `config/venmo.local.toml`, the daemon computes its own codes. SMS
+and email second factors stop at the code box and wait for a human.
 
 ### 4. The proof harness
 
@@ -237,16 +230,7 @@ python3 -m http.server 8080 --directory frontend
 
 The coordinator must list the page's origin in `[server] allowed_origins` or
 the browser blocks the calls. [frontend/README.md](frontend/README.md) covers
-the page, its `?api=` override, and the S3 and CloudFront deployment behind
-zpay.cash.
-
-The counters on the front door come from a static snapshot, not from the
-coordinator. After fills land, refresh it from the machine holding the state:
-
-```bash
-scripts/export-public-stats.py --escrow-state ~/.zecp2p/v2coordinator
-infra/public-api/deploy.sh
-```
+the page and its `?api=` override.
 
 ### What the coordinator will not do
 
@@ -259,10 +243,6 @@ infra/public-api/deploy.sh
   the branch id are re-read immediately before the browser opens.
 - Cap a payment above `max_payment_cents`. That line is the last one against
   a units confusion, and it is yours to set.
-
-[PRODUCTION-READINESS.md](PRODUCTION-READINESS.md) ranks what breaks first when
-the service runs unattended, and [AUDIT-RAIL.md](AUDIT-RAIL.md) records the
-audits of the payment path.
 
 ## Developing
 
@@ -314,7 +294,6 @@ the top of its source.
 | `paid_path` | the paid leg: announce, pre-sign, attest, decrypt, broadcast; needs an attestor built with `--features test-signer` |
 | `fabricated_release` | prove that a release with a made-up scalar is rejected by a node's mempool |
 | `frontend_vectors` | vectors for the page's hand-written crypto, and the check of what the page produced |
-| `inventory` | derive the mainnet address of every project key file; prints no secret |
 
 The coordinator's own tests in `crates/zecp2p-v2coordinator/tests` drive the
 `/escrow/*` contract and the JS interop with the page. The page's crypto is
@@ -338,5 +317,3 @@ counts against the per-handle limit until its refund height.
 - [specs/zec-native-escrow.md](specs/zec-native-escrow.md): the escrow
   protocol. A 2-of-2 P2SH with a CLTV refund, released by an adaptor signature
   the attestor's outcome completes. Read this before the code.
-- [docs/status/](docs/status/): dated run reports, review rounds and
-  decisions, including the regtest paid-path run and the security audits.

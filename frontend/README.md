@@ -31,8 +31,8 @@ and needs no configuration.
 The front door reads three things and never posts:
 
 - `GET /api/stats` every 30 seconds: payments completed, dollars settled,
-  open orders, last payment. This is a static snapshot behind a Lambda
-  (`infra/public-api/`), not the coordinator.
+  open orders, last payment. This is a static snapshot served beside the
+  site, not the coordinator.
 - `GET /escrow/capabilities` every two minutes: the rate, the limits and the
   spread on the fees table.
 - `GET /escrow/quote?amount=X&unit=zec` once per pause in typing. A reply that
@@ -71,46 +71,3 @@ do not resolve relative paths. If the domain changes, those three tags in
 vectors the Rust crate emits, and the mock coordinator that serves the page
 with a timer for a chain. None of it runs under `cargo test`; run it whenever
 `escrow.js` changes.
-
-## Deploying
-
-```bash
-./scripts/deploy-site.sh
-```
-
-Live at <https://zpay.cash/>, with `www.zpay.cash` serving the same
-distribution. The CloudFront domain <https://d2acgjt7j1yqe8.cloudfront.net/>
-still answers and is what the deploy script prints.
-
-The site is a private S3 bucket (`zpay-site-<account-id>`) behind CloudFront
-distribution `<distribution-id>`, which reads it through an origin access
-control; the bucket denies everything else, so the S3 URLs are not reachable.
-Both hostnames are alternate domain names on the distribution, so CloudFront
-terminates TLS for them with an ACM certificate in `us-east-1` (certificates
-for CloudFront must live in that region regardless of where anything else
-runs). DNS is Cloudflare, and the two records are CNAMEs to the distribution
-set to DNS-only: proxying them would put Cloudflare's certificate in front
-and hide CloudFront's. CloudFront compresses text on the way out, routes
-`/api/*` to the Lambda and `/escrow/*` to the coordinator, and a CloudFront
-function appends `index.html` to directory URLs, which an S3 REST origin does
-not do on its own.
-
-The script syncs in four passes, because the `Cache-Control` differs by file
-and `aws s3 sync` sets one value per invocation:
-
-| pass | files | max-age |
-| --- | --- | --- |
-| 1 | css, js | 1 day |
-| 2 | `fonts/`, `og.png` | 1 year, immutable |
-| 3 | html | 60s, must-revalidate |
-| 4 | deletes only | |
-
-HTML goes up after the assets it references, so a page is never live pointing
-at something that has not landed. The fourth pass removes keys that are gone
-from `frontend/`; it exists because the earlier passes filter, and a filtered
-`aws s3 sync --delete` skips excluded keys when deciding what to delete. The
-invalidation covers the short-TTL paths only, since the year-long assets are
-content-stable. `README.md`, `app/test/` and any `shot-*.png` stay local.
-
-Both the bucket and the distribution can be overridden with
-`ZPAY_SITE_BUCKET` and `ZPAY_SITE_DISTRIBUTION`.
