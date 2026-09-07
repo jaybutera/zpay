@@ -12,8 +12,7 @@ in the shipped config) which is the liquidity provider's margin for fronting
 dollars against a coin whose price moves while the escrow is open.
 
 This guide covers three things: sending a payment, running the service, and
-working on the code. The older route through Base and zk-p2p's USDC escrow is
-documented next to its crate in [crates/zecp2p-coordinator/README.md](crates/zecp2p-coordinator/README.md).
+working on the code.
 
 ## Sending ZEC to a Venmo handle
 
@@ -115,9 +114,20 @@ never sees the password; it drives the pay form in a tab that is already
 signed in, and it stops before the send button unless `live_payments` is on.
 
 Run a dedicated Chrome with its own profile on port 9223, headed under Xvfb.
-[deploy/hub/chrome-venmo.service](deploy/hub/chrome-venmo.service) is the
-systemd user unit the live service uses, with the flags and the memory caps.
-Two of its choices are not optional:
+The live service runs it as a systemd user unit whose command is:
+
+```bash
+xvfb-run -a -s "-screen 0 1280x900x24" google-chrome \
+  --remote-debugging-port=9223 --remote-debugging-address=127.0.0.1 \
+  --user-data-dir=$HOME/.zecp2p/chrome-venmo \
+  --user-agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36" \
+  --no-first-run --no-default-browser-check --disable-background-networking \
+  --disable-gpu --disable-dev-shm-usage --window-size=1280,900 about:blank
+```
+
+The user agent must match `user_agent` in the coordinator's `[venmo]` block:
+the enclave replays the captured cookie under the agent it was captured with.
+Two of the choices above are not optional:
 
 - **A separate profile and port.** The coordinator drives the first tab whose
   URL contains `venmo.com`. Attaching it to a browser a person also uses puts
@@ -257,20 +267,18 @@ audits of the payment path.
 ## Developing
 
 Rust 1.88 or later (`alloy` and `zcash_primitives` both declare that floor;
-the tree is built with 1.98), Node 20 or later, Python 3, and Foundry if you
-touch the Base rail's contract.
+the tree is built with 1.98), Node 20 or later, and Python 3.
 
 ```bash
 cargo build --release
 cargo test --workspace
-(cd contracts && forge test)
 ```
 
 `Cargo.lock` is not committed. A fresh checkout resolves dependencies itself,
 and a resolution that picks a newer `winnow` breaks every `alloy` crate at
 compile time; copy the lock file from a working checkout if that happens.
 
-Tests that need a live node, an anvil fork of Base, or a signed-in browser are
+Tests that need a live node or a signed-in browser are
 marked `#[ignore]` and run with `cargo test -- --ignored`. The escrow crate's
 read the node from `ZECP2P_RPC_URL` and `ZECP2P_RPC_NETWORK`.
 
@@ -330,6 +338,5 @@ counts against the per-handle limit until its refund height.
 - [specs/zec-native-escrow.md](specs/zec-native-escrow.md): the escrow
   protocol. A 2-of-2 P2SH with a CLTV refund, released by an adaptor signature
   the attestor's outcome completes. Read this before the code.
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): the Base rail, end to end.
 - [docs/status/](docs/status/): dated run reports, review rounds and
   decisions, including the regtest paid-path run and the security audits.

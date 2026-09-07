@@ -2,8 +2,6 @@
 resolver = "2"
 members = [
     "crates/zecp2p-types",
-    "crates/zecp2p-coordinator",
-    "crates/zecp2p-cli",
     "crates/zecp2p-taker",
     "crates/zecp2p-escrow",
     "crates/zecp2p-attestor",

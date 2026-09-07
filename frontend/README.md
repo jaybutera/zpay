@@ -50,10 +50,6 @@ fragment and in this browser's localStorage, and nowhere else. The page
 rebuilds the escrow address from its own key, the LP's key and the refund
 height before it shows one, and refuses an order whose address differs.
 
-`app/advanced/` is the page for the Base rail (the older route through 1Click
-and zk-p2p's USDC escrow), against a different coordinator and a different
-API. The app's footer links it as "Advanced route"; the front door does not.
-
 ## The SITE block
 
 The top of `site.js` holds every value the copy leans on: the fee percent, the

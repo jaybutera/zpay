@@ -42,11 +42,8 @@ with JavaScript" to "the crate agrees".
 
 ## The older checks
 
-`qr-verify.js`, `crypto-vectors.js`, `session-key-vectors.js` and
-`zaddr-vectors.js` cover the QR encoder, and the Base-route session key and
-address checksums (SHA-256, base58check, bech32m) that `advanced/` still uses
-from `zaddr.js`. They need `npm install jsqr qrcode` and the coordinator's
-`verify_js_sigs` example; see their headers.
+`qr-verify.js` covers the QR encoder. It needs `npm install jsqr qrcode`;
+see its header.
 
 ## What these caught
 
