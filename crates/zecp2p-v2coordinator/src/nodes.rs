@@ -13,6 +13,33 @@
 //!   output" or "that transaction is rejected" has answered, and asking a
 //!   second node the same question would swap one node's opinion for another's
 //!   until one agrees. Only [`ChainError::Unreachable`] fails over.
+//!
+//! # Re-running the closure is safe, and why that is not luck
+//!
+//! [`NodePool::try_each`] may call its closure against more than one endpoint,
+//! so the closure has to be re-runnable. Two things make that true rather than
+//! hoped for.
+//!
+//! The pool only re-runs on `Unreachable`, and `Unreachable` covers one case
+//! that is not simply "nothing happened": a request that timed out or lost its
+//! connection *after* the node received it. `rpc.rs` maps a failed `send()` and
+//! a failed body read to `Unreachable`, and a node can have accepted a
+//! transaction before either. So a broadcast really can be retried against a
+//! second endpoint after the first one accepted it.
+//!
+//! That is harmless because the retry sends **the same signed bytes**, which
+//! have the same txid. The second node either accepts the transaction it has
+//! not seen, or answers that it already knows it - and `RpcChainClient::broadcast`
+//! maps every form of "already known" to success with the txid computed from
+//! the bytes. There is no path where a re-run produces a second, different
+//! transaction, because the closure does not build one: the caller signed it
+//! before `try_each` was entered.
+//!
+//! The rule this imposes on callers: **a closure passed here must not create
+//! anything, and must not depend on having run exactly once.** A closure that
+//! signs, that draws a nonce, or that increments a counter belongs in
+//! `with_chain_any`, which runs against the preferred endpoint and never
+//! retries.
 //! - **The working endpoint is remembered**, so an outage costs one wasted call
 //!   rather than one per call, and recovery is re-checked from the top on the
 //!   next miss rather than pinned to the fallback forever.
