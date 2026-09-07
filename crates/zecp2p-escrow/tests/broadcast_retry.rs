@@ -210,3 +210,106 @@ fn a_real_rejection_still_reads_as_a_rejection() {
         );
     }
 }
+
+/// A caller that stops between attempts really stops, and says so distinctly.
+///
+/// The coordinator puts a wall-clock budget on one attempt this way, because it
+/// runs this loop inside its sweep and the deadline the loop retries to is tens
+/// of minutes off. The property that matters is that the loop *returns*: an
+/// early exit implemented as a no-op sleep would spin against the node as fast
+/// as it could answer, which is worse than the blocking it replaced.
+#[test]
+fn a_caller_can_stop_retrying_between_attempts() {
+    let policy = EscrowPolicy::mainnet_default();
+    let refund_height = 3_500_000;
+
+    // Far more refusals than the caller will sit through, and a height well
+    // inside the deadline, so nothing but the caller's own decision can end it.
+    let node = ScriptedNode::new(
+        (0..1000)
+            .map(|_| Err(ChainError::NotYet(SLOW.into())))
+            .collect(),
+        3_400_000,
+    );
+
+    let mut attempts = 0;
+    let err = broadcast_release_until_deadline(&node, &policy, refund_height, &[0u8; 8], || {
+        attempts += 1;
+        // Two naps, then stop. Standing in for a budget running out.
+        attempts < 3
+    })
+    .expect_err("stopping early is not success");
+
+    match err {
+        LpError::BroadcastGaveUp { last } => {
+            assert!(
+                last.contains("could not find transparent input"),
+                "the node's last word should survive: {last}"
+            );
+        }
+        other => panic!("stopping early must be distinguishable from a refusal, got {other}"),
+    }
+    assert_eq!(attempts, 3, "the loop must return on the refusal, not spin");
+}
+
+/// Stopping early is not the deadline passing, and the two must not be confused.
+///
+/// `BroadcastDeadlinePassed` means the chain has moved past the point where the
+/// release still beats the refund - the trade is lost. `BroadcastGaveUp` means
+/// only that this attempt stopped: the release is still worth broadcasting and
+/// the caller is expected to come back. A caller that treated the second as the
+/// first would abandon a release it could still land.
+#[test]
+fn giving_up_early_is_not_the_deadline_passing() {
+    let policy = EscrowPolicy::mainnet_default();
+    let refund_height = 3_500_000;
+    let deadline = policy.broadcast_deadline_for_refund_height(refund_height);
+
+    // Inside the deadline: stopping here is the caller's choice.
+    let inside = ScriptedNode::new(
+        (0..10).map(|_| Err(ChainError::NotYet(SLOW.into()))).collect(),
+        deadline - 100,
+    );
+    let err = broadcast_release_until_deadline(&inside, &policy, refund_height, &[0u8; 8], || false)
+        .expect_err("the caller stopped");
+    assert!(
+        matches!(err, LpError::BroadcastGaveUp { .. }),
+        "inside the deadline, stopping is the caller's decision: {err}"
+    );
+
+    // Past the deadline the chain decides, whatever the caller would have done.
+    let past = ScriptedNode::new(
+        (0..10).map(|_| Err(ChainError::NotYet(SLOW.into()))).collect(),
+        deadline + 1,
+    );
+    let err = broadcast_release_until_deadline(&past, &policy, refund_height, &[0u8; 8], || true)
+        .expect_err("past the deadline the LP must stop");
+    assert!(
+        matches!(err, LpError::BroadcastDeadlinePassed { .. }),
+        "past the deadline the chain decides, not the caller: {err}"
+    );
+}
+
+/// A caller that never stops gets exactly the old behaviour.
+///
+/// The signature changed for every existing caller, so the no-change case is
+/// worth pinning: `|| true` must still retry to the deadline and report it the
+/// way it always did.
+#[test]
+fn always_returning_true_is_the_original_behaviour() {
+    let policy = EscrowPolicy::mainnet_default();
+    let refund_height = 3_500_000;
+    let deadline = policy.broadcast_deadline_for_refund_height(refund_height);
+
+    let node = ScriptedNode::new(
+        (0..100).map(|_| Err(ChainError::NotYet(SLOW.into()))).collect(),
+        deadline + 1,
+    );
+    let mut naps = 0;
+    let err = broadcast_release_until_deadline(&node, &policy, refund_height, &[0u8; 8], || {
+        naps += 1;
+        true
+    })
+    .expect_err("past the deadline this still stops");
+    assert!(matches!(err, LpError::BroadcastDeadlinePassed { .. }), "{err}");
+}
