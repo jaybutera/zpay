@@ -244,7 +244,10 @@ async fn main() -> Result<()> {
         println!("wrote {} iterations to {path}", stats.total());
     }
 
-    report(&harness, &stats);
+    // Asked once, at the end: the node is the only thing that knows how many
+    // spends the run really produced.
+    let broadcasts = harness.node.broadcast_count().await;
+    report(&harness, &stats, broadcasts);
     Ok(())
 }
 
@@ -275,7 +278,7 @@ fn write_jsonl(path: &str, stats: &generator::Stats) -> Result<()> {
     Ok(())
 }
 
-fn report(harness: &Harness, stats: &generator::Stats) {
+fn report(harness: &Harness, stats: &generator::Stats, broadcasts: usize) {
     let counters = &harness.rail_counters;
     let node = harness.node.counters();
     use std::sync::atomic::Ordering::Relaxed;
@@ -343,6 +346,7 @@ fn report(harness: &Harness, stats: &generator::Stats) {
         harness.attestor.announces(),
         harness.attestor.attests()
     );
+    println!("  spends accepted {broadcasts}");
 
     let errors = stats.error_histogram();
     if !errors.is_empty() {
@@ -399,25 +403,26 @@ fn report(harness: &Harness, stats: &generator::Stats) {
             released.saturating_sub(truly)
         ),
     );
+    // Counted at the chain, not in the order records.
+    //
+    // An order carries one `release_txid` however many times its escrow was
+    // really spent, so deduplicating those cannot fail for the reason this
+    // invariant names. What can fail is the count the node kept: every order
+    // that released or refunded spent its escrow exactly once, so the number of
+    // spends the chain accepted must not exceed the number of orders that
+    // settled. The node refuses a second spend of an outpoint - as a real one
+    // would - so a coordinator that tried would also show up as a broadcast
+    // failure in the histogram above.
+    let settled = stats.released() + stats.refunded();
     check(
         "no escrow released more than once",
-        harness_broadcasts_le(stats),
-        "more releases than released orders".to_string(),
+        broadcasts <= settled,
+        format!(
+            "the chain accepted {broadcasts} spends for {settled} orders that released \
+             or refunded, so {} escrow(s) were spent twice",
+            broadcasts.saturating_sub(settled)
+        ),
     );
-}
-
-/// Releases are one per released order. More than that would mean an escrow was
-/// spent twice, which the chain would refuse and the harness must not miss.
-fn harness_broadcasts_le(stats: &generator::Stats) -> bool {
-    let release_txids: Vec<&str> = stats
-        .outcomes
-        .iter()
-        .filter_map(|o| o.release_txid.as_deref())
-        .collect();
-    let mut unique = release_txids.clone();
-    unique.sort_unstable();
-    unique.dedup();
-    unique.len() == release_txids.len()
 }
 
 fn check(what: &str, ok: bool, detail: String) {

@@ -12,7 +12,7 @@ use std::time::Duration;
 use zecp2p_loadgen::generator::{self, Plan};
 use zecp2p_loadgen::rail::RailProfile;
 use zecp2p_loadgen::scenario::Path;
-use zecp2p_loadgen::{Harness, HarnessOptions};
+use zecp2p_loadgen::{Harness, HarnessOptions, HARNESS_REFUND_ADDRESS};
 
 /// A harness with a rail fast enough for a test.
 async fn harness(rail: RailProfile) -> Harness {
@@ -287,4 +287,71 @@ async fn the_report_counts_what_the_run_actually_did() {
     // The node saw the run.
     assert!(Arc::strong_count(&h.env) >= 1);
     assert!(h.node.counters().total() > 0);
+}
+
+/// The fourth invariant, from the chain rather than from the order records.
+///
+/// An order carries one `release_txid` however many times its escrow was really
+/// spent, so deduplicating those cannot fail for the reason the invariant
+/// names. The chain is what can tell: a real node refuses a second transaction
+/// spending an output it has already seen spent, and so must this one, or the
+/// harness models away exactly the failure it is watching for.
+#[tokio::test]
+async fn the_chain_refuses_a_second_spend_of_one_escrow() {
+    let h = harness(RailProfile {
+        pay_latency_ms: 1,
+        preflight_latency_ms: 0,
+        ..RailProfile::default()
+    })
+    .await;
+
+    let stats = generator::run(h.env.clone(), plan(1, 1, vec![(Path::Release, 1)]))
+        .await
+        .expect("the run completes");
+    assert_eq!(stats.released(), 1, "{:?}", stats.outcomes[0].error);
+
+    let broadcasts = h.node.broadcasts().await;
+    assert_eq!(broadcasts.len(), 1, "one release, one spend");
+    let release = &broadcasts[0];
+
+    // The chain saw the escrow's outpoint spent, once.
+    assert_eq!(h.node.spent_outpoints().await.len(), 1);
+
+    // The same transaction again is a re-broadcast, which is not an error the
+    // client treats as one, and must not be recorded twice.
+    let again = h.node.submit(release).await;
+    assert!(
+        !again.is_accepted() && zecp2p_escrow::rpc::is_already_accepted(again.message()),
+        "a re-broadcast should read as already-accepted, and it read {again:?}"
+    );
+    assert_eq!(h.node.broadcast_count().await, 1);
+
+    // A *different* transaction spending the same escrow is the double spend.
+    // Re-signing the timeout branch produces one: different bytes, same input.
+    let order = h
+        .env
+        .state
+        .store
+        .get(stats.outcomes[0].order_id.as_deref().expect("an order id"))
+        .expect("the order is still in the store");
+    let funding = order.funding.as_ref().expect("the order was funded");
+    let rival = zecp2p_loadgen::stack::TestUser::new()
+        .sign_refund(&order, &funding.txid, funding.vout, HARNESS_REFUND_ADDRESS)
+        .expect("a rival spend of the same outpoint builds");
+
+    let refused = h.node.submit(&rival).await;
+    assert!(
+        !refused.is_accepted(),
+        "the chain accepted a second spend of one escrow, which a real node would \
+         refuse and which is the whole of the fourth invariant"
+    );
+    assert!(
+        refused.message().contains("already spent by"),
+        "the refusal should name the transaction that spent it: {refused:?}"
+    );
+    assert_eq!(
+        h.node.broadcast_count().await,
+        1,
+        "a refused spend must not be counted as one"
+    );
 }

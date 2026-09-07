@@ -96,6 +96,13 @@ The third is the one to watch. A release hands the user's ZEC to the LP, and the
 only thing justifying it is dollars having reached the payee; the coordinator
 cannot verify that, so the harness keeps the ledger it has no access to.
 
+The fourth is counted at the chain, not in the order records. An order carries
+one `release_txid` however many times its escrow was really spent, so
+deduplicating those cannot fail for the reason the invariant names. The fake
+node instead keeps a spent set the way a real one does: it refuses a second
+transaction spending an output it has already seen spent, and the report
+compares the spends it accepted against the orders that released or refunded.
+
 ## Findings from the first runs
 
 **A lying rail drains escrows, and nothing downstream notices.** With

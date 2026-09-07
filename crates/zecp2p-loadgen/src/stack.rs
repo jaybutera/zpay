@@ -93,6 +93,16 @@ struct NodeInner {
     branch_id: Mutex<u32>,
     utxos: Mutex<HashMap<Outpoint, NodeUtxo>>,
     broadcasts: Mutex<Vec<Vec<u8>>>,
+    /// Every outpoint an accepted broadcast has spent, and the txid that spent
+    /// it.
+    ///
+    /// This is what makes "no escrow released more than once" a question the
+    /// harness can answer. A real node holds a UTXO set and refuses a second
+    /// transaction spending an output it has already seen spent; a node that
+    /// accepts one hides exactly the failure the invariant exists for, because
+    /// each order records a single `release_txid` however many times its escrow
+    /// was actually spent.
+    spent: Mutex<HashMap<Outpoint, String>>,
     faults: NodeFaults,
     counters: NodeCounters,
 }
@@ -111,6 +121,7 @@ impl FakeNode {
             branch_id: Mutex::new(BRANCH_ID),
             utxos: Mutex::new(HashMap::new()),
             broadcasts: Mutex::new(Vec::new()),
+            spent: Mutex::new(HashMap::new()),
             faults: NodeFaults::default(),
             counters: NodeCounters::default(),
         });
@@ -166,6 +177,28 @@ impl FakeNode {
         self.inner.broadcasts.lock().await.len()
     }
 
+    /// Offers a signed transaction to the chain, exactly as the RPC does.
+    ///
+    /// The same path `sendrawtransaction` takes, so a test can ask the chain
+    /// what it makes of a second spend without standing up an HTTP client.
+    pub async fn submit(&self, raw_tx: &[u8]) -> Submitted {
+        submit(&self.inner, raw_tx).await
+    }
+
+    /// The outpoints this chain has seen spent, and by which txid.
+    ///
+    /// One entry per escrow that was released or refunded. Two spends of one
+    /// outpoint cannot appear here: the second is refused.
+    pub async fn spent_outpoints(&self) -> Vec<(String, u32, String)> {
+        self.inner
+            .spent
+            .lock()
+            .await
+            .iter()
+            .map(|((txid, vout), by)| (txid.clone(), *vout, by.clone()))
+            .collect()
+    }
+
     /// Moves the chain tip, which is how a run reaches `T`.
     pub async fn set_height(&self, height: u32) {
         *self.inner.height.lock().await = height;
@@ -197,6 +230,140 @@ struct RpcCall {
     params: serde_json::Value,
 }
 
+/// What the chain made of a transaction offered to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Submitted {
+    /// It went on the chain. The txid, in display order.
+    Accepted(String),
+    /// A JSON-RPC error, in the shape a node returns one.
+    Refused { code: i32, message: String },
+}
+
+impl Submitted {
+    pub fn is_accepted(&self) -> bool {
+        matches!(self, Submitted::Accepted(_))
+    }
+
+    pub fn message(&self) -> &str {
+        match self {
+            Submitted::Accepted(_) => "",
+            Submitted::Refused { message, .. } => message,
+        }
+    }
+}
+
+/// Which of the chain's outputs a transaction spends, and whether that is
+/// allowed.
+enum Spend {
+    /// It spends an output nothing has spent before.
+    Fresh(Outpoint),
+    /// The same transaction, offered twice. Not an error, and not a second
+    /// spend.
+    Again,
+    /// It spends an output already spent by a different transaction.
+    Double { by: String },
+    /// It spends nothing this chain knows about.
+    Unknown,
+}
+
+/// Offers a transaction to the chain and records what it spent.
+///
+/// The reason this is more than an append to a list: the fourth invariant a run
+/// checks is "no escrow released more than once", and an order carries a single
+/// `release_txid` however many times its escrow was really spent. A node that
+/// accepts a second spend hides exactly the failure the invariant exists for.
+/// So the chain keeps a spent set, the way a real one does, and refuses.
+///
+/// The transaction's input is found by asking, for each outpoint the node
+/// knows, whether these bytes spend it. Unspent outpoints are tried first and
+/// the search stops at the first hit, so the ordinary case costs one parse per
+/// escrow that is funded and not yet settled. The spent set is only walked when
+/// nothing unspent matched - which is the double spend this exists to catch.
+async fn submit(inner: &NodeInner, raw: &[u8]) -> Submitted {
+    inner.counters.sendrawtransaction.fetch_add(1, Ordering::Relaxed);
+
+    if inner.faults.reject_broadcast.load(Ordering::Relaxed) {
+        inner.counters.failed.fetch_add(1, Ordering::Relaxed);
+        return Submitted::Refused {
+            code: -26,
+            message: "tx unpaid action limit exceeded".to_string(),
+        };
+    }
+
+    let txid = zecp2p_escrow::tx::txid_of_signed(raw)
+        .map(|t| zecp2p_escrow::rpc::txid_to_display(&t))
+        .unwrap_or_default();
+
+    let mut spent = inner.spent.lock().await;
+    match classify(inner, &mut spent, raw, &txid).await {
+        Spend::Fresh(outpoint) => {
+            spent.insert(outpoint, txid.clone());
+            drop(spent);
+            inner.broadcasts.lock().await.push(raw.to_vec());
+            Submitted::Accepted(txid)
+        }
+        // How zebra and zcashd answer a re-broadcast of something they already
+        // hold; `rpc::is_already_accepted` turns it back into a success.
+        // Recording it again would make a run report more spends than there
+        // were.
+        Spend::Again => Submitted::Refused {
+            code: -27,
+            message: "transaction already exists".to_string(),
+        },
+        Spend::Double { by } => {
+            inner.counters.failed.fetch_add(1, Ordering::Relaxed);
+            Submitted::Refused {
+                code: -25,
+                message: format!("Missing inputs: {txid} spends an output already spent by {by}"),
+            }
+        }
+        // The harness only ever broadcasts spends of escrows it funded, so this
+        // is a transaction the chain has no opinion on rather than a conflict.
+        Spend::Unknown => {
+            drop(spent);
+            inner.broadcasts.lock().await.push(raw.to_vec());
+            Submitted::Accepted(txid)
+        }
+    }
+}
+
+async fn classify(
+    inner: &NodeInner,
+    spent: &mut HashMap<Outpoint, String>,
+    raw: &[u8],
+    txid: &str,
+) -> Spend {
+    let spends = |outpoint: &Outpoint| -> bool {
+        let Ok(bytes) = zecp2p_escrow::rpc::txid_from_display(&outpoint.0) else {
+            return false;
+        };
+        zecp2p_escrow::tx::spends_outpoint(raw, &bytes, outpoint.1).unwrap_or(false)
+    };
+
+    let unspent: Vec<Outpoint> = {
+        let utxos = inner.utxos.lock().await;
+        utxos
+            .keys()
+            .filter(|o| !spent.contains_key(*o))
+            .cloned()
+            .collect()
+    };
+    if let Some(outpoint) = unspent.into_iter().find(|o| spends(o)) {
+        return Spend::Fresh(outpoint);
+    }
+
+    for (outpoint, by) in spent.iter() {
+        if spends(outpoint) {
+            return if by == txid {
+                Spend::Again
+            } else {
+                Spend::Double { by: by.clone() }
+            };
+        }
+    }
+    Spend::Unknown
+}
+
 async fn node_rpc(
     axum::extract::State(inner): axum::extract::State<Arc<NodeInner>>,
     axum::Json(call): axum::Json<RpcCall>,
@@ -209,10 +376,9 @@ async fn node_rpc(
     match call.method.as_str() {
         "getblockchaininfo" => inner.counters.getblockchaininfo.fetch_add(1, Ordering::Relaxed),
         "gettxout" => inner.counters.gettxout.fetch_add(1, Ordering::Relaxed),
-        "sendrawtransaction" => inner
-            .counters
-            .sendrawtransaction
-            .fetch_add(1, Ordering::Relaxed),
+        // `sendrawtransaction` counts itself, inside `submit`, so that a
+        // caller reaching the chain directly is counted the same way.
+        "sendrawtransaction" => 0,
         _ => inner.counters.other.fetch_add(1, Ordering::Relaxed),
     };
 
@@ -249,19 +415,16 @@ async fn node_rpc(
             }
         }
         "sendrawtransaction" => {
-            if inner.faults.reject_broadcast.load(Ordering::Relaxed) {
-                inner.counters.failed.fetch_add(1, Ordering::Relaxed);
-                return axum::Json(serde_json::json!({
-                    "result": null,
-                    "error": { "code": -26, "message": "tx unpaid action limit exceeded" },
-                }));
-            }
             let raw = hex::decode(call.params[0].as_str().unwrap_or_default()).unwrap_or_default();
-            let txid = zecp2p_escrow::tx::txid_of_signed(&raw)
-                .map(|t| zecp2p_escrow::rpc::txid_to_display(&t))
-                .unwrap_or_default();
-            inner.broadcasts.lock().await.push(raw);
-            serde_json::Value::String(txid)
+            match submit(&inner, &raw).await {
+                Submitted::Accepted(txid) => serde_json::Value::String(txid),
+                Submitted::Refused { code, message } => {
+                    return axum::Json(serde_json::json!({
+                        "result": null,
+                        "error": { "code": code, "message": message },
+                    }))
+                }
+            }
         }
         _ => {
             return axum::Json(serde_json::json!({
