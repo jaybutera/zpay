@@ -355,3 +355,70 @@ async fn the_chain_refuses_a_second_spend_of_one_escrow() {
         "a refused spend must not be counted as one"
     );
 }
+
+/// A run must hand back what it measured, even when it measured nothing.
+///
+/// The report used to be taken out of its `Arc` with `try_unwrap`, which failed
+/// whenever anything else still held a clone - and the progress ticker did,
+/// because `abort` only schedules a cancellation and nothing here yielded long
+/// enough for the runtime to drop the task. An empty plan is the shortest way
+/// to that state: no iteration ever runs, so nothing yields at all, and every
+/// one of thirty `--count 0` runs returned "an iteration outlived the run"
+/// instead of a report.
+#[tokio::test]
+async fn an_empty_plan_still_returns_a_report() {
+    let h = harness(RailProfile {
+        pay_latency_ms: 1,
+        preflight_latency_ms: 0,
+        ..RailProfile::default()
+    })
+    .await;
+
+    let stats = generator::run(h.env.clone(), plan(0, 1, vec![(Path::Release, 1)]))
+        .await
+        .expect("a run with nothing to do still returns its report");
+
+    assert_eq!(stats.total(), 0);
+    assert_eq!(stats.succeeded(), 0);
+}
+
+/// The same loss, in the shape a soak actually hits.
+///
+/// An arrival gap longer than one iteration means the last iteration has
+/// already finished when the loop breaks, so awaiting the spawned tasks
+/// returns without ever yielding to the runtime - the ticker stays alive and
+/// the whole run's results go over the side. Eight of eight runs of
+/// `--duration 2 --arrival-gap-ms 1500 --pay-latency-ms 1` lost their report.
+/// This is that run, scaled down: two iterations, each far shorter than the
+/// gap between them.
+#[tokio::test]
+async fn an_arrival_gap_longer_than_an_iteration_still_returns_a_report() {
+    let h = harness(RailProfile {
+        pay_latency_ms: 1,
+        preflight_latency_ms: 0,
+        ..RailProfile::default()
+    })
+    .await;
+
+    let stats = generator::run(
+        h.env.clone(),
+        Plan {
+            duration: Some(Duration::from_millis(400)),
+            arrival_gap: Duration::from_millis(350),
+            ..plan(0, 1, vec![(Path::Release, 1)])
+        },
+    )
+    .await
+    .expect("a gapped run still returns its report");
+
+    assert!(
+        stats.total() >= 1,
+        "no iteration ran, so the report being intact proves nothing"
+    );
+    assert_eq!(
+        stats.released(),
+        stats.total(),
+        "the iterations that ran should all be in the report: {:?}",
+        stats.error_histogram()
+    );
+}
