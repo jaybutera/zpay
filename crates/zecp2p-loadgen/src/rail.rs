@@ -45,6 +45,11 @@ pub struct RailProfile {
     pub preflight_latency_ms: u64,
     /// One payment in this many errors inside `pay`, after the journal claim.
     /// Zero disables it.
+    ///
+    /// Tested before [`Self::false_paid_in`], so on a call that is a multiple
+    /// of both this one wins and the false paid does not fire. Two ratios that
+    /// share a factor therefore inject fewer false paids than the ratio alone
+    /// suggests; pick coprime ones, or set one at a time.
     pub pay_failure_in: u32,
     /// One payment in this many gets past `pay` and fails to attest, the way a
     /// missing prover configuration does. Zero disables it.
@@ -157,7 +162,7 @@ pub fn note_a_rail_would_type(leg: &FiatLeg) -> String {
 ///
 /// `n` counts from one. A ratio of zero never fires.
 fn every(n: usize, ratio: u32) -> bool {
-    ratio > 0 && n % (ratio as usize) == 0
+    ratio > 0 && n.is_multiple_of(ratio as usize)
 }
 
 #[async_trait::async_trait]
@@ -174,6 +179,19 @@ impl FiatRail for ModelRail {
 
     async fn pay(&self, leg: &FiatLeg) -> Result<PaidFiat> {
         let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+
+        // Before the in-flight window opens, not inside it. A `?` between the
+        // increment and the decrement would leave `in_flight` raised for the
+        // rest of the run and every later payment would read as an overlap,
+        // failing the one invariant the slot exists to hold. Unreachable in
+        // practice - the cents come from a `u128` of a real amount - which is
+        // exactly why it would be missed.
+        let cents = u64::try_from(leg.payment.cents()).map_err(|_| {
+            anyhow::anyhow!(
+                "a payment of {} cents does not fit a u64",
+                leg.payment.cents()
+            )
+        })?;
 
         // The overlap measurement brackets the whole drive, so it sees the
         // window the slot has to close rather than an instant.
@@ -198,7 +216,7 @@ impl FiatRail for ModelRail {
                 "INJECTED false paid: reporting fiat_left with nothing sent"
             );
             Ok(PaidFiat {
-                cents: u64::try_from(leg.payment.cents())?,
+                cents,
                 fiat_left: true,
                 note: Some(note_a_rail_would_type(leg)),
             })
@@ -206,7 +224,7 @@ impl FiatRail for ModelRail {
             self.counters.reported_sent.fetch_add(1, Ordering::SeqCst);
             self.counters.truly_sent.fetch_add(1, Ordering::SeqCst);
             Ok(PaidFiat {
-                cents: u64::try_from(leg.payment.cents())?,
+                cents,
                 fiat_left: true,
                 note: Some(note_a_rail_would_type(leg)),
             })

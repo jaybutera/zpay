@@ -79,6 +79,16 @@ identical orders would measure that refusal and nothing else, so each iteration
 draws its own amount from `--amount-min`/`--amount-max` and the handle pool
 rotates.
 
+The sequence's period is every ten-thousandth of a ZEC the range holds, forced
+odd so the handle rotation cannot divide it: 8,004 orders for the default range
+and four handles. That is not unlimited. Orders collide on the *cents* the
+coordinator quotes, and a span of `s` ZEC at rate `r` can only express
+`s * r * 100` distinct cents - 805 for 0.05-0.25 at $40.25. Orders stay open for
+the refund window on the `never_fund` path and indefinitely on a
+`NeedsOperator` line, so a soak meaning to hold more open orders than
+`handles * 805` should widen the range or name more `--handles`; otherwise it
+will report refusals that are the harness's own.
+
 ## The chain-tip lease
 
 There is one chain. The `refund` and `never_sign` paths reach `T` by moving its

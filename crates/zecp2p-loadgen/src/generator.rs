@@ -95,17 +95,45 @@ impl Plan {
 
     /// An amount for iteration `n`, spread across the configured range.
     ///
-    /// Rounded to whole cents of ZEC so two iterations that land on the same
-    /// value are rare but the number stays one a person can read in a log.
+    /// Rounded to a ten-thousandth of a ZEC so two iterations that land on the
+    /// same value are rare but the number stays one a person can read in a log.
+    ///
+    /// The period used to be a flat 1,000, which the four-handle rotation
+    /// divides: iteration n+1,000 asked for the same handle and the same
+    /// amount as iteration n, and `put_unless_in_flight` refuses the second
+    /// while the first is still open. Orders stay open for the refund window
+    /// on the `never_fund` path and indefinitely on a `NeedsOperator` line, so
+    /// a long soak reported refusals that were the harness's own. The period is
+    /// now every value the range can express, forced odd so the handle count
+    /// cannot divide it.
+    ///
+    /// That raises the ceiling; it does not remove it. Two orders collide on
+    /// the *cents* the coordinator quotes, not on the ZEC, and a span of `s`
+    /// ZEC at rate `r` can only express `s * r * 100` distinct cents - 805 for
+    /// the default 0.05-0.25 range at $40.25. A soak that intends to hold more
+    /// open orders than the handles times that should widen `--amount-min` and
+    /// `--amount-max` or name more `--handles`.
     fn amount_for(&self, n: usize) -> f64 {
         if self.amount_max_zec <= self.amount_min_zec {
             return self.amount_min_zec;
         }
         let span = self.amount_max_zec - self.amount_min_zec;
-        // A large odd stride, so consecutive iterations are far apart in the
-        // range and a run does not open several identical escrows in a row.
-        let step = ((n * 7919) % 1000) as f64 / 1000.0;
-        let raw = self.amount_min_zec + span * step;
+        // Counted in whole ten-thousandths of a ZEC rather than as a fraction
+        // of the span, so every step is a distinct amount. Spacing them any
+        // finer than the rounding does not make more amounts, it makes two
+        // steps round to one - which is how a period longer than the range can
+        // express still repeats.
+        //
+        // Forced odd, because a period the handle count divides repeats the
+        // whole (handle, amount) pair on its own cycle rather than on the
+        // product of the two.
+        let units = ((span * 10_000.0).round().max(1.0) as usize) | 1;
+        // A prime stride, so it is coprime with the period and every amount is
+        // visited before any repeats, and large enough that consecutive
+        // iterations land far apart in the range rather than adjacent.
+        let stride = if units.is_multiple_of(7919) { 7907 } else { 7919 };
+        let base = (self.amount_min_zec * 10_000.0).round();
+        let raw = (base + (n.wrapping_mul(stride) % units) as f64) / 10_000.0;
         (raw * 10_000.0).round() / 10_000.0
     }
 
@@ -423,6 +451,39 @@ mod tests {
             ..Plan::default()
         };
         assert_eq!(plan.amount_for(3), 0.1);
+    }
+
+    /// The period is the range's own, not a flat thousand.
+    ///
+    /// A soak past the period asks a handle for an amount it may still have an
+    /// order open at, and `put_unless_in_flight` refuses it. That refusal is
+    /// the harness's, not the coordinator's, and it lands in the report as if
+    /// it were a finding.
+    #[test]
+    fn the_amount_and_handle_pair_outlasts_a_long_soak() {
+        let plan = Plan {
+            amount_min_zec: 0.05,
+            amount_max_zec: 0.25,
+            handles: vec!["alice".into(), "bob".into(), "carol".into(), "dave".into()],
+            ..Plan::default()
+        };
+
+        // The old sequence repeated here, exactly.
+        assert_ne!(
+            (plan.handle_for(0), plan.amount_for(0)),
+            (plan.handle_for(1000), plan.amount_for(1000)),
+            "iteration 1,000 asks for what iteration 0 asked for"
+        );
+
+        // Nothing repeats across a run four times that long.
+        let mut seen = std::collections::HashSet::new();
+        for n in 0..4000 {
+            let key = (plan.handle_for(n), plan.amount_for(n).to_bits());
+            assert!(
+                seen.insert(key),
+                "iteration {n} repeats a (handle, amount) pair from earlier in the run"
+            );
+        }
     }
 
     #[test]

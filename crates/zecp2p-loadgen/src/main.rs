@@ -87,6 +87,9 @@ struct Args {
     ///
     /// The 2026-09-05 incident's shape. The coordinator cannot tell; the run's
     /// ledger can, and the report prints both numbers.
+    ///
+    /// --pay-failure-in is tested first, so a call that is a multiple of both
+    /// fails rather than lying. Set one at a time, or pick coprime ratios.
     #[arg(long, default_value_t = 0)]
     false_paid_in: u32,
 
