@@ -383,3 +383,61 @@ async fn an_output_that_is_unwound_stops_being_reported() {
         "an unwound output is still being reported, so no reorg can be modelled"
     );
 }
+
+/// A duration run ends when its duration ends, even with the slot stuck.
+///
+/// The run loop waits for a permit, and waiting for a permit means waiting for
+/// an iteration - which, behind the ambiguous pay failure above, waits the
+/// whole sweep timeout. The deadline used to be checked only before that wait,
+/// so the loop sat there past its own end, then spent the permit that freed on
+/// one more iteration begun entirely outside the window, which ran up to the
+/// sweep timeout of its own: a run ended at roughly `duration + 2 x
+/// sweep_timeout`. At the soak settings this harness exists for
+/// (`--duration 60 --sweep-timeout 600`) a one-minute run kept going for
+/// twenty, and every rate the report quotes was divided by that wall.
+///
+/// The bound held here is the contract: once the deadline passes, the
+/// iterations already in flight get their full sweep timeout to finish and no
+/// new one starts. So a run cannot outlast `duration + sweep_timeout`, and the
+/// pre-fix run - which needed twice the sweep timeout - is outside it.
+#[tokio::test]
+async fn a_duration_run_stops_at_its_deadline_behind_a_stuck_slot() {
+    let h = harness(RailProfile {
+        // Every payment dies after the journal claim, so the first iteration
+        // takes the slot and never gives it back.
+        pay_failure_in: 1,
+        ..quick()
+    })
+    .await;
+
+    let duration = Duration::from_millis(300);
+    let sweep = Duration::from_secs(2);
+
+    let stats = generator::run(
+        h.env.clone(),
+        Plan {
+            duration: Some(duration),
+            ..plan(0, 1, vec![(Path::Release, 1)], sweep)
+        },
+    )
+    .await
+    .expect("the run completes");
+
+    assert_eq!(
+        h.rail_counters.pay_errors(),
+        1,
+        "the slot was never stuck, so the loop never had to wait for it"
+    );
+    assert!(
+        stats.total() >= 2,
+        "the loop never got as far as queueing behind the stuck slot, so this \
+         proves nothing"
+    );
+    assert!(
+        stats.wall < duration + sweep + Duration::from_secs(1),
+        "the run overran its deadline: {:?} for a {duration:?} run with a \
+         {sweep:?} sweep timeout, which is the shape of starting an iteration \
+         after the deadline had passed",
+        stats.wall
+    );
+}

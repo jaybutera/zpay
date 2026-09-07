@@ -294,10 +294,6 @@ pub async fn run(env: Arc<Env>, plan: Plan) -> Result<Stats> {
     };
 
     loop {
-        // Take the sequence number first, so two workers cannot draw the same
-        // amount and handle and collide on the store's in-flight rule.
-        let n = issued.fetch_add(1, Ordering::SeqCst);
-
         match deadline {
             Some(end) => {
                 if Instant::now() >= end {
@@ -305,17 +301,48 @@ pub async fn run(env: Arc<Env>, plan: Plan) -> Result<Stats> {
                 }
             }
             None => {
-                if n >= plan.count {
+                if issued.load(Ordering::SeqCst) >= plan.count {
                     break;
                 }
             }
         }
 
-        let permit = permits
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("the semaphore is not closed");
+        // Waiting for a permit is waiting for an iteration to finish, and an
+        // iteration may take the whole sweep timeout - so in duration mode the
+        // clock has to be part of the wait. Checking it only above meant a run
+        // parked behind a stuck payment slot sat here past its deadline, then
+        // spent the permit that freed on one more iteration begun entirely
+        // outside the run's window, which itself ran up to the sweep timeout:
+        // a `--duration 60 --sweep-timeout 600` run kept going for twenty
+        // minutes, and `orders/sec` was divided by the inflated wall.
+        let permit = match deadline {
+            Some(end) => {
+                tokio::select! {
+                    biased;
+                    permit = permits.clone().acquire_owned() => {
+                        permit.expect("the semaphore is not closed")
+                    }
+                    // The deadline passed while every permit was held. The
+                    // iterations already in flight still get their full sweep
+                    // timeout to finish below; what stops here is starting
+                    // new ones.
+                    _ = tokio::time::sleep_until(tokio::time::Instant::from_std(end)) => break,
+                }
+            }
+            None => permits
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("the semaphore is not closed"),
+        };
+
+        // The sequence number is drawn once the iteration is certain to start,
+        // and only this loop draws one, so the numbers stay unique and no two
+        // iterations collide on the store's in-flight rule. Drawing it above
+        // the wait instead made the progress line count an iteration that had
+        // not started - by one, for as long as the loop was parked here, which
+        // is exactly when someone is reading that line.
+        let n = issued.fetch_add(1, Ordering::SeqCst);
 
         let env = env.clone();
         let task_plan = plan.clone();

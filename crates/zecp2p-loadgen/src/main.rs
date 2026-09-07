@@ -30,6 +30,10 @@ struct Args {
     count: usize,
 
     /// Run for this many seconds instead of for a count.
+    ///
+    /// The deadline stops new orders from starting; the ones already in flight
+    /// still get their --sweep-timeout to finish, so the wall clock can exceed
+    /// the duration by up to that much and no more.
     #[arg(long)]
     duration: Option<u64>,
 
