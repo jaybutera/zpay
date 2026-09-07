@@ -318,15 +318,20 @@ pub async fn run(env: Arc<Env>, plan: Plan) -> Result<Stats> {
         let permit = match deadline {
             Some(end) => {
                 tokio::select! {
+                    // The deadline is polled first. Were the permit first, a
+                    // permit released in the same wake as the timer fires
+                    // would win the race and one iteration would start after
+                    // the deadline - a scheduler tick's worth of overrun, but
+                    // the contract reads better without it.
                     biased;
-                    permit = permits.clone().acquire_owned() => {
-                        permit.expect("the semaphore is not closed")
-                    }
                     // The deadline passed while every permit was held. The
                     // iterations already in flight still get their full sweep
                     // timeout to finish below; what stops here is starting
                     // new ones.
                     _ = tokio::time::sleep_until(tokio::time::Instant::from_std(end)) => break,
+                    permit = permits.clone().acquire_owned() => {
+                        permit.expect("the semaphore is not closed")
+                    }
                 }
             }
             None => permits
@@ -387,8 +392,20 @@ pub async fn run(env: Arc<Env>, plan: Plan) -> Result<Stats> {
             outcomes.lock().await.push(outcome);
         }));
 
+        // The gap is capped at the deadline, so a run whose arrival gap is
+        // longer than its remaining time does not sleep past its own end and
+        // then wake to check a clock that ran out minutes ago. Sleeping only
+        // as far as the deadline lands the loop back at the check above, which
+        // breaks. Without the cap, `--duration 1 --arrival-gap-ms 5000` walled
+        // 5 s against the `--duration` help's stated bound of duration plus
+        // one sweep timeout.
         if !plan.arrival_gap.is_zero() {
-            tokio::time::sleep(plan.arrival_gap).await;
+            let next = Instant::now() + plan.arrival_gap;
+            let until = match deadline {
+                Some(end) => next.min(end),
+                None => next,
+            };
+            tokio::time::sleep_until(tokio::time::Instant::from_std(until)).await;
         }
     }
 

@@ -400,18 +400,46 @@ async fn an_output_that_is_unwound_stops_being_reported() {
 /// iterations already in flight get their full sweep timeout to finish and no
 /// new one starts. So a run cannot outlast `duration + sweep_timeout`, and the
 /// pre-fix run - which needed twice the sweep timeout - is outside it.
+///
+/// The slot is wedged by a run of its own before the clock starts. Wedging it
+/// inside the timed run instead - one iteration failing the payment, the next
+/// queueing behind it - made the test depend on the first iteration finishing
+/// within the duration, which under the parallel load of this binary it did
+/// not always do: the test then failed its own precondition about one run in
+/// five. Wedged up front, the timed run's first iteration is stuck from the
+/// moment it starts, so the loop is parked on its permit for the whole
+/// duration no matter how slow the machine is.
 #[tokio::test]
 async fn a_duration_run_stops_at_its_deadline_behind_a_stuck_slot() {
     let h = harness(RailProfile {
-        // Every payment dies after the journal claim, so the first iteration
-        // takes the slot and never gives it back.
+        // Every payment dies after the journal claim, so the first order to
+        // reach the slot takes it and never gives it back.
         pay_failure_in: 1,
         ..quick()
     })
     .await;
 
-    let duration = Duration::from_millis(300);
     let sweep = Duration::from_secs(2);
+
+    // One order, to wedge the slot.
+    let wedge = generator::run(h.env.clone(), plan(1, 1, vec![(Path::Release, 1)], sweep))
+        .await
+        .expect("the wedge run completes");
+
+    assert_eq!(
+        wedge.succeeded(),
+        0,
+        "the payment was supposed to fail; it did not, so nothing is holding \
+         the slot"
+    );
+    assert_eq!(
+        h.rail_counters.pay_errors(),
+        1,
+        "exactly one payment should have failed, and it is the one holding the \
+         slot"
+    );
+
+    let duration = Duration::from_millis(300);
 
     let stats = generator::run(
         h.env.clone(),
@@ -426,12 +454,21 @@ async fn a_duration_run_stops_at_its_deadline_behind_a_stuck_slot() {
     assert_eq!(
         h.rail_counters.pay_errors(),
         1,
-        "the slot was never stuck, so the loop never had to wait for it"
+        "an iteration of the timed run reached the payment slot, so it was not \
+         queued behind the wedged one and this proves nothing"
     );
     assert!(
-        stats.total() >= 2,
-        "the loop never got as far as queueing behind the stuck slot, so this \
-         proves nothing"
+        stats.wall >= sweep,
+        "the timed run's iteration was not stuck on the slot - it took {:?} \
+         against a {sweep:?} sweep timeout - so the loop was never waiting for \
+         a permit when its deadline passed and this proves nothing",
+        stats.wall
+    );
+    assert_eq!(
+        stats.total(),
+        1,
+        "the only permit was held past the deadline by the stuck iteration, so \
+         a second iteration can only have started after the deadline had passed"
     );
     assert!(
         stats.wall < duration + sweep + Duration::from_secs(1),
