@@ -77,6 +77,11 @@ while [ $# -gt 0 ]; do
 done
 
 [ -n "$HOST" ] || die "no host. Pass --host, or set ZECP2P_DEPLOY_HOST."
+# Same reason as the hash check below: this reaches a remote shell and a cargo
+# package name, and both are ordinary identifiers.
+case "$BIN_NAME" in
+  *[!0-9a-zA-Z._-]*|"") die "'$BIN_NAME' is not a binary name" ;;
+esac
 # The unit is named after the binary unless one was given, so `--binary
 # zecp2p-taker` restarts the taker's unit rather than the coordinator's.
 : "${UNIT:=$BIN_NAME}"
@@ -116,6 +121,12 @@ fi
 # --rollback: promote a kept version. No build, no upload.
 # ---------------------------------------------------------------------------
 if [ -n "$ROLLBACK" ]; then
+  # Every value that reaches a remote shell below is interpolated into it, so
+  # the ones that come from an argument are checked for shape first. A hash is
+  # hex and nothing else; anything else is a typo at best.
+  case "$ROLLBACK" in
+    *[!0-9a-fA-F]*|"") die "a version is a hex commit hash, not '$ROLLBACK'. Run --list." ;;
+  esac
   say "rolling back to $ROLLBACK"
   r "test -x $REMOTE_DIR/bin/versions/$BIN_NAME-$ROLLBACK" \
     || die "$HOST has no kept version $ROLLBACK. Run --list to see what it has."
