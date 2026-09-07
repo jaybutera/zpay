@@ -337,7 +337,15 @@ pub async fn run(env: Arc<Env>, plan: Plan) -> Result<Stats> {
         }
     }
 
+    // `abort` only *schedules* the cancellation. The ticker's future - and with
+    // it the clone of `outcomes` it holds - is not dropped until the runtime
+    // polls the task again, and when the last iteration has already finished
+    // nothing below yields long enough for that to happen. Awaiting the handle
+    // is what makes the ordering certain: it resolves only once the task has
+    // been dropped. Without it a soak whose arrival gap is longer than one
+    // iteration threw away every result it had, every time.
     ticker.abort();
+    let _ = ticker.await;
 
     for task in tasks {
         // A panicking iteration should not take the run's report with it.
@@ -346,9 +354,11 @@ pub async fn run(env: Arc<Env>, plan: Plan) -> Result<Stats> {
         }
     }
 
-    let outcomes = Arc::try_unwrap(outcomes)
-        .map_err(|_| anyhow::anyhow!("an iteration outlived the run"))?
-        .into_inner();
+    // Taken out of the mutex rather than unwrapped out of the `Arc`. Every
+    // iteration has been awaited and the ticker has been joined, so nothing
+    // else holds a reference - but an hour of soak results is not a thing to
+    // discard because some future edit kept one alive.
+    let outcomes = std::mem::take(&mut *outcomes.lock().await);
 
     Ok(Stats {
         outcomes,
