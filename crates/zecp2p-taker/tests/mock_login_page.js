@@ -32,6 +32,11 @@ class Element {
     this.innerText = text;
     this.value = attrs.value || '';
     this.disabled = !!attrs.disabled;
+    // `name` is a real property on a form control, not only an attribute, and
+    // the confirmation report reads `i.name`. Modelling it as attribute-only
+    // made a predicate that works in a browser answer nothing here, which is
+    // the same class of mock-versus-browser gap as the textarea's innerText.
+    this.name = attrs.name || '';
     this.events = [];
     // React's value tracker: the thing a plain `el.value =` fails to update,
     // which is why a fill that does not clear it is silently discarded.
@@ -135,8 +140,34 @@ class Document {
       // A getter, not a snapshot: a page whose click removes a button must
       // read differently afterwards, and the confirmation step is precisely a
       // second read of the same page.
+      //
+      // Form-control values are excluded, and that exclusion is the whole
+      // point rather than an accident of how the fixtures are built. In a
+      // browser `innerText` is the rendered text of an element's content; a
+      // `<textarea>`'s typed value and an `<input>`'s value are not content
+      // and never appear in it. The 2026-09-07 $1.50 run turned on exactly
+      // that: `carriesNote` searched `document.body.innerText` for a note that
+      // only ever lived in the textarea, so it could not pass on a correctly
+      // filled form. Before that run the fixtures happened to agree with the
+      // browser -- `Fill` writes `.value` and never touches `.innerText` -- so
+      // the mock was right by omission and nothing here said so. Stating the
+      // rule makes a fixture that sets `innerText` on a form control fail
+      // loudly instead of quietly modelling a browser that does not exist.
       get innerText() {
-        return [text || '', ...self.elements.map((e) => e.innerText)].join(' ');
+        const rendered = self.elements.map((e) => {
+          if (e.tagName === 'TEXTAREA' || e.tagName === 'INPUT') {
+            if (e.innerText) {
+              throw new Error(
+                `${e.tagName} carries innerText ${JSON.stringify(e.innerText)}: a browser ` +
+                  'renders no text for a form control, so a fixture that sets it is ' +
+                  'modelling a page that cannot exist',
+              );
+            }
+            return '';
+          }
+          return e.innerText;
+        });
+        return [text || '', ...rendered].join(' ');
       },
     };
   }
@@ -329,6 +360,37 @@ function cleanPayPage() {
   return page;
 }
 
+/// The live page's own shape: the note is in the textarea and nowhere else.
+///
+/// `cleanPayPage` pushes a `<div>` carrying the note when the sheet opens, on
+/// the guess that Venmo renders it as copy. The 2026-09-06 $1.50 run says it
+/// does not. The form was filled correctly -- amount 1.50, note typed, payee
+/// resolved -- and the drive refused to click, because `carriesNote` tested
+/// `document.body.innerText` and a `<textarea>`'s value is not part of it.
+///
+/// So this page removes the echo. It is otherwise a clean page that sends on
+/// confirm, which makes it the honest model of a payment that should go
+/// through: if the driver refuses here, it refuses every real payment.
+function noteOnlyInFieldPage() {
+  const page = livePayPage();
+  const pay = page.elements.find((e) => e.innerText === 'Pay');
+  const open = pay.onclick;
+  pay.onclick = () => {
+    open();
+    // Drop the sheet's rendered copy of the note. What is left is the sheet
+    // button and the textarea the note was typed into.
+    const note = page.elements.find((e) => e.getAttribute('id') === 'payment-note');
+    const echo = page.elements.filter(
+      (e) => e.tagName === 'DIV' && note && e.innerText === note.value,
+    );
+    for (const el of echo) {
+      const at = page.elements.indexOf(el);
+      if (at !== -1) page.elements.splice(at, 1);
+    }
+  };
+  return page;
+}
+
 /// A clean form whose confirm click does nothing.
 ///
 /// The round-1 state, reached honestly: our own click opens the sheet, and
@@ -434,8 +496,18 @@ function otherPayeeSheetPage() {
   // it.
 
   // The page still names our payee: the form under the sheet is for us. That
-  // is exactly the case `RequireRecipient` cannot catch and the note must.
+  // is exactly the case `RequireRecipient` cannot catch, and the reason the
+  // open-sheet guard has to be the one that refuses.
   page.text = 'Pay jay-butera';
+  // Built from `stalePayPage`, which carries no `__NEXT_DATA__` because the
+  // 2026-09-05 incident's tab did not need one. Without page state the
+  // recipient check refuses first and the open sheet is never reached, so this
+  // fixture would prove the sheet guard works while never running it. The form
+  // under the sheet is genuinely addressed to our payee: that is the whole
+  // shape of the danger, a correct form with somebody else's confirmation over
+  // it.
+  page.nextData = payPageState([payee(IDS.jayButera, 'Jay-Butera', 'Jay Butera')]);
+  page.location = { href: page.url };
   return page;
 }
 
@@ -550,6 +622,40 @@ function mixedCaseFormPage() {
   return page;
 }
 
+/// The live page with the confirmation input nobody in this repo handles.
+///
+/// The 2026-09-07 CDP read of the stuck tab found, alongside the filled form
+/// and the enabled confirmation button, an `<input name="pwu-confirm-last-four"
+/// type="number">`, empty. Nothing in any crate references it: no step fills
+/// it, no check reads it, and no earlier inspection recorded it. Whether it
+/// gates the confirm click is unknown, because on that run the click never
+/// happened -- the note predicate refused first, so the button was never
+/// pressed and Venmo was never asked.
+///
+/// This page exists to pin the one thing that can be settled from code: the
+/// driver must *notice* it and say so, rather than time out for 120s claiming
+/// a button never appeared. The sheet still sends on confirm, because modelling
+/// it as blocking would be asserting the answer to the open question.
+function stepUpConfirmPage() {
+  const page = noteOnlyInFieldPage();
+  page.elements.push(
+    new Element('input', { name: 'pwu-confirm-last-four', type: 'number', value: '' }),
+  );
+  return page;
+}
+
+/// A fixture that models a browser that does not exist.
+///
+/// The note on the textarea's `innerText` as well as its value. No browser
+/// renders text for a form control, so `document.body.innerText` must refuse
+/// this rather than quietly returning a string the live page never would.
+function unfaithfulNotePage() {
+  const page = cleanPayPage();
+  const note = page.elements.find((e) => e.getAttribute('id') === 'payment-note');
+  note.innerText = 'thanks 5df45b72';
+  return page;
+}
+
 const PAGES = {
   signin: signinPage,
   code: codePage,
@@ -558,6 +664,9 @@ const PAGES = {
   cleanpay: cleanPayPage,
   inertclickpay: inertClickPayPage,
   livepay: livePayPage,
+  noteonlyinfield: noteOnlyInFieldPage,
+  stepupconfirm: stepUpConfirmPage,
+  unfaithfulnote: unfaithfulNotePage,
   dismissingpay: dismissingPayPage,
   expiringpay: expiringPayPage,
   otherpayeesheet: otherPayeeSheetPage,

@@ -136,6 +136,52 @@ fn confirmed(result: &StepResult) -> bool {
         })
 }
 
+/// Whether the driver would have stopped the run at this step.
+///
+/// `run_sequence` keeps going after every step, because a step that answers a
+/// report rather than throwing does not stop the node runner. The real driver
+/// does stop: `VenmoBrowser::pay` calls `execute`, `execute` judges the report
+/// in Rust and returns `Err`, and the `for` loop over the steps returns. Until
+/// this existed the tests only ever noticed a refusal that threw *inside* the
+/// JavaScript, so `RequireNoOpenSheet` refusing a page proved nothing about
+/// whether a money button afterwards was pressed -- and in the sequence it
+/// was. A test that wants to claim no money moved has to ask this question.
+fn refused(step: &PaymentStep, result: &StepResult) -> bool {
+    if !result.ok {
+        return true;
+    }
+    match step {
+        // Judged in Rust off a report: `ok: false` is a refusal.
+        PaymentStep::RequireNoOpenSheet
+        | PaymentStep::RequireSendConfirmed { .. }
+        | PaymentStep::WaitForConfirm { .. } => {
+            result.value.get("ok") == Some(&serde_json::json!(false))
+        }
+        // The recipient check answers the payees and `page_pays_only` judges
+        // them. Anything but exactly our payee stops the run.
+        PaymentStep::RequireRecipient { payee_id, .. } => {
+            let payees = result.value.get("payees").and_then(|v| v.as_array());
+            match payees {
+                Some(list) => {
+                    list.len() != 1
+                        || list[0].get("id").and_then(|v| v.as_str()) != Some(payee_id.as_str())
+                }
+                None => true,
+            }
+        }
+        // The amount is compared in Rust against what the field answered.
+        PaymentStep::RequireAmount { expected, .. } => {
+            result.value.as_str().map(|v| v != expected).unwrap_or(true)
+        }
+        _ => false,
+    }
+}
+
+/// The first step the driver would have stopped at, if any.
+fn first_refusal(steps: &[PaymentStep], results: &[StepResult]) -> Option<usize> {
+    steps.iter().zip(results).position(|(s, r)| refused(s, r))
+}
+
 /// The expressions for every step that is not a poll.
 ///
 /// `WaitFor`, `WaitForConfirm` and `RequireSendConfirmed` are polled by the
@@ -395,55 +441,344 @@ fn a_retry_of_the_same_order_refuses_its_own_stale_sheet() {
 ///
 /// The label matches on prefix and amount, and a sheet an earlier drive left
 /// open for a different payee at the same amount matches both. If that sheet
-/// posts on click it pays the previous drive's recipient. The note is what
-/// tells them apart: it is per-payment and this run typed its own two steps
-/// earlier.
+/// posts on click it pays the previous drive's recipient.
+///
+/// The note used to be what told them apart, and that binding is gone: since
+/// `carriesNote` reads the note field, and this run's own fill put the note
+/// there, the note no longer discriminates. What refuses this page is
+/// `RequireNoOpenSheet`, which is temporal and does not care what the sheet
+/// says: the sheet existed before our click, so it is not ours. That is the
+/// stronger guard and it sits before every money button.
+///
+/// This test was passing for the wrong reason until 2026-09-07. It asked for
+/// the first result with `ok == false`, which only sees a refusal thrown from
+/// inside the JavaScript, and `RequireNoOpenSheet` answers a report instead.
+/// So the refusal it was reading was the note check inside `ConfirmNamedAmount`
+/// -- two steps and one money click later. In the sequence the bare "Pay"
+/// click had already run. `first_refusal` asks the question the driver asks.
 #[test]
 fn a_stale_sheet_for_another_payee_is_refused_before_the_click() {
     if !node_available() {
         return;
     }
     let steps = the_incident_payment();
-    let click = steps
-        .iter()
-        .rposition(|s| s.is_irreversible())
-        .expect("a send step");
-
     let results = run_sequence("otherpayeesheet", &expressions(&steps));
 
-    // The run must stop at or before the click. Where it stops is the
-    // interesting part: the fills rewrite the amount and the note, so by the
-    // time the click is reached this page no longer looks stale -- which is
-    // why the *first* refusal matters more than the last.
-    let stopped = results
-        .iter()
-        .position(|r| !r.ok)
-        .expect("some step must refuse this page");
-    assert!(
-        stopped <= click,
-        "the refusal must come no later than the click: stopped at {stopped}, click at {click}"
-    );
+    let stopped = first_refusal(&steps, &results).expect("some step must refuse this page");
 
-    // No money moved. The bare "Pay" click does run here, and that is fine:
-    // on a form it only opens a confirmation, and this page's confirmation was
-    // already open. What must not run is the click that names an amount, which
-    // is the one that sends -- and it refuses inside its own JavaScript,
-    // before `el.click()`.
-    let sent = steps
-        .iter()
-        .take(stopped)
-        .any(|s| matches!(s, PaymentStep::ConfirmNamedAmount { .. }));
+    // No money button runs. Not "the amount-naming one does not" -- none of
+    // them, including the bare "Pay" that opens a sheet, because on this page
+    // a sheet is already open and opening another is not what we want either.
     assert!(
-        !sent,
-        "the amount-naming confirmation was clicked before the page was refused"
-    );
-
-    // And it refuses for the right reason: the sheet is not this drive's.
-    let why = results[stopped].error.clone().unwrap_or_default();
-    assert!(
-        why.contains("note"),
-        "the refusal at step {stopped} ({}) should name the note, got {why:?}",
+        steps[..stopped].iter().all(|s| !s.is_irreversible()),
+        "step {stopped} ({}) refused, but a money step ran before it",
         steps[stopped].describe()
+    );
+
+    // And it refuses for the right reason: a sheet this drive did not open.
+    assert!(
+        matches!(steps[stopped], PaymentStep::RequireNoOpenSheet),
+        "the refusal should be the open-sheet check, got step {stopped} ({})",
+        steps[stopped].describe()
+    );
+    let sheets = results[stopped]
+        .value
+        .get("sheets")
+        .and_then(|v| v.as_array())
+        .expect("the report names the sheets it found");
+    assert_eq!(
+        sheets,
+        &vec![serde_json::json!("Pay Someone Else $2.01")],
+        "the refusal must name the other payee's sheet"
+    );
+}
+
+/// The 2026-09-07 failure: a correctly filled form the driver refused to pay.
+///
+/// Order `esc_5276115f1f0173f248dfacc2`, $1.50, mainnet. The escrow funded
+/// 142,565 zat and reached 10 confirmations, the coordinator entered `paying`,
+/// and the fiat leg then sat for 120s and gave up with "waited 120s for a
+/// confirmation button naming $1.50 and it never appeared". The tab, read over
+/// CDP while it was stuck, had the amount field on "1.50", the note textarea on
+/// "thanks c67ce0b7", the payee resolved to Jay-Butera, and an enabled button
+/// reading exactly "Pay Jay Butera $1.50". Nothing was missing. No dollars left
+/// the account.
+///
+/// `carriesNote` tested `document.body.innerText` for the note, and a
+/// `<textarea>`'s value is not in `innerText`. The note half of the predicate
+/// could not pass on any correctly filled form, so the click never happened.
+/// Five consecutive live runs failed on this leg with the suite green, because
+/// every fixture rendered the note as a `<div>` beside the field and no test
+/// drove a page shaped like the real one.
+///
+/// This is that page: the note is in the textarea and nowhere else. The drive
+/// must click, and it must report the payment posted.
+#[test]
+fn a_note_that_lives_only_in_the_field_is_still_paid() {
+    if !node_available() {
+        return;
+    }
+    let steps = the_incident_payment();
+    let results = run_sequence("noteonlyinfield", &expressions(&steps));
+
+    // A thrown refusal stops the node runner, so a short result list is itself
+    // the failure: name the step that threw rather than comparing lengths.
+    if results.len() != steps.len() {
+        let at = results.len() - 1;
+        panic!(
+            "the drive stopped at step {at} ({}) on a correctly filled form: {}. \
+             The form was right -- amount typed, note typed, payee resolved -- so \
+             every step had to pass and one refused.",
+            steps[at].describe(),
+            results[at].error.clone().unwrap_or_default()
+        );
+    }
+    if let Some(stopped) = first_refusal(&steps, &results) {
+        panic!(
+            "step {stopped} ({}) refused a correctly filled form: {:?} {}",
+            steps[stopped].describe(),
+            results[stopped].error,
+            results[stopped].value
+        );
+    }
+
+    // The confirmation wait is the step that failed live. It has to pass here,
+    // and its report has to say the note was found rather than passing for
+    // some other reason.
+    let waited = steps
+        .iter()
+        .position(|s| matches!(s, PaymentStep::WaitForConfirm { .. }))
+        .expect("the sequence must wait for the confirmation");
+    assert_eq!(
+        results[waited].value.get("note"),
+        Some(&serde_json::json!(true)),
+        "the note is in the textarea, so the note half must be satisfied: {}",
+        results[waited].value
+    );
+
+    // The money button was actually pressed, and it was the right one.
+    let clicked = steps
+        .iter()
+        .position(|s| matches!(s, PaymentStep::ConfirmNamedAmount { .. }))
+        .expect("the sequence must carry the amount-naming click");
+    assert_eq!(
+        results[clicked].value,
+        serde_json::json!("Pay Jay Butera $2.01"),
+        "the drive must click the confirmation naming this payment"
+    );
+
+    assert!(
+        confirmed(results.last().expect("the confirmation")),
+        "the form went away, so the payment posted: {}",
+        results.last().unwrap().value
+    );
+}
+
+/// The note predicate is satisfiable on a page that renders no note at all.
+///
+/// Stated as its own test rather than left implicit in the payment above,
+/// because this is the property whose absence cost five live runs: a predicate
+/// that guards a money click has to be able to answer yes. A guard that cannot
+/// pass is not a strict guard, it is an outage.
+#[test]
+fn the_note_check_can_pass_when_the_note_is_only_in_the_textarea() {
+    if !node_available() {
+        return;
+    }
+    let steps = the_incident_payment();
+    let results = run_sequence("noteonlyinfield", &expressions(&steps));
+    let waited = steps
+        .iter()
+        .position(|s| matches!(s, PaymentStep::WaitForConfirm { .. }))
+        .expect("a confirmation wait");
+    let report = &results[waited].value;
+
+    // Every half, named. A bare `ok` would not distinguish this from a page
+    // where the note happened to be rendered somewhere.
+    for half in ["ok", "note", "named", "enabled"] {
+        assert_eq!(
+            report.get(half),
+            Some(&serde_json::json!(true)),
+            "the {half} half of the confirmation wait must be satisfied: {report}"
+        );
+    }
+}
+
+/// No money-gating predicate reads a form control's value out of rendered text.
+///
+/// The class of bug, stated once so a new step inherits the rule rather than
+/// rediscovering it. A predicate that searches `document.body.innerText` for a
+/// string that only ever lives in an `<input>` or `<textarea>` value cannot pass
+/// on a correct page: `innerText` is rendered content and a form control's value
+/// is not content. That is unsatisfiable, and an unsatisfiable guard in front of
+/// a money click is an outage, not caution.
+///
+/// The two things the payment steps look for are the amount and the note. Both
+/// live in fields. So: whatever reads the amount must read a field, and whatever
+/// reads the note must at least be able to read a field.
+#[test]
+fn every_field_backed_check_reads_a_field() {
+    let steps = the_incident_payment();
+
+    for step in &steps {
+        let js = step.expression_for_test();
+        match step {
+            // The amount readback exists precisely because a React input can
+            // hold a value the script never set. It has to read `.value`.
+            PaymentStep::RequireAmount { .. } => {
+                assert!(
+                    js.contains(".value"),
+                    "the amount readback must read the field's value, got {js}"
+                );
+                assert!(
+                    !js.contains("innerText"),
+                    "the amount is not rendered text; reading it there is the \
+                     unsatisfiable-predicate bug, got {js}"
+                );
+            }
+            // The note check may prefer rendered text, and must not stop there:
+            // on the live page the note is in the textarea and nowhere else.
+            PaymentStep::WaitForConfirm { .. } | PaymentStep::ConfirmNamedAmount { .. } => {
+                assert!(
+                    js.contains("carriesNote"),
+                    "the confirmation steps gate on the note, got {js}"
+                );
+                assert!(
+                    js.contains("f.value") || js.contains(".value"),
+                    "the note check must be able to read the field, or it cannot \
+                     pass on a correctly filled form: {js}"
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+/// An unhandled confirmation input on the page is reported, not ignored.
+///
+/// The 2026-09-07 CDP read of the stuck tab found an empty
+/// `<input name="pwu-confirm-last-four" type="number">` next to the form.
+/// Nothing in any crate touches it: no step fills it, no check reads it, and no
+/// earlier inspection of the live page recorded it existing.
+///
+/// **Whether it gates the confirm click is unknown and this test does not
+/// claim otherwise.** On that run the click never happened, because the note
+/// predicate refused first, so Venmo was never asked what it would do with an
+/// empty field. Only a live run that reaches the click can settle it.
+///
+/// What can be settled from code is that the driver stops being silent about
+/// it. If a future confirmation wait does time out, the operator is told the
+/// page carries an input this driver never fills in, instead of being sent to
+/// look for a button that is on screen.
+#[test]
+fn an_unhandled_confirmation_input_is_named_in_the_report() {
+    if !node_available() {
+        return;
+    }
+    let steps = the_incident_payment();
+    let results = run_sequence("stepupconfirm", &expressions(&steps));
+    let waited = steps
+        .iter()
+        .position(|s| matches!(s, PaymentStep::WaitForConfirm { .. }))
+        .expect("a confirmation wait");
+    let report = &results[waited].value;
+
+    assert_eq!(
+        report.get("stepUp"),
+        Some(&serde_json::json!(["pwu-confirm-last-four"])),
+        "the report must name the input no step in this driver fills in: {report}"
+    );
+
+    // And noticing it does not become a refusal. The driver has no evidence
+    // the field is required, and refusing on a page that would have paid is
+    // the failure this whole change is about.
+    assert_eq!(
+        report.get("ok"),
+        Some(&serde_json::json!(true)),
+        "an input of unknown purpose must not block a payment: {report}"
+    );
+    assert!(
+        confirmed(results.last().expect("the confirmation")),
+        "this page still sends on confirm: {}",
+        results.last().unwrap().value
+    );
+}
+
+/// A fixture cannot give a form control rendered text.
+///
+/// The mock's `document.body.innerText` used to be a plain join of every
+/// element's `innerText`, and the fixtures happened to agree with a browser
+/// only because `Fill` writes `.value` and never `.innerText`. That accident is
+/// what let every fixture render the note beside the field while the live page
+/// kept it in the field alone, and it is why five live runs failed green.
+///
+/// The getter now refuses a form control carrying text, so the agreement is a
+/// rule rather than a coincidence. This test is what proves the rule is armed:
+/// without it, a later fixture could quietly restore the unfaithful model.
+#[test]
+fn the_mock_refuses_to_render_text_inside_a_form_control() {
+    if !node_available() {
+        return;
+    }
+    // `unfaithfulnote` puts the note on the textarea's `innerText`, which no
+    // browser does. Reading `document.body.innerText` must throw.
+    let results = run_sequence("unfaithfulnote", &["document.body.innerText".to_string()]);
+    assert!(
+        !results[0].ok,
+        "a textarea with innerText models a page that cannot exist, so reading \
+         the body must refuse: {:?}",
+        results[0].value
+    );
+    let why = results[0].error.clone().unwrap_or_default();
+    assert!(
+        why.contains("TEXTAREA") && why.contains("form control"),
+        "the refusal must say what is wrong with the fixture, got {why:?}"
+    );
+}
+
+/// The confirmation wait says which half refused, not just that it refused.
+///
+/// The live message was "waited 120s for a confirmation button naming $1.50 and
+/// it never appeared". The button was there and enabled for the whole 120s.
+/// The operator read the message and looked for a missing button, which is the
+/// diagnostic cost of a three-part predicate that answers one bool.
+///
+/// `stalepay` reproduces the live shape exactly: an enabled "Pay Jay Butera
+/// $2.01" button on the page, and a note this drive never typed. The report has
+/// to say the button is there and the note is not.
+#[test]
+fn the_confirmation_wait_names_the_half_that_refused() {
+    if !node_available() {
+        return;
+    }
+    let wait = PaymentStep::WaitForConfirm {
+        amount: "2.01".to_string(),
+        note: "a note this page has never held".to_string(),
+    };
+    let results = run_sequence("stalepay", &[wait.expression_for_test()]);
+    let report = &results[0].value;
+
+    assert_eq!(
+        report.get("ok"),
+        Some(&serde_json::json!(false)),
+        "a note the page does not carry must refuse: {report}"
+    );
+    assert_eq!(
+        report.get("note"),
+        Some(&serde_json::json!(false)),
+        "the note is the half that failed: {report}"
+    );
+    // The half the old message blamed. The button is on the page and enabled,
+    // so a timeout here must not say it never appeared.
+    assert_eq!(
+        report.get("named"),
+        Some(&serde_json::json!(true)),
+        "the button naming the amount is on this page: {report}"
+    );
+    assert_eq!(
+        report.get("enabled"),
+        Some(&serde_json::json!(true)),
+        "and it is enabled, which is what made the live message wrong: {report}"
     );
 }
 

@@ -101,18 +101,37 @@ const CONFIRM_PREFIX: &str = "Pay ";
 /// note is per-payment, this run typed it two steps earlier, and it is the same
 /// string `locate_payment` later searches the feed for.
 ///
-/// Read from the page's rendered text only, never from the note field. Reading
-/// the field made this satisfiable by our own fill two steps earlier, so it
-/// discriminated between sheets only when the field rejected the write -- an
-/// assumption about Venmo nothing on record supports, and the round-2 review
-/// showed the mock was the only thing enforcing it.
+/// Read from the page's rendered text **and** from the note field, because on
+/// the live page the note is only ever in the field. Venmo's note control is a
+/// `<textarea>`, and a textarea's value is not part of `document.body.innerText`
+/// -- `innerText` renders an element's *content*, and a textarea's content is
+/// its initial markup, not what was typed into it afterwards. So a predicate
+/// that read only `innerText` could not pass on a correctly filled form,
+/// whatever Venmo did. On 2026-09-07 order `esc_5276115f1f0173f248dfacc2`
+/// funded 142,565 zat, reached the fiat leg, and the drive sat for 120s with
+/// an enabled "Pay Jay Butera $1.50" button in front of it and a correctly
+/// typed note, refusing to click. This half of the predicate was unsatisfiable.
+/// That is the fifth consecutive live run to fail on the fiat leg.
 ///
-/// So this is now a *second* layer behind [`PaymentStep::RequireNoOpenSheet`],
-/// which is the check that actually establishes the sheet is ours. If the live
-/// sheet turns out not to render the note at all this adds nothing, and it
-/// costs nothing either: the temporal check has already refused every sheet
-/// this drive did not open.
-const CARRIES_NOTE_JS: &str = "const carriesNote = (note) => {      const body = document.body ? document.body.innerText : '';      return body.includes(note);    };";
+/// What reading the field costs, stated plainly: the field holds what this run
+/// typed two steps earlier, so on its own it discriminates between sheets only
+/// if Venmo would have rejected the write. Against a sheet an earlier drive
+/// left open for a *different* payee at the same amount, the rendered-text
+/// version refused and this one does not. That case is not unguarded -- it is
+/// guarded by [`PaymentStep::RequireNoOpenSheet`], which refuses any
+/// confirmation that existed before our own click whatever it names, and which
+/// runs before the first money button. The note check was never what
+/// established the sheet was ours; the temporal check is, and it is strictly
+/// stronger, because it does not depend on the sheet saying anything.
+///
+/// `tests/payment_page_test.rs` holds both ends of that trade: the wrong-payee
+/// stale sheet is refused at `RequireNoOpenSheet`, and a page whose note lives
+/// only in the textarea is paid. Neither passes without the other.
+///
+/// The rendered-text half is kept and checked first, for the case where Venmo
+/// does render the note on the sheet. The field half is what makes the
+/// predicate satisfiable at all.
+const CARRIES_NOTE_JS: &str = "const carriesNote = (note) => { const body = document.body ? document.body.innerText : ''; if (body.includes(note)) return true; const fields = [...document.querySelectorAll('textarea, input')]; return fields.some(f => String(f.value || '').includes(note)); };";
 
 /// Whether this run is allowed to move money.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -947,13 +966,82 @@ impl VenmoBrowser {
                 Ok(())
             }
 
-            PaymentStep::WaitForConfirm { amount, .. } => {
-                self.wait_for_expression(
-                    tab,
-                    &step.to_expression(),
-                    &format!("a confirmation button naming ${amount}"),
-                )
-                .await
+            // Polled here rather than through `wait_for_expression`, because
+            // the expression answers a report and the timeout has to name the
+            // half that refused. `wait_for_expression` can only say "it never
+            // appeared", and on 2026-09-07 that sentence was false: the button
+            // was on screen and enabled for the whole 120s, and the note half
+            // was what could not pass. The operator followed the message.
+            PaymentStep::WaitForConfirm { amount, note } => {
+                let expression = step.to_expression();
+                let deadline = std::time::Instant::now() + self.timeout;
+                loop {
+                    let value = self.evaluate(tab, &expression).await?;
+                    let report = value.get("result").and_then(|r| r.get("value"));
+                    let flag = |name: &str| {
+                        report
+                            .and_then(|v| v.get(name))
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false)
+                    };
+                    if flag("ok") {
+                        return Ok(());
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        let list = |name: &str| {
+                            report
+                                .and_then(|v| v.get(name))
+                                .and_then(|v| v.as_array())
+                                .map(|a| {
+                                    a.iter()
+                                        .filter_map(|v| v.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                })
+                                .unwrap_or_default()
+                        };
+                        // Named in the order they are checked, so the first
+                        // "no" is the one to act on.
+                        let why = if !flag("note") {
+                            format!(
+                                "the page does not carry this payment's note ({note:?}). \
+                                 Neither the rendered text nor any field on the page \
+                                 holds it, so the note this run typed is not there and \
+                                 the sheet cannot be shown to be ours"
+                            )
+                        } else if !flag("named") {
+                            format!(
+                                "no button names ${amount}. The buttons on the page \
+                                 are: [{}]",
+                                list("buttons")
+                            )
+                        } else {
+                            format!("the button naming ${amount} is present but disabled")
+                        };
+                        // Reported whether or not it is the cause. Nothing in
+                        // this repo handles this input and no prior inspection
+                        // recorded it; saying it is there costs one clause and
+                        // saves the next operator the search.
+                        let step_up = list("stepUp");
+                        let extra = if step_up.is_empty() {
+                            String::new()
+                        } else {
+                            format!(
+                                " The page also carries an unhandled confirmation \
+                                 input ([{step_up}]) that no step in this driver fills \
+                                 in; if the button stays unclickable this is the first \
+                                 thing to check in the tab."
+                            )
+                        };
+                        anyhow::bail!(
+                            "waited {}s for a usable confirmation of ${amount} and gave \
+                             up: {why}.{extra} The payment may be mid-flow; check the \
+                             tab before retrying.",
+                            self.timeout.as_secs()
+                        );
+                    }
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
             }
 
             PaymentStep::WaitForButton { label } => self.wait_for_button(tab, label).await,
@@ -1468,15 +1556,32 @@ impl PaymentStep {
             // The note has to be on the page as well as the amount on the
             // button. Both halves are about identity: the amount says what the
             // sheet will do, the note says which drive it belongs to.
+            // Answers a report, not a bool, so the timeout can name the half
+            // that was unsatisfied. On 2026-09-07 this returned a bare `false`
+            // for 120s while the button it was described as waiting for was on
+            // screen and enabled; the operator was told "a confirmation button
+            // naming $1.50 never appeared" and spent the incident looking for a
+            // button that was never missing. A predicate with three independent
+            // halves has to say which one refused.
             PaymentStep::WaitForConfirm { amount, note } => format!(
                 "(() => {{ \
                    {helper} \
                    const pre = {pre}; const amt = {amt}; const note = {note}; \
-                   if (note && !carriesNote(note)) return false; \
+                   const hasNote = !note || carriesNote(note); \
+                   const labels = [...document.querySelectorAll('button')] \
+                     .map(b => (b.innerText||'').trim()); \
                    const el = [...document.querySelectorAll('button')] \
                      .find(b => {{ const t=(b.innerText||'').trim(); \
                                   return t.startsWith(pre) && t.includes(amt); }}); \
-                   return !!el && !el.disabled; \
+                   const named = !!el; \
+                   const enabled = named && !el.disabled; \
+                   const stepUp = [...document.querySelectorAll('input')] \
+                     .filter(i => /last-?four|lastFour/i.test(String(i.name||'') + ' ' + \
+                                  String(i.getAttribute('id')||''))) \
+                     .map(i => String(i.name || i.getAttribute('id') || 'unnamed')); \
+                   return {{ ok: hasNote && named && enabled, note: hasNote, \
+                             named: named, enabled: enabled, stepUp: stepUp, \
+                             buttons: labels }}; \
                  }})()",
                 pre = json!(CONFIRM_PREFIX),
                 amt = json!(amount),

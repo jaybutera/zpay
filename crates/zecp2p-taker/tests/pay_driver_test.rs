@@ -41,6 +41,11 @@ enum Confirmation {
     /// The per-user read succeeds and answers a *different* canonical handle,
     /// which is what `jaybutera` -> `JayButera` does on the live site.
     PayeeResolvesToSomeoneElse,
+    /// The 2026-09-07 stall: the confirmation button is on the page and
+    /// enabled, and the note half of the wait will not pass. The live message
+    /// for this said the button never appeared, which sent the operator to look
+    /// for a button that was never missing.
+    ButtonThereNoteMissing,
 }
 
 /// A fake browser: an HTTP `/json/list` and a websocket that answers
@@ -254,9 +259,13 @@ fn answer_for(expression: &str, confirmation: Confirmation) -> serde_json::Value
             // check, long before anything is clicked. Answered rather than
             // `todo!()`ed so a reordering surfaces as a failed assertion, not
             // a panic in the fake.
+            // `ButtonThereNoteMissing` joins them for the same reason: the
+            // run ends at the confirmation wait, so the post-click check is
+            // never reached.
             Confirmation::WrongPayeeOnThePage
             | Confirmation::PayeeDoesNotResolve
-            | Confirmation::PayeeResolvesToSomeoneElse => serde_json::json!({
+            | Confirmation::PayeeResolvesToSomeoneElse
+            | Confirmation::ButtonThereNoteMissing => serde_json::json!({
                 "ok": false, "sheet": true, "form": true,
                 "payBtn": true, "signedOut": false,
                 "url": "https://account.venmo.com/pay?recipients=jay-butera"
@@ -328,7 +337,25 @@ fn answer_for(expression: &str, confirmation: Confirmation) -> serde_json::Value
     if expression.contains("audience") || expression.contains("Private") {
         return serde_json::json!("Private");
     }
-    // Presence polls and the confirmation wait answer a bool.
+    // The confirmation wait answers a report, so a timeout can name the half
+    // that refused rather than claiming the button never appeared. Matched
+    // before the presence polls, because it is no longer a bool.
+    if expression.contains("stepUp") {
+        return match confirmation {
+            // The button is there and enabled; only the note refuses. The
+            // report has to carry that shape or the message cannot name it.
+            Confirmation::ButtonThereNoteMissing => serde_json::json!({
+                "ok": false, "note": false, "named": true, "enabled": true,
+                "stepUp": ["pwu-confirm-last-four"],
+                "buttons": ["Pay", "Pay Jay Butera $2.01"]
+            }),
+            _ => serde_json::json!({
+                "ok": true, "note": true, "named": true, "enabled": true,
+                "stepUp": [], "buttons": ["Pay Jay Butera $2.01"]
+            }),
+        };
+    }
+    // Presence polls answer a bool.
     if expression.contains("!== null") || expression.contains("!!el") {
         return serde_json::json!(true);
     }
@@ -408,6 +435,50 @@ async fn a_confirmed_send_returns_sent() {
         }
         other => panic!("expected Sent, got {other:?}"),
     }
+}
+
+/// The confirmation timeout names the half that refused.
+///
+/// Order `esc_5276115f1f0173f248dfacc2` on 2026-09-07: the escrow funded, the
+/// coordinator entered `paying`, and the fiat leg gave up after 120s saying
+/// "waited 120s for a confirmation button naming $1.50 and it never appeared".
+/// The tab, read over CDP while it was stuck, had that button on screen and
+/// enabled. The message was not vague, it was wrong, and it cost the operator
+/// the incident looking for a missing button.
+///
+/// The wait has three independent halves and now reports them apart, so the
+/// message names the one that said no. This asserts the text, because the text
+/// is the whole deliverable of the change: a report nobody reads is not a fix.
+#[tokio::test]
+async fn a_confirmation_timeout_says_which_half_refused() {
+    let fake = FakeBrowser::start(Confirmation::ButtonThereNoteMissing).await;
+    let browser = VenmoBrowser::new(fake.cdp_url(), 1);
+    let tab = browser.find_venmo_tab().await.expect("the fake tab");
+
+    let err = browser
+        .pay(&tab, &request(), SendMode::Live)
+        .await
+        .expect_err("a wait that never passes is a failure");
+    let why = format!("{err:#}");
+
+    // The half that actually refused.
+    assert!(
+        why.contains("note"),
+        "the message must name the note as the unsatisfied half, got {why:?}"
+    );
+    // And not the half that was fine. This is the sentence that misled the
+    // operator: the button was present and enabled the whole time.
+    assert!(
+        !why.contains("never appeared"),
+        "the button was on the page, so the message must not say it was \
+         missing, got {why:?}"
+    );
+    // The unhandled input is surfaced rather than left for the next reader to
+    // find over CDP.
+    assert!(
+        why.contains("pwu-confirm-last-four"),
+        "an input no step fills in must be named, got {why:?}"
+    );
 }
 
 /// A dry run stops before the first click and never reaches the confirmation.

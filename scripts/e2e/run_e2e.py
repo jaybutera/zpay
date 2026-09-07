@@ -32,17 +32,19 @@ funds anything. A run that cannot persist the key stops while the escrow is
 still empty.
 
 `ZPAY_DRY_RUN=1` opens the order, persists the key and stops there without
-broadcasting a funding transaction. It still books an order at that amount
-for its refund window, so use an amount and handle you are willing to lose a
-slot on.
+broadcasting a funding transaction. The order stays open until its refund
+height and counts against the per-handle limit below, so it is not free, but it
+does not reserve the amount.
 
 Exits 0 only when the page reached `done`. Every other ending, including a
 refusal the page states in its own words, exits non-zero and says which.
 
-One order per amount per handle: the coordinator refuses a second open order
-to the same handle for the same dollars, because two identical payments cannot
-be told apart in the Venmo feed. An abandoned order therefore blocks the next
-run at that amount until its refund height, so do not open orders to rehearse.
+Two open orders at the same amount to the same handle are allowed. Each order
+writes its own hashed tag into the Venmo note (`Order::note_tag`), so
+`locate_payment` tells identical payments apart in the feed. What bounds a rerun
+is the open-order count, not the amount: `max_open_orders` (200) across the
+coordinator and `max_open_per_handle` (5) for one Venmo account, both in
+`web.rs`. An abandoned order costs one of those five until it refunds.
 """
 import json, os, re, subprocess, sys, time
 
