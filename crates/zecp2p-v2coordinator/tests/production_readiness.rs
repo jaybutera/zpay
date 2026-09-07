@@ -882,6 +882,94 @@ async fn one_sweep_reads_the_head_once_however_many_orders() {
     );
 }
 
+/// A straggler from one sweep must not publish its head to the next.
+///
+/// The generation is what makes the shared head safe, and it only works if two
+/// passes never share a number. Resetting the counter between passes - the
+/// obvious way to say "no sweep is running" - makes them repeat: a task still
+/// in flight from pass A finds its number equal to pass B's, its compare
+/// succeeds, and it publishes a head it read during the earlier pass. Every
+/// order in pass B then decides refund eligibility on a stale height.
+///
+/// Driven through the public surface rather than by reaching into the field:
+/// `begin_sweep` returns the number, and what is asserted is that a later pass
+/// never gets one an earlier pass used.
+#[tokio::test]
+async fn two_sweep_passes_never_share_a_generation() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+
+    let state = coordinator_from_config(
+        test_config(dir.path()),
+        scanner.clone() as Arc<dyn zecp2p_v2coordinator::funding::FundingScanner>,
+        &node,
+        None,
+    );
+
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..50 {
+        let generation = state.begin_sweep();
+        assert!(
+            seen.insert(generation),
+            "pass number {generation} was handed out twice; a straggler from the \
+             earlier pass would publish its head to the later one"
+        );
+        state.end_sweep();
+    }
+}
+
+/// Outside a sweep the node is read, and inside one the pass's head is shared.
+///
+/// Both halves matter. The refund endpoint and `presign`'s own advance run
+/// outside a sweep and must see the node; every order inside a pass must share
+/// one read, which is the whole saving.
+#[tokio::test]
+async fn the_shared_head_applies_inside_a_sweep_and_nowhere_else() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = FakeNode::spawn().await;
+    let scanner = Arc::new(FakeScanner::new());
+
+    let state = coordinator_from_config(
+        test_config(dir.path()),
+        scanner.clone() as Arc<dyn zecp2p_v2coordinator::funding::FundingScanner>,
+        &node,
+        None,
+    );
+
+    // Outside a sweep: every call reads the node.
+    let before = state.head_reads();
+    let _ = state.head_for_this_sweep().await.unwrap();
+    let _ = state.head_for_this_sweep().await.unwrap();
+    assert_eq!(
+        state.head_reads() - before,
+        2,
+        "outside a sweep each caller must see the node"
+    );
+
+    // Inside one: the pass shares a single read.
+    state.begin_sweep();
+    let before = state.head_reads();
+    let _ = state.head_for_this_sweep().await.unwrap();
+    let _ = state.head_for_this_sweep().await.unwrap();
+    let _ = state.head_for_this_sweep().await.unwrap();
+    assert_eq!(
+        state.head_reads() - before,
+        1,
+        "inside a sweep the pass shares one head read"
+    );
+
+    // And the sharing ends with the pass.
+    state.end_sweep();
+    let before = state.head_reads();
+    let _ = state.head_for_this_sweep().await.unwrap();
+    assert_eq!(
+        state.head_reads() - before,
+        1,
+        "once the pass is over the shared head must not be reused"
+    );
+}
+
 /// An unreachable primary is failed over to a second endpoint.
 ///
 /// One provider was a single point of failure for the read that decides when a

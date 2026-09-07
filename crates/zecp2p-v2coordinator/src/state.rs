@@ -302,8 +302,16 @@ pub struct AppState {
     sweep_head: Arc<std::sync::Mutex<Option<(u64, (u32, u32))>>>,
     /// Held across the sweep's head read so concurrent orders share one.
     sweep_head_reading: Arc<tokio::sync::Mutex<()>>,
-    /// Which sweep pass is running. Zero means none.
+    /// Which sweep pass is running. Monotonic: it never resets, so two passes
+    /// never share a number and a straggler from an earlier one cannot publish
+    /// its head to a later one. See [`AppState::begin_sweep`].
     sweep_generation: Arc<std::sync::atomic::AtomicU64>,
+    /// Whether a sweep pass is running at all.
+    ///
+    /// Separate from the counter because the counter must stay monotonic. A
+    /// sentinel value in the counter would make pass numbers repeat, which is
+    /// the one thing the generation exists to prevent.
+    sweep_active: Arc<std::sync::atomic::AtomicBool>,
     /// When the last sweep pass finished, for `/health` and the sweep-age
     /// alert. `None` until one has.
     last_sweep_done: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
@@ -628,12 +636,12 @@ impl AppState {
     /// order to a `JoinSet` at once, so without it each of them would find the
     /// slot empty and start its own read.
     pub async fn head_for_this_sweep(&self) -> Result<(u32, u32)> {
-        let generation = self.sweep_generation.load(std::sync::atomic::Ordering::Acquire);
-        if generation == 0 {
+        if !self.sweep_active.load(std::sync::atomic::Ordering::Acquire) {
             // Not in a sweep. The refund endpoint and `presign`'s own advance
             // arrive here, and they must see the node.
             return self.chain_head_uncached().await;
         }
+        let generation = self.sweep_generation.load(std::sync::atomic::Ordering::Acquire);
         if let Some(head) = self.head_for_generation(generation) {
             return Ok(head);
         }
@@ -668,6 +676,17 @@ impl AppState {
 
     /// Opens a sweep pass. Every `head_for_this_sweep` inside it shares one
     /// head read. Returns the pass number.
+    ///
+    /// **The counter only ever goes up.** It is tempting to reset it to zero
+    /// between passes - "no sweep is running" is a real state and zero is the
+    /// obvious way to say it - and that is a bug: pass numbers would repeat, so
+    /// a straggler holding an old number would find it equal to the *current*
+    /// pass's and publish a head it read during the previous one. Two passes
+    /// never share a number, so a late writer's compare always fails.
+    ///
+    /// Whether a sweep is running is tracked separately, by
+    /// [`AppState::sweep_active`], which is a flag rather than a sentinel value
+    /// in the counter.
     pub fn begin_sweep(&self) -> u64 {
         let generation = self
             .sweep_generation
@@ -676,17 +695,19 @@ impl AppState {
         if let Ok(mut slot) = self.sweep_head.lock() {
             *slot = None;
         }
+        self.sweep_active
+            .store(true, std::sync::atomic::Ordering::Release);
         generation
     }
 
     /// Closes a sweep pass, recording that one finished.
     ///
-    /// The generation goes back to zero so a straggler - an order whose task
-    /// outlived the pass, a `presign` advance running alongside - reads the
-    /// node rather than inheriting a head from a pass that has ended.
+    /// A straggler - an order whose task outlived the pass, a `presign` advance
+    /// running alongside - reads the node rather than inheriting a head from a
+    /// pass that has ended, because `head_for_this_sweep` checks the flag.
     pub fn end_sweep(&self) {
-        self.sweep_generation
-            .store(0, std::sync::atomic::Ordering::Release);
+        self.sweep_active
+            .store(false, std::sync::atomic::Ordering::Release);
         if let Ok(mut slot) = self.sweep_head.lock() {
             *slot = None;
         }
@@ -1006,6 +1027,7 @@ impl AppStateBuilder {
             sweep_head: Arc::new(std::sync::Mutex::new(None)),
             sweep_head_reading: Arc::new(tokio::sync::Mutex::new(())),
             sweep_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            sweep_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_sweep_done: Arc::new(std::sync::Mutex::new(None)),
             paying: Arc::new(tokio::sync::Mutex::new(())),
         }))
