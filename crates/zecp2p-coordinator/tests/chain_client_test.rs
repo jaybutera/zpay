@@ -184,7 +184,7 @@ async fn intent_range_preflight_sees_the_old_glue_lacks_it() {
 
     assert!(
         !client.glue_supports_intent_range().await.unwrap(),
-        "the glue deployed before commit e6a0ecc must be reported as lacking \
+        "the glue deployed before commit f866f0d must be reported as lacking \
          processOfframpWithRange; reporting otherwise sends a call that reverts blank"
     );
 }

@@ -25,7 +25,7 @@
 //!
 //! A payment now begins with [`VenmoBrowser::resolve_payee`], one authenticated
 //! `GET /api/user/<handle>` made before the browser is pointed anywhere. It is
-//! the "per-user read" `1a168fa` named and the thing the pay page cannot
+//! the "per-user read" `4b6647d` named and the thing the pay page cannot
 //! substitute for: the pay page renders the recipient as a **display name**
 //! under "To", and the only `@handle` anywhere on it is the logged-in account's
 //! own, from the chrome at the top of every page.
@@ -534,7 +534,7 @@ impl VenmoBrowser {
 
     /// Ask Venmo who a handle is, before the browser is pointed at a pay form.
     ///
-    /// `GET /api/user/<handle>` is the per-user read `1a168fa`'s message named
+    /// `GET /api/user/<handle>` is the per-user read `4b6647d`'s message named
     /// as the real fix, chosen over the alternatives by probing the live
     /// session on 2026-09-06 rather than by guessing:
     ///
@@ -1633,7 +1633,7 @@ impl PaymentStep {
             // pages. The bare-"Pay" clause is what catches the dismissed sheet.
             //
             // **What this still does not catch**, stated plainly because
-            // 51795d6's message wrongly claimed otherwise: any *signed-in*
+            // a859312's message wrongly claimed otherwise: any *signed-in*
             // Venmo page with no form and no sheet answers `ok: true`. That is
             // the account home, a DataDome interstitial at the pay URL, a 5xx,
             // or Venmo unmounting the form to show an error panel. This proves
